@@ -2831,4 +2831,163 @@ mod tests {
         drop(ws2);
         cleanup_db(&url);
     }
+
+    // --- #2 acceptance: identity & sessions ------------------------------
+
+    /// Stand up a proxy backed by a fresh db with one whole-world zone, plus the
+    /// fake zone so the handshake can complete. Returns (proxy, db url, zone).
+    async fn proxy_with_db() -> (Arc<Proxy>, String, FakeZone) {
+        let url = temp_db_url();
+        let db = Arc::new(Db::connect(&url).await.unwrap());
+        let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db));
+        let zone = spawn_fake_zone().await;
+        proxy
+            .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        (proxy, url, zone)
+    }
+
+    /// Spawn a one-shot acceptor running `handle_client` for the next connection,
+    /// and return a client websocket connected to it.
+    async fn dial(proxy: &Arc<Proxy>) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let p = proxy.clone();
+        tokio::spawn(async move {
+            let (srv, _) = listener.accept().await.unwrap();
+            p.handle_client(srv).await;
+        });
+        let (ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        ws
+    }
+
+    /// Read frames until one of the given `type` arrives (skipping any others,
+    /// including handshake/partition housekeeping).
+    async fn recv_until(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, ty: &str) -> Value {
+        loop {
+            match timeout(Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let v = parse(t);
+                    if v.get("type").and_then(|x| x.as_str()) == Some(ty) {
+                        return v;
+                    }
+                }
+                Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => panic!("ws closed waiting for {ty}"),
+                other => panic!("expected text waiting for {ty}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Acceptance: an unknown account is rejected (no welcome, an auth_error).
+    #[tokio::test]
+    async fn unknown_account_is_rejected() {
+        let (proxy, url, _zone) = proxy_with_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "login", "email": "nobody@nowhere.test", "password": "whatever"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "auth_error").await;
+        assert!(
+            err["message"].as_str().unwrap().to_lowercase().contains("invalid"),
+            "unexpected message: {err}"
+        );
+        drop(ws);
+        cleanup_db(&url);
+    }
+
+    /// Acceptance: two logins for the same account collapse to one session — the
+    /// second is refused while the first is online, and allowed again once it ends.
+    #[tokio::test]
+    async fn duplicate_login_collapses_to_one_session() {
+        let (proxy, url, _zone) = proxy_with_db().await;
+        let email = format!("dup_{}@t.test", Uuid::new_v4().simple());
+
+        // Session 1: register and stay connected.
+        let mut ws1 = dial(&proxy).await;
+        ws1.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hero"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws1, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+        assert!(proxy.clients.lock().unwrap().contains_key(&pid));
+
+        // Session 2: a concurrent login for the same account is refused.
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(
+            json!({"type": "login", "email": email, "password": "pw12"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws2, "auth_error").await;
+        assert!(
+            err["message"].as_str().unwrap().contains("already online"),
+            "unexpected message: {err}"
+        );
+        drop(ws2);
+
+        // End session 1 -> the gateway drops the client, freeing the character.
+        drop(ws1);
+        let freed = wait_until(
+            || !proxy.clients.lock().unwrap().contains_key(&pid),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(freed, "character was not freed after the first session ended");
+
+        // Session 3: login now succeeds as the same durable character.
+        let mut ws3 = dial(&proxy).await;
+        ws3.send(Message::Text(
+            json!({"type": "login", "email": email, "password": "pw12"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome3 = recv_until(&mut ws3, "welcome").await;
+        assert_eq!(welcome3["player_id"], pid, "same character on re-login");
+        drop(ws3);
+        cleanup_db(&url);
+    }
+
+    /// Acceptance support: a reconnect with a valid session token resumes the same
+    /// character without re-entering credentials.
+    #[tokio::test]
+    async fn token_reconnect_resumes_same_character() {
+        let (proxy, url, _zone) = proxy_with_db().await;
+        let email = format!("tok_{}@t.test", Uuid::new_v4().simple());
+
+        // Register and capture the issued session token.
+        let mut ws1 = dial(&proxy).await;
+        ws1.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hero"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let ok = recv_until(&mut ws1, "auth_ok").await;
+        let token = ok["token"].as_str().unwrap().to_string();
+        let pid = ok["player_id"].as_str().unwrap().to_string();
+        assert!(!token.is_empty());
+
+        // Disconnect and wait for the gateway to release the character.
+        drop(ws1);
+        let freed = wait_until(
+            || !proxy.clients.lock().unwrap().contains_key(&pid),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(freed);
+
+        // Reconnect with the token alone -> same character, no credentials.
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(json!({"type": "token", "token": token}).to_string()))
+            .await
+            .unwrap();
+        let welcome = recv_until(&mut ws2, "welcome").await;
+        assert_eq!(welcome["player_id"], pid, "token resumed the same character");
+        drop(ws2);
+        cleanup_db(&url);
+    }
 }
