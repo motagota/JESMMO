@@ -1458,6 +1458,24 @@ impl Proxy {
             };
             let kind = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+            // Protocol-version gate. A client that declares its version must match
+            // the gateway's, or it is refused cleanly (retrying can't fix a version
+            // skew, so we close). Legacy/bot clients omit the field and fall through
+            // to the guest path below — preserving backward compatibility.
+            if let Some(v) = data.get("protocol_version").and_then(|v| v.as_u64()) {
+                if v as u32 != PROTOCOL_VERSION {
+                    let _ = tx
+                        .send(Message::Text(
+                            json!({"type": protocol::S_AUTH_ERROR,
+                                   "message": format!(
+                                       "protocol version mismatch: server {PROTOCOL_VERSION}, client {v}")})
+                            .to_string(),
+                        ))
+                        .await;
+                    return None;
+                }
+            }
+
             let result: Result<Identity, auth::AuthError> = if kind == protocol::C_GUEST {
                 Ok(guest_identity(None))
             } else if kind == protocol::C_REGISTER || kind == protocol::C_LOGIN {
@@ -2877,6 +2895,40 @@ mod tests {
                 other => panic!("expected text waiting for {ty}, got {other:?}"),
             }
         }
+    }
+
+    /// Acceptance (#3): a client that declares a mismatched protocol version is
+    /// cleanly refused, while a matching version (and the legacy no-version path)
+    /// is accepted.
+    #[tokio::test]
+    async fn protocol_version_mismatch_is_refused() {
+        let (proxy, url, _zone) = proxy_with_db().await;
+
+        // Mismatched version -> auth_error, no welcome.
+        let mut bad = dial(&proxy).await;
+        bad.send(Message::Text(
+            json!({"type": "guest", "protocol_version": PROTOCOL_VERSION + 1}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut bad, "auth_error").await;
+        assert!(
+            err["message"].as_str().unwrap().contains("version mismatch"),
+            "unexpected message: {err}"
+        );
+        drop(bad);
+
+        // Matching version -> normal welcome.
+        let mut good = dial(&proxy).await;
+        good.send(Message::Text(
+            json!({"type": "guest", "protocol_version": PROTOCOL_VERSION}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut good, "welcome").await;
+        assert_eq!(welcome["protocol_version"], PROTOCOL_VERSION);
+        drop(good);
+        cleanup_db(&url);
     }
 
     /// Acceptance: an unknown account is rejected (no welcome, an auth_error).
