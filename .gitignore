@@ -1,0 +1,20 @@
+# Rust
+/rust_server/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Server logs / runtime output
+server/*_out.txt
+server/*_err.txt
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db

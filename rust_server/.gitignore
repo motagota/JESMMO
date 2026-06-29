@@ -1,0 +1,9 @@
+/target
+# Dev SQLite database (created on first run) and its WAL/shared-memory sidecars.
+mmo_dev.db
+mmo_dev.db-wal
+mmo_dev.db-shm
+# Stray test databases, if a test ever fails before cleanup.
+mmo_test_*.db
+mmo_test_*.db-wal
+mmo_test_*.db-shm

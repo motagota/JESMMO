@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Seamless World — Spatial Zones</title>
+    <style>
+        body { background: #0a0a0a; color: #00ff88; font-family: monospace; }
+        h1 { margin-bottom: 4px; }
+        .hint { color: #5a5; font-size: 12px; margin-bottom: 12px; }
+        #bar { margin-bottom: 10px; font-size: 14px; }
+        #bar span { color: #fff; }
+
+        /* The whole 1200x1200 world, drawn at SCALE. Zones are rectangles within it. */
+        #world {
+            position: relative; background: #001100; border: 2px solid #00ff88;
+            overflow: hidden;
+        }
+        #zonesLayer, #entityLayer {
+            position: absolute; inset: 0;
+        }
+        .zonebox {
+            position: absolute; box-sizing: border-box;
+            border: 1px solid rgba(0,255,136,0.35);
+            background: rgba(0,255,136,0.04);
+        }
+        .zonebox.active { border-color: #ffe14c; }
+        /* Territory ownership. */
+        .zonebox.mine  { border-color: #00ff88; background: rgba(0,255,136,0.10); }
+        .zonebox.enemy { border-color: #ff5a5a; background: rgba(255,90,90,0.10); }
+        /* Capture-bar fill, grows from the bottom of the zone box. */
+        .capfill {
+            position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+            background: rgba(76,255,158,0.20); pointer-events: none;
+        }
+        .capfill.mine  { background: rgba(0,255,136,0.28); }
+        .capfill.enemy { background: rgba(255,90,90,0.28); }
+        .zonelabel {
+            position: absolute; top: 2px; left: 4px; font-size: 11px;
+            color: #4cff9e; white-space: nowrap; pointer-events: none; z-index: 1;
+        }
+        .entity {
+            position: absolute; border-radius: 50%;
+            transform: translate(-50%, -50%); /* position interpolated per-frame in JS */
+        }
+        .entity.me   { width: 12px; height: 12px; background: #00ff88; box-shadow: 0 0 8px #00ff88; z-index: 5; }
+        .entity.other{ width: 8px; height: 8px; background: #4c8cff; box-shadow: 0 0 5px #4c8cff; }
+        .entity.mob  { width: 10px; height: 10px; background: #ff5a5a; box-shadow: 0 0 6px #ff3a3a; }
+
+        /* Thin HP bar pinned above each entity (positioned per-frame in JS). */
+        .hpbar {
+            position: absolute; width: 16px; height: 3px; transform: translate(-50%, -50%);
+            background: #400; border: 1px solid #000; z-index: 6; pointer-events: none;
+        }
+        .hpbar > i { display: block; height: 100%; background: #2ecc71; width: 100%; }
+        .hpbar.mob > i { background: #ff5a5a; }
+
+        /* Brief melee swing wedge shown in the facing direction. */
+        .swing {
+            position: absolute; width: 0; height: 0; z-index: 4; pointer-events: none;
+            border-left: 30px solid transparent; border-right: 30px solid transparent;
+            border-bottom: 30px solid rgba(0,255,136,0.35);
+            transform: translate(-50%, -100%);
+        }
+
+        #log { height: 110px; overflow-y: auto; background: #050505; border: 1px solid #222;
+            padding: 8px; font-size: 12px; margin-top: 12px; }
+        .msg { margin: 1px 0; }
+        .sys { color: #4c8cff; }
+        .err { color: #ff6c6c; }
+        .mig { color: #ffe14c; }
+
+        /* Login / register overlay (M0 identity). */
+        #authOverlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 200;
+            display: flex; align-items: center; justify-content: center;
+        }
+        #authOverlay.hidden { display: none; }
+        #authBox {
+            background: #071107; border: 1px solid #00ff88; padding: 20px 24px;
+            width: 320px; box-shadow: 0 0 24px rgba(0,255,136,0.25);
+        }
+        #authBox h2 { margin: 0 0 12px; }
+        #authBox input {
+            display: block; width: 100%; box-sizing: border-box; margin: 6px 0;
+            background: #0a0a0a; border: 1px solid #1f5; color: #00ff88;
+            font-family: monospace; padding: 8px;
+        }
+        #authBox button {
+            background: #00ff88; color: #042; border: none; font-family: monospace;
+            font-weight: bold; padding: 8px 10px; margin: 8px 6px 0 0; cursor: pointer;
+        }
+        #authBox button.ghost { background: transparent; color: #4c8cff; border: 1px solid #345; }
+        #authMsg { color: #ff6c6c; font-size: 12px; min-height: 16px; margin-top: 8px; }
+        #authVer { color: #5a5; font-size: 11px; margin-top: 6px; }
+    </style>
+</head>
+
+<body>
+    <div id="authOverlay">
+        <div id="authBox">
+            <h2>Enter the Capital</h2>
+            <input id="authEmail" type="email" placeholder="email" autocomplete="username">
+            <input id="authPass" type="password" placeholder="password" autocomplete="current-password">
+            <input id="authName" type="text" placeholder="character name (register only)">
+            <div>
+                <button id="btnLogin">Login</button>
+                <button id="btnRegister">Register</button>
+                <button id="btnGuest" class="ghost">Play as guest</button>
+            </div>
+            <div id="authMsg"></div>
+            <div id="authVer">protocol —</div>
+        </div>
+    </div>
+
+    <h1>Seamless World — Spatial Zones</h1>
+    <div class="hint">Move with WASD / arrow keys. Press <b>Space</b> (or click) to swing in your facing direction — kill the red mobs before they kill you. Cross a boundary and you migrate seamlessly; zones auto-split when crowded.</div>
+    <div id="bar">
+        Connection: <span id="conn">Connecting…</span> &nbsp;|&nbsp;
+        HP: <span id="hp">100</span> &nbsp;|&nbsp;
+        My zone: <span id="zone">N/A</span> &nbsp;|&nbsp;
+        Pos: <span id="pos">N/A</span> &nbsp;|&nbsp;
+        Zones: <span id="zcount">0</span>
+    </div>
+
+    <div id="world">
+        <div id="zonesLayer"></div>
+        <div id="entityLayer"></div>
+    </div>
+
+    <div id="log"></div>
+
+    <script>
+        const SCALE = 0.5;
+        let WORLD = 1200;
+
+        const connEl = document.getElementById('conn');
+        const hpEl = document.getElementById('hp');
+        const zoneEl = document.getElementById('zone');
+        const posEl = document.getElementById('pos');
+        const zcountEl = document.getElementById('zcount');
+        const worldEl = document.getElementById('world');
+        const zonesLayer = document.getElementById('zonesLayer');
+        const entityLayer = document.getElementById('entityLayer');
+        const logEl = document.getElementById('log');
+
+        let myId = null;
+        let myZone = null;
+
+        // zoneId -> { box, label, region }
+        const zoneBoxes = new Map();
+        // entityId -> { el, zone }
+        const entities = new Map();
+
+        function sizeWorld() {
+            worldEl.style.width = (WORLD * SCALE) + 'px';
+            worldEl.style.height = (WORLD * SCALE) + 'px';
+        }
+        sizeWorld();
+
+        function log(msg, cls) {
+            const d = document.createElement('div');
+            d.className = 'msg ' + (cls || '');
+            d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logEl.appendChild(d);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Rebuild the zone rectangles from a partition message.
+        function applyPartition(zones) {
+            const seen = new Set();
+            for (const z of zones) {
+                seen.add(z.zone_id);
+                let rec = zoneBoxes.get(z.zone_id);
+                if (!rec) {
+                    const box = document.createElement('div');
+                    box.className = 'zonebox';
+                    const fill = document.createElement('div');
+                    fill.className = 'capfill';
+                    const label = document.createElement('div');
+                    label.className = 'zonelabel';
+                    box.appendChild(fill);
+                    box.appendChild(label);
+                    zonesLayer.appendChild(box);
+                    rec = { box, fill, label, owner: null, progress: 0 };
+                    zoneBoxes.set(z.zone_id, rec);
+                }
+                rec.region = z;
+                rec.owner = z.owner ?? null;
+                rec.progress = z.progress ?? 0;
+                rec.box.style.left = (z.x0 * SCALE) + 'px';
+                rec.box.style.top = (z.y0 * SCALE) + 'px';
+                rec.box.style.width = ((z.x1 - z.x0) * SCALE) + 'px';
+                rec.box.style.height = ((z.y1 - z.y0) * SCALE) + 'px';
+            }
+            // Remove boxes for zones that no longer exist.
+            for (const [id, rec] of [...zoneBoxes]) {
+                if (!seen.has(id)) { rec.box.remove(); zoneBoxes.delete(id); }
+            }
+            zcountEl.textContent = zoneBoxes.size;
+            refreshCounts();
+        }
+
+        // Apply a live capture update for one zone, then repaint.
+        function applyCapture(zoneId, owner, progress) {
+            const rec = zoneBoxes.get(zoneId);
+            if (!rec) return;
+            rec.owner = owner ?? null;
+            rec.progress = progress ?? 0;
+            refreshCounts();
+        }
+
+        // Kept for callers that only care about my-zone highlight; full repaint.
+        function refreshZoneStyles() { refreshCounts(); }
+
+        function refreshCounts() {
+            const counts = new Map();
+            for (const { zone } of entities.values()) {
+                counts.set(zone, (counts.get(zone) || 0) + 1);
+            }
+            for (const [id, rec] of zoneBoxes) {
+                const mine = rec.owner && rec.owner === myId;
+                const enemy = rec.owner && !mine;
+                rec.box.classList.toggle('mine', !!mine);
+                rec.box.classList.toggle('enemy', !!enemy);
+                rec.box.classList.toggle('active', id === myZone);
+                rec.fill.className = 'capfill' + (mine ? ' mine' : (enemy ? ' enemy' : ''));
+                rec.fill.style.height = Math.max(0, Math.min(100, rec.progress)) + '%';
+
+                const own = rec.owner
+                    ? (mine ? '— YOURS' : `— ${rec.owner.slice(0, 4)}`)
+                    : (rec.progress > 0 ? `— capturing ${Math.round(rec.progress)}%` : '');
+                rec.label.textContent = `${id} (${counts.get(id) || 0}) ${own}`;
+            }
+        }
+
+        function upsertEntity(id, zone, state) {
+            const kind = state.type || 'player';
+            let rec = entities.get(id);
+            if (!rec) {
+                // rx,ry = current rendered pos; tx,ty = authoritative target we lerp toward.
+                const el = document.createElement('div');
+                const bar = document.createElement('div');
+                bar.className = 'hpbar';
+                bar.appendChild(document.createElement('i'));
+                entityLayer.appendChild(el);
+                entityLayer.appendChild(bar);
+                rec = { el, bar, zone: null, kind,
+                        rx: state.x, ry: state.y, tx: state.x, ty: state.y,
+                        hp: state.hp, maxHp: state.max_hp || 100 };
+                entities.set(id, rec);
+            }
+            rec.kind = kind;
+            rec.hp = state.hp;
+            rec.maxHp = state.max_hp || rec.maxHp || 100;
+            const cls = id === myId ? 'me' : (kind === 'mob' ? 'mob' : 'other');
+            rec.el.className = 'entity ' + cls;
+            rec.bar.className = 'hpbar' + (kind === 'mob' ? ' mob' : '');
+            rec.bar.firstChild.style.width =
+                Math.max(0, Math.min(100, (rec.hp / rec.maxHp) * 100)) + '%';
+            rec.el.title = id;
+            rec.zone = zone;
+
+            if (id === myId) {
+                // We predict our own movement locally. Only accept the server's position
+                // as a correction when it has drifted noticeably (e.g. after a migration,
+                // a respawn, or hitting a world edge); otherwise prediction stays smooth.
+                const drift = Math.hypot(state.x - rec.tx, state.y - rec.ty);
+                if (drift > 30) { rec.tx = state.x; rec.ty = state.y; }
+                if (myZone !== zone) { myZone = zone; zoneEl.textContent = zone; refreshZoneStyles(); }
+                posEl.textContent = `(${Math.round(rec.tx)}, ${Math.round(rec.ty)})`;
+                hpEl.textContent = Math.max(0, rec.hp);
+            } else {
+                rec.tx = state.x; rec.ty = state.y;
+            }
+        }
+
+        // Per-frame interpolation: ease each entity's rendered position toward its
+        // target, and keep its HP bar pinned just above it.
+        function renderLoop() {
+            for (const rec of entities.values()) {
+                rec.rx += (rec.tx - rec.rx) * 0.25;
+                rec.ry += (rec.ty - rec.ry) * 0.25;
+                const sx = rec.rx * SCALE, sy = rec.ry * SCALE;
+                rec.el.style.left = sx + 'px';
+                rec.el.style.top = sy + 'px';
+                rec.bar.style.left = sx + 'px';
+                rec.bar.style.top = (sy - 9) + 'px';
+            }
+            requestAnimationFrame(renderLoop);
+        }
+        requestAnimationFrame(renderLoop);
+
+        function removeEntity(id) {
+            const rec = entities.get(id);
+            if (rec) { rec.el.remove(); rec.bar.remove(); entities.delete(id); }
+        }
+
+        const ws = new WebSocket('ws://localhost:8766');
+
+        ws.onopen = () => {
+            connEl.textContent = 'Connected';
+            connEl.style.color = '#00ff88';
+            log('Connected to gateway', 'sys');
+        };
+
+        // --- Auth (M0 identity) -------------------------------------------------
+        const authOverlay = document.getElementById('authOverlay');
+        const authMsg = document.getElementById('authMsg');
+        const authVer = document.getElementById('authVer');
+        const emailEl = document.getElementById('authEmail');
+        emailEl.value = localStorage.getItem('mmo_email') || '';
+        function showAuth(show) { authOverlay.classList.toggle('hidden', !show); }
+        function authVisible() { return !authOverlay.classList.contains('hidden'); }
+        function sendAuth(obj) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+        function emailVal() { return emailEl.value.trim(); }
+        function passVal() { return document.getElementById('authPass').value; }
+
+        document.getElementById('btnLogin').onclick = () => {
+            authMsg.textContent = '';
+            localStorage.setItem('mmo_email', emailVal());
+            sendAuth({ type: 'login', email: emailVal(), password: passVal() });
+        };
+        document.getElementById('btnRegister').onclick = () => {
+            authMsg.textContent = '';
+            localStorage.setItem('mmo_email', emailVal());
+            sendAuth({
+                type: 'register', email: emailVal(), password: passVal(),
+                name: document.getElementById('authName').value,
+            });
+        };
+        document.getElementById('btnGuest').onclick = () => {
+            authMsg.textContent = '';
+            sendAuth({ type: 'guest' });
+        };
+
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            switch (msg.type) {
+                case 'auth_required': {
+                    if (msg.protocol_version) authVer.textContent = 'protocol v' + msg.protocol_version;
+                    // Resume a prior session silently if we hold a token.
+                    const saved = localStorage.getItem('mmo_token');
+                    if (saved) { showAuth(false); sendAuth({ type: 'token', token: saved }); }
+                    else { showAuth(true); }
+                    break;
+                }
+                case 'auth_ok':
+                    if (msg.token) localStorage.setItem('mmo_token', msg.token);
+                    log('Authenticated as ' + (msg.name || msg.player_id.slice(0, 8)), 'sys');
+                    break;
+                case 'auth_error':
+                    localStorage.removeItem('mmo_token'); // a stale token won't resume
+                    authMsg.textContent = msg.message || 'authentication failed';
+                    showAuth(true);
+                    break;
+                case 'welcome':
+                    showAuth(false);
+                    myId = msg.player_id;
+                    myZone = msg.zone;
+                    zoneEl.textContent = msg.zone;
+                    refreshZoneStyles();
+                    log(`You are ${myId.slice(0, 8)}… in ${msg.zone}`, 'sys');
+                    break;
+                case 'partition':
+                    if (msg.world) { WORLD = msg.world; sizeWorld(); }
+                    applyPartition(msg.zones);
+                    break;
+                case 'status_update':
+                    upsertEntity(msg.player_id, msg.zone, msg.state);
+                    refreshCounts();
+                    break;
+                case 'despawn':
+                    removeEntity(msg.player_id);
+                    refreshCounts();
+                    break;
+                case 'zone_capture':
+                    applyCapture(msg.zone_id, msg.owner, msg.progress);
+                    break;
+                case 'zone_migration':
+                    myZone = msg.zone;
+                    zoneEl.textContent = msg.zone;
+                    refreshZoneStyles();
+                    log(`Migrated to ${msg.zone}`, 'mig');
+                    break;
+                case 'you_died':
+                    log('You died — respawning…', 'err');
+                    flashDeath();
+                    break;
+            }
+        };
+
+        // Brief red screen flash on death.
+        function flashDeath() {
+            const f = document.createElement('div');
+            f.style.cssText = 'position:fixed;inset:0;background:rgba(255,0,0,0.35);' +
+                'z-index:99;pointer-events:none;transition:opacity .6s;';
+            document.body.appendChild(f);
+            requestAnimationFrame(() => { f.style.opacity = '0'; });
+            setTimeout(() => f.remove(), 700);
+        }
+
+        ws.onclose = () => {
+            connEl.textContent = 'Disconnected';
+            connEl.style.color = '#ff6c6c';
+            log('Connection closed', 'err');
+        };
+        ws.onerror = () => log('WebSocket error', 'err');
+
+        // --- Continuous input ---------------------------------------------------
+        // Track held keys and send moves on a steady tick instead of relying on the
+        // OS key-repeat (which stutters), and predict our own movement immediately.
+        const STEP = 10;          // units sent per tick (matches the server step)
+        const TICK_MS = 60;       // ~16 moves/sec; steady cadence
+        const keysDown = new Set();
+
+        const KEY_DIR = {
+            ArrowUp: [0, -1], w: [0, -1], W: [0, -1],
+            ArrowDown: [0, 1], s: [0, 1], S: [0, 1],
+            ArrowLeft: [-1, 0], a: [-1, 0], A: [-1, 0],
+            ArrowRight: [1, 0], d: [1, 0], D: [1, 0],
+        };
+
+        let facing = [1, 0];          // last movement direction; aims our swing
+        let lastAttack = 0;
+        const ATTACK_COOLDOWN_MS = 300;  // matches the server's swing cooldown
+
+        document.addEventListener('keydown', (e) => {
+            // While the login overlay is up, let keystrokes go to the form.
+            if (authVisible()) return;
+            if (e.key === ' ') { e.preventDefault(); attack(); return; }
+            if (!(e.key in KEY_DIR)) return;
+            e.preventDefault();
+            keysDown.add(e.key);
+        });
+        document.addEventListener('keyup', (e) => {
+            if (e.key in KEY_DIR) keysDown.delete(e.key);
+        });
+        // Stop moving if the window loses focus (otherwise a key can get "stuck").
+        window.addEventListener('blur', () => keysDown.clear());
+        // Click in the world also swings (aimed at the cursor relative to me).
+        worldEl.addEventListener('mousedown', (e) => {
+            const me = entities.get(myId);
+            if (me) {
+                const rect = worldEl.getBoundingClientRect();
+                const dx = (e.clientX - rect.left) - me.rx * SCALE;
+                const dy = (e.clientY - rect.top) - me.ry * SCALE;
+                if (dx || dy) facing = [Math.sign(dx) || 0, Math.sign(dy) || 0];
+            }
+            attack();
+        });
+
+        function attack() {
+            const now = performance.now();
+            if (ws.readyState !== WebSocket.OPEN || now - lastAttack < ATTACK_COOLDOWN_MS) return;
+            lastAttack = now;
+            ws.send(JSON.stringify({ type: 'attack', dx: facing[0], dy: facing[1] }));
+            showSwing();
+        }
+
+        // Cosmetic swing wedge in the facing direction, pinned to my dot.
+        function showSwing() {
+            const me = entities.get(myId);
+            if (!me) return;
+            const w = document.createElement('div');
+            w.className = 'swing';
+            const ang = Math.atan2(facing[1], facing[0]) * 180 / Math.PI + 90; // wedge points "up" by default
+            w.style.left = (me.rx * SCALE) + 'px';
+            w.style.top = (me.ry * SCALE) + 'px';
+            w.style.transform = `translate(-50%, -100%) rotate(${ang}deg)`;
+            w.style.transformOrigin = '50% 100%';
+            entityLayer.appendChild(w);
+            setTimeout(() => w.remove(), 120);
+        }
+
+        setInterval(() => {
+            if (ws.readyState !== WebSocket.OPEN || keysDown.size === 0) return;
+            let dx = 0, dy = 0;
+            for (const k of keysDown) { dx += KEY_DIR[k][0]; dy += KEY_DIR[k][1]; }
+            if (dx === 0 && dy === 0) return;
+            facing = [Math.sign(dx), Math.sign(dy)];
+            dx *= STEP; dy *= STEP;
+            ws.send(JSON.stringify({ type: 'move', dx, dy }));
+
+            // Client-side prediction: move our own dot now, clamped to the world.
+            const me = entities.get(myId);
+            if (me) {
+                me.tx = Math.max(0, Math.min(WORLD, me.tx + dx));
+                me.ty = Math.max(0, Math.min(WORLD, me.ty + dy));
+                posEl.textContent = `(${Math.round(me.tx)}, ${Math.round(me.ty)})`;
+            }
+        }, TICK_MS);
+    </script>
+</body>
+
+</html>

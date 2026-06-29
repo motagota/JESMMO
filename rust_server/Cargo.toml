@@ -1,0 +1,44 @@
+[package]
+name = "zone_server"
+version = "0.1.0"
+edition = "2021"
+
+# Shared library: persistence, auth, and protocol code used by the binaries.
+[lib]
+name = "mmo"
+path = "src/lib.rs"
+
+# Two binaries that mirror the Python server:
+#   proxy        <- proxy.py
+#   zone_server  <- zoneServer.py
+[[bin]]
+name = "proxy"
+path = "src/bin/proxy.rs"
+
+[[bin]]
+name = "zone_server"
+path = "src/bin/zone_server.rs"
+
+# Connection-density load generator (see comments in the file for usage).
+[[bin]]
+name = "loadtest"
+path = "src/bin/loadtest.rs"
+
+# Simulated player bots: N client connections that random-walk through the proxy.
+[[bin]]
+name = "bots"
+path = "src/bin/bots.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+# Persistence: SQLite for dev (bundled, no system lib), Postgres-ready behind the
+# repository module. Runtime queries (no compile-time DATABASE_URL needed).
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
+# Password hashing for accounts.
+argon2 = "0.5"

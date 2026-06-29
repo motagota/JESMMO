@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Server Management</title>
+    <style>
+        body {
+            background: #0a0a0a; color: #d8d8d8; font-family: monospace;
+            max-width: 880px; margin: 0 auto; padding: 16px;
+        }
+        h1 { color: #00ff88; }
+        .bar { display: flex; gap: 24px; align-items: center; margin-bottom: 16px; }
+        .stat { font-size: 14px; }
+        .stat b { color: #00ff88; font-size: 22px; }
+        #conn { font-weight: bold; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #222; }
+        th { color: #00ff88; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+        td.players { font-size: 18px; color: #00ff88; }
+        .state { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+        .state.normal { background: #14361f; color: #4cff9e; }
+        .state.marking { background: #3a3413; color: #ffe14c; }
+        .state.migrating { background: #3a2413; color: #ffb84c; }
+        .state.retired { background: #3a1313; color: #ff6c6c; }
+        fieldset { border: 1px solid #333; border-radius: 6px; margin-bottom: 16px; }
+        legend { color: #00ff88; padding: 0 6px; }
+        label { display: inline-block; min-width: 60px; }
+        select, button, input {
+            background: #111; color: #d8d8d8; border: 1px solid #444;
+            border-radius: 4px; padding: 6px 10px; font-family: monospace; font-size: 13px;
+        }
+        button { cursor: pointer; }
+        button:hover { border-color: #00ff88; color: #00ff88; }
+        button.primary { background: #00ff88; color: #001100; border-color: #00ff88; font-weight: bold; }
+        .row { margin: 8px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        #log {
+            height: 160px; overflow-y: auto; background: #050505; border: 1px solid #222;
+            padding: 8px; font-size: 12px;
+        }
+        .msg { margin: 1px 0; }
+        .sys { color: #4c8cff; }
+        .ack { color: #00ff88; }
+        .err { color: #ff6c6c; }
+    </style>
+</head>
+
+<body>
+    <h1>Server Management</h1>
+    <div class="bar">
+        <div class="stat">Admin: <span id="conn">Connecting…</span></div>
+        <div class="stat">Players online: <b id="total">0</b></div>
+        <div class="stat">Zones: <b id="zoneCount">0</b></div>
+    </div>
+
+    <table>
+        <thead>
+            <tr><th>Zone</th><th>Region</th><th>State</th><th>Players</th><th>Ver</th><th>Update</th></tr>
+        </thead>
+        <tbody id="zoneRows">
+            <tr><td colspan="6" style="color:#666">No zones registered</td></tr>
+        </tbody>
+    </table>
+
+    <fieldset>
+        <legend>Load test (watch auto-scaling)</legend>
+        <div class="row">
+            <label for="botCount">Bots</label>
+            <input id="botCount" type="number" value="12" min="1" max="200" style="width:70px">
+            <label for="botRamp">Ramp (ms/bot)</label>
+            <input id="botRamp" type="number" value="300" min="0" max="5000" style="width:80px">
+            <button class="primary" id="spawnBots">Scale up bots</button>
+            <button id="clearBots">Clear bots</button>
+            <span style="color:#888">ramps players in so zones split; clear to watch them merge back</span>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Rolling update (zero-downtime deploy)</legend>
+        <div class="row">
+            <button class="primary" id="updateAll">Push update — roll all zones</button>
+            <span style="color:#888">spawns updated instances, migrates players seamlessly, retires the old ones</span>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Issue migration</legend>
+        <div class="row">
+            <label for="source">Source</label>
+            <select id="source"></select>
+            <label for="target">Target</label>
+            <select id="target"></select>
+        </div>
+        <div class="row">
+            <button class="primary" data-phase="auto">Auto migrate (all phases)</button>
+            <button data-phase="phase1">Phase 1: Mark</button>
+            <button data-phase="phase2">Phase 2: Transfer</button>
+            <button data-phase="phase3">Phase 3: Retire</button>
+        </div>
+    </fieldset>
+
+    <div id="log"></div>
+
+    <script>
+        const ADMIN_URL = 'ws://localhost:8767';
+        const connEl = document.getElementById('conn');
+        const totalEl = document.getElementById('total');
+        const zoneCountEl = document.getElementById('zoneCount');
+        const zoneRowsEl = document.getElementById('zoneRows');
+        const sourceEl = document.getElementById('source');
+        const targetEl = document.getElementById('target');
+        const logEl = document.getElementById('log');
+
+        let knownZones = [];
+        let ws;
+
+        function log(msg, cls) {
+            const d = document.createElement('div');
+            d.className = 'msg ' + (cls || '');
+            d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logEl.appendChild(d);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Preserve the user's current selection across status refreshes.
+        function syncZoneSelects(zoneIds) {
+            const same = zoneIds.length === knownZones.length &&
+                zoneIds.every((z, i) => z === knownZones[i]);
+            if (same) return;
+            knownZones = zoneIds;
+            for (const sel of [sourceEl, targetEl]) {
+                const prev = sel.value;
+                sel.innerHTML = '';
+                for (const z of zoneIds) {
+                    const opt = document.createElement('option');
+                    opt.value = z; opt.textContent = z;
+                    sel.appendChild(opt);
+                }
+                if (zoneIds.includes(prev)) sel.value = prev;
+            }
+            // Default target to a different zone than source when possible.
+            if (zoneIds.length > 1 && targetEl.value === sourceEl.value) {
+                targetEl.value = zoneIds.find(z => z !== sourceEl.value) || targetEl.value;
+            }
+        }
+
+        function renderStatus(data) {
+            totalEl.textContent = data.total_players;
+            zoneCountEl.textContent = data.zones.length;
+
+            if (data.zones.length === 0) {
+                zoneRowsEl.innerHTML = '<tr><td colspan="6" style="color:#666">No zones registered</td></tr>';
+            } else {
+                zoneRowsEl.innerHTML = '';
+                for (const z of data.zones) {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML =
+                        `<td>${z.zone_id}</td>` +
+                        `<td style="color:#888">${z.region ?? z.uri}</td>` +
+                        `<td><span class="state ${z.migration_state}">${z.migration_state}</span></td>` +
+                        `<td class="players">${z.players}</td>` +
+                        `<td>v${z.version ?? 1}</td>` +
+                        `<td><button class="rowupd" data-zone="${z.zone_id}">Update</button></td>`;
+                    zoneRowsEl.appendChild(tr);
+                }
+            }
+            syncZoneSelects(data.zones.map(z => z.zone_id));
+        }
+
+        function connect() {
+            ws = new WebSocket(ADMIN_URL);
+            ws.onopen = () => {
+                connEl.textContent = 'Connected';
+                connEl.style.color = '#00ff88';
+                log('Connected to proxy admin', 'sys');
+            };
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if (data.type === 'status') renderStatus(data);
+                else if (data.type === 'ack') log(data.message, 'ack');
+            };
+            ws.onclose = () => {
+                connEl.textContent = 'Disconnected — retrying…';
+                connEl.style.color = '#ff6c6c';
+                log('Disconnected, retrying in 2s', 'err');
+                setTimeout(connect, 2000);
+            };
+            ws.onerror = () => log('WebSocket error', 'err');
+        }
+
+        document.querySelectorAll('button[data-phase]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    log('Not connected', 'err');
+                    return;
+                }
+                const phase = btn.dataset.phase;
+                const source = sourceEl.value;
+                const target = targetEl.value;
+                if (!source) { log('No source zone selected', 'err'); return; }
+                if ((phase === 'phase2' || phase === 'auto')) {
+                    if (!target) { log('No target zone selected', 'err'); return; }
+                    if (source === target) { log('Source and target must differ', 'err'); return; }
+                }
+                ws.send(JSON.stringify({ type: 'migrate', phase, source, target }));
+                log(`Sent: migrate ${phase} ${source}${(phase === 'phase2' || phase === 'auto') ? ' -> ' + target : ''}`, 'sys');
+            });
+        });
+
+        function sendUpdate(target) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) { log('Not connected', 'err'); return; }
+            ws.send(JSON.stringify({ type: 'update', target }));
+            log(`Sent: rolling update ${target}`, 'sys');
+        }
+
+        function send(obj) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) { log('Not connected', 'err'); return; }
+            ws.send(JSON.stringify(obj));
+        }
+
+        document.getElementById('spawnBots').addEventListener('click', () => {
+            const count = parseInt(document.getElementById('botCount').value, 10) || 0;
+            const ramp_ms = parseInt(document.getElementById('botRamp').value, 10) || 0;
+            send({ type: 'spawn_bots', count, ramp_ms });
+            log(`Sent: scale up ${count} bots (ramp ${ramp_ms}ms)`, 'sys');
+        });
+        document.getElementById('clearBots').addEventListener('click', () => {
+            send({ type: 'clear_bots' });
+            log('Sent: clear bots', 'sys');
+        });
+
+        document.getElementById('updateAll').addEventListener('click', () => sendUpdate('all'));
+        // Per-zone Update buttons (delegated, since rows are re-rendered).
+        zoneRowsEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('button.rowupd');
+            if (btn) sendUpdate(btn.dataset.zone);
+        });
+
+        connect();
+    </script>
+</body>
+
+</html>
