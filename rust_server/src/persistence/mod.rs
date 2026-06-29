@@ -884,6 +884,46 @@ impl Db {
         tx.commit().await?;
         Ok(remaining)
     }
+
+    // --- World seeding ----------------------------------------------------
+
+    pub async fn plot_count(&self) -> Result<i64, DbError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM plot")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Seed the authored capital into the database: the starter plot grid (as
+    /// unowned plots) and the first build orders. **Idempotent** — safe to call on
+    /// every boot. Plots seed only when the pool is empty; each build-order kind is
+    /// created at most once per district. `now` stamps newly issued orders.
+    pub async fn seed_capital(
+        &self,
+        capital: &crate::world::Capital,
+        now: i64,
+    ) -> Result<(), DbError> {
+        if self.plot_count().await? == 0 {
+            for (district, cell) in capital.starter_plots() {
+                self.insert_unowned_plot(
+                    district,
+                    cell.grid_x as i64,
+                    cell.grid_y as i64,
+                    cell.w as i64,
+                    cell.h as i64,
+                    cell.tier,
+                )
+                .await?;
+            }
+        }
+        for o in &capital.build_orders {
+            let existing = self.build_orders_for_district(o.district).await?;
+            if !existing.iter().any(|b| b.kind == o.kind) {
+                self.insert_build_order(o.district, o.kind, o.required_json, now)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1045,5 +1085,26 @@ mod tests {
         assert_eq!(remaining, 0);
         let nodes = db.resource_nodes_for_district("market").await.unwrap();
         assert_eq!(nodes[0].respawn_at, Some(9999)); // respawn scheduled on empty
+    }
+
+    #[tokio::test]
+    async fn seed_capital_is_idempotent_and_claimable() {
+        let (db, _t) = TempDb::open().await;
+        let cap = crate::world::capital();
+
+        db.seed_capital(&cap, 100).await.unwrap();
+        let plots = db.plot_count().await.unwrap();
+        assert_eq!(plots, cap.starter_plots().len() as i64);
+        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), 1);
+
+        // Re-seed (simulating a restart): no duplicate plots or orders.
+        db.seed_capital(&cap, 200).await.unwrap();
+        assert_eq!(db.plot_count().await.unwrap(), plots);
+        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), 1);
+
+        // A fresh character can claim one of the seeded starter plots.
+        let cid = a_character(&db).await;
+        let claimed = db.claim_plot(&cid, "suburbs", 3600, 300).await.unwrap();
+        assert!(claimed.is_some(), "a seeded starter plot should be claimable");
     }
 }

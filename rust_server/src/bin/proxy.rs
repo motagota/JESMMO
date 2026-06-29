@@ -39,7 +39,8 @@ use mmo::auth;
 use mmo::persistence::Db;
 use mmo::protocol::{self, PROTOCOL_VERSION};
 
-/// Spawn point for a brand-new character: the centre of the world.
+/// Spawn point for a brand-new character: the capital's town centre (the spawn
+/// anchor authored in `mmo::world`). Kept in sync via `spawn_matches_town_centre`.
 const SPAWN_X: i32 = WORLD_SIZE / 2;
 const SPAWN_Y: i32 = WORLD_SIZE / 2;
 const SPAWN_HP: i32 = 100;
@@ -227,6 +228,10 @@ struct Proxy {
     /// Live session tokens: token -> character_id, for reconnect without re-login.
     /// In-memory and single-gateway for M0.
     sessions: Mutex<HashMap<String, String>>,
+    /// The authored capital (named districts, road graph, plot grid, town centre).
+    /// District identity is keyed to world geometry, so the gateway can name the
+    /// district owning any zone region regardless of how the sim is sharded.
+    capital: mmo::world::Capital,
 }
 
 impl Proxy {
@@ -260,6 +265,7 @@ impl Proxy {
             bot_handles: Mutex::new(Vec::new()),
             db,
             sessions: Mutex::new(HashMap::new()),
+            capital: mmo::world::capital(),
         })
     }
 
@@ -695,8 +701,10 @@ impl Proxy {
             .map(|(id, _)| id.clone())
     }
 
-    /// Tell every client the current spatial partition so they can draw it.
-    fn broadcast_partition(&self) {
+    /// Build the current spatial partition: world size + each shard's region,
+    /// owner, capture progress, and the **district** it belongs to (named by region
+    /// centre, so the capital reads as named/multi-district however it's sharded).
+    fn partition_snapshot(&self) -> Value {
         let zones: Vec<Value> = {
             let zones = self.zones.lock().unwrap();
             let order = self.zone_order.lock().unwrap();
@@ -704,20 +712,30 @@ impl Proxy {
                 .iter()
                 .filter_map(|id| {
                     zones.get(id).map(|z| {
+                        let district = self
+                            .capital
+                            .district_for_region(mmo::world::Rect::new(
+                                z.region.x0, z.region.y0, z.region.x1, z.region.y1,
+                            ))
+                            .map(|d| d.name);
                         json!({
                             "zone_id": id,
                             "x0": z.region.x0, "y0": z.region.y0,
                             "x1": z.region.x1, "y1": z.region.y1,
                             "owner": z.owner,
                             "progress": z.capture_progress,
+                            "district": district,
                         })
                     })
                 })
                 .collect()
         };
-        let msg = Message::Text(
-            json!({"type": "partition", "world": WORLD_SIZE, "zones": zones}).to_string(),
-        );
+        json!({"type": "partition", "world": WORLD_SIZE, "zones": zones})
+    }
+
+    /// Tell every client the current spatial partition so they can draw it.
+    fn broadcast_partition(&self) {
+        let msg = Message::Text(self.partition_snapshot().to_string());
         let clients = self.clients.lock().unwrap();
         for info in clients.values() {
             self.push_to_client(info, msg.clone());
@@ -1999,6 +2017,16 @@ async fn main() {
     let db = match Db::connect(&db_url).await {
         Ok(db) => {
             println!("[Proxy] Database ready ({db_url})");
+            // Seed the authored capital (plot grid + first build orders) on boot.
+            // Idempotent, so a restart never duplicates it.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            match db.seed_capital(&mmo::world::capital(), now).await {
+                Ok(()) => println!("[Proxy] Capital seeded ({} starter plots)", mmo::world::capital().starter_plots().len()),
+                Err(e) => println!("[Proxy] WARNING: capital seeding failed: {e}"),
+            }
             Some(Arc::new(db))
         }
         Err(e) => {
@@ -2049,6 +2077,7 @@ mod tests {
             bot_handles: Mutex::new(Vec::new()),
             db: None,
             sessions: Mutex::new(HashMap::new()),
+            capital: mmo::world::capital(),
         })
     }
 
@@ -2895,6 +2924,42 @@ mod tests {
                 other => panic!("expected text waiting for {ty}, got {other:?}"),
             }
         }
+    }
+
+    /// #4: the gateway's spawn constant must agree with the authored town centre.
+    #[test]
+    fn spawn_matches_town_centre() {
+        let c = mmo::world::capital();
+        assert_eq!((SPAWN_X, SPAWN_Y), c.town_centre);
+        // And the town centre is a real, named district.
+        assert!(c.district_at(SPAWN_X, SPAWN_Y).is_some());
+    }
+
+    /// #4: the partition the gateway broadcasts names each shard's district, so the
+    /// capital reads as named & multi-district regardless of sharding.
+    #[tokio::test]
+    async fn partition_labels_districts() {
+        let proxy = test_proxy();
+        // Three shards, one per authored district band.
+        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 400, y1: 1200 });
+        add_zone_region(&proxy, "z_civic", Region { x0: 400, y0: 0, x1: 800, y1: 1200 });
+        add_zone_region(&proxy, "z_suburbs", Region { x0: 800, y0: 0, x1: 1200, y1: 1200 });
+
+        let snap = proxy.partition_snapshot();
+        let by_zone = |zid: &str| -> String {
+            snap["zones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|z| z["zone_id"] == zid)
+                .unwrap()["district"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(by_zone("z_market"), "Market District");
+        assert_eq!(by_zone("z_civic"), "Civic Centre");
+        assert_eq!(by_zone("z_suburbs"), "Starter Suburbs");
     }
 
     /// Acceptance (#3): a client that declares a mismatched protocol version is

@@ -15,6 +15,11 @@ server/*_out.txt
 server/*_err.txt
 *.log
 
+# SQLite dev/test databases (created at runtime; never committed)
+*.db
+*.db-wal
+*.db-shm
+
 # OS / editor
 .DS_Store
 Thumbs.db
