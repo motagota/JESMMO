@@ -18,6 +18,10 @@ signal status_update(id: String, zone: String, state: Dictionary)
 signal despawn(id: String)
 signal zone_migration(zone: String)
 signal you_died
+signal gather_progress(node_id: String, pct: int)
+signal gather_result(item_id: String, qty: int)
+signal inv_update(items: Array)
+signal skill_update(skill_id: String, xp: int, level: int)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -75,6 +79,17 @@ func _handle_text(text: String) -> void:
 			zone_migration.emit(String(msg.get("zone", "")))
 		Protocol.S_YOU_DIED:
 			you_died.emit()
+		Protocol.S_GATHER_PROGRESS:
+			gather_progress.emit(String(msg.get("node_id", "")), int(msg.get("pct", 0)))
+		Protocol.S_GATHER_RESULT:
+			gather_result.emit(String(msg.get("item_id", "")), int(msg.get("qty", 0)))
+		Protocol.S_INV_UPDATE:
+			inv_update.emit(msg.get("items", []))
+		Protocol.S_SKILL_UPDATE:
+			skill_update.emit(
+				String(msg.get("skill_id", "")),
+				int(msg.get("xp", 0)),
+				int(msg.get("level", 0)))
 		_:
 			pass # zone_capture and any future server messages are ignored for now
 
@@ -106,3 +121,10 @@ func send_move(dx: int, dy: int) -> void:
 ## Flag a melee swing in a facing direction.
 func send_attack(dx: int, dy: int) -> void:
 	_send({"type": Protocol.C_ATTACK, "dx": dx, "dy": dy})
+
+## Begin gathering a resource node.
+func send_gather_start(node_id: String) -> void:
+	_send({"type": Protocol.C_GATHER_START, "node_id": node_id})
+
+func send_gather_stop() -> void:
+	_send({"type": Protocol.C_GATHER_STOP})

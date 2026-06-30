@@ -12,6 +12,7 @@ extends Node3D
 
 signal move_requested(dx: int, dy: int)
 signal attack_requested(dx: int, dy: int)
+signal gather_pressed
 signal position_changed(wx: float, wy: float)
 
 const _ATTACK_COOLDOWN := 0.3 # seconds; matches the server's swing cadence
@@ -22,6 +23,7 @@ var _pos := Vector2(600, 600) # default at the town centre until the first snaps
 var _facing := Vector2(1, 0)
 var _move_accum := 0.0
 var _attack_accum := 0.0
+var _gather_down := false
 var _active := false
 
 var _mesh: MeshInstance3D
@@ -92,8 +94,14 @@ func _process(delta: float) -> void:
 			_pos.y = clampf(_pos.y + dy, 0.0, 1200.0)
 			position_changed.emit(_pos.x, _pos.y)
 
-	if Input.is_action_just_pressed("ui_accept") or Input.is_physical_key_pressed(KEY_SPACE):
+	if Input.is_physical_key_pressed(KEY_SPACE):
 		_try_attack()
+
+	# Gather: edge-detect the key so one press starts one gather request.
+	var g := Input.is_physical_key_pressed(KEY_E)
+	if g and not _gather_down:
+		gather_pressed.emit()
+	_gather_down = g
 
 	# Render: ease toward the predicted/authoritative world position.
 	var target := Protocol.w2v(_pos.x, _pos.y)
