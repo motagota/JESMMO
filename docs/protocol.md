@@ -155,10 +155,19 @@ logged-in characters (guests see `gather.result` feedback but nothing is saved).
 
 | type | dir | fields | status |
 |---|---|---|---|
-| `inv.update` | S→C | `items[]` (each `{item_id, qty, slot}`) — full authoritative inventory | **live** (sent on login and after a gather) |
-| `inv.move` | C→S | `from`, `to` | reserved (#8) |
-| `store.deposit` | C→S | `item_id`, `qty` | reserved (#8) |
-| `store.withdraw` | C→S | `item_id`, `qty` | reserved (#8) |
+| `inv.update` | S→C | `items[]` (`{item_id, qty, slot}`), `used`, `capacity` — full carried inventory + carry usage | **live** (login, gather, deposit/withdraw) |
+| `store.update` | S→C | `items[]` (`{item_id, qty}`) — full safe-storage contents | **live** (login, deposit/withdraw) |
+| `store.deposit` | C→S | `item_id`, `qty` — move carried → storage (must be near a storage point) | **live** |
+| `store.withdraw` | C→S | `item_id`, `qty` — move storage → carried (bounded by capacity) | **live** |
+| `inv.move` | C→S | `from`, `to` | reserved (slot drag/drop, later) |
+
+Carried inventory has a finite **carry capacity** (`MAX_CARRY`); storage is unbounded
+and does **not** count against it. Gathering stops yielding into a full inventory;
+depositing frees it. Deposit/withdraw are gated server-side on standing near a
+**storage point** (an authored town storehouse in M2; per-plot home `storage`
+structures in #12 add more, reusing these same messages). Like gather, the **zone**
+validates proximity and emits an internal `store_op` to the gateway, which performs
+the durable transactional transfer and pushes the updated `inv.update` / `store.update`.
 
 ### `build.*` — build orders & placement (M2 §4.3, M3 §4.5)
 
@@ -216,10 +225,14 @@ logged-in characters (guests see `gather.result` feedback but nothing is saved).
 
 Zones self-register (`register_zone`) and exchange `player_join` / `player_leave` /
 `spawn_entity` / `move` / `attack` / `migrate_request` / `set_region` / `shutdown` /
-`zone_stats` with the gateway. The zone also emits **`gather_yield`**
-`{player_id, item_id, qty, skill, xp}` — an internal message the gateway consumes
-(never forwards) to persist the gathered item + skill XP and push `inv.update` /
-`skill.update`. See `proxy.rs` and `zone_server.rs`.
+`zone_stats` with the gateway. The zone also emits internal messages the gateway
+consumes (never forwards) to perform durable writes and push the result:
+**`gather_yield`** `{player_id, item_id, qty, skill, xp}` (persist gathered item +
+skill XP → `inv.update`/`skill.update`) and **`store_op`**
+`{player_id, op, item_id, qty}` (transactional inventory↔storage transfer →
+`inv.update`/`store.update`). Resource nodes and storage points are synced to
+clients as `status_update`s with `state.type` `"resource"` / `"storage"`. See
+`proxy.rs` and `zone_server.rs`.
 
 **M0 note on positions.** A returning character is recreated at its exact saved
 position via `spawn_entity` to whichever zone owns that point (routed by

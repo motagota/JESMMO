@@ -42,8 +42,11 @@ reviews as plain script diffs without opening the editor.
    ```
 3. Log in / register / play as guest. Move with **WASD** or the arrow keys;
    **Space** swings; **E** gathers the nearest resource node in range (walk up to a
-   green tree or grey rock). Your inventory and gathering skill show in the HUD;
-   gathered items persist for logged-in characters.
+   green tree or grey rock). Your inventory (with carry capacity), gathering skill,
+   and gather progress show in the HUD. Walk up to the **town storehouse** (the
+   brown chest by the town centre) to open the storage panel and **deposit** /
+   **withdraw** items — stored items are safe and don't count against carry
+   capacity. Gameplay state persists for logged-in characters.
 
 The gateway is `ws://127.0.0.1:8766` (see `Main.gd::GATEWAY_URL`). A session token
 is cached in `user://session.cfg` for silent reconnects.
@@ -76,8 +79,9 @@ Godot --headless --path client_godot -s res://tests/smoke.gd         # connect/a
 Godot --headless --path client_godot -s res://tests/smoke_gather.gd  # register, walk, gather wood
 ```
 `smoke.gd` expects `SMOKE_OK welcome …` then a `status_update` stream;
-`smoke_gather.gd` registers a character, walks to the civic tree, gathers, and
-expects `SMOKE_GATHER_OK inventory shows wood`. Both exit non-zero on timeout.
+`smoke_gather.gd` registers a character, walks to the civic tree, gathers, then
+walks to the storehouse and deposits, expecting `SMOKE_STORE_OK storehouse holds
+wood …`. Both exit non-zero on timeout.
 
 ## Scope (Phase 1, M1)
 

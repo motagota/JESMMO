@@ -20,6 +20,11 @@ use uuid::Uuid;
 /// semantics (e.g. "email already taken") check before writing.
 pub type DbError = sqlx::Error;
 
+/// Total carried quantity a character may hold across all items. Storage (the home
+/// stash) is the overflow and does **not** count toward this. Gathering stops
+/// yielding into a full inventory; depositing frees it.
+pub const MAX_CARRY: i64 = 50;
+
 /// An account row (the login identity). One human, one account.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Account {
@@ -50,6 +55,91 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// --- In-transaction item helpers ---------------------------------------------
+// Shared by the inventory/storage methods so deposit/withdraw move both sides in
+// a single transaction. Each treats a character's holdings of an item as one
+// collapsed stack (the M2 model is a total-quantity carry cap, not per-slot).
+
+type Tx<'a> = sqlx::Transaction<'a, sqlx::Sqlite>;
+
+async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM inventory_item WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT 1",
+    )
+    .bind(character_id).bind(item_id).fetch_optional(&mut **tx).await?;
+    match existing {
+        Some(id) => {
+            sqlx::query("UPDATE inventory_item SET qty = qty + ? WHERE id = ?")
+                .bind(qty).bind(&id).execute(&mut **tx).await?;
+        }
+        None => {
+            sqlx::query("INSERT INTO inventory_item (id, character_id, item_id, qty, slot) VALUES (?, ?, ?, ?, NULL)")
+                .bind(Uuid::new_v4().to_string()).bind(character_id).bind(item_id).bind(qty)
+                .execute(&mut **tx).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<i64, DbError> {
+    let cur: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+    )
+    .bind(character_id).bind(item_id).fetch_one(&mut **tx).await?;
+    let cur = cur.unwrap_or(0);
+    let take = qty.min(cur).max(0);
+    if take > 0 {
+        sqlx::query("DELETE FROM inventory_item WHERE character_id = ? AND item_id = ?")
+            .bind(character_id).bind(item_id).execute(&mut **tx).await?;
+        let remaining = cur - take;
+        if remaining > 0 {
+            sqlx::query("INSERT INTO inventory_item (id, character_id, item_id, qty, slot) VALUES (?, ?, ?, ?, NULL)")
+                .bind(Uuid::new_v4().to_string()).bind(character_id).bind(item_id).bind(remaining)
+                .execute(&mut **tx).await?;
+        }
+    }
+    Ok(take)
+}
+
+async fn add_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM storage_item WHERE character_id = ? AND item_id = ? LIMIT 1",
+    )
+    .bind(character_id).bind(item_id).fetch_optional(&mut **tx).await?;
+    match existing {
+        Some(id) => {
+            sqlx::query("UPDATE storage_item SET qty = qty + ? WHERE id = ?")
+                .bind(qty).bind(&id).execute(&mut **tx).await?;
+        }
+        None => {
+            sqlx::query("INSERT INTO storage_item (id, character_id, item_id, qty) VALUES (?, ?, ?, ?)")
+                .bind(Uuid::new_v4().to_string()).bind(character_id).bind(item_id).bind(qty)
+                .execute(&mut **tx).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<i64, DbError> {
+    let cur: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(qty) FROM storage_item WHERE character_id = ? AND item_id = ?",
+    )
+    .bind(character_id).bind(item_id).fetch_one(&mut **tx).await?;
+    let cur = cur.unwrap_or(0);
+    let take = qty.min(cur).max(0);
+    if take > 0 {
+        sqlx::query("DELETE FROM storage_item WHERE character_id = ? AND item_id = ?")
+            .bind(character_id).bind(item_id).execute(&mut **tx).await?;
+        let remaining = cur - take;
+        if remaining > 0 {
+            sqlx::query("INSERT INTO storage_item (id, character_id, item_id, qty) VALUES (?, ?, ?, ?)")
+                .bind(Uuid::new_v4().to_string()).bind(character_id).bind(item_id).bind(remaining)
+                .execute(&mut **tx).await?;
+        }
+    }
+    Ok(take)
 }
 
 impl Db {
@@ -340,55 +430,111 @@ impl Db {
 
     // --- Inventory & storage ---------------------------------------------
 
-    /// Add `qty` of an item to a character's carried inventory, stacking onto an
-    /// existing stack of the same item if one exists. Returns the resulting stack.
+    /// Total carried quantity for a character (storage does not count toward it).
+    pub async fn inventory_total(&self, character_id: &str) -> Result<i64, DbError> {
+        let total: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// Add up to `qty` of an item to a character's carried inventory, **bounded by
+    /// the carry capacity** [`MAX_CARRY`] (storage is the overflow). Stacks onto the
+    /// existing row if present. Returns how many units were actually added — which
+    /// may be less than `qty`, or `0` when the inventory is full.
     pub async fn add_to_inventory(
         &self,
         character_id: &str,
         item_id: &str,
         qty: i64,
-    ) -> Result<InventoryItem, DbError> {
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
         let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query_as::<_, InventoryItem>(
-            "SELECT id, character_id, item_id, qty, slot FROM inventory_item \
-             WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT 1",
+        let total: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let room = (MAX_CARRY - total.unwrap_or(0)).max(0);
+        let add = qty.min(room);
+        if add > 0 {
+            add_inventory_in_tx(&mut tx, character_id, item_id, add).await?;
+        }
+        tx.commit().await?;
+        Ok(add)
+    }
+
+    /// Remove up to `qty` of an item from carried inventory. Returns the amount
+    /// actually removed.
+    pub async fn remove_from_inventory(
+        &self,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let removed = remove_inventory_in_tx(&mut tx, character_id, item_id, qty).await?;
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    /// Deposit up to `qty` of an item from carried inventory into safe storage, in
+    /// one transaction. Returns the amount moved (bounded by what's carried).
+    pub async fn deposit(
+        &self,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let moved = remove_inventory_in_tx(&mut tx, character_id, item_id, qty).await?;
+        if moved > 0 {
+            add_storage_in_tx(&mut tx, character_id, item_id, moved).await?;
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Withdraw up to `qty` of an item from storage back into carried inventory, in
+    /// one transaction. Bounded by what's stored **and** the remaining carry
+    /// capacity. Returns the amount moved.
+    pub async fn withdraw(
+        &self,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let stored: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM storage_item WHERE character_id = ? AND item_id = ?",
         )
         .bind(character_id)
         .bind(item_id)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let row = match existing {
-            Some(mut it) => {
-                it.qty += qty;
-                sqlx::query("UPDATE inventory_item SET qty = ? WHERE id = ?")
-                    .bind(it.qty)
-                    .bind(&it.id)
-                    .execute(&mut *tx)
-                    .await?;
-                it
-            }
-            None => {
-                let id = Uuid::new_v4().to_string();
-                sqlx::query(
-                    "INSERT INTO inventory_item (id, character_id, item_id, qty, slot) VALUES (?, ?, ?, ?, NULL)",
-                )
-                .bind(&id)
+        let carried: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
                 .bind(character_id)
-                .bind(item_id)
-                .bind(qty)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
-                InventoryItem {
-                    id,
-                    character_id: character_id.to_string(),
-                    item_id: item_id.to_string(),
-                    qty,
-                    slot: None,
-                }
-            }
-        };
+        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        let moved = qty.min(stored.unwrap_or(0)).min(room);
+        if moved > 0 {
+            remove_storage_in_tx(&mut tx, character_id, item_id, moved).await?;
+            add_inventory_in_tx(&mut tx, character_id, item_id, moved).await?;
+        }
         tx.commit().await?;
-        Ok(row)
+        Ok(moved)
     }
 
     pub async fn inventory_for_character(
@@ -992,24 +1138,56 @@ mod tests {
         assert_eq!(skills.len(), 2);
     }
 
+    fn qty_of(items: &[InventoryItem], item: &str) -> i64 {
+        items.iter().filter(|i| i.item_id == item).map(|i| i.qty).sum()
+    }
+
     #[tokio::test]
-    async fn inventory_and_storage_stack() {
+    async fn inventory_stacks_and_caps_at_carry_limit() {
         let (db, _t) = TempDb::open().await;
         let cid = a_character(&db).await;
-        db.add_to_inventory(&cid, "wood", 3).await.unwrap();
-        let stack = db.add_to_inventory(&cid, "wood", 2).await.unwrap();
-        assert_eq!(stack.qty, 5);
-        db.add_to_inventory(&cid, "stone", 1).await.unwrap();
+        assert_eq!(db.add_to_inventory(&cid, "wood", 3).await.unwrap(), 3);
+        assert_eq!(db.add_to_inventory(&cid, "wood", 2).await.unwrap(), 2); // stacks
         let inv = db.inventory_for_character(&cid).await.unwrap();
-        assert_eq!(inv.len(), 2);
+        assert_eq!(qty_of(&inv, "wood"), 5);
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), 5);
 
-        let dep = db.deposit_to_storage(&cid, "wood", 10).await.unwrap();
-        let dep = {
-            let _ = dep;
-            db.deposit_to_storage(&cid, "wood", 5).await.unwrap()
-        };
-        assert_eq!(dep.qty, 15);
-        assert_eq!(db.storage_for_character(&cid).await.unwrap().len(), 1);
+        // Fill to MAX_CARRY; further adds are partially then fully rejected.
+        let added = db.add_to_inventory(&cid, "stone", 100).await.unwrap();
+        assert_eq!(added, MAX_CARRY - 5, "only the remaining room is added");
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), MAX_CARRY);
+        assert_eq!(db.add_to_inventory(&cid, "wood", 1).await.unwrap(), 0, "full inventory");
+    }
+
+    #[tokio::test]
+    async fn deposit_frees_capacity_and_withdraw_respects_it() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", MAX_CARRY).await.unwrap(); // carry full
+        assert_eq!(db.add_to_inventory(&cid, "stone", 1).await.unwrap(), 0);
+
+        // Deposit moves carried wood into storage (which is uncapped) and frees carry.
+        let moved = db.deposit(&cid, "wood", 30).await.unwrap();
+        assert_eq!(moved, 30);
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), MAX_CARRY - 30);
+        assert_eq!(qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood"), MAX_CARRY - 30);
+        let stored = db.storage_for_character(&cid).await.unwrap();
+        assert_eq!(stored.iter().find(|s| s.item_id == "wood").unwrap().qty, 30);
+        // Now there is room to carry again.
+        assert_eq!(db.add_to_inventory(&cid, "stone", 1).await.unwrap(), 1);
+
+        // Withdraw is bounded by remaining carry room: only fills to MAX_CARRY.
+        let room = MAX_CARRY - db.inventory_total(&cid).await.unwrap();
+        let got = db.withdraw(&cid, "wood", 999).await.unwrap();
+        assert_eq!(got, room);
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), MAX_CARRY);
+        // The rest stays safely in storage.
+        assert_eq!(db.storage_for_character(&cid).await.unwrap().iter()
+            .find(|s| s.item_id == "wood").unwrap().qty, 30 - room);
+
+        // Depositing more than carried only moves what's there.
+        let inv_stone = qty_of(&db.inventory_for_character(&cid).await.unwrap(), "stone");
+        assert_eq!(db.deposit(&cid, "stone", 999).await.unwrap(), inv_stone);
     }
 
     #[tokio::test]

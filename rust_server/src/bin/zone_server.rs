@@ -58,6 +58,9 @@ const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
 const GATHER_XP: i64 = 10; // gathering-skill xp per unit
 const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 
+// --- Storage ------------------------------------------------------------------
+const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use it
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -175,6 +178,14 @@ fn node_status_json(n: &ResourceNode) -> Value {
     })
 }
 
+fn storage_status_json(s: &mmo::world::StoragePoint) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": s.id,
+        "state": { "x": s.x, "y": s.y, "type": "storage", "facing": [0, 0] },
+    })
+}
+
 fn clamp_world(x: i32, y: i32) -> (i32, i32) {
     (x.clamp(0, WORLD_SIZE - 1), y.clamp(0, WORLD_SIZE - 1))
 }
@@ -258,6 +269,8 @@ struct ZoneServer {
     nodes: Mutex<HashMap<String, ResourceNode>>,
     /// In-progress gather jobs, keyed by player id.
     gathering: Mutex<HashMap<String, GatherJob>>,
+    /// Authored storage access points in this zone's region (deposit/withdraw spots).
+    storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
 }
 
 impl ZoneServer {
@@ -274,6 +287,7 @@ impl ZoneServer {
             capital: mmo::world::capital(),
             nodes: Mutex::new(HashMap::new()),
             gathering: Mutex::new(HashMap::new()),
+            storage_points: Mutex::new(Vec::new()),
         })
     }
 
@@ -303,14 +317,35 @@ impl ZoneServer {
         }
     }
 
-    /// Push the current state of every node to the gateway (which broadcasts it),
-    /// so a just-joined client renders the nodes.
+    /// (Re)spawn the authored storage points inside this zone's current region.
+    fn spawn_storage_points(&self) {
+        let r = *self.region.lock().unwrap();
+        let pts = self
+            .capital
+            .storage_points_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        *self.storage_points.lock().unwrap() = pts;
+    }
+
+    /// Push the current state of every node and storage point to the gateway (which
+    /// broadcasts it), so a just-joined client renders them.
     fn send_all_nodes(&self) {
         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
             for n in self.nodes.lock().unwrap().values() {
                 let _ = tx.send(Message::Text(node_status_json(n).to_string()));
             }
+            for s in self.storage_points.lock().unwrap().iter() {
+                let _ = tx.send(Message::Text(storage_status_json(s).to_string()));
+            }
         }
+    }
+
+    /// Whether `(px, py)` is within range of any storage point in this zone.
+    fn near_storage(&self, px: i32, py: i32) -> bool {
+        self.storage_points
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| dist2(px, py, s.x, s.y) <= (STORAGE_RANGE as i64).pow(2))
     }
 
     /// Whether this zone sits in a `safe` capital district (by its region centre,
@@ -411,9 +446,10 @@ impl ZoneServer {
                     "[Zone {}] Region set to ({},{})-({},{})",
                     self.zone_id, r.x0, r.y0, r.x1, r.y1
                 );
-                // A freshly-split zone gets its own mobs and nodes for the new region.
+                // A freshly-split zone gets its own mobs, nodes, and storage points.
                 self.spawn_mobs(MOBS_PER_ZONE);
                 self.spawn_nodes();
+                self.spawn_storage_points();
                 continue;
             }
 
@@ -513,6 +549,25 @@ impl ZoneServer {
                 }
                 "gather.stop" => {
                     self.gathering.lock().unwrap().remove(&player_id);
+                }
+                "store.deposit" | "store.withdraw" => {
+                    // Validate the player is at a storage point; the gateway performs
+                    // the durable inventory<->storage transfer and pushes the result.
+                    let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let at_storage = {
+                        let entities = self.entities.lock().unwrap();
+                        entities.get(&player_id).map(|p| self.near_storage(p.x, p.y)).unwrap_or(false)
+                    };
+                    if at_storage && qty > 0 && !item_id.is_empty() {
+                        let op = if msg_type == "store.deposit" { "deposit" } else { "withdraw" };
+                        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                            let _ = tx.send(Message::Text(json!({
+                                "type": "store_op", "player_id": player_id,
+                                "op": op, "item_id": item_id, "qty": qty,
+                            }).to_string()));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -989,9 +1044,10 @@ impl ZoneServer {
             tokio::spawn(async move { me.register_with_proxy().await });
         }
 
-        // Seed mobs and the authored resource nodes, then start the 20 Hz sim.
+        // Seed mobs, resource nodes, and storage points, then start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
         self.spawn_nodes();
+        self.spawn_storage_points();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });

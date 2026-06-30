@@ -165,6 +165,18 @@ pub struct ResourceNodeSpawn {
     pub qty: i64,
 }
 
+/// An authored storage access point — a place a player can stand near to deposit
+/// to / withdraw from the safe home stash. For M2 this is a public town storehouse;
+/// in M3 (#12) per-plot home `storage` structures become additional storage points
+/// using the same protocol and server ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoragePoint {
+    pub id: &'static str,
+    pub district: &'static str,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -173,6 +185,7 @@ pub struct Capital {
     pub town_centre: (i32, i32),
     pub build_orders: Vec<SeedBuildOrder>,
     pub resource_nodes: Vec<ResourceNodeSpawn>,
+    pub storage_points: Vec<StoragePoint>,
 }
 
 impl Capital {
@@ -203,6 +216,15 @@ impl Capital {
             .iter()
             .copied()
             .filter(|n| r.contains(n.x, n.y))
+            .collect()
+    }
+
+    /// Authored storage points whose position falls inside `r`.
+    pub fn storage_points_in(&self, r: Rect) -> Vec<StoragePoint> {
+        self.storage_points
+            .iter()
+            .copied()
+            .filter(|s| r.contains(s.x, s.y))
             .collect()
     }
 }
@@ -282,12 +304,22 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 1120, y: 600, qty: 5 },
     ];
 
+    // A public town storehouse beside the town centre (the M2 stash). Per-plot
+    // home storage (#12) will add more storage points using the same protocol.
+    let storage_points = vec![StoragePoint {
+        id: "storehouse_town",
+        district: "civic",
+        x: tcx + 30,
+        y: tcy + 10,
+    }];
+
     Capital {
         districts: vec![market, civic, suburbs],
         roads,
         town_centre,
         build_orders,
         resource_nodes,
+        storage_points,
     }
 }
 
@@ -390,6 +422,20 @@ mod tests {
         assert!(in_civic.iter().all(|n| n.district == "civic"));
         // The whole world contains every node.
         assert_eq!(c.resource_nodes_in(Rect::new(0, 0, WORLD_SIZE, WORLD_SIZE)).len(), c.resource_nodes.len());
+    }
+
+    #[test]
+    fn storage_point_is_in_the_civic_centre_near_spawn() {
+        let c = capital();
+        assert!(!c.storage_points.is_empty());
+        let (tcx, tcy) = c.town_centre;
+        for s in &c.storage_points {
+            assert_eq!(c.district_at(s.x, s.y).map(|d| d.id), Some(s.district));
+            // Near the town centre so a fresh spawn can reach it.
+            assert!((s.x - tcx).pow(2) + (s.y - tcy).pow(2) < 100 * 100);
+        }
+        let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
+        assert_eq!(c.storage_points_in(civic).len(), c.storage_points.len());
     }
 
     #[test]

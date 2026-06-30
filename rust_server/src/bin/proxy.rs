@@ -566,8 +566,9 @@ impl Proxy {
                     if let (Some(pid), Some(st)) =
                         (target_player.as_deref(), data.get("state"))
                     {
-                        let is_resource = st.get("type").and_then(|v| v.as_str()) == Some("resource");
-                        if !is_resource {
+                        let kind = st.get("type").and_then(|v| v.as_str());
+                        let authored = kind == Some("resource") || kind == Some("storage");
+                        if !authored {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
@@ -642,6 +643,16 @@ impl Proxy {
                         let skill = data.get("skill").and_then(|v| v.as_str()).unwrap_or("gathering");
                         let xp = data.get("xp").and_then(|v| v.as_i64()).unwrap_or(0);
                         self.apply_gather_yield(pid, item, qty, skill, xp).await;
+                    }
+                }
+                Some("store_op") => {
+                    // Internal: a zone validated a deposit/withdraw at a storage point.
+                    // Perform the durable transfer and push the result (not forwarded).
+                    if let Some(pid) = target_player.as_deref() {
+                        let op = data.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                        let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_store_op(pid, op, item, qty).await;
                     }
                 }
                 Some("migrate_request") => {
@@ -1635,15 +1646,58 @@ impl Proxy {
         }
     }
 
-    /// Push a character's current inventory to its client as `inv.update`.
+    /// Push a character's current inventory (with carry capacity) to its client as
+    /// `inv.update`.
     async fn send_inventory(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         if let Ok(items) = db.inventory_for_character(pid).await {
+            let used: i64 = items.iter().map(|it| it.qty).sum();
             let arr: Vec<Value> = items
                 .iter()
                 .map(|it| json!({"item_id": it.item_id, "qty": it.qty, "slot": it.slot}))
                 .collect();
-            self.push_to_player(pid, json!({"type": "inv.update", "player_id": pid, "items": arr}));
+            self.push_to_player(pid, json!({
+                "type": "inv.update", "player_id": pid, "items": arr,
+                "used": used, "capacity": mmo::persistence::MAX_CARRY,
+            }));
+        }
+    }
+
+    /// Push a character's safe storage contents to its client as `store.update`.
+    async fn send_storage(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if let Ok(items) = db.storage_for_character(pid).await {
+            let arr: Vec<Value> = items
+                .iter()
+                .map(|it| json!({"item_id": it.item_id, "qty": it.qty}))
+                .collect();
+            self.push_to_player(pid, json!({"type": "store.update", "player_id": pid, "items": arr}));
+        }
+    }
+
+    /// Perform a storage transfer reported by a zone (`store_op`) and push the
+    /// updated inventory + storage to the client. The zone validated proximity; the
+    /// gateway owns the durable, transactional move. No-op for guests / no DB.
+    async fn apply_store_op(&self, pid: &str, op: &str, item_id: &str, qty: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let moved = match op {
+            "deposit" => db.deposit(pid, item_id, qty).await,
+            "withdraw" => db.withdraw(pid, item_id, qty).await,
+            _ => Ok(0),
+        };
+        if moved.is_ok() {
+            self.send_inventory(pid).await;
+            self.send_storage(pid).await;
         }
     }
 
@@ -1817,9 +1871,10 @@ impl Proxy {
             self.route_client_frame(&player_id, frame);
         }
 
-        // Hydrate the client's gameplay state: its persisted inventory and skills.
+        // Hydrate the client's gameplay state: inventory, storage, and skills.
         if identity.persistent {
             self.send_inventory(&player_id).await;
+            self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
         }
 
@@ -3028,6 +3083,17 @@ mod tests {
         }
     }
 
+    /// Read the next text frame (skipping ping/pong), or `None` on timeout/close.
+    async fn recv_frame(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Option<Value> {
+        loop {
+            match timeout(Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => return Some(parse(t)),
+                Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+                _ => return None,
+            }
+        }
+    }
+
     /// #4: the gateway's spawn constant must agree with the authored town centre.
     #[test]
     fn spawn_matches_town_centre() {
@@ -3208,6 +3274,69 @@ mod tests {
         let s = recv_until(&mut ws, "skill.update").await;
         assert_eq!(s["skill_id"], "gathering");
         assert_eq!(s["xp"].as_i64(), Some(10));
+
+        drop(ws);
+    }
+
+    /// #8: a `store_op` deposit reported by a zone moves carried items into safe
+    /// storage and pushes the updated inventory + storage to the client.
+    #[tokio::test]
+    async fn store_deposit_persists_and_notifies_client() {
+        let (proxy, _dbf, zone) = proxy_with_db().await;
+        let email = format!("s_{}@t.test", Uuid::new_v4().simple());
+
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hero"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Give the character some wood (as a gather would), then deposit 3.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 5, "skill": "gathering", "xp": 10,
+            }).to_string()))
+            .unwrap();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "store_op", "player_id": pid,
+                "op": "deposit", "item_id": "wood", "qty": 3,
+            }).to_string()))
+            .unwrap();
+
+        // Storage ends up with 3 wood; carried inventory drops to 2 (and the
+        // deposited wood no longer counts against carry capacity). The two updates
+        // interleave, so scan frames once and check both.
+        let mut stored_ok = false;
+        let mut carry_ok = false;
+        for _ in 0..30 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            match v["type"].as_str() {
+                Some("store.update") => {
+                    let items = v["items"].as_array().cloned().unwrap_or_default();
+                    if items.iter().any(|it| it["item_id"] == "wood" && it["qty"].as_i64() == Some(3)) {
+                        stored_ok = true;
+                    }
+                }
+                Some("inv.update") => {
+                    let items = v["items"].as_array().cloned().unwrap_or_default();
+                    let wood = items.iter().find(|it| it["item_id"] == "wood");
+                    if wood.map(|w| w["qty"].as_i64()) == Some(Some(2)) {
+                        assert_eq!(v["used"].as_i64(), Some(2), "carry usage should drop with the deposit");
+                        carry_ok = true;
+                    }
+                }
+                _ => {}
+            }
+            if stored_ok && carry_ok {
+                break;
+            }
+        }
+        assert!(stored_ok, "storage never showed the deposited wood");
+        assert!(carry_ok, "inventory never reflected the deposit");
 
         drop(ws);
     }
