@@ -702,8 +702,9 @@ impl Proxy {
     }
 
     /// Build the current spatial partition: world size + each shard's region,
-    /// owner, capture progress, and the **district** it belongs to (named by region
-    /// centre, so the capital reads as named/multi-district however it's sharded).
+    /// owner, capture progress, and the **district**/**safety** it belongs to (by
+    /// region centre, so the capital reads as named/multi-district and safe/wilds
+    /// however it's sharded).
     fn partition_snapshot(&self) -> Value {
         let zones: Vec<Value> = {
             let zones = self.zones.lock().unwrap();
@@ -712,19 +713,22 @@ impl Proxy {
                 .iter()
                 .filter_map(|id| {
                     zones.get(id).map(|z| {
-                        let district = self
-                            .capital
-                            .district_for_region(mmo::world::Rect::new(
-                                z.region.x0, z.region.y0, z.region.x1, z.region.y1,
-                            ))
-                            .map(|d| d.name);
+                        let d = self.capital.district_for_region(mmo::world::Rect::new(
+                            z.region.x0, z.region.y0, z.region.x1, z.region.y1,
+                        ));
+                        // safe inside the capital, wilds outside it (Phase 2 material).
+                        let safety = match d.map(|d| d.safety) {
+                            Some(mmo::world::Safety::Safe) => "safe",
+                            Some(mmo::world::Safety::Wilds) | None => "wilds",
+                        };
                         json!({
                             "zone_id": id,
                             "x0": z.region.x0, "y0": z.region.y0,
                             "x1": z.region.x1, "y1": z.region.y1,
                             "owner": z.owner,
                             "progress": z.capture_progress,
-                            "district": district,
+                            "district": d.map(|d| d.name),
+                            "safety": safety,
                         })
                     })
                 })

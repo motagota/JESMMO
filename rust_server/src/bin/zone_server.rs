@@ -213,6 +213,9 @@ struct ZoneServer {
     proxy_tx: Mutex<Option<Tx>>,
     /// Monotonic counter for unique mob ids within this zone.
     mob_counter: Mutex<u64>,
+    /// The authored world, used to decide whether this zone's region is a safe
+    /// capital district (zero-PvP, no mob aggression) or open wilds.
+    capital: mmo::world::Capital,
 }
 
 impl ZoneServer {
@@ -226,7 +229,21 @@ impl ZoneServer {
             entities: Mutex::new(HashMap::new()),
             proxy_tx: Mutex::new(None),
             mob_counter: Mutex::new(0),
+            capital: mmo::world::capital(),
         })
+    }
+
+    /// Whether this zone sits in a `safe` capital district (by its region centre,
+    /// against the authored world). Safe zones disable mob aggression and any
+    /// player damage; regions outside the authored capital default to wilds.
+    /// Recomputed from the current region, so a split that moves the zone updates
+    /// its safety automatically.
+    fn is_safe(&self) -> bool {
+        let r = *self.region.lock().unwrap();
+        self.capital
+            .district_for_region(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1))
+            .map(|d| d.safety == mmo::world::Safety::Safe)
+            .unwrap_or(false)
     }
 
     /// Report our current entity count to the proxy (feeds the admin count).
@@ -436,6 +453,10 @@ impl ZoneServer {
                 None => continue, // no proxy connected yet
             };
             let region = *self.region.lock().unwrap();
+            // Safe capital districts disable mob aggression, player damage, and the
+            // territory-capture (wilds) mechanic. Re-evaluated each tick so a split
+            // that moves this zone is honored immediately.
+            let safe = self.is_safe();
 
             let mut rng = rand::thread_rng();
             let mut changed: HashSet<String> = HashSet::new();
@@ -474,12 +495,16 @@ impl ZoneServer {
                         let e = entities.get(mid).unwrap();
                         (e.x, e.y, e.attack_cooldown == 0)
                     };
-                    // Nearest player within aggro range.
+                    // Nearest player within aggro range. In a safe zone mobs never
+                    // target players — they only wander (friendly wildlife) — so no
+                    // contact damage is ever produced.
                     let mut best: Option<(String, i32, i32, i64)> = None;
-                    for (pid, px, py) in &players {
-                        let d2 = dist2(mx, my, *px, *py);
-                        if d2 <= aggro2 && best.as_ref().map_or(true, |b| d2 < b.3) {
-                            best = Some((pid.clone(), *px, *py, d2));
+                    if !safe {
+                        for (pid, px, py) in &players {
+                            let d2 = dist2(mx, my, *px, *py);
+                            if d2 <= aggro2 && best.as_ref().map_or(true, |b| d2 < b.3) {
+                                best = Some((pid.clone(), *px, *py, d2));
+                            }
                         }
                     }
 
@@ -512,11 +537,15 @@ impl ZoneServer {
                     changed.insert(mid.clone());
                 }
 
-                // Apply mob contact damage to players.
-                for (pid, dmg) in player_damage {
-                    if let Some(e) = entities.get_mut(&pid) {
-                        e.hp -= dmg;
-                        changed.insert(pid);
+                // Apply mob contact damage to players. Never in a safe zone — the
+                // map is empty there, but the guard makes "no player takes damage in
+                // the capital" an explicit, enforced invariant.
+                if !safe {
+                    for (pid, dmg) in player_damage {
+                        if let Some(e) = entities.get_mut(&pid) {
+                            e.hp -= dmg;
+                            changed.insert(pid);
+                        }
                     }
                 }
 
@@ -598,6 +627,8 @@ impl ZoneServer {
                 }
 
                 // --- 5. Capture bar: clear the mobs, then hold the ground. ---
+                // Territory control is a wilds mechanic; the safe capital has no
+                // capturable ground, so the bar never moves there.
                 let present: Vec<String> = entities
                     .iter()
                     .filter(|(_, e)| e.kind == EntityKind::Player)
@@ -608,6 +639,7 @@ impl ZoneServer {
                 let mobs_clear = live_mobs <= CAPTURE_MOB_THRESHOLD;
 
                 match (&claimant, mobs_clear) {
+                    _ if safe => {}
                     (Some(p), true) => {
                         if owner.as_ref() == Some(p) {
                             progress = 100.0; // reinforce a zone you already hold
@@ -814,4 +846,71 @@ async fn main() {
 
     let server = ZoneServer::new(zone_id, port, proxy_uri, region, version);
     server.start().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zone_for_region(region: Region) -> Arc<ZoneServer> {
+        ZoneServer::new("test".to_string(), 0, None, region, 1)
+    }
+
+    /// Drive a freshly-built zone's `game_loop` for `ticks` with a wired (dummy)
+    /// proxy channel, then return the live entity HP for `player_id`.
+    async fn run_with_player_and_adjacent_mob(
+        region: Region,
+        player_id: &str,
+        spot: (i32, i32),
+        ticks: u32,
+    ) -> i32 {
+        let zone = zone_for_region(region);
+        // game_loop needs a proxy tx or it idles; keep the rx so the channel stays open.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        *zone.proxy_tx.lock().unwrap() = Some(tx);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert(player_id.to_string(), Entity::player(spot.0, spot.1, PLAYER_MAX_HP));
+            es.insert("mob_x".to_string(), Entity::mob(spot.0, spot.1)); // in attack range
+        }
+        let runner = zone.clone();
+        tokio::spawn(runner.game_loop());
+        // Wait the requested number of ticks (plus slack for the immediate first tick).
+        sleep(Duration::from_millis(TICK_MS * ticks as u64 + 60)).await;
+        let hp = zone.entities.lock().unwrap().get(player_id).map(|e| e.hp).unwrap_or(0);
+        hp
+    }
+
+    #[test]
+    fn safe_in_capital_wilds_outside() {
+        // Each authored district band is safe.
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 400, y1: 1200 }).is_safe()); // market
+        assert!(zone_for_region(Region { x0: 400, y0: 0, x1: 800, y1: 1200 }).is_safe()); // civic
+        assert!(zone_for_region(Region { x0: 800, y0: 0, x1: 1200, y1: 1200 }).is_safe()); // suburbs
+        // The default whole-world zone is safe (centre is the Civic Centre).
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 1200, y1: 1200 }).is_safe());
+        // A region whose centre falls outside the authored capital is wilds.
+        assert!(!zone_for_region(Region { x0: 600, y0: 600, x1: 2000, y1: 2000 }).is_safe());
+    }
+
+    /// Acceptance (#5): in the safe capital, a mob sitting on top of a player deals
+    /// no damage — the player's HP is untouched.
+    #[tokio::test]
+    async fn safe_zone_deals_no_player_damage() {
+        // Civic Centre band, centred on the town centre — safe.
+        let region = Region { x0: 400, y0: 0, x1: 800, y1: 1200 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (600, 600), 8).await;
+        assert_eq!(hp, PLAYER_MAX_HP, "a player took damage inside the safe capital");
+    }
+
+    /// Control: the same setup in a wilds region *does* damage the player, proving
+    /// the test actually exercises the mob-aggression/damage path that #5 gates.
+    #[tokio::test]
+    async fn wilds_zone_damages_player() {
+        // A region whose centre is outside the capital -> wilds. It still contains
+        // the (600,600) spot so the mob can reach the player.
+        let region = Region { x0: 600, y0: 600, x1: 2000, y1: 2000 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (600, 600), 8).await;
+        assert!(hp < PLAYER_MAX_HP, "a wilds mob should have damaged the player (hp={hp})");
+    }
 }
