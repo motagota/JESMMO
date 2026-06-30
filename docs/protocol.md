@@ -84,7 +84,7 @@ Any client-supplied `player_id` is ignored — the gateway stamps the real one.
 | type | fields | notes |
 |---|---|---|
 | `welcome` | see above | |
-| `partition` | `world`, `zones[]` | world size + each zone's region/owner/progress/`district`; drives the map |
+| `partition` | `world`, `zones[]` | world size + each zone's region/owner/progress/`district`/`safety` (`safe`\|`wilds`); drives the map |
 | `status_update` | `player_id`, `state{x,y,hp,max_hp,type,facing}`, `zone` | entity snapshot (~20 Hz) |
 | `despawn` | `player_id` | stop rendering an entity (death/disconnect) |
 | `zone_migration` | `zone` | the player's authoritative zone changed (seamless handoff) |
@@ -109,8 +109,13 @@ homes.
 
 - **Town centre / spawn:** world centre `(600, 600)`, inside the Civic Centre.
 - **District identity is keyed to world geometry**, not to sim processes. The
-  gateway labels each shard's `district` in `partition` by its region centre, so
-  the capital stays correctly named however the world is split/merged.
+  gateway labels each shard's `district` and `safety` in `partition` by its region
+  centre, so the capital stays correctly named however the world is split/merged.
+- **Safe-zone enforcement (zero-PvP):** a zone whose region is a `safe` district
+  disables mob aggression and **never applies damage to a player**, and the
+  territory-capture (wilds) mechanic is off. Regions outside the authored capital
+  default to `wilds` (Phase 2). The zone re-evaluates safety from its current
+  region each tick, so a split that moves it is honored immediately.
 - **Seeded on boot (idempotent):** the starter plot grid (as `unowned` plots) and
   the first build order (`town_well`, Civic Centre). A restart never duplicates them.
 
