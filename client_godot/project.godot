@@ -1,0 +1,24 @@
+; JESMMO — Godot 3D client (Phase 1, M1 skeleton).
+;
+; Engine configuration. Most wiring is done in code (Main.gd builds the scene
+; tree procedurally) so the project stays diff-friendly and reviewable without
+; opening the editor. See README.md.
+
+config_version=5
+
+[application]
+
+config/name="JESMMO Client"
+config/description="Phase 1 3D client: connect, log in, render a district, move with prediction."
+run/main_scene="res://Main.tscn"
+config/features=PackedStringArray("4.6", "Forward Plus")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

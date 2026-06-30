@@ -1,0 +1,5 @@
+# Godot 4 import cache / editor state — regenerated on open, never committed.
+.godot/
+# Exported builds.
+/build/
+*.import
