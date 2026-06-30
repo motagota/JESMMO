@@ -52,6 +52,12 @@ const CAPTURE_MOB_THRESHOLD: usize = 2; // capture only progresses at/below this
 const CAPTURE_RATE: f32 = 1.0; // bar units/tick while capturing (~5s to take a zone)
 const CAPTURE_DECAY: f32 = 0.5; // bar units/tick lost when a capture stalls
 
+// --- Resource gathering -------------------------------------------------------
+const GATHER_RANGE: i32 = 50; // must be within this of a node to gather it
+const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
+const GATHER_XP: i64 = 10; // gathering-skill xp per unit
+const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -138,6 +144,37 @@ impl Entity {
     }
 }
 
+/// A gatherable node's runtime (cache-only) state. The authored spawn lives in
+/// `mmo::world`; this tracks the current quantity and respawn countdown.
+struct ResourceNode {
+    id: String,
+    item_id: String,
+    x: i32,
+    y: i32,
+    qty: i64,
+    max_qty: i64,
+    respawn_timer: i32, // ticks until refill while depleted (qty == 0)
+}
+
+/// An in-progress gather: which node a player is working and how far along the
+/// current unit they are.
+struct GatherJob {
+    node_id: String,
+    progress: i32,
+}
+
+fn node_status_json(n: &ResourceNode) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": n.id,
+        "state": {
+            "x": n.x, "y": n.y, "type": "resource",
+            "item_id": n.item_id, "qty": n.qty,
+            "hp": n.qty, "max_hp": n.max_qty, "facing": [0, 0],
+        },
+    })
+}
+
 fn clamp_world(x: i32, y: i32) -> (i32, i32) {
     (x.clamp(0, WORLD_SIZE - 1), y.clamp(0, WORLD_SIZE - 1))
 }
@@ -216,6 +253,11 @@ struct ZoneServer {
     /// The authored world, used to decide whether this zone's region is a safe
     /// capital district (zero-PvP, no mob aggression) or open wilds.
     capital: mmo::world::Capital,
+    /// Gatherable resource nodes in this zone's region (cache-only runtime state),
+    /// keyed by node id.
+    nodes: Mutex<HashMap<String, ResourceNode>>,
+    /// In-progress gather jobs, keyed by player id.
+    gathering: Mutex<HashMap<String, GatherJob>>,
 }
 
 impl ZoneServer {
@@ -230,7 +272,45 @@ impl ZoneServer {
             proxy_tx: Mutex::new(None),
             mob_counter: Mutex::new(0),
             capital: mmo::world::capital(),
+            nodes: Mutex::new(HashMap::new()),
+            gathering: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// (Re)spawn the authored resource nodes that fall inside this zone's current
+    /// region. Replaces any existing node set, so a split re-derives the nodes it
+    /// now owns. Mirrors `spawn_mobs` but driven by authored world data.
+    fn spawn_nodes(&self) {
+        let r = *self.region.lock().unwrap();
+        let spawns = self
+            .capital
+            .resource_nodes_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        let mut nodes = self.nodes.lock().unwrap();
+        nodes.clear();
+        for s in spawns {
+            nodes.insert(
+                s.id.to_string(),
+                ResourceNode {
+                    id: s.id.to_string(),
+                    item_id: s.item_id.to_string(),
+                    x: s.x,
+                    y: s.y,
+                    qty: s.qty,
+                    max_qty: s.qty,
+                    respawn_timer: 0,
+                },
+            );
+        }
+    }
+
+    /// Push the current state of every node to the gateway (which broadcasts it),
+    /// so a just-joined client renders the nodes.
+    fn send_all_nodes(&self) {
+        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+            for n in self.nodes.lock().unwrap().values() {
+                let _ = tx.send(Message::Text(node_status_json(n).to_string()));
+            }
+        }
     }
 
     /// Whether this zone sits in a `safe` capital district (by its region centre,
@@ -331,8 +411,9 @@ impl ZoneServer {
                     "[Zone {}] Region set to ({},{})-({},{})",
                     self.zone_id, r.x0, r.y0, r.x1, r.y1
                 );
-                // A freshly-split zone gets its own mobs within the new region.
+                // A freshly-split zone gets its own mobs and nodes for the new region.
                 self.spawn_mobs(MOBS_PER_ZONE);
+                self.spawn_nodes();
                 continue;
             }
 
@@ -350,6 +431,7 @@ impl ZoneServer {
                     for id in ids {
                         self.send_status_update(&id).await;
                     }
+                    self.send_all_nodes(); // so the joiner renders gatherable nodes
                     self.send_zone_stats();
                 }
                 "player_leave" => {
@@ -409,6 +491,28 @@ impl ZoneServer {
                             e.swinging = true;
                         }
                     }
+                }
+                "gather.start" => {
+                    // Begin gathering a node: validate it exists, is in range, and has
+                    // stock; the per-unit yield is resolved authoritatively in the tick.
+                    let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let ok = {
+                        let entities = self.entities.lock().unwrap();
+                        let nodes = self.nodes.lock().unwrap();
+                        match (entities.get(&player_id), nodes.get(&node_id)) {
+                            (Some(p), Some(n)) => n.qty > 0 && dist2(p.x, p.y, n.x, n.y) <= (GATHER_RANGE as i64).pow(2),
+                            _ => false,
+                        }
+                    };
+                    if ok {
+                        self.gathering.lock().unwrap().insert(
+                            player_id.clone(),
+                            GatherJob { node_id, progress: 0 },
+                        );
+                    }
+                }
+                "gather.stop" => {
+                    self.gathering.lock().unwrap().remove(&player_id);
                 }
                 _ => {}
             }
@@ -684,6 +788,87 @@ impl ZoneServer {
                 }
             } // entities lock released here
 
+            // --- 7. Resource gathering + node respawn. ---
+            // Locks taken after `entities` (consistent order) to avoid deadlock.
+            {
+                let entities = self.entities.lock().unwrap();
+                let mut nodes = self.nodes.lock().unwrap();
+                let mut gathering = self.gathering.lock().unwrap();
+                let mut finished: Vec<String> = Vec::new();
+                let mut touched: HashSet<String> = HashSet::new();
+
+                for (pid, job) in gathering.iter_mut() {
+                    // Player and node must exist, be in range, and the node have stock.
+                    let (px, py) = match entities.get(pid) {
+                        Some(p) => (p.x, p.y),
+                        None => { finished.push(pid.clone()); continue; }
+                    };
+                    let (nx, ny, has_stock) = match nodes.get(&job.node_id) {
+                        Some(n) => (n.x, n.y, n.qty > 0),
+                        None => { finished.push(pid.clone()); continue; }
+                    };
+                    if !has_stock || dist2(px, py, nx, ny) > (GATHER_RANGE as i64).pow(2) {
+                        finished.push(pid.clone());
+                        continue;
+                    }
+
+                    job.progress += 1;
+                    let pct = (job.progress * 100 / GATHER_PERIOD).min(100);
+                    packets.push(json!({
+                        "type": "gather.progress", "player_id": pid,
+                        "node_id": job.node_id, "pct": pct,
+                    }).to_string());
+
+                    if job.progress >= GATHER_PERIOD {
+                        job.progress = 0;
+                        let node = nodes.get_mut(&job.node_id).unwrap();
+                        node.qty -= 1;
+                        let item = node.item_id.clone();
+                        touched.insert(node.id.clone());
+                        // Client-facing yield feedback.
+                        packets.push(json!({
+                            "type": "gather.result", "player_id": pid,
+                            "item_id": item, "qty": 1,
+                        }).to_string());
+                        // Internal: the gateway persists inventory + xp and pushes
+                        // the authoritative inv.update / skill.update to the client.
+                        packets.push(json!({
+                            "type": "gather_yield", "player_id": pid,
+                            "item_id": item, "qty": 1, "skill": "gathering", "xp": GATHER_XP,
+                        }).to_string());
+                        if node.qty <= 0 {
+                            node.respawn_timer = NODE_RESPAWN_TICKS;
+                            finished.push(pid.clone()); // stop gathering a depleted node
+                        }
+                    }
+                }
+                for pid in finished {
+                    gathering.remove(&pid);
+                }
+
+                // Respawn depleted nodes on their timer.
+                for node in nodes.values_mut() {
+                    if node.qty <= 0 && node.respawn_timer > 0 {
+                        node.respawn_timer -= 1;
+                        if node.respawn_timer == 0 {
+                            node.qty = node.max_qty;
+                            touched.insert(node.id.clone());
+                        }
+                    }
+                }
+
+                // Emit node state: a live node -> status_update; a depleted one -> despawn.
+                for id in &touched {
+                    if let Some(n) = nodes.get(id) {
+                        if n.qty > 0 {
+                            packets.push(node_status_json(n).to_string());
+                        } else {
+                            packets.push(json!({"type": "despawn", "player_id": n.id}).to_string());
+                        }
+                    }
+                }
+            }
+
             for id in &despawns {
                 packets.push(json!({"type": "despawn", "player_id": id}).to_string());
             }
@@ -804,8 +989,9 @@ impl ZoneServer {
             tokio::spawn(async move { me.register_with_proxy().await });
         }
 
-        // Seed mobs, then start the authoritative 20 Hz simulation.
+        // Seed mobs and the authored resource nodes, then start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
+        self.spawn_nodes();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -912,5 +1098,112 @@ mod tests {
         let region = Region { x0: 600, y0: 600, x1: 2000, y1: 2000 };
         let hp = run_with_player_and_adjacent_mob(region, "p1", (600, 600), 8).await;
         assert!(hp < PLAYER_MAX_HP, "a wilds mob should have damaged the player (hp={hp})");
+    }
+
+    // --- #7: resource gathering -----------------------------------------------
+
+    const CIVIC: Region = Region { x0: 400, y0: 0, x1: 800, y1: 1200 };
+    const TREE: &str = "node_civic_tree_0"; // authored at (540, 540), wood, qty 5
+
+    /// Civic zone with its authored nodes spawned and a player standing on the tree.
+    fn civic_zone_on_tree() -> Arc<ZoneServer> {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_nodes();
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(540, 540, PLAYER_MAX_HP),
+        );
+        zone
+    }
+
+    /// Run the game loop for `ticks` and return every text packet the zone emitted.
+    async fn drive(zone: Arc<ZoneServer>, ticks: u32) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *zone.proxy_tx.lock().unwrap() = Some(tx);
+        let runner = zone.clone();
+        tokio::spawn(runner.game_loop());
+        sleep(Duration::from_millis(TICK_MS * ticks as u64 + 80)).await;
+        let mut out = Vec::new();
+        while let Ok(Message::Text(t)) = rx.try_recv() {
+            out.push(t);
+        }
+        out
+    }
+
+    fn count(packets: &[String], needle: &str) -> usize {
+        packets.iter().filter(|p| p.contains(needle)).count()
+    }
+
+    #[tokio::test]
+    async fn gather_yields_item_and_xp_then_continues() {
+        let zone = civic_zone_on_tree();
+        zone.gathering.lock().unwrap().insert(
+            "p1".to_string(),
+            GatherJob { node_id: TREE.to_string(), progress: 0 },
+        );
+        // One GATHER_PERIOD plus slack -> exactly one unit yielded.
+        let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
+
+        assert!(count(&packets, "\"gather.progress\"") > 0, "no progress packets");
+        assert_eq!(count(&packets, "\"gather.result\""), 1, "expected one yield");
+        assert!(packets.iter().any(|p| p.contains("\"gather_yield\"")
+            && p.contains("\"skill\":\"gathering\"") && p.contains("\"xp\":10")),
+            "missing internal gather_yield with xp");
+        // Node decremented but still alive; the job continues.
+        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 4);
+        assert_eq!(count(&packets, "\"despawn\""), 0, "a live node should not despawn");
+        assert!(zone.gathering.lock().unwrap().contains_key("p1"), "job should continue");
+    }
+
+    #[tokio::test]
+    async fn gather_depletes_node_then_despawns_and_schedules_respawn() {
+        let zone = civic_zone_on_tree();
+        zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 1; // one unit left
+        zone.gathering.lock().unwrap().insert(
+            "p1".to_string(),
+            GatherJob { node_id: TREE.to_string(), progress: 0 },
+        );
+        let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
+
+        assert_eq!(count(&packets, "\"gather.result\""), 1);
+        assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(TREE)),
+            "depleted node should despawn");
+        let nodes = zone.nodes.lock().unwrap();
+        let n = nodes.get(TREE).unwrap();
+        assert_eq!(n.qty, 0);
+        assert!(n.respawn_timer > 0, "respawn should be scheduled");
+        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job ends on depletion");
+    }
+
+    #[tokio::test]
+    async fn gather_out_of_range_is_cancelled() {
+        let zone = civic_zone_on_tree();
+        // Move the player far from the tree (still in-region, but out of gather range).
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 780;
+        zone.gathering.lock().unwrap().insert(
+            "p1".to_string(),
+            GatherJob { node_id: TREE.to_string(), progress: 0 },
+        );
+        let packets = drive(zone.clone(), 6).await;
+
+        assert_eq!(count(&packets, "\"gather.result\""), 0, "no yield out of range");
+        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job cancelled");
+        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node untouched");
+    }
+
+    #[tokio::test]
+    async fn node_respawns_after_timer() {
+        let zone = civic_zone_on_tree();
+        {
+            let mut nodes = zone.nodes.lock().unwrap();
+            let n = nodes.get_mut(TREE).unwrap();
+            n.qty = 0;
+            n.respawn_timer = 2; // refills in ~2 ticks
+        }
+        let packets = drive(zone.clone(), 5).await;
+
+        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node refilled");
+        assert!(packets.iter().any(|p| p.contains(TREE) && p.contains("\"resource\"")),
+            "respawn should emit a node status_update");
     }
 }

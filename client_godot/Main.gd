@@ -73,6 +73,10 @@ func _wire_signals() -> void:
 	_net.despawn.connect(func(id): _entities.remove(id))
 	_net.zone_migration.connect(func(zone): _hud.set_zone(zone))
 	_net.you_died.connect(func(): _hud.set_conn("you died — respawning…"))
+	_net.gather_progress.connect(func(_node_id, pct): _hud.set_gather_progress(pct))
+	_net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
+	_net.inv_update.connect(func(items): _hud.set_inventory(items))
+	_net.skill_update.connect(func(skill_id, xp, level): _hud.set_skill(skill_id, xp, level))
 
 	_login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
 	_login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
@@ -80,6 +84,7 @@ func _wire_signals() -> void:
 
 	_player.move_requested.connect(func(dx, dy): _net.send_move(dx, dy))
 	_player.attack_requested.connect(func(dx, dy): _net.send_attack(dx, dy))
+	_player.gather_pressed.connect(_on_gather_pressed)
 	_player.position_changed.connect(func(wx, wy): _hud.set_pos(wx, wy))
 
 # --- handshake ----------------------------------------------------------------
@@ -110,6 +115,12 @@ func _on_welcome(data: Dictionary) -> void:
 	_hud.set_zone(String(data.get("zone", "—")))
 	_login.show_overlay(false)
 	_player.activate()
+
+## Gather the nearest in-range resource node (resolved from the entity manager).
+func _on_gather_pressed() -> void:
+	var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
+	if node_id != "":
+		_net.send_gather_start(node_id)
 
 func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
 	if id == _my_id:

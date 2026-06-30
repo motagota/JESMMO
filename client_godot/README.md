@@ -41,7 +41,9 @@ reviews as plain script diffs without opening the editor.
    Godot --path client_godot
    ```
 3. Log in / register / play as guest. Move with **WASD** or the arrow keys;
-   **Space** swings.
+   **Space** swings; **E** gathers the nearest resource node in range (walk up to a
+   green tree or grey rock). Your inventory and gathering skill show in the HUD;
+   gathered items persist for logged-in characters.
 
 The gateway is `ws://127.0.0.1:8766` (see `Main.gd::GATEWAY_URL`). A session token
 is cached in `user://session.cfg` for silent reconnects.
@@ -68,12 +70,14 @@ Parse-check every script:
 Godot --headless --path client_godot --editor --quit
 ```
 
-End-to-end network smoke (requires the server running, per "Run it"):
+End-to-end smokes (require the server running, per "Run it"):
 ```sh
-Godot --headless --path client_godot -s res://tests/smoke.gd
+Godot --headless --path client_godot -s res://tests/smoke.gd         # connect/auth/welcome
+Godot --headless --path client_godot -s res://tests/smoke_gather.gd  # register, walk, gather wood
 ```
-Expect `SMOKE_OK welcome player=… zone=…` followed by a `status_update` stream;
-it exits non-zero on timeout.
+`smoke.gd` expects `SMOKE_OK welcome …` then a `status_update` stream;
+`smoke_gather.gd` registers a character, walks to the civic tree, gathers, and
+expects `SMOKE_GATHER_OK inventory shows wood`. Both exit non-zero on timeout.
 
 ## Scope (Phase 1, M1)
 

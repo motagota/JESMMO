@@ -561,14 +561,18 @@ impl Proxy {
             match msg_type.as_deref() {
                 Some("status_update") => {
                     // Cache the entity's latest position so a rolling update can
-                    // recreate it at the right spot in a new zone instance.
+                    // recreate it at the right spot in a new zone instance. Resource
+                    // nodes are authored, not player entities — never cache/recreate them.
                     if let (Some(pid), Some(st)) =
                         (target_player.as_deref(), data.get("state"))
                     {
-                        let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                        let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                        let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                        self.entity_state.lock().unwrap().insert(pid.to_string(), (x, y, hp));
+                        let is_resource = st.get("type").and_then(|v| v.as_str()) == Some("resource");
+                        if !is_resource {
+                            let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
+                            self.entity_state.lock().unwrap().insert(pid.to_string(), (x, y, hp));
+                        }
                     }
                     // Stamp the owning zone and fan the update out to EVERY client,
                     // so each renders the whole world (entities carry world coords).
@@ -627,6 +631,17 @@ impl Proxy {
                     }
                     if owner_changed {
                         self.broadcast_partition();
+                    }
+                }
+                Some("gather_yield") => {
+                    // Internal: a zone yielded a gathered unit. Persist it and push
+                    // the authoritative inventory/skill to the client (not forwarded).
+                    if let Some(pid) = target_player.as_deref() {
+                        let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let skill = data.get("skill").and_then(|v| v.as_str()).unwrap_or("gathering");
+                        let xp = data.get("xp").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_gather_yield(pid, item, qty, skill, xp).await;
                     }
                 }
                 Some("migrate_request") => {
@@ -1609,6 +1624,70 @@ impl Proxy {
         }
     }
 
+    /// Send one JSON message to whichever connected client owns `pid`.
+    fn push_to_player(&self, pid: &str, msg: Value) {
+        let text = msg.to_string();
+        let clients = self.clients.lock().unwrap();
+        for info in clients.values() {
+            if info.player_id == pid {
+                self.push_to_client(info, Message::Text(text.clone()));
+            }
+        }
+    }
+
+    /// Push a character's current inventory to its client as `inv.update`.
+    async fn send_inventory(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if let Ok(items) = db.inventory_for_character(pid).await {
+            let arr: Vec<Value> = items
+                .iter()
+                .map(|it| json!({"item_id": it.item_id, "qty": it.qty, "slot": it.slot}))
+                .collect();
+            self.push_to_player(pid, json!({"type": "inv.update", "player_id": pid, "items": arr}));
+        }
+    }
+
+    /// Push a character's current skills to its client as `skill.update`s.
+    async fn send_skills(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if let Ok(skills) = db.skills_for_character(pid).await {
+            for s in skills {
+                self.push_to_player(pid, json!({
+                    "type": "skill.update", "player_id": pid,
+                    "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
+                }));
+            }
+        }
+    }
+
+    /// Persist a gather yield reported by a zone (`gather_yield`) and push the
+    /// authoritative inventory + skill back to the client. The zone is authoritative
+    /// for the *simulation* (range, depletion); the gateway owns the *durable* write,
+    /// mirroring how character position is persisted. No-op for guests / no DB.
+    async fn apply_gather_yield(&self, pid: &str, item_id: &str, qty: i64, skill: &str, xp: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return; // guests gather visually (gather.result) but nothing is persisted
+        }
+        if db.add_to_inventory(pid, item_id, qty).await.is_err() {
+            return;
+        }
+        self.send_inventory(pid).await;
+        if let Ok(s) = db.grant_skill_xp(pid, skill, xp).await {
+            self.push_to_player(pid, json!({
+                "type": "skill.update", "player_id": pid,
+                "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
+            }));
+        }
+    }
+
     async fn handle_client(self: Arc<Self>, raw: TcpStream) {
         let ws = match tokio_tungstenite::accept_async(raw).await {
             Ok(ws) => ws,
@@ -1736,6 +1815,12 @@ impl Proxy {
         // route it now so nothing is lost.
         if let Some(frame) = identity.pending.clone() {
             self.route_client_frame(&player_id, frame);
+        }
+
+        // Hydrate the client's gameplay state: its persisted inventory and skills.
+        if identity.persistent {
+            self.send_inventory(&player_id).await;
+            self.send_skills(&player_id).await;
         }
 
         // Liveness: ping on an interval; if a full interval passes with no frame
@@ -3081,6 +3166,50 @@ mod tests {
         let welcome3 = recv_until(&mut ws3, "welcome").await;
         assert_eq!(welcome3["player_id"], pid, "same character on re-login");
         drop(ws3);
+    }
+
+    /// #7: a `gather_yield` reported by a zone is persisted and the authoritative
+    /// inventory + skill are pushed back to the gathering client.
+    #[tokio::test]
+    async fn gather_yield_persists_and_notifies_client() {
+        let (proxy, _dbf, zone) = proxy_with_db().await;
+        let email = format!("g_{}@t.test", Uuid::new_v4().simple());
+
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hero"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+
+        // The (fake) zone reports a gathered unit of wood for this player.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 1, "skill": "gathering", "xp": 10,
+            }).to_string()))
+            .unwrap();
+
+        // The client receives an inv.update carrying the wood (proves the DB round
+        // trip: add_to_inventory -> read back -> push), then a skill.update.
+        let mut got_wood = false;
+        for _ in 0..10 {
+            let v = recv_until(&mut ws, "inv.update").await;
+            let items = v["items"].as_array().cloned().unwrap_or_default();
+            if items.iter().any(|it| it["item_id"] == "wood" && it["qty"].as_i64() == Some(1)) {
+                got_wood = true;
+                break;
+            }
+        }
+        assert!(got_wood, "client never received an inv.update with the gathered wood");
+
+        let s = recv_until(&mut ws, "skill.update").await;
+        assert_eq!(s["skill_id"], "gathering");
+        assert_eq!(s["xp"].as_i64(), Some(10));
+
+        drop(ws);
     }
 
     /// Acceptance support: a reconnect with a valid session token resumes the same

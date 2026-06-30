@@ -129,6 +129,42 @@ pub struct SeedBuildOrder {
     pub required_json: &'static str,
 }
 
+/// A static item definition (the item registry). Gathered resources, crafted
+/// goods, and build-order costs all reference these by `id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Item {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub stack_size: i64,
+    pub category: &'static str, // "wood" | "stone" | ...
+}
+
+/// The Phase 1 item registry. Look up by id with [`item`].
+pub fn items() -> Vec<Item> {
+    vec![
+        Item { id: "wood", name: "Wood", stack_size: 100, category: "wood" },
+        Item { id: "stone", name: "Stone", stack_size: 100, category: "stone" },
+    ]
+}
+
+/// Look up an item definition by id.
+pub fn item(id: &str) -> Option<Item> {
+    items().into_iter().find(|i| i.id == id)
+}
+
+/// An authored gatherable node: a fixed spawn that yields `item_id` until its
+/// `qty` is exhausted, then respawns. Node *runtime* state (current qty, respawn
+/// timer) is cache-only in the owning zone; this is just the authored spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceNodeSpawn {
+    pub id: &'static str,
+    pub district: &'static str,
+    pub item_id: &'static str,
+    pub x: i32,
+    pub y: i32,
+    pub qty: i64,
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -136,6 +172,7 @@ pub struct Capital {
     pub roads: Vec<RoadSegment>,
     pub town_centre: (i32, i32),
     pub build_orders: Vec<SeedBuildOrder>,
+    pub resource_nodes: Vec<ResourceNodeSpawn>,
 }
 
 impl Capital {
@@ -156,6 +193,16 @@ impl Capital {
         self.districts
             .iter()
             .flat_map(|d| d.plots().into_iter().map(move |c| (d.id, c)))
+            .collect()
+    }
+
+    /// Authored resource nodes whose position falls inside `r` — the set a zone
+    /// owning that region should spawn and simulate.
+    pub fn resource_nodes_in(&self, r: Rect) -> Vec<ResourceNodeSpawn> {
+        self.resource_nodes
+            .iter()
+            .copied()
+            .filter(|n| r.contains(n.x, n.y))
             .collect()
     }
 }
@@ -217,11 +264,30 @@ pub fn capital() -> Capital {
         required_json: r#"{"wood":20,"stone":10}"#,
     }];
 
+    // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
+    // spawn finds wood immediately) plus wood/stone scattered through the
+    // districts. Ids are stable so a node keeps its identity across respawns.
+    let (tcx, tcy) = town_centre;
+    let resource_nodes = vec![
+        ResourceNodeSpawn { id: "node_civic_tree_0", district: "civic", item_id: "wood", x: tcx - 60, y: tcy - 60, qty: 5 },
+        ResourceNodeSpawn { id: "node_civic_tree_1", district: "civic", item_id: "wood", x: tcx + 60, y: tcy - 60, qty: 5 },
+        ResourceNodeSpawn { id: "node_civic_tree_2", district: "civic", item_id: "wood", x: tcx - 60, y: tcy + 60, qty: 5 },
+        ResourceNodeSpawn { id: "node_civic_tree_3", district: "civic", item_id: "wood", x: tcx + 60, y: tcy + 60, qty: 5 },
+        ResourceNodeSpawn { id: "node_civic_rock_0", district: "civic", item_id: "stone", x: tcx, y: tcy - 110, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_0", district: "market", item_id: "wood", x: 180, y: 400, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 250, y: 760, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 120, y: 600, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 1000, y: 300, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 1050, y: 900, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 1120, y: 600, qty: 5 },
+    ];
+
     Capital {
         districts: vec![market, civic, suburbs],
         roads,
         town_centre,
         build_orders,
+        resource_nodes,
     }
 }
 
@@ -289,6 +355,41 @@ mod tests {
         }
         // Only the suburbs carry a grid; the capital total matches.
         assert_eq!(c.starter_plots().len(), 24);
+    }
+
+    #[test]
+    fn item_registry_and_node_spawns_are_consistent() {
+        let c = capital();
+        // Every node references a real item and sits inside its district.
+        assert!(!c.resource_nodes.is_empty());
+        for n in &c.resource_nodes {
+            assert!(item(n.item_id).is_some(), "node {} -> unknown item {}", n.id, n.item_id);
+            let d = c.districts.iter().find(|d| d.id == n.district).expect("node district exists");
+            assert!(d.region.contains(n.x, n.y), "node {} escapes {}", n.id, n.district);
+            assert!(n.qty > 0);
+        }
+        // Node ids are unique.
+        let mut seen = std::collections::HashSet::new();
+        for n in &c.resource_nodes {
+            assert!(seen.insert(n.id), "duplicate node id {}", n.id);
+        }
+        // A fresh spawn at the town centre finds wood nearby.
+        let (tcx, tcy) = c.town_centre;
+        let near = c.resource_nodes.iter().any(|n| {
+            n.item_id == "wood" && ((n.x - tcx).pow(2) + (n.y - tcy).pow(2)) < 200 * 200
+        });
+        assert!(near, "no wood near the town centre");
+    }
+
+    #[test]
+    fn resource_nodes_in_filters_by_region() {
+        let c = capital();
+        let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
+        let in_civic = c.resource_nodes_in(civic);
+        assert!(!in_civic.is_empty());
+        assert!(in_civic.iter().all(|n| n.district == "civic"));
+        // The whole world contains every node.
+        assert_eq!(c.resource_nodes_in(Rect::new(0, 0, WORLD_SIZE, WORLD_SIZE)).len(), c.resource_nodes.len());
     }
 
     #[test]

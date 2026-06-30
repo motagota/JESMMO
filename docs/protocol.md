@@ -130,24 +130,35 @@ the gateway/zone handlers that act on them arrive with their milestones, so unti
 then sending one is a no-op. Direction: **C→S** client to server, **S→C** server
 to client.
 
-### `gather.*` — resource gathering (M2 §4.1)
+### `gather.*` — resource gathering (M2 §4.1) — **live**
 
 | type | dir | fields |
 |---|---|---|
-| `gather.start` | C→S | `node_id` |
-| `gather.progress` | S→C | `node_id`, `pct` |
-| `gather.result` | S→C | `item_id`, `qty` |
-| `node.depleted` | S→C | `node_id` |
-| `node.respawn` | S→C | `node_id` |
+| `gather.start` | C→S | `node_id` — begin gathering a node in range |
+| `gather.stop` | C→S | — (optional; gathering also stops on depletion or walking away) |
+| `gather.progress` | S→C | `node_id`, `pct` (0–100 for the current unit) |
+| `gather.result` | S→C | `item_id`, `qty` (one unit yielded; floating feedback) |
+| `node.depleted` / `node.respawn` | S→C | reserved — node lifecycle currently rides the entity sync (see below) |
+
+**Resource nodes** are synced as ordinary entities: a `status_update` with
+`state.type = "resource"` (and `item_id`, `qty`) spawns/updates the node on the
+client; a `despawn` removes a depleted one; a later `status_update` brings it back
+on respawn. So `node.depleted`/`node.respawn` stay reserved for richer client FX.
+
+The gather loop is server-authoritative: the **zone** validates range and runs the
+swing timer; each completed unit decrements the node, emits `gather.result`, and
+sends an internal `gather_yield` to the gateway, which persists the item + XP and
+pushes the authoritative `inv.update` / `skill.update`. Gathering persists only for
+logged-in characters (guests see `gather.result` feedback but nothing is saved).
 
 ### `inv.*` / `store.*` — inventory & storage (M2 §4.2)
 
-| type | dir | fields |
-|---|---|---|
-| `inv.update` | S→C | `items` |
-| `inv.move` | C→S | `from`, `to` |
-| `store.deposit` | C→S | `item_id`, `qty` |
-| `store.withdraw` | C→S | `item_id`, `qty` |
+| type | dir | fields | status |
+|---|---|---|---|
+| `inv.update` | S→C | `items[]` (each `{item_id, qty, slot}`) — full authoritative inventory | **live** (sent on login and after a gather) |
+| `inv.move` | C→S | `from`, `to` | reserved (#8) |
+| `store.deposit` | C→S | `item_id`, `qty` | reserved (#8) |
+| `store.withdraw` | C→S | `item_id`, `qty` | reserved (#8) |
 
 ### `build.*` — build orders & placement (M2 §4.3, M3 §4.5)
 
@@ -170,10 +181,10 @@ to client.
 
 ### `skill.*` — use-based skills (M2 §4.6)
 
-| type | dir | fields |
-|---|---|---|
-| `skill.update` | S→C | `skill_id`, `xp`, `level` |
-| `skill.levelup` | S→C | `skill_id`, `level` |
+| type | dir | fields | status |
+|---|---|---|---|
+| `skill.update` | S→C | `skill_id`, `xp`, `level` | **live** (sent on login and on XP gain) |
+| `skill.levelup` | S→C | `skill_id`, `level` | reserved (#10) |
 
 ### `craft.*` / `home.*` — crafting & home (M3 §4.5)
 
@@ -205,7 +216,10 @@ to client.
 
 Zones self-register (`register_zone`) and exchange `player_join` / `player_leave` /
 `spawn_entity` / `move` / `attack` / `migrate_request` / `set_region` / `shutdown` /
-`zone_stats` with the gateway. See `proxy.rs` and `zone_server.rs`.
+`zone_stats` with the gateway. The zone also emits **`gather_yield`**
+`{player_id, item_id, qty, skill, xp}` — an internal message the gateway consumes
+(never forwards) to persist the gathered item + skill XP and push `inv.update` /
+`skill.update`. See `proxy.rs` and `zone_server.rs`.
 
 **M0 note on positions.** A returning character is recreated at its exact saved
 position via `spawn_entity` to whichever zone owns that point (routed by
