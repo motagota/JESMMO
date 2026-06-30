@@ -84,12 +84,35 @@ Any client-supplied `player_id` is ignored — the gateway stamps the real one.
 | type | fields | notes |
 |---|---|---|
 | `welcome` | see above | |
-| `partition` | `world`, `zones[]` | world size + each zone's region/owner/progress; drives the map |
+| `partition` | `world`, `zones[]` | world size + each zone's region/owner/progress/`district`; drives the map |
 | `status_update` | `player_id`, `state{x,y,hp,max_hp,type,facing}`, `zone` | entity snapshot (~20 Hz) |
 | `despawn` | `player_id` | stop rendering an entity (death/disconnect) |
 | `zone_migration` | `zone` | the player's authoritative zone changed (seamless handoff) |
 | `zone_capture` | `zone_id`, `owner`, `progress` | territory-control state (wilds mechanic; off in safe zones later) |
 | `you_died` | `player_id` | local death feedback |
+
+---
+
+## The Capital (world content)
+
+The world is the authored **Capital** (`mmo::world::capital()`): a 1200×1200 space
+tiled into three named districts as vertical bands, all **safe** (zero-PvP) for
+Phase 1. The capital starts **empty** — authored ground, roads, and a plot grid,
+but no buildings; structures appear only as players complete build orders / build
+homes.
+
+| district | id | region `[x0,x1) × [y0,y1)` | notes |
+|---|---|---|---|
+| Market District | `market` | `[0,400) × [0,1200)` | |
+| Civic Centre | `civic` | `[400,800) × [0,1200)` | town centre + first build-order board |
+| Starter Suburbs | `suburbs` | `[800,1200) × [0,1200)` | starter plot grid (3×8 = 24 plots) |
+
+- **Town centre / spawn:** world centre `(600, 600)`, inside the Civic Centre.
+- **District identity is keyed to world geometry**, not to sim processes. The
+  gateway labels each shard's `district` in `partition` by its region centre, so
+  the capital stays correctly named however the world is split/merged.
+- **Seeded on boot (idempotent):** the starter plot grid (as `unowned` plots) and
+  the first build order (`town_well`, Civic Centre). A restart never duplicates them.
 
 ---
 

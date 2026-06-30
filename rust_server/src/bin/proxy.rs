@@ -39,7 +39,8 @@ use mmo::auth;
 use mmo::persistence::Db;
 use mmo::protocol::{self, PROTOCOL_VERSION};
 
-/// Spawn point for a brand-new character: the centre of the world.
+/// Spawn point for a brand-new character: the capital's town centre (the spawn
+/// anchor authored in `mmo::world`). Kept in sync via `spawn_matches_town_centre`.
 const SPAWN_X: i32 = WORLD_SIZE / 2;
 const SPAWN_Y: i32 = WORLD_SIZE / 2;
 const SPAWN_HP: i32 = 100;
@@ -227,6 +228,10 @@ struct Proxy {
     /// Live session tokens: token -> character_id, for reconnect without re-login.
     /// In-memory and single-gateway for M0.
     sessions: Mutex<HashMap<String, String>>,
+    /// The authored capital (named districts, road graph, plot grid, town centre).
+    /// District identity is keyed to world geometry, so the gateway can name the
+    /// district owning any zone region regardless of how the sim is sharded.
+    capital: mmo::world::Capital,
 }
 
 impl Proxy {
@@ -260,6 +265,7 @@ impl Proxy {
             bot_handles: Mutex::new(Vec::new()),
             db,
             sessions: Mutex::new(HashMap::new()),
+            capital: mmo::world::capital(),
         })
     }
 
@@ -695,8 +701,10 @@ impl Proxy {
             .map(|(id, _)| id.clone())
     }
 
-    /// Tell every client the current spatial partition so they can draw it.
-    fn broadcast_partition(&self) {
+    /// Build the current spatial partition: world size + each shard's region,
+    /// owner, capture progress, and the **district** it belongs to (named by region
+    /// centre, so the capital reads as named/multi-district however it's sharded).
+    fn partition_snapshot(&self) -> Value {
         let zones: Vec<Value> = {
             let zones = self.zones.lock().unwrap();
             let order = self.zone_order.lock().unwrap();
@@ -704,20 +712,30 @@ impl Proxy {
                 .iter()
                 .filter_map(|id| {
                     zones.get(id).map(|z| {
+                        let district = self
+                            .capital
+                            .district_for_region(mmo::world::Rect::new(
+                                z.region.x0, z.region.y0, z.region.x1, z.region.y1,
+                            ))
+                            .map(|d| d.name);
                         json!({
                             "zone_id": id,
                             "x0": z.region.x0, "y0": z.region.y0,
                             "x1": z.region.x1, "y1": z.region.y1,
                             "owner": z.owner,
                             "progress": z.capture_progress,
+                            "district": district,
                         })
                     })
                 })
                 .collect()
         };
-        let msg = Message::Text(
-            json!({"type": "partition", "world": WORLD_SIZE, "zones": zones}).to_string(),
-        );
+        json!({"type": "partition", "world": WORLD_SIZE, "zones": zones})
+    }
+
+    /// Tell every client the current spatial partition so they can draw it.
+    fn broadcast_partition(&self) {
+        let msg = Message::Text(self.partition_snapshot().to_string());
         let clients = self.clients.lock().unwrap();
         for info in clients.values() {
             self.push_to_client(info, msg.clone());
@@ -1999,6 +2017,16 @@ async fn main() {
     let db = match Db::connect(&db_url).await {
         Ok(db) => {
             println!("[Proxy] Database ready ({db_url})");
+            // Seed the authored capital (plot grid + first build orders) on boot.
+            // Idempotent, so a restart never duplicates it.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            match db.seed_capital(&mmo::world::capital(), now).await {
+                Ok(()) => println!("[Proxy] Capital seeded ({} starter plots)", mmo::world::capital().starter_plots().len()),
+                Err(e) => println!("[Proxy] WARNING: capital seeding failed: {e}"),
+            }
             Some(Arc::new(db))
         }
         Err(e) => {
@@ -2049,6 +2077,7 @@ mod tests {
             bot_handles: Mutex::new(Vec::new()),
             db: None,
             sessions: Mutex::new(HashMap::new()),
+            capital: mmo::world::capital(),
         })
     }
 
@@ -2704,27 +2733,41 @@ mod tests {
     // M0: persistence + auth
     // ----------------------------------------------------------------------
 
-    /// A unique sqlite file url for a test (relative to the crate dir).
-    fn temp_db_url() -> String {
-        format!("sqlite://mmo_test_{}.db", Uuid::new_v4().simple())
+    /// An RAII temp sqlite database for gateway tests. The file lives under the
+    /// system temp dir (never the crate dir) and is removed — with its `-wal`/`-shm`
+    /// sidecars — when the guard drops, so cleanup happens even if a test panics.
+    struct TestDb {
+        url: String,
     }
-
-    fn cleanup_db(url: &str) {
-        let file = url.trim_start_matches("sqlite://");
-        let _ = std::fs::remove_file(file);
-        let _ = std::fs::remove_file(format!("{file}-wal"));
-        let _ = std::fs::remove_file(format!("{file}-shm"));
+    impl TestDb {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mmo_test_{}.db", Uuid::new_v4().simple()));
+            TestDb { url: format!("sqlite://{}", path.to_string_lossy()) }
+        }
+        fn url(&self) -> &str {
+            &self.url
+        }
+    }
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let file = self.url.trim_start_matches("sqlite://");
+            let _ = std::fs::remove_file(file);
+            let _ = std::fs::remove_file(format!("{file}-wal"));
+            let _ = std::fs::remove_file(format!("{file}-shm"));
+        }
     }
 
     /// Data-layer durability: state written by one `Db` is readable by a fresh
     /// `Db` opened on the same file — i.e. it survives a process restart.
     #[tokio::test]
     async fn persistence_survives_reopen() {
-        let url = temp_db_url();
+        let dbf = TestDb::new();
+        let url = dbf.url();
         let email = format!("a_{}@t.test", Uuid::new_v4().simple());
 
         let cid = {
-            let db = Db::connect(&url).await.unwrap();
+            let db = Db::connect(url).await.unwrap();
             let ch = auth::register(&db, &email, "pw12", "Hero", 100, 200, 100)
                 .await
                 .unwrap();
@@ -2733,7 +2776,7 @@ mod tests {
         }; // pool dropped — simulates shutdown
 
         // Reopen the same file: the character is still there.
-        let db2 = Db::connect(&url).await.unwrap();
+        let db2 = Db::connect(url).await.unwrap();
         let ch = db2
             .character_by_id(&cid)
             .await
@@ -2749,7 +2792,6 @@ mod tests {
         assert!(auth::register(&db2, &email, "pw12", "Dup", 0, 0, 100).await.is_err());
 
         drop(db2);
-        cleanup_db(&url);
     }
 
     /// End-to-end through the real gateway handshake: register, have the zone
@@ -2757,8 +2799,8 @@ mod tests {
     /// is recreated at its saved position with the same durable id.
     #[tokio::test]
     async fn register_then_login_restores_saved_position() {
-        let url = temp_db_url();
-        let db = Arc::new(Db::connect(&url).await.unwrap());
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
         let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
         let mut zone = spawn_fake_zone().await;
         proxy
@@ -2847,22 +2889,22 @@ mod tests {
         assert_eq!(spawn["hp"], 88);
 
         drop(ws2);
-        cleanup_db(&url);
     }
 
     // --- #2 acceptance: identity & sessions ------------------------------
 
     /// Stand up a proxy backed by a fresh db with one whole-world zone, plus the
-    /// fake zone so the handshake can complete. Returns (proxy, db url, zone).
-    async fn proxy_with_db() -> (Arc<Proxy>, String, FakeZone) {
-        let url = temp_db_url();
-        let db = Arc::new(Db::connect(&url).await.unwrap());
+    /// fake zone so the handshake can complete. The returned `TestDb` guard must be
+    /// held for the test's lifetime; it deletes the db file on drop.
+    async fn proxy_with_db() -> (Arc<Proxy>, TestDb, FakeZone) {
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
         let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db));
         let zone = spawn_fake_zone().await;
         proxy
             .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
             .await;
-        (proxy, url, zone)
+        (proxy, dbf, zone)
     }
 
     /// Spawn a one-shot acceptor running `handle_client` for the next connection,
@@ -2897,12 +2939,48 @@ mod tests {
         }
     }
 
+    /// #4: the gateway's spawn constant must agree with the authored town centre.
+    #[test]
+    fn spawn_matches_town_centre() {
+        let c = mmo::world::capital();
+        assert_eq!((SPAWN_X, SPAWN_Y), c.town_centre);
+        // And the town centre is a real, named district.
+        assert!(c.district_at(SPAWN_X, SPAWN_Y).is_some());
+    }
+
+    /// #4: the partition the gateway broadcasts names each shard's district, so the
+    /// capital reads as named & multi-district regardless of sharding.
+    #[tokio::test]
+    async fn partition_labels_districts() {
+        let proxy = test_proxy();
+        // Three shards, one per authored district band.
+        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 400, y1: 1200 });
+        add_zone_region(&proxy, "z_civic", Region { x0: 400, y0: 0, x1: 800, y1: 1200 });
+        add_zone_region(&proxy, "z_suburbs", Region { x0: 800, y0: 0, x1: 1200, y1: 1200 });
+
+        let snap = proxy.partition_snapshot();
+        let by_zone = |zid: &str| -> String {
+            snap["zones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|z| z["zone_id"] == zid)
+                .unwrap()["district"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(by_zone("z_market"), "Market District");
+        assert_eq!(by_zone("z_civic"), "Civic Centre");
+        assert_eq!(by_zone("z_suburbs"), "Starter Suburbs");
+    }
+
     /// Acceptance (#3): a client that declares a mismatched protocol version is
     /// cleanly refused, while a matching version (and the legacy no-version path)
     /// is accepted.
     #[tokio::test]
     async fn protocol_version_mismatch_is_refused() {
-        let (proxy, url, _zone) = proxy_with_db().await;
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
 
         // Mismatched version -> auth_error, no welcome.
         let mut bad = dial(&proxy).await;
@@ -2928,13 +3006,12 @@ mod tests {
         let welcome = recv_until(&mut good, "welcome").await;
         assert_eq!(welcome["protocol_version"], PROTOCOL_VERSION);
         drop(good);
-        cleanup_db(&url);
     }
 
     /// Acceptance: an unknown account is rejected (no welcome, an auth_error).
     #[tokio::test]
     async fn unknown_account_is_rejected() {
-        let (proxy, url, _zone) = proxy_with_db().await;
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
         let mut ws = dial(&proxy).await;
         ws.send(Message::Text(
             json!({"type": "login", "email": "nobody@nowhere.test", "password": "whatever"}).to_string(),
@@ -2947,14 +3024,13 @@ mod tests {
             "unexpected message: {err}"
         );
         drop(ws);
-        cleanup_db(&url);
     }
 
     /// Acceptance: two logins for the same account collapse to one session — the
     /// second is refused while the first is online, and allowed again once it ends.
     #[tokio::test]
     async fn duplicate_login_collapses_to_one_session() {
-        let (proxy, url, _zone) = proxy_with_db().await;
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
         let email = format!("dup_{}@t.test", Uuid::new_v4().simple());
 
         // Session 1: register and stay connected.
@@ -3001,14 +3077,13 @@ mod tests {
         let welcome3 = recv_until(&mut ws3, "welcome").await;
         assert_eq!(welcome3["player_id"], pid, "same character on re-login");
         drop(ws3);
-        cleanup_db(&url);
     }
 
     /// Acceptance support: a reconnect with a valid session token resumes the same
     /// character without re-entering credentials.
     #[tokio::test]
     async fn token_reconnect_resumes_same_character() {
-        let (proxy, url, _zone) = proxy_with_db().await;
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
         let email = format!("tok_{}@t.test", Uuid::new_v4().simple());
 
         // Register and capture the issued session token.
@@ -3040,6 +3115,5 @@ mod tests {
         let welcome = recv_until(&mut ws2, "welcome").await;
         assert_eq!(welcome["player_id"], pid, "token resumed the same character");
         drop(ws2);
-        cleanup_db(&url);
     }
 }
