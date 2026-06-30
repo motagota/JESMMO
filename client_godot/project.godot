@@ -1,8 +1,10 @@
-; JESMMO — Godot 3D client (Phase 1, M1 skeleton).
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
 ;
-; Engine configuration. Most wiring is done in code (Main.gd builds the scene
-; tree procedurally) so the project stays diff-friendly and reviewable without
-; opening the editor. See README.md.
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
 
 config_version=5
 
@@ -11,14 +13,10 @@ config_version=5
 config/name="JESMMO Client"
 config/description="Phase 1 3D client: connect, log in, render a district, move with prediction."
 run/main_scene="res://Main.tscn"
-config/features=PackedStringArray("4.6", "Forward Plus")
+config/features=PackedStringArray("4.4", "Forward Plus")
 
 [display]
 
 window/size/viewport_width=1280
 window/size/viewport_height=720
 window/stretch/mode="canvas_items"
-
-[rendering]
-
-renderer/rendering_method="forward_plus"

@@ -1,8 +1,9 @@
 # JESMMO — Godot 3D Client (Phase 1 skeleton)
 
-The net-new 3D client for the capital, built with **Godot 4.6 / GDScript**. It
-connects to the gateway, logs in, renders a district in 3D, and moves the local
-player with client-side prediction while the server stays authoritative. The 2D
+The net-new 3D client for the capital, built with **Godot 4.4+ / GDScript**
+(developed against 4.4; parse/smoke-checked on 4.6). It connects to the gateway,
+logs in, renders a district in 3D, and moves the local player with client-side
+prediction while the server stays authoritative. The 2D
 [`client/client.html`](../client/client.html) remains as a debug/admin spectator.
 
 Implements issue **#6** (M1).
@@ -34,10 +35,10 @@ reviews as plain script diffs without opening the editor.
    cargo run --bin zone_server -- zone_a 9001 ws://127.0.0.1:8764 &
    ```
    (On Windows, `..\start_servers.ps1` launches both in their own windows.)
-2. Open `client_godot/` in Godot 4.6 and press **F5**, or run the main scene from
+2. Open `client_godot/` in Godot 4.4+ and press **F5**, or run the main scene from
    the CLI:
    ```sh
-   Godot_v4.6 --path client_godot
+   Godot --path client_godot
    ```
 3. Log in / register / play as guest. Move with **WASD** or the arrow keys;
    **Space** swings.
@@ -64,12 +65,12 @@ is cached in `user://session.cfg` for silent reconnects.
 
 Parse-check every script:
 ```sh
-Godot_v4.6 --headless --path client_godot --editor --quit
+Godot --headless --path client_godot --editor --quit
 ```
 
 End-to-end network smoke (requires the server running, per "Run it"):
 ```sh
-Godot_v4.6 --headless --path client_godot -s res://tests/smoke.gd
+Godot --headless --path client_godot -s res://tests/smoke.gd
 ```
 Expect `SMOKE_OK welcome player=… zone=…` followed by a `status_update` stream;
 it exits non-zero on timeout.
