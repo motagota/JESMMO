@@ -596,7 +596,13 @@ impl Proxy {
                         (target_player.as_deref(), data.get("state"))
                     {
                         let kind = st.get("type").and_then(|v| v.as_str());
-                        let authored = kind == Some("resource") || kind == Some("storage");
+                        // Authored, non-player world entities are re-sent by the zone
+                        // on (re)spawn; never cache them as player state (which would
+                        // resurrect them as fake players on a rolling update).
+                        let authored = matches!(
+                            kind,
+                            Some("resource") | Some("storage") | Some("build_board") | Some("structure")
+                        );
                         if !authored {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;

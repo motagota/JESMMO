@@ -15,6 +15,7 @@ var _moves := 0
 var _wood_qty := 0
 var _well_id := ""
 var _well_wood_progress := -1
+var _saw_board := false
 
 func _initialize() -> void:
 	randomize()
@@ -26,6 +27,11 @@ func _initialize() -> void:
 	_net.welcome.connect(func(d):
 		print("SMOKE: welcome ", d.get("player_id"))
 		_phase = "to_tree")
+	# The build board must actually be pushed to the (registered) client, so the
+	# player can find it in the world.
+	_net.status_update.connect(func(_id, _zone, state):
+		if String(state.get("type", "")) == "build_board":
+			_saw_board = true)
 	_net.build_list.connect(func(orders):
 		for o in orders:
 			if String(o.get("kind", "")) == "town_well":
@@ -44,7 +50,11 @@ func _initialize() -> void:
 func _process(delta: float) -> bool:
 	_t += delta
 	if _phase == "wait_progress" and _well_wood_progress >= 1:
-		print("SMOKE_BUILD_OK town_well holds wood x", _well_wood_progress)
+		if not _saw_board:
+			push_error("SMOKE_BUILD_NO_BOARD logged-in player never received the build board entity")
+			quit(1)
+			return true
+		print("SMOKE_BUILD_OK town_well holds wood x%d, board rendered" % _well_wood_progress)
 		return true
 	if _t > 40.0:
 		push_error("SMOKE_BUILD_TIMEOUT phase=%s well=%s wood=%d progress=%d" % [
