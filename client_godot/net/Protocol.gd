@@ -30,16 +30,21 @@ const C_GUEST := "guest"
 const C_MOVE := "move"
 const C_ATTACK := "attack"
 
-# --- gameplay: gathering / inventory / skills (M2) ----------------------------
+# --- gameplay: gathering / inventory / skills / storage (M2) ------------------
 const C_GATHER_START := "gather.start"
 const C_GATHER_STOP := "gather.stop"
 const S_GATHER_PROGRESS := "gather.progress"
 const S_GATHER_RESULT := "gather.result"
 const S_INV_UPDATE := "inv.update"
 const S_SKILL_UPDATE := "skill.update"
+const C_STORE_DEPOSIT := "store.deposit"
+const C_STORE_WITHDRAW := "store.withdraw"
+const S_STORE_UPDATE := "store.update"
 
 ## Must be within this many world units of a node to gather it (mirrors the server).
 const GATHER_RANGE := 50.0
+## Must be within this of a storage point to deposit/withdraw (mirrors the server).
+const STORAGE_RANGE := 60.0
 
 # --- movement / render tuning (mirrors client.html and the server) ------------
 ## World units sent per move tick, per axis. The server applies the delta directly.

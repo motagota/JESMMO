@@ -66,15 +66,16 @@ func _refresh_status() -> void:
 
 # --- gameplay -----------------------------------------------------------------
 
-func set_inventory(items: Array) -> void:
+func set_inventory(items: Array, used: int, capacity: int) -> void:
+	var cap := "  [%d/%d]" % [used, capacity] if capacity > 0 else ""
 	if items.is_empty():
-		_inv.text = "inventory: (empty)"
+		_inv.text = "inventory: (empty)" + cap
 		return
 	var parts := PackedStringArray()
 	for it_v in items:
 		var it: Dictionary = it_v
 		parts.append("%s x%d" % [String(it.get("item_id", "?")), int(it.get("qty", 0))])
-	_inv.text = "inventory: " + ", ".join(parts)
+	_inv.text = "inventory: " + ", ".join(parts) + cap
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
 	_skill.text = "%s: Lv %d  (%d xp)" % [skill_id, level, xp]

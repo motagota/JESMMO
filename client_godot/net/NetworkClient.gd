@@ -20,8 +20,9 @@ signal zone_migration(zone: String)
 signal you_died
 signal gather_progress(node_id: String, pct: int)
 signal gather_result(item_id: String, qty: int)
-signal inv_update(items: Array)
+signal inv_update(items: Array, used: int, capacity: int)
 signal skill_update(skill_id: String, xp: int, level: int)
+signal store_update(items: Array)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -84,12 +85,17 @@ func _handle_text(text: String) -> void:
 		Protocol.S_GATHER_RESULT:
 			gather_result.emit(String(msg.get("item_id", "")), int(msg.get("qty", 0)))
 		Protocol.S_INV_UPDATE:
-			inv_update.emit(msg.get("items", []))
+			inv_update.emit(
+				msg.get("items", []),
+				int(msg.get("used", 0)),
+				int(msg.get("capacity", 0)))
 		Protocol.S_SKILL_UPDATE:
 			skill_update.emit(
 				String(msg.get("skill_id", "")),
 				int(msg.get("xp", 0)),
 				int(msg.get("level", 0)))
+		Protocol.S_STORE_UPDATE:
+			store_update.emit(msg.get("items", []))
 		_:
 			pass # zone_capture and any future server messages are ignored for now
 
@@ -128,3 +134,10 @@ func send_gather_start(node_id: String) -> void:
 
 func send_gather_stop() -> void:
 	_send({"type": Protocol.C_GATHER_STOP})
+
+## Deposit / withdraw items at a storage point (validated server-side by proximity).
+func send_store_deposit(item_id: String, qty: int) -> void:
+	_send({"type": Protocol.C_STORE_DEPOSIT, "item_id": item_id, "qty": qty})
+
+func send_store_withdraw(item_id: String, qty: int) -> void:
+	_send({"type": Protocol.C_STORE_WITHDRAW, "item_id": item_id, "qty": qty})

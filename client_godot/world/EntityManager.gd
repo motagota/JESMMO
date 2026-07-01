@@ -47,11 +47,20 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 ## The id of the nearest live resource node within `max_dist` world units of
 ## `from` (world coords), or "" if none. Used by the gather interaction.
 func nearest_resource(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "resource", true)
+
+## The id of the nearest storage point within `max_dist`, or "" if none.
+func nearest_storage(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "storage", false)
+
+func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
 	var best := ""
 	var best_d := max_dist
 	for id in _entities:
 		var rec: Dictionary = _entities[id]
-		if rec.get("kind", "") != "resource" or int(rec.get("qty", 0)) <= 0:
+		if rec.get("kind", "") != kind:
+			continue
+		if need_stock and int(rec.get("qty", 0)) <= 0:
 			continue
 		var d := from.distance_to(rec.get("wpos", Vector2.ZERO))
 		if d <= best_d:
@@ -77,6 +86,7 @@ func _height_for(kind: String) -> float:
 	match kind:
 		"mob": return 1.0
 		"resource": return 1.5
+		"storage": return 0.6
 		_: return 1.2
 
 func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
@@ -101,6 +111,12 @@ func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
 				tree.height = 4.0
 				mi.mesh = tree
 				mi.material_override = _solid(Color(0.18, 0.65, 0.30))
+		"storage":
+			# A storehouse chest.
+			var chest := BoxMesh.new()
+			chest.size = Vector3(3.0, 1.4, 2.0)
+			mi.mesh = chest
+			mi.material_override = _solid(Color(0.6, 0.45, 0.2))
 		_:
 			var cap := CapsuleMesh.new()
 			cap.radius = 0.6

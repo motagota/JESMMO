@@ -15,6 +15,7 @@ var _entities: EntityManager
 var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
+var _storage: StoragePanel
 
 var _my_id := ""
 var _seeded_position := false
@@ -35,6 +36,10 @@ func _ready() -> void:
 	_hud = Hud.new()
 	add_child(_hud)
 
+	_storage = StoragePanel.new()
+	_storage.visible = false
+	add_child(_storage)
+
 	_login = Login.new()
 	_login.visible = false
 	add_child(_login)
@@ -44,6 +49,13 @@ func _ready() -> void:
 
 	_wire_signals()
 	_net.connect_to(GATEWAY_URL)
+
+func _process(_delta: float) -> void:
+	# Open the storage panel only while standing near a storage point.
+	if _my_id == "":
+		return
+	var near := _entities.nearest_storage(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
+	_storage.show_panel(near)
 
 func _build_environment() -> void:
 	var env := Environment.new()
@@ -75,8 +87,14 @@ func _wire_signals() -> void:
 	_net.you_died.connect(func(): _hud.set_conn("you died — respawning…"))
 	_net.gather_progress.connect(func(_node_id, pct): _hud.set_gather_progress(pct))
 	_net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
-	_net.inv_update.connect(func(items): _hud.set_inventory(items))
+	_net.inv_update.connect(func(items, used, capacity):
+		_hud.set_inventory(items, used, capacity)
+		_storage.set_inventory(items))
 	_net.skill_update.connect(func(skill_id, xp, level): _hud.set_skill(skill_id, xp, level))
+	_net.store_update.connect(func(items): _storage.set_storage(items))
+
+	_storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
+	_storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
 
 	_login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
 	_login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
