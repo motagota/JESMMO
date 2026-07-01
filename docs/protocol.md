@@ -171,15 +171,28 @@ the durable transactional transfer and pushes the updated `inv.update` / `store.
 
 ### `build.*` — build orders & placement (M2 §4.3, M3 §4.5)
 
-| type | dir | fields |
-|---|---|---|
-| `build.list` | C→S | — (open orders for the district) |
-| `build.contribute` | C→S | `order_id`, `item_id`, `qty` |
-| `build.progress` | S→C | `order_id`, `progress` |
-| `build.completed` | S→C | `order_id`, `structures` |
-| `build.unlocked` | S→C | `order_ids` |
-| `build.place` | C→S | `kind`, `x`, `y`, `rot` |
-| `build.placed` | S→C | `structure` |
+| type | dir | fields | status |
+|---|---|---|---|
+| `build.list` | C→S / S→C | C→S: request the district's board. S→C: `orders[]` (`{order_id, kind, required, progress, state}`) — pushed on login and after any unlock, and in reply to a request | **live** |
+| `build.contribute` | C→S | `order_id`, `item_id`, `qty` — pool carried items into an order (must be near a build board) | **live** |
+| `build.progress` | S→C | `order_id`, `required`, `progress` (each an `{item_id: qty}` map) | **live** |
+| `build.completed` | S→C | `order_id`, `structures[]` (`{kind, x, y}`) | **live** |
+| `build.unlocked` | S→C | `order_ids[]` — dependents that just opened | **live** |
+| `build.place` | C→S | `kind`, `x`, `y`, `rot` | reserved (per-plot player builds, #12) |
+| `build.placed` | S→C | `structure` | reserved (#12) |
+
+City build orders are **district-scoped and gateway-owned** (pooled across every zone
+sharding that district). Each order has item **costs** (`required`) that contributions
+(`progress`) fill; a **tech tree** gates dependents behind a prerequisite order (seeded
+`locked`, opened on the prerequisite's completion). Like gather/store, the **zone**
+validates that the player is standing near a **build board** and emits an internal
+`build_contribute` op to the gateway, which performs the durable pooled contribution
+(bounded by the order's remaining need and what's carried) and pushes the results. On
+completion the order flips to `completed`, each **contributor** is granted **building**
+XP (lump-sum, split by units contributed), the authored **structure** spawns, and any
+dependents unlock. Completed city structures are durable via the `build_order` row
+itself (no `structure` row in Phase 1) and render as `status_update` entities.
+Contributing persists only for logged-in characters (guests are a no-op).
 
 ### `plot.*` — plots (M3 §4.4)
 
@@ -228,11 +241,14 @@ Zones self-register (`register_zone`) and exchange `player_join` / `player_leave
 `zone_stats` with the gateway. The zone also emits internal messages the gateway
 consumes (never forwards) to perform durable writes and push the result:
 **`gather_yield`** `{player_id, item_id, qty, skill, xp}` (persist gathered item +
-skill XP → `inv.update`/`skill.update`) and **`store_op`**
+skill XP → `inv.update`/`skill.update`), **`store_op`**
 `{player_id, op, item_id, qty}` (transactional inventory↔storage transfer →
-`inv.update`/`store.update`). Resource nodes and storage points are synced to
-clients as `status_update`s with `state.type` `"resource"` / `"storage"`. See
-`proxy.rs` and `zone_server.rs`.
+`inv.update`/`store.update`), and **`build_contribute`**
+`{player_id, order_id, item_id, qty}` (pooled build-order contribution →
+`inv.update`/`build.progress`, and on completion `skill.update`/`build.completed`/
+`build.unlocked`). Resource nodes, storage points, build boards, and completed
+structures are synced to clients as `status_update`s with `state.type` `"resource"` /
+`"storage"` / `"build_board"` / `"structure"`. See `proxy.rs` and `zone_server.rs`.
 
 **M0 note on positions.** A returning character is recreated at its exact saved
 position via `spawn_entity` to whichever zone owns that point (routed by

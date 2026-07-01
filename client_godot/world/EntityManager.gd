@@ -53,6 +53,10 @@ func nearest_resource(from: Vector2, max_dist: float) -> String:
 func nearest_storage(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "storage", false)
 
+## The id of the nearest build board within `max_dist`, or "" if none.
+func nearest_build_board(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "build_board", false)
+
 func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
 	var best := ""
 	var best_d := max_dist
@@ -87,6 +91,8 @@ func _height_for(kind: String) -> float:
 		"mob": return 1.0
 		"resource": return 1.5
 		"storage": return 0.6
+		"build_board": return 0.9
+		"structure": return 1.0
 		_: return 1.2
 
 func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
@@ -117,6 +123,19 @@ func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
 			chest.size = Vector3(3.0, 1.4, 2.0)
 			mi.mesh = chest
 			mi.material_override = _solid(Color(0.6, 0.45, 0.2))
+		"build_board":
+			# A notice board: a tall thin slab.
+			var slab := BoxMesh.new()
+			slab.size = Vector3(2.4, 1.8, 0.4)
+			mi.mesh = slab
+			mi.material_override = _solid(Color(0.85, 0.7, 0.35))
+		"structure":
+			# A completed city structure (well/wall/stall). A pale stone block; the
+			# authored kind rides in state.kind for future per-kind meshes.
+			var block := BoxMesh.new()
+			block.size = Vector3(3.0, 2.4, 3.0)
+			mi.mesh = block
+			mi.material_override = _solid(Color(0.75, 0.78, 0.8))
 		_:
 			var cap := CapsuleMesh.new()
 			cap.radius = 0.6

@@ -23,6 +23,10 @@ signal gather_result(item_id: String, qty: int)
 signal inv_update(items: Array, used: int, capacity: int)
 signal skill_update(skill_id: String, xp: int, level: int)
 signal store_update(items: Array)
+signal build_list(orders: Array)
+signal build_progress(order_id: String, required: Dictionary, progress: Dictionary)
+signal build_completed(order_id: String, structures: Array)
+signal build_unlocked(order_ids: Array)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -96,6 +100,19 @@ func _handle_text(text: String) -> void:
 				int(msg.get("level", 0)))
 		Protocol.S_STORE_UPDATE:
 			store_update.emit(msg.get("items", []))
+		Protocol.S_BUILD_LIST:
+			build_list.emit(msg.get("orders", []))
+		Protocol.S_BUILD_PROGRESS:
+			build_progress.emit(
+				String(msg.get("order_id", "")),
+				msg.get("required", {}),
+				msg.get("progress", {}))
+		Protocol.S_BUILD_COMPLETED:
+			build_completed.emit(
+				String(msg.get("order_id", "")),
+				msg.get("structures", []))
+		Protocol.S_BUILD_UNLOCKED:
+			build_unlocked.emit(msg.get("order_ids", []))
 		_:
 			pass # zone_capture and any future server messages are ignored for now
 
@@ -141,3 +158,11 @@ func send_store_deposit(item_id: String, qty: int) -> void:
 
 func send_store_withdraw(item_id: String, qty: int) -> void:
 	_send({"type": Protocol.C_STORE_WITHDRAW, "item_id": item_id, "qty": qty})
+
+## Request the district's build-order board (the server also pushes it unprompted).
+func send_build_list() -> void:
+	_send({"type": Protocol.C_BUILD_LIST})
+
+## Contribute carried items to a build order (validated server-side by board proximity).
+func send_build_contribute(order_id: String, item_id: String, qty: int) -> void:
+	_send({"type": Protocol.C_BUILD_CONTRIBUTE, "order_id": order_id, "item_id": item_id, "qty": qty})

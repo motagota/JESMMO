@@ -41,10 +41,22 @@ const C_STORE_DEPOSIT := "store.deposit"
 const C_STORE_WITHDRAW := "store.withdraw"
 const S_STORE_UPDATE := "store.update"
 
+# --- gameplay: build orders (M2) ----------------------------------------------
+## `build.list` is bidirectional: the client sends it to request the district's
+## board; the server also pushes it (hydration / after an unlock) with `orders`.
+const C_BUILD_LIST := "build.list"
+const S_BUILD_LIST := "build.list"
+const C_BUILD_CONTRIBUTE := "build.contribute"
+const S_BUILD_PROGRESS := "build.progress"
+const S_BUILD_COMPLETED := "build.completed"
+const S_BUILD_UNLOCKED := "build.unlocked"
+
 ## Must be within this many world units of a node to gather it (mirrors the server).
 const GATHER_RANGE := 50.0
 ## Must be within this of a storage point to deposit/withdraw (mirrors the server).
 const STORAGE_RANGE := 60.0
+## Must be within this of a build board to contribute (mirrors the server).
+const BOARD_RANGE := 60.0
 
 # --- movement / render tuning (mirrors client.html and the server) ------------
 ## World units sent per move tick, per axis. The server applies the delta directly.
@@ -61,4 +73,3 @@ const WORLD_SCALE := 0.1
 ## The server's Y axis becomes the scene's Z axis; height (Y) is gameplay-flat.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
 	return Vector3(wx * WORLD_SCALE, y, wy * WORLD_SCALE)
-

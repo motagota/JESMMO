@@ -16,6 +16,7 @@ var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
 var _storage: StoragePanel
+var _build: BuildPanel
 
 var _my_id := ""
 var _seeded_position := false
@@ -40,6 +41,10 @@ func _ready() -> void:
 	_storage.visible = false
 	add_child(_storage)
 
+	_build = BuildPanel.new()
+	_build.visible = false
+	add_child(_build)
+
 	_login = Login.new()
 	_login.visible = false
 	add_child(_login)
@@ -51,11 +56,13 @@ func _ready() -> void:
 	_net.connect_to(GATEWAY_URL)
 
 func _process(_delta: float) -> void:
-	# Open the storage panel only while standing near a storage point.
+	# Open the storage / build panels only while standing near their fixtures.
 	if _my_id == "":
 		return
-	var near := _entities.nearest_storage(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
-	_storage.show_panel(near)
+	var near_store := _entities.nearest_storage(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
+	_storage.show_panel(near_store)
+	var near_board := _entities.nearest_build_board(_player.world_pos(), Protocol.BOARD_RANGE) != ""
+	_build.show_panel(near_board)
 
 func _build_environment() -> void:
 	var env := Environment.new()
@@ -89,12 +96,18 @@ func _wire_signals() -> void:
 	_net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
 	_net.inv_update.connect(func(items, used, capacity):
 		_hud.set_inventory(items, used, capacity)
-		_storage.set_inventory(items))
+		_storage.set_inventory(items)
+		_build.set_inventory(items))
 	_net.skill_update.connect(func(skill_id, xp, level): _hud.set_skill(skill_id, xp, level))
 	_net.store_update.connect(func(items): _storage.set_storage(items))
+	_net.build_list.connect(func(orders): _build.set_orders(orders))
+	_net.build_progress.connect(func(order_id, required, progress): _build.update_progress(order_id, required, progress))
+	_net.build_completed.connect(func(order_id, _structures): _build.mark_completed(order_id))
+	_net.build_unlocked.connect(func(_ids): _net.send_build_list())
 
 	_storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
 	_storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
+	_build.do_contribute.connect(func(order_id, item_id, qty): _net.send_build_contribute(order_id, item_id, qty))
 
 	_login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
 	_login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))

@@ -10,6 +10,7 @@
 //! a full server restart — restores the player exactly. Gameplay tables (plots,
 //! skills, inventory, build orders, rent) land in later milestones.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,10 @@ pub type DbError = sqlx::Error;
 /// stash) is the overflow and does **not** count toward this. Gathering stops
 /// yielding into a full inventory; depositing frees it.
 pub const MAX_CARRY: i64 = 50;
+
+/// Building-skill XP granted per unit contributed to a build order, paid lump-sum to
+/// each contributor when the order completes (see [`Db::contribute`]).
+pub const BUILD_XP_PER_UNIT: i64 = 5;
 
 /// An account row (the login identity). One human, one account.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -63,6 +68,18 @@ fn now_secs() -> i64 {
 // collapsed stack (the M2 model is a total-quantity carry cap, not per-slot).
 
 type Tx<'a> = sqlx::Transaction<'a, sqlx::Sqlite>;
+
+/// Parse a build-order cost/progress blob (`{"wood":20,"stone":10}`) into a sorted
+/// `item -> qty` map. Malformed or non-integer entries are skipped, so a bad blob
+/// degrades to "no cost" rather than erroring the whole transaction.
+fn parse_cost(json: &str) -> BTreeMap<String, i64> {
+    serde_json::from_str::<BTreeMap<String, i64>>(json).unwrap_or_default()
+}
+
+/// Serialize an `item -> qty` map back to a cost blob for storage.
+fn dump_cost(cost: &BTreeMap<String, i64>) -> String {
+    serde_json::to_string(cost).unwrap_or_else(|_| "{}".to_string())
+}
 
 async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
     let existing: Option<String> = sqlx::query_scalar(
@@ -339,6 +356,28 @@ pub struct Structure {
     pub hp: i64,
     pub built_by: Option<String>,
     pub data: String,
+}
+
+/// The outcome of a [`Db::contribute`] call: what moved, the order's cost/progress
+/// after it, and — when this contribution completed the order — the contributors to
+/// pay building XP to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContributeResult {
+    /// Units actually moved from carried inventory into the order.
+    pub moved: i64,
+    /// The order's required costs (`item -> qty`).
+    pub required: BTreeMap<String, i64>,
+    /// The order's progress after this contribution (`item -> qty`).
+    pub progress: BTreeMap<String, i64>,
+    /// The order's kind (for the gateway's unlock lookup).
+    pub kind: String,
+    /// The order's district.
+    pub district: String,
+    /// Whether this contribution completed the order.
+    pub completed: bool,
+    /// On completion, `(character_id, total_units)` for each contributor (for lump-sum
+    /// building XP). Empty otherwise.
+    pub contributors: Vec<(String, i64)>,
 }
 
 /// A district-scoped city build quest.
@@ -903,17 +942,19 @@ impl Db {
         district: &str,
         kind: &str,
         required_json: &str,
+        state: &str,
         now: i64,
     ) -> Result<BuildOrder, DbError> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO build_order (id, district, kind, required_json, progress_json, state, issued_at) \
-             VALUES (?, ?, ?, ?, '{}', 'open', ?)",
+             VALUES (?, ?, ?, ?, '{}', ?, ?)",
         )
         .bind(&id)
         .bind(district)
         .bind(kind)
         .bind(required_json)
+        .bind(state)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -923,10 +964,142 @@ impl Db {
             kind: kind.to_string(),
             required_json: required_json.to_string(),
             progress_json: "{}".to_string(),
-            state: "open".to_string(),
+            state: state.to_string(),
             issued_at: now,
             completed_at: None,
         })
+    }
+
+    /// Unlock a `locked` build order (a tech-tree dependent) by flipping it to `open`.
+    /// Idempotent: returns the now-open order, or `None` if there was no locked order
+    /// of that `(district, kind)` (already open/completed, or absent).
+    pub async fn open_build_order(
+        &self,
+        district: &str,
+        kind: &str,
+    ) -> Result<Option<BuildOrder>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let order = sqlx::query_as::<_, BuildOrder>(
+            "SELECT * FROM build_order WHERE district = ? AND kind = ? AND state = 'locked' LIMIT 1",
+        )
+        .bind(district)
+        .bind(kind)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(mut o) = order else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        sqlx::query("UPDATE build_order SET state = 'open' WHERE id = ?")
+            .bind(&o.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        o.state = "open".to_string();
+        Ok(Some(o))
+    }
+
+    /// Contribute up to `qty` of `item_id` from a character's carried inventory to an
+    /// open build order, in one transaction. The moved amount is bounded by the order's
+    /// remaining need for that item **and** what the character actually carries; items
+    /// the order doesn't require move nothing. Records the per-character contribution
+    /// (for lump-sum building XP on completion). When the last required item is met the
+    /// order flips to `completed` and its contributors are returned.
+    pub async fn contribute(
+        &self,
+        character_id: &str,
+        order_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<ContributeResult, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let order = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(order) = order else {
+            tx.commit().await?;
+            return Ok(ContributeResult::default());
+        };
+
+        let required = parse_cost(&order.required_json);
+        let mut progress = parse_cost(&order.progress_json);
+        let mut result = ContributeResult {
+            moved: 0,
+            required: required.clone(),
+            progress: progress.clone(),
+            kind: order.kind.clone(),
+            district: order.district.clone(),
+            completed: false,
+            contributors: Vec::new(),
+        };
+
+        // Only open orders accept contributions; locked/completed ones are a no-op
+        // (but still report their required/progress so the client can render them).
+        if order.state != "open" || qty <= 0 {
+            tx.commit().await?;
+            return Ok(result);
+        }
+
+        let need = required
+            .get(item_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(progress.get(item_id).copied().unwrap_or(0))
+            .max(0);
+        let carried: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let moved = qty.min(need).min(carried.unwrap_or(0)).max(0);
+
+        if moved > 0 {
+            remove_inventory_in_tx(&mut tx, character_id, item_id, moved).await?;
+            *progress.entry(item_id.to_string()).or_insert(0) += moved;
+            sqlx::query("UPDATE build_order SET progress_json = ? WHERE id = ?")
+                .bind(dump_cost(&progress))
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO build_contribution (order_id, character_id, units) VALUES (?, ?, ?) \
+                 ON CONFLICT(order_id, character_id) DO UPDATE SET units = units + excluded.units",
+            )
+            .bind(order_id)
+            .bind(character_id)
+            .bind(moved)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Completion: every required item met (an order with no requirements never
+        // auto-completes here — it isn't part of the authored tree).
+        let completed = !required.is_empty()
+            && required
+                .iter()
+                .all(|(k, v)| progress.get(k).copied().unwrap_or(0) >= *v);
+        if completed {
+            sqlx::query("UPDATE build_order SET state = 'completed', completed_at = ? WHERE id = ?")
+                .bind(now_secs())
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            result.contributors = sqlx::query_as::<_, (String, i64)>(
+                "SELECT character_id, units FROM build_contribution WHERE order_id = ? ORDER BY character_id",
+            )
+            .bind(order_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        result.moved = moved;
+        result.progress = progress;
+        result.completed = completed;
+        Ok(result)
     }
 
     pub async fn build_orders_for_district(
@@ -1064,7 +1237,10 @@ impl Db {
         for o in &capital.build_orders {
             let existing = self.build_orders_for_district(o.district).await?;
             if !existing.iter().any(|b| b.kind == o.kind) {
-                self.insert_build_order(o.district, o.kind, o.required_json, now)
+                // Root orders (no prereq) open at boot; tech-tree dependents seed
+                // `locked` and are opened when their prerequisite completes.
+                let state = if o.prereq.is_none() { "open" } else { "locked" };
+                self.insert_build_order(o.district, o.kind, o.required_json, state, now)
                     .await?;
             }
         }
@@ -1249,7 +1425,7 @@ mod tests {
         db.add_flair(&cid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
 
         let order = db
-            .insert_build_order("market", "town_well", r#"{"wood":20}"#, 100)
+            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100)
             .await
             .unwrap();
         db.save_build_order_progress(&order.id, r#"{"wood":20}"#, "completed", Some(200))
@@ -1273,16 +1449,86 @@ mod tests {
         db.seed_capital(&cap, 100).await.unwrap();
         let plots = db.plot_count().await.unwrap();
         assert_eq!(plots, cap.starter_plots().len() as i64);
-        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), 1);
+        let civic_orders = cap.build_orders.iter().filter(|o| o.district == "civic").count();
+        let seeded = db.build_orders_for_district("civic").await.unwrap();
+        assert_eq!(seeded.len(), civic_orders);
+        // The root order is open; tech-tree dependents seed locked.
+        assert_eq!(seeded.iter().find(|o| o.kind == "town_well").unwrap().state, "open");
+        assert_eq!(seeded.iter().find(|o| o.kind == "wall_section").unwrap().state, "locked");
 
         // Re-seed (simulating a restart): no duplicate plots or orders.
         db.seed_capital(&cap, 200).await.unwrap();
         assert_eq!(db.plot_count().await.unwrap(), plots);
-        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), 1);
+        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), civic_orders);
 
         // A fresh character can claim one of the seeded starter plots.
         let cid = a_character(&db).await;
         let claimed = db.claim_plot(&cid, "suburbs", 3600, 300).await.unwrap();
         assert!(claimed.is_some(), "a seeded starter plot should be claimable");
+    }
+
+    /// A build order pools contributions from multiple characters, bounds each move by
+    /// the remaining need and what's carried, and completes when the last item is met —
+    /// returning every contributor for lump-sum XP.
+    #[tokio::test]
+    async fn build_order_pools_contributions_and_completes() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0)
+            .await
+            .unwrap();
+
+        let a = a_character(&db).await;
+        let b = a_character(&db).await;
+        db.add_to_inventory(&a, "wood", 30).await.unwrap();
+        db.add_to_inventory(&b, "wood", 5).await.unwrap();
+        db.add_to_inventory(&b, "stone", 20).await.unwrap();
+
+        // A contributes wood: bounded by the order's need (20), not the 30 carried.
+        let r = db.contribute(&a, &order.id, "wood", 30).await.unwrap();
+        assert_eq!(r.moved, 20, "capped at the wood requirement");
+        assert!(!r.completed, "stone still outstanding");
+        assert_eq!(r.progress.get("wood"), Some(&20));
+        assert_eq!(db.inventory_total(&a).await.unwrap(), 10, "unspent wood stays carried");
+
+        // Wood is already met: a further wood contribution moves nothing.
+        assert_eq!(db.contribute(&b, &order.id, "wood", 5).await.unwrap().moved, 0);
+
+        // B finishes the stone (bounded to the 10 needed) → completes the order.
+        let done = db.contribute(&b, &order.id, "stone", 20).await.unwrap();
+        assert_eq!(done.moved, 10);
+        assert!(done.completed, "the last required item completes the order");
+        // Both contributors are reported, keyed for XP, with their total units.
+        let by: std::collections::HashMap<_, _> = done.contributors.iter().cloned().collect();
+        assert_eq!(by.get(&a), Some(&20));
+        assert_eq!(by.get(&b), Some(&10));
+
+        // The order is now completed and no longer accepts contributions.
+        let after = db.build_orders_for_district("civic").await.unwrap();
+        let well = after.iter().find(|o| o.id == order.id).unwrap();
+        assert_eq!(well.state, "completed");
+        assert!(well.completed_at.is_some());
+        assert_eq!(db.contribute(&a, &order.id, "stone", 1).await.unwrap().moved, 0);
+    }
+
+    #[tokio::test]
+    async fn open_build_order_unlocks_a_locked_dependent() {
+        let (db, _t) = TempDb::open().await;
+        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0)
+            .await
+            .unwrap();
+        // Unlock flips it open and returns it; a second call is a no-op.
+        let opened = db.open_build_order("civic", "wall_section").await.unwrap().unwrap();
+        assert_eq!(opened.state, "open");
+        assert!(db.open_build_order("civic", "wall_section").await.unwrap().is_none());
+        // A locked order rejects contributions until opened.
+        let locked = db
+            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0)
+            .await
+            .unwrap();
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 40).await.unwrap();
+        assert_eq!(db.contribute(&cid, &locked.id, "wood", 40).await.unwrap().moved, 0,
+            "a locked order accepts nothing");
     }
 }

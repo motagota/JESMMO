@@ -127,6 +127,16 @@ pub struct SeedBuildOrder {
     pub district: &'static str,
     pub kind: &'static str,
     pub required_json: &'static str,
+    /// The build-order kind that must be `completed` before this one unlocks. `None`
+    /// for orders that are open from the start; `Some(kind)` seeds this order `locked`
+    /// until `kind` completes (the tech-tree edge).
+    pub prereq: Option<&'static str>,
+    /// The structure this order spawns on completion, and where it appears (world
+    /// coords). City structures are authored here — the completed `build_order` row is
+    /// their durable source of truth (no `structure` table row in Phase 1/M2).
+    pub structure_kind: &'static str,
+    pub structure_x: i32,
+    pub structure_y: i32,
 }
 
 /// A static item definition (the item registry). Gathered resources, crafted
@@ -177,6 +187,17 @@ pub struct StoragePoint {
     pub y: i32,
 }
 
+/// An authored build-order board — a place a player stands near to contribute to the
+/// district's city build orders. For M2 there is one at the town centre; more can be
+/// authored per district later. Synced to clients as a `build_board` entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildBoard {
+    pub id: &'static str,
+    pub district: &'static str,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -186,6 +207,7 @@ pub struct Capital {
     pub build_orders: Vec<SeedBuildOrder>,
     pub resource_nodes: Vec<ResourceNodeSpawn>,
     pub storage_points: Vec<StoragePoint>,
+    pub build_boards: Vec<BuildBoard>,
 }
 
 impl Capital {
@@ -225,6 +247,16 @@ impl Capital {
             .iter()
             .copied()
             .filter(|s| r.contains(s.x, s.y))
+            .collect()
+    }
+
+    /// Authored build boards whose position falls inside `r` — the set a zone owning
+    /// that region should spawn and gate `build.contribute` proximity against.
+    pub fn build_boards_in(&self, r: Rect) -> Vec<BuildBoard> {
+        self.build_boards
+            .iter()
+            .copied()
+            .filter(|b| r.contains(b.x, b.y))
             .collect()
     }
 }
@@ -280,16 +312,44 @@ pub fn capital() -> Capital {
         RoadSegment { x0: town_centre.0, y0: 0, x1: town_centre.0, y1: WORLD_SIZE },
     ];
 
-    let build_orders = vec![SeedBuildOrder {
-        district: civic.id,
-        kind: "town_well",
-        required_json: r#"{"wood":20,"stone":10}"#,
-    }];
+    // The city tech tree, all in the Civic Centre so one town-centre board demonstrates
+    // the whole loop: the Town Well is open from boot; finishing it unlocks the Wall
+    // Section, which unlocks the Market Stall. Structures appear near the town centre on
+    // completion. Costs are small so the headline demo fills quickly.
+    let (tcx, tcy) = town_centre;
+    let build_orders = vec![
+        SeedBuildOrder {
+            district: civic.id,
+            kind: "town_well",
+            required_json: r#"{"wood":20,"stone":10}"#,
+            prereq: None,
+            structure_kind: "well",
+            structure_x: tcx,
+            structure_y: tcy - 40,
+        },
+        SeedBuildOrder {
+            district: civic.id,
+            kind: "wall_section",
+            required_json: r#"{"stone":30}"#,
+            prereq: Some("town_well"),
+            structure_kind: "wall",
+            structure_x: tcx - 100,
+            structure_y: tcy,
+        },
+        SeedBuildOrder {
+            district: civic.id,
+            kind: "market_stall",
+            required_json: r#"{"wood":40}"#,
+            prereq: Some("wall_section"),
+            structure_kind: "stall",
+            structure_x: tcx + 100,
+            structure_y: tcy - 40,
+        },
+    ];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
     // spawn finds wood immediately) plus wood/stone scattered through the
     // districts. Ids are stable so a node keeps its identity across respawns.
-    let (tcx, tcy) = town_centre;
     let resource_nodes = vec![
         ResourceNodeSpawn { id: "node_civic_tree_0", district: "civic", item_id: "wood", x: tcx - 60, y: tcy - 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_tree_1", district: "civic", item_id: "wood", x: tcx + 60, y: tcy - 60, qty: 5 },
@@ -313,6 +373,15 @@ pub fn capital() -> Capital {
         y: tcy + 10,
     }];
 
+    // The city build-order board, at the town centre (opposite the storehouse) so a
+    // fresh spawn can reach it. Contributions are gated on standing near this.
+    let build_boards = vec![BuildBoard {
+        id: "board_town",
+        district: "civic",
+        x: tcx - 30,
+        y: tcy + 10,
+    }];
+
     Capital {
         districts: vec![market, civic, suburbs],
         roads,
@@ -320,6 +389,7 @@ pub fn capital() -> Capital {
         build_orders,
         resource_nodes,
         storage_points,
+        build_boards,
     }
 }
 
@@ -439,15 +509,42 @@ mod tests {
     }
 
     #[test]
-    fn capital_has_roads_and_a_first_build_order() {
+    fn capital_has_roads_and_the_build_order_tech_tree() {
         let c = capital();
         assert!(!c.roads.is_empty(), "the capital should have an authored road graph");
-        assert_eq!(c.build_orders.len(), 1);
-        let well = &c.build_orders[0];
-        assert_eq!(well.kind, "town_well");
+        // The Town Well is open from boot; the rest of the chain is gated behind it.
+        let well = c.build_orders.iter().find(|o| o.kind == "town_well").expect("town_well");
         assert_eq!(well.district, "civic");
+        assert_eq!(well.prereq, None, "the first order must be open from boot");
         // required_json is valid JSON.
         let v: serde_json::Value = serde_json::from_str(well.required_json).unwrap();
         assert!(v.get("wood").is_some());
+        // Every non-root order names a prereq that is itself an authored order, and every
+        // order authors a structure spec. This keeps the unlock graph well-formed.
+        for o in &c.build_orders {
+            let _: serde_json::Value = serde_json::from_str(o.required_json).unwrap();
+            assert!(!o.structure_kind.is_empty(), "{} has no structure", o.kind);
+            if let Some(p) = o.prereq {
+                assert!(c.build_orders.iter().any(|b| b.kind == p),
+                    "{} depends on unknown order {}", o.kind, p);
+            }
+        }
+        // town_well unlocks wall_section unlocks market_stall.
+        assert!(c.build_orders.iter().any(|o| o.kind == "wall_section" && o.prereq == Some("town_well")));
+        assert!(c.build_orders.iter().any(|o| o.kind == "market_stall" && o.prereq == Some("wall_section")));
+    }
+
+    #[test]
+    fn build_board_is_in_the_civic_centre_near_spawn() {
+        let c = capital();
+        assert!(!c.build_boards.is_empty());
+        let (tcx, tcy) = c.town_centre;
+        for b in &c.build_boards {
+            assert_eq!(c.district_at(b.x, b.y).map(|d| d.id), Some(b.district));
+            assert!((b.x - tcx).pow(2) + (b.y - tcy).pow(2) < 100 * 100,
+                "board should be reachable from a fresh spawn");
+        }
+        let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
+        assert_eq!(c.build_boards_in(civic).len(), c.build_boards.len());
     }
 }
