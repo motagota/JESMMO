@@ -541,7 +541,8 @@ impl ZoneServer {
                     }
                 }
                 "spawn_entity" => {
-                    // A player entered our region (new spawn or migrated in).
+                    // A player entered our region (persistent login/register, or a
+                    // migration from a neighbouring zone).
                     let x = data.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     let y = data.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     let hp = data.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
@@ -549,6 +550,10 @@ impl ZoneServer {
                     self.entities.lock().unwrap().insert(player_id.clone(), Entity::player(x, y, hp));
                     println!("[Zone {}] Received player {player_id} at ({x}, {y})", self.zone_id);
                     self.send_status_update(&player_id).await;
+                    // Persistent players spawn this way (not via player_join), so they
+                    // must also be sent the gatherable nodes, storage points, and build
+                    // boards — otherwise a logged-in player sees no resources to gather.
+                    self.send_all_nodes();
                     self.send_zone_stats();
                 }
                 "attack" => {
