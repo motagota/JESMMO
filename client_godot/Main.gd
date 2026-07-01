@@ -16,6 +16,7 @@ var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
 var _storage: StoragePanel
+var _inventory: InventoryPanel
 var _build: BuildPanel
 
 var _my_id := ""
@@ -41,6 +42,10 @@ func _ready() -> void:
 	_storage.visible = false
 	add_child(_storage)
 
+	_inventory = InventoryPanel.new()
+	_inventory.visible = false
+	add_child(_inventory)
+
 	_build = BuildPanel.new()
 	_build.visible = false
 	add_child(_build)
@@ -56,11 +61,14 @@ func _ready() -> void:
 	_net.connect_to(GATEWAY_URL)
 
 func _process(_delta: float) -> void:
-	# Open the storage / build panels only while standing near their fixtures.
+	# Open the storage / build panels only while standing near their fixtures. The
+	# inventory panel is toggled with I, but is also auto-shown near storage so items
+	# can be dragged straight into it.
 	if _my_id == "":
 		return
 	var near_store := _entities.nearest_storage(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
 	_storage.show_panel(near_store)
+	_inventory.set_forced_open(near_store)
 	var near_board := _entities.nearest_build_board(_player.world_pos(), Protocol.BOARD_RANGE) != ""
 	_build.show_panel(near_board)
 
@@ -97,6 +105,7 @@ func _wire_signals() -> void:
 	_net.inv_update.connect(func(items, used, capacity):
 		_hud.set_inventory(items, used, capacity)
 		_storage.set_inventory(items)
+		_inventory.set_inventory(items, used, capacity)
 		_build.set_inventory(items))
 	_net.skill_update.connect(func(skill_id, xp, level): _hud.set_skill(skill_id, xp, level))
 	_net.store_update.connect(func(items): _storage.set_storage(items))
@@ -107,6 +116,7 @@ func _wire_signals() -> void:
 
 	_storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
 	_storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
+	_inventory.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
 	_build.do_contribute.connect(func(order_id, item_id, qty): _net.send_build_contribute(order_id, item_id, qty))
 
 	_login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))

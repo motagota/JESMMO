@@ -1,8 +1,10 @@
-## Storage panel: shown while the player stands near a storage point. Lists carried
-## items (with a Deposit button each) and stored items (with a Withdraw button).
-## Built in code; `Main` toggles visibility by proximity and feeds it the latest
-## inventory + storage. Deposit/withdraw move the whole stack of that item; the
-## server bounds the amount (carry capacity for withdraw).
+## Storage panel: shown while the player stands near a storage point. Two columns —
+## Carried and Stored — each a drag/drop zone: drag a carried item onto the Stored
+## column (or drop it there) to **deposit**, and a stored item onto the Carried
+## column to **withdraw**. Each row also keeps a Deposit/Withdraw button as a
+## click fallback. Built in code; `Main` toggles visibility by proximity and feeds
+## it the latest inventory + storage. Moves are whole-stack; the server bounds the
+## amount (carry capacity for withdraw).
 class_name StoragePanel
 extends CanvasLayer
 
@@ -25,19 +27,29 @@ func _ready() -> void:
 	cols.add_theme_constant_override("separation", 24)
 	panel.add_child(cols)
 
-	_carry_box = _column(cols, "Carried  →  Deposit")
-	_store_box = _column(cols, "Stored  →  Withdraw")
+	# Carried column accepts dropped *storage* items (= withdraw); Stored column
+	# accepts dropped *inventory* items (= deposit).
+	_carry_box = _column(cols, "Carried  →  Deposit", "storage", do_withdraw)
+	_store_box = _column(cols, "Stored  →  Withdraw", "inventory", do_deposit)
 	_rebuild()
 
-func _column(parent: Control, title: String) -> VBoxContainer:
+## Build a titled column that is also an `ItemDropZone`; returns the inner row box.
+func _column(parent: Control, title: String, accept_source: String, drop_sig: Signal) -> VBoxContainer:
+	var zone := ItemDropZone.new(accept_source)
+	zone.custom_minimum_size = Vector2(190, 0)
+	zone.item_dropped.connect(func(item_id, qty): drop_sig.emit(item_id, qty))
+	parent.add_child(zone)
+
 	var col := VBoxContainer.new()
-	col.custom_minimum_size = Vector2(190, 0)
+	zone.add_child(col)
 	var head := Label.new()
 	head.text = title
 	head.add_theme_font_size_override("font_size", 14)
 	col.add_child(head)
-	parent.add_child(col)
-	return col
+
+	var rows := VBoxContainer.new()
+	col.add_child(rows)
+	return rows
 
 func set_inventory(items: Array) -> void:
 	_inventory = items
@@ -47,19 +59,18 @@ func set_storage(items: Array) -> void:
 	_storage = items
 	_rebuild()
 
-func show_panel(show: bool) -> void:
-	visible = show
+func show_panel(p_show: bool) -> void:
+	visible = p_show
 
 func _rebuild() -> void:
 	if not _carry_box:
 		return
-	_fill(_carry_box, _inventory, "Deposit", do_deposit)
-	_fill(_store_box, _storage, "Withdraw", do_withdraw)
+	_fill(_carry_box, _inventory, "Deposit", "inventory", do_deposit)
+	_fill(_store_box, _storage, "Withdraw", "storage", do_withdraw)
 
-func _fill(box: VBoxContainer, items: Array, verb: String, sig: Signal) -> void:
-	# Clear previous rows (keep the header at index 0).
-	for i in range(box.get_child_count() - 1, 0, -1):
-		box.get_child(i).queue_free()
+func _fill(box: VBoxContainer, items: Array, verb: String, source: String, sig: Signal) -> void:
+	for c in box.get_children():
+		c.queue_free()
 	if items.is_empty():
 		var empty := Label.new()
 		empty.text = "(empty)"
@@ -71,10 +82,9 @@ func _fill(box: VBoxContainer, items: Array, verb: String, sig: Signal) -> void:
 		var item_id := String(it.get("item_id", "?"))
 		var qty := int(it.get("qty", 0))
 		var row := HBoxContainer.new()
-		var lbl := Label.new()
-		lbl.text = "%s x%d" % [item_id, qty]
-		lbl.custom_minimum_size = Vector2(110, 0)
-		row.add_child(lbl)
+		var di := DraggableItem.new(item_id, qty, source)
+		di.custom_minimum_size = Vector2(120, 0)
+		row.add_child(di)
 		var btn := Button.new()
 		btn.text = verb
 		btn.pressed.connect(func(): sig.emit(item_id, qty))
