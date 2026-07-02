@@ -234,6 +234,35 @@ struct Proxy {
     capital: mmo::world::Capital,
 }
 
+/// Render a build order as the client-facing board entry used by `build.list`.
+fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
+    json!({
+        "order_id": o.id,
+        "kind": o.kind,
+        "required": serde_json::from_str::<Value>(&o.required_json).unwrap_or_else(|_| json!({})),
+        "progress": serde_json::from_str::<Value>(&o.progress_json).unwrap_or_else(|_| json!({})),
+        "state": o.state,
+    })
+}
+
+/// An `item -> qty` cost map as a JSON object (for `build.progress`).
+fn cost_json(cost: &std::collections::BTreeMap<String, i64>) -> Value {
+    Value::Object(cost.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
+}
+
+/// A completed city structure as a render entity (`status_update`, `state.type =
+/// "structure"`). Its id is stable per order kind so re-sends update in place.
+fn structure_status_json(spec: &mmo::world::SeedBuildOrder) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": format!("structure_{}", spec.kind),
+        "state": {
+            "x": spec.structure_x, "y": spec.structure_y,
+            "type": "structure", "kind": spec.structure_kind, "facing": [0, 0],
+        },
+    })
+}
+
 impl Proxy {
     fn new(
         host: &str,
@@ -567,7 +596,13 @@ impl Proxy {
                         (target_player.as_deref(), data.get("state"))
                     {
                         let kind = st.get("type").and_then(|v| v.as_str());
-                        let authored = kind == Some("resource") || kind == Some("storage");
+                        // Authored, non-player world entities are re-sent by the zone
+                        // on (re)spawn; never cache them as player state (which would
+                        // resurrect them as fake players on a rolling update).
+                        let authored = matches!(
+                            kind,
+                            Some("resource") | Some("storage") | Some("build_board") | Some("structure")
+                        );
                         if !authored {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -653,6 +688,16 @@ impl Proxy {
                         let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
                         let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
                         self.apply_store_op(pid, op, item, qty).await;
+                    }
+                }
+                Some("build_contribute") => {
+                    // Internal: a zone validated a contribution at a build board. Apply
+                    // the durable pooled contribution and push the result (not forwarded).
+                    if let Some(pid) = target_player.as_deref() {
+                        let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_build_contribute(pid, order_id, item, qty).await;
                     }
                 }
                 Some("migrate_request") => {
@@ -1701,6 +1746,183 @@ impl Proxy {
         }
     }
 
+    // --- Build orders (city authority; #9) --------------------------------
+
+    /// The district id owning a zone's region (by region centre), or `None` if the
+    /// zone is unknown / outside the authored capital.
+    fn district_for_zone(&self, zone_id: &str) -> Option<String> {
+        let region = self.zones.lock().unwrap().get(zone_id).map(|z| z.region)?;
+        self.capital
+            .district_for_region(mmo::world::Rect::new(region.x0, region.y0, region.x1, region.y1))
+            .map(|d| d.id.to_string())
+    }
+
+    /// Send one JSON message to every connected client whose current zone sits in
+    /// `district`. Build-order state is district-scoped, so progress/completion/unlock
+    /// notices go to exactly the players who share that district's board.
+    fn broadcast_to_district(&self, district: &str, msg: Value) {
+        let text = msg.to_string();
+        // Resolve the district's zones once (avoids re-locking `zones` per client).
+        let zone_ids: Vec<String> = {
+            let zones = self.zones.lock().unwrap();
+            zones
+                .iter()
+                .filter(|(_, z)| {
+                    self.capital
+                        .district_for_region(mmo::world::Rect::new(
+                            z.region.x0, z.region.y0, z.region.x1, z.region.y1,
+                        ))
+                        .map(|d| d.id)
+                        == Some(district)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let clients = self.clients.lock().unwrap();
+        for info in clients.values() {
+            if zone_ids.contains(&info.current_zone) {
+                self.push_to_client(info, Message::Text(text.clone()));
+            }
+        }
+    }
+
+    /// Push the open + completed build orders for a player's district as `build.list`.
+    /// (Locked tech-tree dependents are omitted; they appear via `build.unlocked`.)
+    async fn send_build_orders(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let zone_id = match self.clients.lock().unwrap().get(pid).map(|i| i.current_zone.clone()) {
+            Some(z) => z,
+            None => return,
+        };
+        let district = match self.district_for_zone(&zone_id) {
+            Some(d) => d,
+            None => return,
+        };
+        if let Ok(orders) = db.build_orders_for_district(&district).await {
+            let arr: Vec<Value> = orders.iter().filter(|o| o.state != "locked").map(build_order_json).collect();
+            self.push_to_player(pid, json!({"type": "build.list", "player_id": pid, "orders": arr}));
+        }
+    }
+
+    /// Broadcast the refreshed board to everyone sharing `district` (after an unlock).
+    async fn broadcast_build_list(&self, district: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if let Ok(orders) = db.build_orders_for_district(district).await {
+            let arr: Vec<Value> = orders.iter().filter(|o| o.state != "locked").map(build_order_json).collect();
+            self.broadcast_to_district(district, json!({"type": "build.list", "orders": arr}));
+        }
+    }
+
+    /// Render every already-completed city structure for a just-joined client, so
+    /// existing buildings appear on login (the durable source is the completed
+    /// `build_order`; positions are authored).
+    async fn send_completed_structures(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let mut districts: Vec<&str> = self.capital.build_orders.iter().map(|o| o.district).collect();
+        districts.sort_unstable();
+        districts.dedup();
+        let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for d in districts {
+            if let Ok(orders) = db.build_orders_for_district(d).await {
+                for o in orders {
+                    if o.state == "completed" {
+                        completed.insert(o.kind);
+                    }
+                }
+            }
+        }
+        for spec in &self.capital.build_orders {
+            if completed.contains(spec.kind) {
+                self.push_to_player(pid, structure_status_json(spec));
+            }
+        }
+    }
+
+    /// Apply a `build_contribute` reported by a zone (which validated board proximity):
+    /// the durable transactional contribution, then push the freed inventory + broadcast
+    /// progress; on completion, pay lump-sum building XP, spawn the structure, and unlock
+    /// dependents. No-op for guests (no durable inventory).
+    async fn apply_build_contribute(&self, pid: &str, order_id: &str, item_id: &str, qty: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let res = match db.contribute(pid, order_id, item_id, qty).await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if res.moved > 0 {
+            // Contributed items left the player's carry — refresh it, then tell the
+            // district how the order's progress advanced.
+            self.send_inventory(pid).await;
+            self.broadcast_to_district(&res.district, json!({
+                "type": "build.progress", "order_id": order_id,
+                "required": cost_json(&res.required), "progress": cost_json(&res.progress),
+            }));
+        }
+        if !res.completed {
+            return;
+        }
+
+        // Lump-sum building XP to each contributor, split by units contributed.
+        for (cid, units) in &res.contributors {
+            let amount = units * mmo::persistence::BUILD_XP_PER_UNIT;
+            if let Ok(s) = db.grant_skill_xp(cid, "building", amount).await {
+                self.push_to_player(cid, json!({
+                    "type": "skill.update", "player_id": cid,
+                    "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
+                }));
+            }
+        }
+
+        // The authored structure for this order kind.
+        let spec = self.capital.build_orders.iter().find(|o| o.kind == res.kind).copied();
+        let structures: Vec<Value> = spec
+            .iter()
+            .map(|s| json!({"kind": s.structure_kind, "x": s.structure_x, "y": s.structure_y}))
+            .collect();
+        self.broadcast_to_district(&res.district, json!({
+            "type": "build.completed", "order_id": order_id, "structures": structures,
+        }));
+        // Render the new building for every connected client.
+        if let Some(s) = spec {
+            let entity = structure_status_json(&s).to_string();
+            let clients = self.clients.lock().unwrap();
+            for info in clients.values() {
+                self.push_to_client(info, Message::Text(entity.clone()));
+            }
+        }
+
+        // Unlock dependents (authored orders gated behind this kind).
+        let dependents: Vec<(&str, &str)> = self
+            .capital
+            .build_orders
+            .iter()
+            .filter(|o| o.prereq == Some(res.kind.as_str()))
+            .map(|o| (o.district, o.kind))
+            .collect();
+        let mut unlocked_ids: Vec<String> = Vec::new();
+        for (d, k) in dependents {
+            if let Ok(Some(o)) = db.open_build_order(d, k).await {
+                unlocked_ids.push(o.id);
+            }
+        }
+        if !unlocked_ids.is_empty() {
+            self.broadcast_to_district(&res.district, json!({
+                "type": "build.unlocked", "order_ids": unlocked_ids,
+            }));
+        }
+        // Refresh the board for the district (the newly opened orders now appear).
+        self.broadcast_build_list(&res.district).await;
+    }
+
     /// Push a character's current skills to its client as `skill.update`s.
     async fn send_skills(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
@@ -1871,11 +2093,14 @@ impl Proxy {
             self.route_client_frame(&player_id, frame);
         }
 
-        // Hydrate the client's gameplay state: inventory, storage, and skills.
+        // Hydrate the client's gameplay state: inventory, storage, skills, the
+        // district's build-order board, and any already-completed city structures.
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
+            self.send_build_orders(&player_id).await;
+            self.send_completed_structures(&player_id).await;
         }
 
         // Liveness: ping on an interval; if a full interval passes with no frame
@@ -1903,6 +2128,12 @@ impl Proxy {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // `build.list` is a pure read of gateway-owned city state — answer
+                    // it directly rather than routing to the zone.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("build.list") {
+                        self.send_build_orders(&player_id).await;
+                        continue;
+                    }
                     // Route to the player's zone (or buffer if mid-migration). A
                     // false result means the client is no longer tracked.
                     if !self.route_client_frame(&player_id, data) {
@@ -3337,6 +3568,89 @@ mod tests {
         }
         assert!(stored_ok, "storage never showed the deposited wood");
         assert!(carry_ok, "inventory never reflected the deposit");
+
+        drop(ws);
+    }
+
+    /// #9 headline: pooling gathered items into the Town Well fills it, then completion
+    /// pays building XP, spawns the structure, and unlocks the next order — the full
+    /// gateway path a zone's `build_contribute` drives.
+    #[tokio::test]
+    async fn build_contribute_completes_order_pays_xp_and_unlocks() {
+        let (proxy, dbf, zone) = proxy_with_db().await;
+        // Seed the capital's build-order tech tree into the shared db file.
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+        let well_id = db
+            .build_orders_for_district("civic")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "town_well")
+            .unwrap()
+            .id;
+
+        let email = format!("b_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Builder"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Stock exactly the Town Well's cost (wood 20 + stone 10), as gathering would.
+        for (item, qty) in [("wood", 20), ("stone", 10)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "gather_yield", "player_id": pid,
+                    "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+                }).to_string()))
+                .unwrap();
+        }
+        // Contribute both items to the well (zone already validated board proximity).
+        for (item, qty) in [("wood", 20), ("stone", 10)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": well_id, "item_id": item, "qty": qty,
+                }).to_string()))
+                .unwrap();
+        }
+
+        // Expect: progress, completion (with the well structure), a building skill gain,
+        // and the wall_section unlock. Frames interleave — scan once, check all.
+        let (mut progressed, mut completed, mut built_xp, mut unlocked) = (false, false, false, false);
+        for _ in 0..80 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            match v["type"].as_str() {
+                Some("build.progress") if v["order_id"] == json!(well_id) => progressed = true,
+                Some("build.completed") if v["order_id"] == json!(well_id) => {
+                    let structs = v["structures"].as_array().cloned().unwrap_or_default();
+                    assert!(structs.iter().any(|s| s["kind"] == "well"), "well structure missing");
+                    completed = true;
+                }
+                Some("skill.update") if v["skill_id"] == "building" => {
+                    if v["xp"].as_i64().unwrap_or(0) > 0 {
+                        built_xp = true;
+                    }
+                }
+                Some("build.unlocked") => unlocked = true,
+                _ => {}
+            }
+            if progressed && completed && built_xp && unlocked {
+                break;
+            }
+        }
+        assert!(progressed, "never saw build.progress");
+        assert!(completed, "the Town Well never completed");
+        assert!(built_xp, "contributor never gained building XP");
+        assert!(unlocked, "the dependent order never unlocked");
+
+        // Durable: the order is completed and wall_section is now open.
+        let orders = db.build_orders_for_district("civic").await.unwrap();
+        assert_eq!(orders.iter().find(|o| o.id == well_id).unwrap().state, "completed");
+        assert_eq!(orders.iter().find(|o| o.kind == "wall_section").unwrap().state, "open");
 
         drop(ws);
     }

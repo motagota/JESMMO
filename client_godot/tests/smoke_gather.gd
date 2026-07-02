@@ -11,6 +11,7 @@ var _phase := "auth" # auth -> to_tree -> gather -> wait_wood -> to_store -> dep
 var _moves := 0
 var _wood_qty := 0
 var _stored_wood := 0
+var _resources := {} # id -> true, resource nodes the client actually received
 
 func _initialize() -> void:
 	randomize()
@@ -22,6 +23,11 @@ func _initialize() -> void:
 	_net.welcome.connect(func(d):
 		print("SMOKE: welcome ", d.get("player_id"))
 		_phase = "to_tree")
+	# Track resource nodes the server actually pushes to us — a registered player
+	# spawns via spawn_entity, so this verifies that path sends the nodes too.
+	_net.status_update.connect(func(id, _zone, state):
+		if String(state.get("type", "")) == "resource":
+			_resources[id] = true)
 	_net.inv_update.connect(func(items, _used, _capacity):
 		for it in items:
 			if String(it.get("item_id", "")) == "wood":
@@ -51,6 +57,12 @@ func _process(delta: float) -> bool:
 				_moves = 0
 				_phase = "gather"
 		"gather":
+			# The node we walked to must have been pushed to us; if a logged-in
+			# player receives no resources, fail loudly rather than time out.
+			if not _resources.has("node_civic_tree_0"):
+				push_error("SMOKE_NO_RESOURCES logged-in player received no resource nodes (seen=%d)" % _resources.size())
+				quit(1)
+				return true
 			_net.send_gather_start("node_civic_tree_0")
 			_phase = "wait_wood"
 		"wait_wood":

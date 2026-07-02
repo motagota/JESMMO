@@ -61,6 +61,9 @@ const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 // --- Storage ------------------------------------------------------------------
 const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use it
 
+// --- Build orders -------------------------------------------------------------
+const BOARD_RANGE: i32 = 60; // must be within this of a build board to contribute
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,6 +189,14 @@ fn storage_status_json(s: &mmo::world::StoragePoint) -> Value {
     })
 }
 
+fn build_board_status_json(b: &mmo::world::BuildBoard) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": b.id,
+        "state": { "x": b.x, "y": b.y, "type": "build_board", "facing": [0, 0] },
+    })
+}
+
 fn clamp_world(x: i32, y: i32) -> (i32, i32) {
     (x.clamp(0, WORLD_SIZE - 1), y.clamp(0, WORLD_SIZE - 1))
 }
@@ -271,6 +282,8 @@ struct ZoneServer {
     gathering: Mutex<HashMap<String, GatherJob>>,
     /// Authored storage access points in this zone's region (deposit/withdraw spots).
     storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
+    /// Authored build-order boards in this zone's region (contribution spots).
+    build_boards: Mutex<Vec<mmo::world::BuildBoard>>,
 }
 
 impl ZoneServer {
@@ -288,6 +301,7 @@ impl ZoneServer {
             nodes: Mutex::new(HashMap::new()),
             gathering: Mutex::new(HashMap::new()),
             storage_points: Mutex::new(Vec::new()),
+            build_boards: Mutex::new(Vec::new()),
         })
     }
 
@@ -326,6 +340,15 @@ impl ZoneServer {
         *self.storage_points.lock().unwrap() = pts;
     }
 
+    /// (Re)spawn the authored build-order boards inside this zone's current region.
+    fn spawn_build_boards(&self) {
+        let r = *self.region.lock().unwrap();
+        let boards = self
+            .capital
+            .build_boards_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        *self.build_boards.lock().unwrap() = boards;
+    }
+
     /// Push the current state of every node and storage point to the gateway (which
     /// broadcasts it), so a just-joined client renders them.
     fn send_all_nodes(&self) {
@@ -335,6 +358,9 @@ impl ZoneServer {
             }
             for s in self.storage_points.lock().unwrap().iter() {
                 let _ = tx.send(Message::Text(storage_status_json(s).to_string()));
+            }
+            for b in self.build_boards.lock().unwrap().iter() {
+                let _ = tx.send(Message::Text(build_board_status_json(b).to_string()));
             }
         }
     }
@@ -346,6 +372,15 @@ impl ZoneServer {
             .unwrap()
             .iter()
             .any(|s| dist2(px, py, s.x, s.y) <= (STORAGE_RANGE as i64).pow(2))
+    }
+
+    /// Whether `(px, py)` is within range of any build board in this zone.
+    fn near_board(&self, px: i32, py: i32) -> bool {
+        self.build_boards
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| dist2(px, py, b.x, b.y) <= (BOARD_RANGE as i64).pow(2))
     }
 
     /// Whether this zone sits in a `safe` capital district (by its region centre,
@@ -446,10 +481,12 @@ impl ZoneServer {
                     "[Zone {}] Region set to ({},{})-({},{})",
                     self.zone_id, r.x0, r.y0, r.x1, r.y1
                 );
-                // A freshly-split zone gets its own mobs, nodes, and storage points.
+                // A freshly-split zone gets its own mobs, nodes, storage points, and
+                // build boards.
                 self.spawn_mobs(MOBS_PER_ZONE);
                 self.spawn_nodes();
                 self.spawn_storage_points();
+                self.spawn_build_boards();
                 continue;
             }
 
@@ -504,7 +541,8 @@ impl ZoneServer {
                     }
                 }
                 "spawn_entity" => {
-                    // A player entered our region (new spawn or migrated in).
+                    // A player entered our region (persistent login/register, or a
+                    // migration from a neighbouring zone).
                     let x = data.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     let y = data.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     let hp = data.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
@@ -512,6 +550,10 @@ impl ZoneServer {
                     self.entities.lock().unwrap().insert(player_id.clone(), Entity::player(x, y, hp));
                     println!("[Zone {}] Received player {player_id} at ({x}, {y})", self.zone_id);
                     self.send_status_update(&player_id).await;
+                    // Persistent players spawn this way (not via player_join), so they
+                    // must also be sent the gatherable nodes, storage points, and build
+                    // boards — otherwise a logged-in player sees no resources to gather.
+                    self.send_all_nodes();
                     self.send_zone_stats();
                 }
                 "attack" => {
@@ -565,6 +607,26 @@ impl ZoneServer {
                             let _ = tx.send(Message::Text(json!({
                                 "type": "store_op", "player_id": player_id,
                                 "op": op, "item_id": item_id, "qty": qty,
+                            }).to_string()));
+                        }
+                    }
+                }
+                "build.contribute" => {
+                    // Validate the player is at a build board; the gateway (city
+                    // authority) performs the durable pooled contribution and pushes
+                    // the result.
+                    let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let at_board = {
+                        let entities = self.entities.lock().unwrap();
+                        entities.get(&player_id).map(|p| self.near_board(p.x, p.y)).unwrap_or(false)
+                    };
+                    if at_board && qty > 0 && !order_id.is_empty() && !item_id.is_empty() {
+                        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                            let _ = tx.send(Message::Text(json!({
+                                "type": "build_contribute", "player_id": player_id,
+                                "order_id": order_id, "item_id": item_id, "qty": qty,
                             }).to_string()));
                         }
                     }
@@ -1044,10 +1106,12 @@ impl ZoneServer {
             tokio::spawn(async move { me.register_with_proxy().await });
         }
 
-        // Seed mobs, resource nodes, and storage points, then start the 20 Hz sim.
+        // Seed mobs, resource nodes, storage points, and build boards, then start the
+        // 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
         self.spawn_nodes();
         self.spawn_storage_points();
+        self.spawn_build_boards();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -1245,6 +1309,18 @@ mod tests {
         assert_eq!(count(&packets, "\"gather.result\""), 0, "no yield out of range");
         assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job cancelled");
         assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node untouched");
+    }
+
+    #[tokio::test]
+    async fn build_board_spawns_in_civic_and_gates_by_range() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_build_boards();
+        let boards = zone.build_boards.lock().unwrap().clone();
+        assert!(!boards.is_empty(), "the civic centre has an authored build board");
+        let b = boards[0];
+        assert!(zone.near_board(b.x, b.y), "on the board is in range");
+        assert!(zone.near_board(b.x + BOARD_RANGE - 1, b.y), "just inside range");
+        assert!(!zone.near_board(b.x + BOARD_RANGE + 20, b.y), "out of range");
     }
 
     #[tokio::test]

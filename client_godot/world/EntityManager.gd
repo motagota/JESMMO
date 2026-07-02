@@ -53,6 +53,10 @@ func nearest_resource(from: Vector2, max_dist: float) -> String:
 func nearest_storage(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "storage", false)
 
+## The id of the nearest build board within `max_dist`, or "" if none.
+func nearest_build_board(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "build_board", false)
+
 func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
 	var best := ""
 	var best_d := max_dist
@@ -87,6 +91,8 @@ func _height_for(kind: String) -> float:
 		"mob": return 1.0
 		"resource": return 1.5
 		"storage": return 0.6
+		"build_board": return 0.9
+		"structure": return 1.0
 		_: return 1.2
 
 func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
@@ -117,6 +123,24 @@ func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
 			chest.size = Vector3(3.0, 1.4, 2.0)
 			mi.mesh = chest
 			mi.material_override = _solid(Color(0.6, 0.45, 0.2))
+		"build_board":
+			# A notice board: a tall bright slab with a floating label so it stands
+			# out among the town-centre fixtures and is easy to walk up to.
+			var slab := BoxMesh.new()
+			slab.size = Vector3(2.6, 2.0, 0.4)
+			mi.mesh = slab
+			mi.material_override = _solid(Color(0.95, 0.75, 0.15))
+			_add_label(mi, "🔨 Build Orders", 2.4, Color(1.0, 0.9, 0.4))
+		"structure":
+			# A completed city structure (well/wall/stall). A pale stone block labelled
+			# with its kind; the authored kind rides in state.kind.
+			var block := BoxMesh.new()
+			block.size = Vector3(3.0, 2.4, 3.0)
+			mi.mesh = block
+			mi.material_override = _solid(Color(0.75, 0.78, 0.8))
+			var kind_name := String(state.get("kind", "")).capitalize()
+			if kind_name != "":
+				_add_label(mi, kind_name, 2.6, Color(0.85, 0.95, 1.0))
 		_:
 			var cap := CapsuleMesh.new()
 			cap.radius = 0.6
@@ -129,3 +153,17 @@ func _solid(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = c
 	return m
+
+## Attach a billboarded text label floating `height` metres above an entity mesh,
+## drawn on top (no depth test) so it's readable from across the district.
+func _add_label(parent: Node3D, text: String, height: float, color: Color) -> void:
+	var label := Label3D.new()
+	label.text = text
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.no_depth_test = true
+	label.fixed_size = true
+	label.pixel_size = 0.004
+	label.modulate = color
+	label.outline_size = 8
+	label.position = Vector3(0, height, 0)
+	parent.add_child(label)

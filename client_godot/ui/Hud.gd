@@ -14,6 +14,9 @@ var conn := "connecting…"
 var zone := "—"
 var pos := Vector2.ZERO
 
+## skill_id -> {level, xp}, so each skill renders on the one line independently.
+var _skills: Dictionary = {}
+
 var _gain_tween: Tween
 
 func _ready() -> void:
@@ -78,7 +81,14 @@ func set_inventory(items: Array, used: int, capacity: int) -> void:
 	_inv.text = "inventory: " + ", ".join(parts) + cap
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
-	_skill.text = "%s: Lv %d  (%d xp)" % [skill_id, level, xp]
+	# Track each skill independently so a building-XP gain doesn't overwrite the
+	# gathering line (and vice versa).
+	_skills[skill_id] = {"level": level, "xp": xp}
+	var parts := PackedStringArray()
+	for sid in _skills:
+		var s: Dictionary = _skills[sid]
+		parts.append("%s: Lv %d  (%d xp)" % [sid, int(s["level"]), int(s["xp"])])
+	_skill.text = "  |  ".join(parts)
 
 func set_gather_progress(pct: int) -> void:
 	if pct <= 0 or pct >= 100:
