@@ -37,6 +37,7 @@ const S_GATHER_PROGRESS := "gather.progress"
 const S_GATHER_RESULT := "gather.result"
 const S_INV_UPDATE := "inv.update"
 const S_SKILL_UPDATE := "skill.update"
+const S_SKILL_LEVELUP := "skill.levelup"
 const C_STORE_DEPOSIT := "store.deposit"
 const C_STORE_WITHDRAW := "store.withdraw"
 const S_STORE_UPDATE := "store.update"
@@ -73,3 +74,15 @@ const WORLD_SCALE := 0.1
 ## The server's Y axis becomes the scene's Z axis; height (Y) is gameplay-flat.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
 	return Vector3(wx * WORLD_SCALE, y, wy * WORLD_SCALE)
+
+## Mirror of the server's XP → level curve (`persistence::level_for_xp`): level n at
+## 100·n² xp. Kept here so the skills panel can render progress-to-next-level and the
+## build board can grey orders the player can't yet contribute to.
+static func level_for_xp(xp: int) -> int:
+	if xp <= 0:
+		return 0
+	return int(floor(sqrt(float(xp) / 100.0)))
+
+## Total xp required to reach the start of `level`'s band (inverse of level_for_xp).
+static func xp_for_level(level: int) -> int:
+	return 100 * level * level

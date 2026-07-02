@@ -1,6 +1,8 @@
-## Heads-up display: connection/zone/position, the gathered inventory, the
-## gathering skill, a transient gather-progress line, and floating "+N item"
-## feedback. Built in code; driven by `Main`.
+## Heads-up display: connection/zone/position, the gathered inventory, a one-line
+## skills glance, a transient gather-progress line, floating "+N item" feedback, and
+## a level-up banner. Built in code; driven by `Main`. The full skills breakdown
+## (progress bars) lives in the dedicated `SkillsPanel` (K); this keeps a compact
+## at-a-glance readout.
 class_name Hud
 extends CanvasLayer
 
@@ -9,6 +11,7 @@ var _inv: Label
 var _skill: Label
 var _gather: Label
 var _gain: Label
+var _levelup: Label
 
 var conn := "connecting…"
 var zone := "—"
@@ -18,6 +21,7 @@ var pos := Vector2.ZERO
 var _skills: Dictionary = {}
 
 var _gain_tween: Tween
+var _levelup_tween: Tween
 
 func _ready() -> void:
 	layer = 5
@@ -29,7 +33,7 @@ func _ready() -> void:
 	_inv = _line(box)
 	_inv.text = "inventory: (empty)"
 	_skill = _line(box)
-	_skill.text = "gathering: Lv 0"
+	_skill.text = "gathering: Lv 0    [K] skills"
 	_gather = _line(box)
 	_gather.modulate = Color(0.8, 1.0, 0.6)
 
@@ -39,6 +43,13 @@ func _ready() -> void:
 	_gain.position = Vector2(560, 360)
 	_gain.modulate = Color(0.9, 1.0, 0.6, 0.0)
 	add_child(_gain)
+
+	# Level-up banner, just above the gain feedback; gold so it reads as a milestone.
+	_levelup = Label.new()
+	_levelup.add_theme_font_size_override("font_size", 34)
+	_levelup.position = Vector2(500, 300)
+	_levelup.modulate = Color(1.0, 0.85, 0.2, 0.0)
+	add_child(_levelup)
 
 	_refresh_status()
 
@@ -88,6 +99,7 @@ func set_skill(skill_id: String, xp: int, level: int) -> void:
 	for sid in _skills:
 		var s: Dictionary = _skills[sid]
 		parts.append("%s: Lv %d  (%d xp)" % [sid, int(s["level"]), int(s["xp"])])
+	parts.append("[K] skills")
 	_skill.text = "  |  ".join(parts)
 
 func set_gather_progress(pct: int) -> void:
@@ -104,3 +116,12 @@ func flash_gain(item_id: String, qty: int) -> void:
 		_gain_tween.kill()
 	_gain_tween = create_tween()
 	_gain_tween.tween_property(_gain, "modulate:a", 0.0, 1.0)
+
+## Celebrate a skill level-up (from a `skill.levelup` push): a gold banner that fades.
+func flash_levelup(skill_id: String, level: int) -> void:
+	_levelup.text = "%s  Level %d!" % [String(skill_id).capitalize(), level]
+	_levelup.modulate.a = 1.0
+	if _levelup_tween and _levelup_tween.is_valid():
+		_levelup_tween.kill()
+	_levelup_tween = create_tween()
+	_levelup_tween.tween_property(_levelup, "modulate:a", 0.0, 2.0)

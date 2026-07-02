@@ -242,6 +242,10 @@ fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
         "required": serde_json::from_str::<Value>(&o.required_json).unwrap_or_else(|_| json!({})),
         "progress": serde_json::from_str::<Value>(&o.progress_json).unwrap_or_else(|_| json!({})),
         "state": o.state,
+        // Skill gate (0 = ungated). The client greys the order and shows
+        // "requires <skill> <level>" for players below the threshold.
+        "required_skill": o.required_skill,
+        "required_level": o.required_level,
     })
 }
 
@@ -1874,11 +1878,8 @@ impl Proxy {
         // Lump-sum building XP to each contributor, split by units contributed.
         for (cid, units) in &res.contributors {
             let amount = units * mmo::persistence::BUILD_XP_PER_UNIT;
-            if let Ok(s) = db.grant_skill_xp(cid, "building", amount).await {
-                self.push_to_player(cid, json!({
-                    "type": "skill.update", "player_id": cid,
-                    "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
-                }));
+            if let Ok(gain) = db.grant_skill_xp(cid, "building", amount).await {
+                self.push_skill_gain(cid, &gain);
             }
         }
 
@@ -1923,6 +1924,23 @@ impl Proxy {
         self.broadcast_build_list(&res.district).await;
     }
 
+    /// Emit a `skill.update` for a just-granted skill, plus a `skill.levelup` when the
+    /// grant crossed a level boundary. Centralises the two events so every XP source
+    /// (gather, build, …) feeds the client identically.
+    fn push_skill_gain(&self, cid: &str, gain: &mmo::persistence::SkillGain) {
+        let s = &gain.skill;
+        self.push_to_player(cid, json!({
+            "type": "skill.update", "player_id": cid,
+            "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
+        }));
+        if gain.leveled_up {
+            self.push_to_player(cid, json!({
+                "type": "skill.levelup", "player_id": cid,
+                "skill_id": s.skill_id, "level": s.level,
+            }));
+        }
+    }
+
     /// Push a character's current skills to its client as `skill.update`s.
     async fn send_skills(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
@@ -1956,11 +1974,8 @@ impl Proxy {
             return;
         }
         self.send_inventory(pid).await;
-        if let Ok(s) = db.grant_skill_xp(pid, skill, xp).await {
-            self.push_to_player(pid, json!({
-                "type": "skill.update", "player_id": pid,
-                "skill_id": s.skill_id, "xp": s.xp, "level": s.level,
-            }));
+        if let Ok(gain) = db.grant_skill_xp(pid, skill, xp).await {
+            self.push_skill_gain(pid, &gain);
         }
     }
 
@@ -3619,8 +3634,10 @@ mod tests {
         }
 
         // Expect: progress, completion (with the well structure), a building skill gain,
-        // and the wall_section unlock. Frames interleave — scan once, check all.
-        let (mut progressed, mut completed, mut built_xp, mut unlocked) = (false, false, false, false);
+        // a building level-up (30 units → 150 XP → Building 1), and the wall_section
+        // unlock. Frames interleave — scan once, check all.
+        let (mut progressed, mut completed, mut built_xp, mut leveled, mut unlocked) =
+            (false, false, false, false, false);
         for _ in 0..80 {
             let Some(v) = recv_frame(&mut ws).await else { break };
             match v["type"].as_str() {
@@ -3635,16 +3652,21 @@ mod tests {
                         built_xp = true;
                     }
                 }
+                Some("skill.levelup") if v["skill_id"] == "building" => {
+                    assert_eq!(v["level"].as_i64(), Some(1), "well completion reaches Building 1");
+                    leveled = true;
+                }
                 Some("build.unlocked") => unlocked = true,
                 _ => {}
             }
-            if progressed && completed && built_xp && unlocked {
+            if progressed && completed && built_xp && leveled && unlocked {
                 break;
             }
         }
         assert!(progressed, "never saw build.progress");
         assert!(completed, "the Town Well never completed");
         assert!(built_xp, "contributor never gained building XP");
+        assert!(leveled, "contributor never got a building level-up");
         assert!(unlocked, "the dependent order never unlocked");
 
         // Durable: the order is completed and wall_section is now open.

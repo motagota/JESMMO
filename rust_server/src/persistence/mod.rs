@@ -308,6 +308,15 @@ pub struct Skill {
     pub level: i64,
 }
 
+/// The outcome of a [`Db::grant_skill_xp`] call: the updated skill and whether the
+/// grant crossed a level boundary (so the caller can fire a `skill.levelup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillGain {
+    pub skill: Skill,
+    /// True when this grant raised the cached level (a new level was reached).
+    pub leveled_up: bool,
+}
+
 /// A carried inventory item (finite slots).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct InventoryItem {
@@ -391,6 +400,11 @@ pub struct BuildOrder {
     pub state: String,
     pub issued_at: i64,
     pub completed_at: Option<i64>,
+    /// The skill a contributor must have levelled to contribute, e.g. `"building"`.
+    /// `None`/level 0 means ungated. Enforcement is per contributor (skills are
+    /// per-character); the client greys the order for players below the threshold.
+    pub required_skill: Option<String>,
+    pub required_level: i64,
 }
 
 /// A gatherable resource node.
@@ -427,7 +441,7 @@ impl Db {
         character_id: &str,
         skill_id: &str,
         amount: i64,
-    ) -> Result<Skill, DbError> {
+    ) -> Result<SkillGain, DbError> {
         let mut tx = self.pool.begin().await?;
         let current: i64 = sqlx::query_scalar(
             "SELECT xp FROM skill WHERE character_id = ? AND skill_id = ?",
@@ -437,6 +451,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?
         .unwrap_or(0);
+        let previous_level = level_for_xp(current);
         let xp = (current + amount).max(0);
         let level = level_for_xp(xp);
         sqlx::query(
@@ -450,12 +465,27 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(Skill {
-            character_id: character_id.to_string(),
-            skill_id: skill_id.to_string(),
-            xp,
-            level,
+        Ok(SkillGain {
+            skill: Skill {
+                character_id: character_id.to_string(),
+                skill_id: skill_id.to_string(),
+                xp,
+                level,
+            },
+            leveled_up: level > previous_level,
         })
+    }
+
+    /// The current cached level of a character's skill (0 if the skill row is absent).
+    pub async fn skill_level(&self, character_id: &str, skill_id: &str) -> Result<i64, DbError> {
+        let xp: Option<i64> = sqlx::query_scalar(
+            "SELECT xp FROM skill WHERE character_id = ? AND skill_id = ?",
+        )
+        .bind(character_id)
+        .bind(skill_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(level_for_xp(xp.unwrap_or(0)))
     }
 
     pub async fn skills_for_character(&self, character_id: &str) -> Result<Vec<Skill>, DbError> {
@@ -944,11 +974,14 @@ impl Db {
         required_json: &str,
         state: &str,
         now: i64,
+        required_skill: Option<&str>,
+        required_level: i64,
     ) -> Result<BuildOrder, DbError> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO build_order (id, district, kind, required_json, progress_json, state, issued_at) \
-             VALUES (?, ?, ?, ?, '{}', ?, ?)",
+            "INSERT INTO build_order \
+             (id, district, kind, required_json, progress_json, state, issued_at, required_skill, required_level) \
+             VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(district)
@@ -956,6 +989,8 @@ impl Db {
         .bind(required_json)
         .bind(state)
         .bind(now)
+        .bind(required_skill)
+        .bind(required_level)
         .execute(&self.pool)
         .await?;
         Ok(BuildOrder {
@@ -967,6 +1002,8 @@ impl Db {
             state: state.to_string(),
             issued_at: now,
             completed_at: None,
+            required_skill: required_skill.map(|s| s.to_string()),
+            required_level,
         })
     }
 
@@ -1039,6 +1076,26 @@ impl Db {
         if order.state != "open" || qty <= 0 {
             tx.commit().await?;
             return Ok(result);
+        }
+
+        // Skill gate: a contributor below the order's required level moves nothing.
+        // Skills are per-character, so this is enforced per contributor here and shown
+        // greyed ("requires Building N") on the client for players who can't yet build it.
+        if order.required_level > 0 {
+            let skill_id = order.required_skill.as_deref().unwrap_or("building");
+            let have: i64 = sqlx::query_scalar(
+                "SELECT xp FROM skill WHERE character_id = ? AND skill_id = ?",
+            )
+            .bind(character_id)
+            .bind(skill_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(level_for_xp)
+            .unwrap_or(0);
+            if have < order.required_level {
+                tx.commit().await?;
+                return Ok(result);
+            }
         }
 
         let need = required
@@ -1240,8 +1297,16 @@ impl Db {
                 // Root orders (no prereq) open at boot; tech-tree dependents seed
                 // `locked` and are opened when their prerequisite completes.
                 let state = if o.prereq.is_none() { "open" } else { "locked" };
-                self.insert_build_order(o.district, o.kind, o.required_json, state, now)
-                    .await?;
+                self.insert_build_order(
+                    o.district,
+                    o.kind,
+                    o.required_json,
+                    state,
+                    now,
+                    o.required_skill,
+                    o.required_level,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1304,14 +1369,22 @@ mod tests {
     async fn skill_xp_accumulates_and_levels() {
         let (db, _t) = TempDb::open().await;
         let cid = a_character(&db).await;
-        let s = db.grant_skill_xp(&cid, "gathering", 60).await.unwrap();
-        assert_eq!((s.xp, s.level), (60, 0));
-        let s = db.grant_skill_xp(&cid, "gathering", 50).await.unwrap();
-        assert_eq!((s.xp, s.level), (110, 1)); // use-based, no decay
+        let g = db.grant_skill_xp(&cid, "gathering", 60).await.unwrap();
+        assert_eq!((g.skill.xp, g.skill.level), (60, 0));
+        assert!(!g.leveled_up, "still level 0");
+        let g = db.grant_skill_xp(&cid, "gathering", 50).await.unwrap();
+        assert_eq!((g.skill.xp, g.skill.level), (110, 1)); // use-based, no decay
+        assert!(g.leveled_up, "crossed into level 1");
+        // A further grant that stays within the level does not report a level-up.
+        let g = db.grant_skill_xp(&cid, "gathering", 10).await.unwrap();
+        assert_eq!(g.skill.level, 1);
+        assert!(!g.leveled_up, "no boundary crossed");
         // separate skills are independent
         db.grant_skill_xp(&cid, "building", 400).await.unwrap();
         let skills = db.skills_for_character(&cid).await.unwrap();
         assert_eq!(skills.len(), 2);
+        assert_eq!(db.skill_level(&cid, "building").await.unwrap(), 2);
+        assert_eq!(db.skill_level(&cid, "absent").await.unwrap(), 0);
     }
 
     fn qty_of(items: &[InventoryItem], item: &str) -> i64 {
@@ -1425,7 +1498,7 @@ mod tests {
         db.add_flair(&cid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
 
         let order = db
-            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100)
+            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100, None, 0)
             .await
             .unwrap();
         db.save_build_order_progress(&order.id, r#"{"wood":20}"#, "completed", Some(200))
@@ -1474,7 +1547,7 @@ mod tests {
     async fn build_order_pools_contributions_and_completes() {
         let (db, _t) = TempDb::open().await;
         let order = db
-            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0)
+            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0)
             .await
             .unwrap();
 
@@ -1514,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn open_build_order_unlocks_a_locked_dependent() {
         let (db, _t) = TempDb::open().await;
-        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0)
+        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0, None, 0)
             .await
             .unwrap();
         // Unlock flips it open and returns it; a second call is a no-op.
@@ -1523,12 +1596,38 @@ mod tests {
         assert!(db.open_build_order("civic", "wall_section").await.unwrap().is_none());
         // A locked order rejects contributions until opened.
         let locked = db
-            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0)
+            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0, None, 0)
             .await
             .unwrap();
         let cid = a_character(&db).await;
         db.add_to_inventory(&cid, "wood", 40).await.unwrap();
         assert_eq!(db.contribute(&cid, &locked.id, "wood", 40).await.unwrap().moved, 0,
             "a locked order accepts nothing");
+    }
+
+    #[tokio::test]
+    async fn skill_gated_order_rejects_until_the_threshold_is_reached() {
+        let (db, _t) = TempDb::open().await;
+        // An open order that still requires Building 1 to contribute to.
+        let order = db
+            .insert_build_order("civic", "watchtower", r#"{"wood":30}"#, "open", 0, Some("building"), 1)
+            .await
+            .unwrap();
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+
+        // Below the threshold (Building 0): the gate rejects, nothing moves, the wood
+        // stays carried, and the order does not complete.
+        let r = db.contribute(&cid, &order.id, "wood", 30).await.unwrap();
+        assert_eq!(r.moved, 0, "greyed order accepts nothing below its skill threshold");
+        assert!(!r.completed);
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), 30, "wood untouched");
+
+        // Reach Building 1, then the same contribution succeeds and completes it.
+        db.grant_skill_xp(&cid, "building", 100).await.unwrap();
+        assert_eq!(db.skill_level(&cid, "building").await.unwrap(), 1);
+        let r = db.contribute(&cid, &order.id, "wood", 30).await.unwrap();
+        assert_eq!(r.moved, 30, "the threshold un-greys the order");
+        assert!(r.completed);
     }
 }

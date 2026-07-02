@@ -1,9 +1,12 @@
 ## Build-order board panel: shown while the player stands near a build board. Lists
 ## the district's city build orders with their per-item cost as `progress/required`
 ## and a Contribute button per outstanding item. Built in code; `Main` toggles
-## visibility by proximity and feeds it the latest orders (`build.list`) + inventory.
-## Contribute moves the player's whole carried stack of that item toward the order;
-## the server bounds it by the remaining need and what's carried.
+## visibility by proximity and feeds it the latest orders (`build.list`), inventory,
+## and the player's skill levels. Contribute moves the player's whole carried stack of
+## that item toward the order; the server bounds it by the remaining need and what's
+## carried. Orders the player can't yet build (skill gate) render greyed with a
+## "requires <skill> <level>" note and no Contribute buttons — the server enforces the
+## same gate, so this is UX, not trust.
 class_name BuildPanel
 extends CanvasLayer
 
@@ -12,6 +15,8 @@ signal do_contribute(order_id: String, item_id: String, qty: int)
 var _list: VBoxContainer
 var _orders: Array = []
 var _inventory: Array = []
+## skill_id -> level, for greying orders above the player's current skill.
+var _skill_levels: Dictionary = {}
 
 func _ready() -> void:
 	layer = 8
@@ -40,6 +45,12 @@ func set_orders(orders: Array) -> void:
 
 func set_inventory(items: Array) -> void:
 	_inventory = items
+	_rebuild()
+
+## Feed the player's current skill levels (from `skill.update`) so gated orders grey
+## out until the threshold is reached.
+func set_skill_levels(levels: Dictionary) -> void:
+	_skill_levels = levels
 	_rebuild()
 
 ## Update one order's cost/progress in place (from a `build.progress` push).
@@ -94,8 +105,24 @@ func _rebuild() -> void:
 			title.modulate = Color(0.6, 0.9, 0.6)
 			_list.add_child(title)
 			continue
+
+		# Skill gate: an order requiring a skill level the player hasn't reached shows
+		# greyed with a "requires …" note and offers no Contribute buttons.
+		var rs: Variant = o.get("required_skill")
+		var req_skill := String(rs) if rs != null else ""
+		var req_level := int(o.get("required_level", 0))
+		var locked := req_level > 0 and int(_skill_levels.get(req_skill, 0)) < req_level
+
 		title.text = kind
+		if locked:
+			title.modulate = Color(0.55, 0.55, 0.6)
 		_list.add_child(title)
+		if locked:
+			var req := Label.new()
+			req.add_theme_font_size_override("font_size", 11)
+			req.modulate = Color(0.95, 0.7, 0.4)
+			req.text = "  requires %s %d" % [req_skill.capitalize(), req_level]
+			_list.add_child(req)
 
 		var order_id := String(o.get("order_id", ""))
 		var required: Dictionary = o.get("required", {})
@@ -108,9 +135,11 @@ func _rebuild() -> void:
 			var lbl := Label.new()
 			lbl.text = "  %s  %d/%d" % [item, have, need]
 			lbl.custom_minimum_size = Vector2(150, 0)
+			if locked:
+				lbl.modulate = Color(0.55, 0.55, 0.6)
 			row.add_child(lbl)
 			var carried := _carried(item)
-			if have < need and carried > 0:
+			if not locked and have < need and carried > 0:
 				var btn := Button.new()
 				btn.text = "Contribute %d" % carried
 				btn.pressed.connect(func(): do_contribute.emit(order_id, item, carried))

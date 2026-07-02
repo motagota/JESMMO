@@ -137,6 +137,12 @@ pub struct SeedBuildOrder {
     pub structure_kind: &'static str,
     pub structure_x: i32,
     pub structure_y: i32,
+    /// Skill gate: a contributor must have levelled `required_skill` to at least
+    /// `required_level` before this order accepts their contributions. `None`/0 means
+    /// ungated. Distinct from `prereq` (a tech-tree edge): a skill-gated order can be
+    /// `open` from boot yet show greyed until the player is skilled enough.
+    pub required_skill: Option<&'static str>,
+    pub required_level: i64,
 }
 
 /// A static item definition (the item registry). Gathered resources, crafted
@@ -326,6 +332,8 @@ pub fn capital() -> Capital {
             structure_kind: "well",
             structure_x: tcx,
             structure_y: tcy - 40,
+            required_skill: None,
+            required_level: 0,
         },
         SeedBuildOrder {
             district: civic.id,
@@ -335,6 +343,8 @@ pub fn capital() -> Capital {
             structure_kind: "wall",
             structure_x: tcx - 100,
             structure_y: tcy,
+            required_skill: None,
+            required_level: 0,
         },
         SeedBuildOrder {
             district: civic.id,
@@ -344,6 +354,23 @@ pub fn capital() -> Capital {
             structure_kind: "stall",
             structure_x: tcx + 100,
             structure_y: tcy - 40,
+            required_skill: None,
+            required_level: 0,
+        },
+        // Skill-gated tier: open from boot but greyed until the contributor reaches
+        // Building 1 — which a solo player earns by completing the Town Well. This is
+        // the headline #10 demo: a threshold un-greys a previously locked structure,
+        // independent of the well→wall→market prerequisite chain.
+        SeedBuildOrder {
+            district: civic.id,
+            kind: "watchtower",
+            required_json: r#"{"wood":30,"stone":20}"#,
+            prereq: None,
+            structure_kind: "watchtower",
+            structure_x: tcx + 60,
+            structure_y: tcy + 80,
+            required_skill: Some("building"),
+            required_level: 1,
         },
     ];
 
@@ -532,6 +559,24 @@ mod tests {
         // town_well unlocks wall_section unlocks market_stall.
         assert!(c.build_orders.iter().any(|o| o.kind == "wall_section" && o.prereq == Some("town_well")));
         assert!(c.build_orders.iter().any(|o| o.kind == "market_stall" && o.prereq == Some("wall_section")));
+
+        // A skill gate is `Some(skill)` iff its level is positive, and a positive gate is
+        // reachable: the required level never exceeds what completing the Town Well grants
+        // solo (so the headline demo — a threshold un-greying a structure — is achievable).
+        let well_units: i64 = serde_json::from_str::<serde_json::Value>(well.required_json)
+            .unwrap().as_object().unwrap().values().map(|v| v.as_i64().unwrap()).sum();
+        let well_level = crate::persistence::level_for_xp(well_units * crate::persistence::BUILD_XP_PER_UNIT);
+        for o in &c.build_orders {
+            assert_eq!(o.required_skill.is_some(), o.required_level > 0,
+                "{}: skill gate and level must agree", o.kind);
+            assert!(o.required_level <= well_level,
+                "{} gates at Building {} but the Town Well only grants Building {}",
+                o.kind, o.required_level, well_level);
+        }
+        // The authored gated demo order exists: open from boot yet greyed until Building 1.
+        let tower = c.build_orders.iter().find(|o| o.kind == "watchtower").expect("watchtower");
+        assert_eq!(tower.prereq, None, "the gated demo is open from boot, gated only by skill");
+        assert_eq!((tower.required_skill, tower.required_level), (Some("building"), 1));
     }
 
     #[test]
