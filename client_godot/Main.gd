@@ -18,9 +18,12 @@ var _hud: Hud
 var _storage: StoragePanel
 var _inventory: InventoryPanel
 var _build: BuildPanel
+var _skills: SkillsPanel
 
 var _my_id := ""
 var _seeded_position := false
+## skill_id -> level, mirrored to the build board so it can grey gated orders.
+var _skill_levels: Dictionary = {}
 
 func _ready() -> void:
 	_build_environment()
@@ -49,6 +52,9 @@ func _ready() -> void:
 	_build = BuildPanel.new()
 	_build.visible = false
 	add_child(_build)
+
+	_skills = SkillsPanel.new()
+	add_child(_skills)
 
 	_login = Login.new()
 	_login.visible = false
@@ -107,7 +113,8 @@ func _wire_signals() -> void:
 		_storage.set_inventory(items)
 		_inventory.set_inventory(items, used, capacity)
 		_build.set_inventory(items))
-	_net.skill_update.connect(func(skill_id, xp, level): _hud.set_skill(skill_id, xp, level))
+	_net.skill_update.connect(_on_skill_update)
+	_net.skill_levelup.connect(func(skill_id, level): _hud.flash_levelup(skill_id, level))
 	_net.store_update.connect(func(items): _storage.set_storage(items))
 	_net.build_list.connect(func(orders): _build.set_orders(orders))
 	_net.build_progress.connect(func(order_id, required, progress): _build.update_progress(order_id, required, progress))
@@ -127,6 +134,14 @@ func _wire_signals() -> void:
 	_player.attack_requested.connect(func(dx, dy): _net.send_attack(dx, dy))
 	_player.gather_pressed.connect(_on_gather_pressed)
 	_player.position_changed.connect(func(wx, wy): _hud.set_pos(wx, wy))
+
+## Fan a skill update out to the HUD glance line, the skills panel (progress bars),
+## and the build board (which greys orders above the player's current level).
+func _on_skill_update(skill_id: String, xp: int, level: int) -> void:
+	_hud.set_skill(skill_id, xp, level)
+	_skills.set_skill(skill_id, xp, level)
+	_skill_levels[skill_id] = level
+	_build.set_skill_levels(_skill_levels)
 
 # --- handshake ----------------------------------------------------------------
 

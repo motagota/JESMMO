@@ -22,6 +22,7 @@ signal gather_progress(node_id: String, pct: int)
 signal gather_result(item_id: String, qty: int)
 signal inv_update(items: Array, used: int, capacity: int)
 signal skill_update(skill_id: String, xp: int, level: int)
+signal skill_levelup(skill_id: String, level: int)
 signal store_update(items: Array)
 signal build_list(orders: Array)
 signal build_progress(order_id: String, required: Dictionary, progress: Dictionary)
@@ -97,6 +98,10 @@ func _handle_text(text: String) -> void:
 			skill_update.emit(
 				String(msg.get("skill_id", "")),
 				int(msg.get("xp", 0)),
+				int(msg.get("level", 0)))
+		Protocol.S_SKILL_LEVELUP:
+			skill_levelup.emit(
+				String(msg.get("skill_id", "")),
 				int(msg.get("level", 0)))
 		Protocol.S_STORE_UPDATE:
 			store_update.emit(msg.get("items", []))

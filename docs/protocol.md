@@ -173,7 +173,7 @@ the durable transactional transfer and pushes the updated `inv.update` / `store.
 
 | type | dir | fields | status |
 |---|---|---|---|
-| `build.list` | C→S / S→C | C→S: request the district's board. S→C: `orders[]` (`{order_id, kind, required, progress, state}`) — pushed on login and after any unlock, and in reply to a request | **live** |
+| `build.list` | C→S / S→C | C→S: request the district's board. S→C: `orders[]` (`{order_id, kind, required, progress, state, required_skill, required_level}`) — pushed on login and after any unlock, and in reply to a request. `required_level` 0 = ungated; otherwise the client greys the order until the player reaches `required_skill` level `required_level` (the server enforces the same gate on `build.contribute`) | **live** |
 | `build.contribute` | C→S | `order_id`, `item_id`, `qty` — pool carried items into an order (must be near a build board) | **live** |
 | `build.progress` | S→C | `order_id`, `required`, `progress` (each an `{item_id: qty}` map) | **live** |
 | `build.completed` | S→C | `order_id`, `structures[]` (`{kind, x, y}`) | **live** |
@@ -206,7 +206,7 @@ Contributing persists only for logged-in characters (guests are a no-op).
 | type | dir | fields | status |
 |---|---|---|---|
 | `skill.update` | S→C | `skill_id`, `xp`, `level` | **live** (sent on login and on XP gain) |
-| `skill.levelup` | S→C | `skill_id`, `level` | reserved (#10) |
+| `skill.levelup` | S→C | `skill_id`, `level` — fired alongside `skill.update` when an XP grant crosses a level boundary | **live** |
 
 ### `craft.*` / `home.*` — crafting & home (M3 §4.5)
 
