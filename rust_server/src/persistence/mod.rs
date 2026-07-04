@@ -1546,6 +1546,14 @@ impl Db {
             .await
     }
 
+    /// Every build order still accepting contributions, across every district
+    /// — an ops counter (#16), not gameplay-scoped like `build_orders_for_district`.
+    pub async fn count_open_build_orders(&self) -> Result<i64, DbError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM build_order WHERE state = 'open'")
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// Seed the authored capital into the database: the starter plot grid (as
     /// unowned plots) and the first build orders. **Idempotent** — safe to call on
     /// every boot. Plots seed only when the pool is empty; each build-order kind is
@@ -1859,6 +1867,53 @@ mod tests {
         // Storage (character-global, never plot-scoped — #12/#13) was never touched.
         let stash = db.storage_for_character(&cid).await.unwrap();
         assert_eq!(stash.iter().find(|i| i.item_id == "wood").unwrap().qty, 10);
+    }
+
+    /// #16: reclaiming one plot must not disturb a *different* character's plot,
+    /// structures, or flair — an isolation check the single-plot-focused reclaim
+    /// tests above didn't specifically cover.
+    #[tokio::test]
+    async fn reclaiming_one_plot_does_not_disturb_another_owners_plot() {
+        let (db, _t) = TempDb::open().await;
+        let alice = a_character(&db).await;
+        let bob = a_character(&db).await;
+        db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        db.insert_unowned_plot("suburbs", 1, 0, 8, 8, 0).await.unwrap();
+        let alice_plot = db.claim_plot(&alice, "suburbs", 1000, 0).await.unwrap().unwrap();
+        let bob_plot = db.claim_plot(&bob, "suburbs", 1000, 0).await.unwrap().unwrap();
+        assert_ne!(alice_plot.id, bob_plot.id);
+
+        let alice_bed = db.place_structure(&alice_plot.id, "bed", 2, 3, 0, 100, Some(&alice), "{}").await.unwrap();
+        let bob_bed = db.place_structure(&bob_plot.id, "bed", 2, 3, 0, 100, Some(&bob), "{}").await.unwrap();
+        db.add_flair(&bob, Some(&bob_plot.id), "rug", 1, 1, 0).await.unwrap();
+        db.set_respawn_structure(&bob, Some(&bob_bed.id)).await.unwrap();
+
+        // Reclaim only Alice's plot: the pure state-machine transition (as the
+        // real ticker would drive it) plus the belongings side-effect.
+        db.apply_rent_tick(&alice_plot.id, 1500, 500).await.unwrap(); // -> lapsed
+        db.apply_rent_tick(&alice_plot.id, 3000, 500).await.unwrap(); // -> reclaimed
+        let deleted = db.reclaim_plot_belongings(&alice_plot.id, &alice).await.unwrap();
+        assert_eq!(deleted, vec![alice_bed.id]);
+
+        // Bob's plot, structure, flair, and respawn are all completely untouched.
+        let bob_plot_after = db.load_plot(&bob_plot.id).await.unwrap().unwrap();
+        assert_eq!(bob_plot_after.owner_character_id.as_deref(), Some(bob.as_str()));
+        assert_eq!(bob_plot_after.state, "active");
+        let bob_structures = db.structures_for_plot(&bob_plot.id).await.unwrap();
+        assert_eq!(bob_structures.len(), 1);
+        assert_eq!(bob_structures[0].id, bob_bed.id);
+        assert_eq!(db.flair_for_plot(&bob_plot.id).await.unwrap().len(), 1);
+        assert_eq!(
+            db.respawn_point_for_character(&bob).await.unwrap(),
+            Some((2, 3)),
+            "Bob's respawn bed is untouched"
+        );
+
+        // Alice's plot really is reclaimed, and a third character can claim it.
+        assert!(db.plot_for_character(&alice).await.unwrap().is_none());
+        let carol = a_character(&db).await;
+        let claimed = db.claim_plot(&carol, "suburbs", 1000, 100).await.unwrap().unwrap();
+        assert_eq!(claimed.id, alice_plot.id);
     }
 
     #[tokio::test]

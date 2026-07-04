@@ -17,7 +17,7 @@
 //   * Zone and admin connections stay unbounded: they are trusted internal peers
 //     with a single consumer each, where head-of-line stalling is not a DoS vector.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -195,6 +195,18 @@ struct ClientInfo {
     persistent: bool,
 }
 
+/// The cached last-known state of an entity, as reported by its owning zone's
+/// `status_update`s — position/hp for recreating it elsewhere, plus an
+/// in-progress gather job (if any) so a split/merge/rolling-update doesn't
+/// silently drop it (#16). `gather` is `(node_id, progress)`.
+#[derive(Clone)]
+struct EntityCache {
+    x: i32,
+    y: i32,
+    hp: i32,
+    gather: Option<(String, i32)>,
+}
+
 /// The outcome of the auth handshake: who this connection is and where to spawn.
 struct Identity {
     /// Durable character id (DB) or an ephemeral `guest_*` id.
@@ -223,10 +235,11 @@ struct Proxy {
     /// How often each client is pinged for liveness. A field (not just a const)
     /// so tests can drive the reaper on a short interval.
     ping_interval: Duration,
-    /// Last position+hp the proxy saw for each entity (from status_updates),
-    /// keyed by player_id. Used to recreate entities at their real position in a
-    /// freshly-spawned zone instance during a rolling update.
-    entity_state: Mutex<HashMap<String, (i32, i32, i32)>>,
+    /// Last position+hp (and in-progress gather job, if any, #16) the proxy saw
+    /// for each entity (from status_updates), keyed by player_id. Used to
+    /// recreate entities at their real position — and resume gathering — in a
+    /// freshly-spawned zone instance during a split/merge/rolling update.
+    entity_state: Mutex<HashMap<String, EntityCache>>,
     /// Child processes the gateway spawned (the current instance per zone id),
     /// so a later update can reap the one it replaces.
     children: Mutex<HashMap<String, Child>>,
@@ -252,7 +265,21 @@ struct Proxy {
     /// District identity is keyed to world geometry, so the gateway can name the
     /// district owning any zone region regardless of how the sim is sharded.
     capital: mmo::world::Capital,
+    /// Unix-second timestamp of every rent reclaim (#16 ops counter, "reclaims in
+    /// the last 24h"). In-memory only, like `dropped_frames` — a pure metric, not
+    /// durable state (the reclaim itself is already durable via the DB).
+    rent_reclaim_log: Mutex<VecDeque<i64>>,
+    /// Rolling window of recent DB write durations in ms (#16 ops counter),
+    /// sampled from the already-periodic `persistence_flush`/rent-ticker writes
+    /// rather than instrumenting every call site.
+    db_write_latencies_ms: Mutex<VecDeque<u64>>,
 }
+
+/// Cap on the rolling DB-latency sample window (#16) — recent-enough to be a
+/// useful health signal without growing unbounded.
+const DB_LATENCY_SAMPLES: usize = 50;
+/// Window for the "rent reclaims" ops counter.
+const RECLAIM_LOG_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Render a build order as the client-facing board entry used by `build.list`.
 fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
@@ -356,6 +383,8 @@ impl Proxy {
             db,
             sessions: Mutex::new(HashMap::new()),
             capital: mmo::world::capital(),
+            rent_reclaim_log: Mutex::new(VecDeque::new()),
+            db_write_latencies_ms: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -396,37 +425,88 @@ impl Proxy {
         }
     }
 
-    /// Build a snapshot of zones + per-zone player counts for the admin UI.
-    /// Counts come from each zone's reported population, so AI players are
-    /// included just like humans — every entity is a player.
-    fn status_snapshot(&self) -> Value {
-        let zones = self.zones.lock().unwrap();
-        let order = self.zone_order.lock().unwrap();
-
+    /// Build a snapshot of zones + per-zone player counts, plus gameplay
+    /// counters (#16), for the admin UI. Player counts come from each zone's
+    /// reported population, so AI players are included just like humans —
+    /// every entity is a player.
+    async fn status_snapshot(&self) -> Value {
         let mut total = 0usize;
-        let zones_json: Vec<Value> = order
-            .iter()
-            .filter_map(|zid| {
-                zones.get(zid).map(|z| {
-                    total += z.population;
-                    json!({
-                        "zone_id": zid,
-                        "uri": z.uri,
-                        "migration_state": z.migration_state.as_str(),
-                        "players": z.population,
-                        "version": z.version,
-                        "region": format!("({},{})-({},{})", z.region.x0, z.region.y0, z.region.x1, z.region.y1),
+        let zones_json: Vec<Value> = {
+            let zones = self.zones.lock().unwrap();
+            let order = self.zone_order.lock().unwrap();
+            order
+                .iter()
+                .filter_map(|zid| {
+                    zones.get(zid).map(|z| {
+                        total += z.population;
+                        json!({
+                            "zone_id": zid,
+                            "uri": z.uri,
+                            "migration_state": z.migration_state.as_str(),
+                            "players": z.population,
+                            "version": z.version,
+                            "region": format!("({},{})-({},{})", z.region.x0, z.region.y0, z.region.x1, z.region.y1),
+                        })
                     })
                 })
-            })
-            .collect();
+                .collect()
+        };
+
+        let (active_plots, open_build_orders) = match &self.db {
+            Some(db) => (
+                db.rent_active_plots().await.map(|p| p.len()).unwrap_or(0),
+                db.count_open_build_orders().await.unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
 
         json!({
             "type": "status",
             "total_players": total,
             "dropped_frames": self.dropped_frames.load(Ordering::Relaxed),
             "zones": zones_json,
+            "active_plots": active_plots,
+            "open_build_orders": open_build_orders,
+            "rent_reclaims_last_24h": self.reclaims_last_24h(),
+            "db_write_latency_ms": self.avg_db_latency_ms(),
         })
+    }
+
+    /// Record a rent reclaim for the "reclaims in the last 24h" ops counter
+    /// (#16) — in-memory only, like `dropped_frames`; the reclaim itself is
+    /// already durable via the DB regardless of this log.
+    fn record_reclaim(&self) {
+        self.rent_reclaim_log.lock().unwrap().push_back(now_secs());
+    }
+
+    /// Reclaims recorded in the last 24h, pruning older entries as it reads.
+    fn reclaims_last_24h(&self) -> usize {
+        let mut log = self.rent_reclaim_log.lock().unwrap();
+        let cutoff = now_secs() - RECLAIM_LOG_WINDOW_SECS;
+        while log.front().is_some_and(|&t| t < cutoff) {
+            log.pop_front();
+        }
+        log.len()
+    }
+
+    /// Record a DB write's duration for the rolling write-latency ops counter
+    /// (#16), sampled from the already-periodic `persistence_flush`/rent-ticker
+    /// writes rather than instrumenting every call site.
+    fn record_db_latency(&self, elapsed: Duration) {
+        let mut samples = self.db_write_latencies_ms.lock().unwrap();
+        samples.push_back(elapsed.as_millis() as u64);
+        while samples.len() > DB_LATENCY_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    /// Rolling average DB write latency in ms (0.0 with no samples yet).
+    fn avg_db_latency_ms(&self) -> f64 {
+        let samples = self.db_write_latencies_ms.lock().unwrap();
+        if samples.is_empty() {
+            return 0.0;
+        }
+        samples.iter().sum::<u64>() as f64 / samples.len() as f64
     }
 
     /// Admin connection: pushes a status snapshot every second and accepts
@@ -460,7 +540,7 @@ impl Proxy {
             loop {
                 interval.tick().await;
                 if push_tx
-                    .send(Message::Text(me.status_snapshot().to_string()))
+                    .send(Message::Text(me.status_snapshot().await.to_string()))
                     .is_err()
                 {
                     break;
@@ -669,7 +749,13 @@ impl Proxy {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                            self.entity_state.lock().unwrap().insert(pid.to_string(), (x, y, hp));
+                            // In-progress gather job, if the zone included one (#16) — so
+                            // a split/merge/rolling-update can resume it instead of
+                            // silently dropping it.
+                            let gather = st.get("gather_node").and_then(|v| v.as_str()).map(|node| {
+                                (node.to_string(), st.get("gather_progress").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
+                            });
+                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
                         }
                     }
                     // Stamp the owning zone and fan the update out to EVERY client,
@@ -865,14 +951,19 @@ impl Proxy {
     /// authoritative position, and follow the player's client session (re-pointing
     /// `current_zone` and notifying it of the crossing). Shared by
     /// `handle_migrate_request` (a live region-boundary crossing) and
-    /// `handle_player_died` (a respawn, which may also cross zones).
+    /// `handle_player_died` (a respawn, which may also cross zones). Carries
+    /// forward any in-progress gather job (#16) so the new zone can resume it.
     fn relocate_player(&self, pid: &str, x: i32, y: i32, hp: i32, target: &str) {
         let target_tx = self.zones.lock().unwrap().get(target).map(|z| z.tx.clone());
         let Some(tx) = target_tx else { return };
-        let _ = tx.send(Message::Text(
-            json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp}).to_string(),
-        ));
-        self.entity_state.lock().unwrap().insert(pid.to_string(), (x, y, hp));
+        let gather = self.entity_state.lock().unwrap().get(pid).and_then(|c| c.gather.clone());
+        let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
+        if let Some((node_id, progress)) = &gather {
+            msg["gather_node"] = json!(node_id);
+            msg["gather_progress"] = json!(progress);
+        }
+        let _ = tx.send(Message::Text(msg.to_string()));
+        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
 
         // Follow the player's client session (every entity is a client).
         let mut clients = self.clients.lock().unwrap();
@@ -1214,19 +1305,20 @@ impl Proxy {
             return false;
         };
 
-        // 4. Recreate every entity in the new instance at its cached position.
+        // 4. Recreate every entity in the new instance at its cached position,
+        //    resuming an in-progress gather job if it had one (#16).
         for p in &players {
-            let (x, y, hp) = self
-                .entity_state
-                .lock()
-                .unwrap()
-                .get(p)
-                .copied()
-                .unwrap_or((WORLD_SIZE / 2, WORLD_SIZE / 2, 100));
-            let _ = new_tx.send(Message::Text(
-                json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp})
-                    .to_string(),
-            ));
+            let cached = self.entity_state.lock().unwrap().get(p).cloned();
+            let (x, y, hp, gather) = match cached {
+                Some(c) => (c.x, c.y, c.hp, c.gather),
+                None => (WORLD_SIZE / 2, WORLD_SIZE / 2, 100, None),
+            };
+            let mut msg = json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp});
+            if let Some((node_id, progress)) = &gather {
+                msg["gather_node"] = json!(node_id);
+                msg["gather_progress"] = json!(progress);
+            }
+            let _ = new_tx.send(Message::Text(msg.to_string()));
         }
 
         // 5. Swap routing to the new instance, mark Normal, and collect buffered
@@ -1384,16 +1476,17 @@ impl Proxy {
             return false; // region too small to subdivide further
         }
 
-        // Players currently in this zone, with cached world positions.
-        let players: Vec<(String, i32, i32, i32)> = {
+        // Players currently in this zone, with cached world positions (and any
+        // in-progress gather job, #16).
+        let players: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == zone_id)
-                .map(|i| {
-                    let (x, y, hp) = state.get(&i.player_id).copied().unwrap_or((region.x0, region.y0, 100));
-                    (i.player_id.clone(), x, y, hp)
+                .map(|i| match state.get(&i.player_id).cloned() {
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
+                    None => (i.player_id.clone(), region.x0, region.y0, 100, None),
                 })
                 .collect()
         };
@@ -1464,17 +1557,19 @@ impl Proxy {
         // Migrate the players who now fall in the `give` half, at their exact
         // world position (seamless — no teleport).
         let mut moved = 0;
-        for (pid, x, y, hp) in &players {
+        for (pid, x, y, hp, gather) in &players {
             if !give.contains(*x, *y) {
                 continue;
             }
             let _ = old_tx.send(Message::Text(
                 json!({"type": "player_leave", "player_id": pid}).to_string(),
             ));
-            let _ = new_tx.send(Message::Text(
-                json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp})
-                    .to_string(),
-            ));
+            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
+            if let Some((node_id, progress)) = gather {
+                msg["gather_node"] = json!(node_id);
+                msg["gather_progress"] = json!(progress);
+            }
+            let _ = new_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = new_id.clone();
                 let _ = info.tx.try_send(Message::Text(
@@ -1512,17 +1607,17 @@ impl Proxy {
         };
         let union = keep_region.union(&drop_region);
 
-        // Players to move out of the retiring zone, with their world positions.
-        let movers: Vec<(String, i32, i32, i32)> = {
+        // Players to move out of the retiring zone, with their world positions
+        // (and any in-progress gather job, #16).
+        let movers: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == drop_id)
-                .map(|i| {
-                    let (x, y, hp) =
-                        state.get(&i.player_id).copied().unwrap_or((union.x0, union.y0, 100));
-                    (i.player_id.clone(), x, y, hp)
+                .map(|i| match state.get(&i.player_id).cloned() {
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
+                    None => (i.player_id.clone(), union.x0, union.y0, 100, None),
                 })
                 .collect()
         };
@@ -1547,11 +1642,13 @@ impl Proxy {
         self.sync_home_structures_to_zone(keep_id, union).await;
 
         // Move the retiring zone's players into the survivor at their positions.
-        for (pid, x, y, hp) in &movers {
-            let _ = keep_tx.send(Message::Text(
-                json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp})
-                    .to_string(),
-            ));
+        for (pid, x, y, hp, gather) in &movers {
+            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
+            if let Some((node_id, progress)) = gather {
+                msg["gather_node"] = json!(node_id);
+                msg["gather_progress"] = json!(progress);
+            }
+            let _ = keep_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = keep_id.to_string();
                 let _ = info.tx.try_send(Message::Text(
@@ -1793,14 +1890,16 @@ impl Proxy {
                     .filter_map(|i| {
                         state
                             .get(&i.player_id)
-                            .map(|&(x, y, hp)| (i.player_id.clone(), i.current_zone.clone(), x, y, hp))
+                            .map(|c| (i.player_id.clone(), i.current_zone.clone(), c.x, c.y, c.hp))
                     })
                     .collect()
             };
             for (id, district, x, y, hp) in targets {
+                let started = Instant::now();
                 let _ = db
                     .save_character(&id, x as i64, y as i64, hp as i64, &district)
                     .await;
+                self.record_db_latency(started.elapsed());
             }
         }
     }
@@ -2357,6 +2456,7 @@ impl Proxy {
         self.push_to_player(former_owner, json!({
             "type": "rent.reclaimed", "plot_id": plot.id, "moved_to_storage": Vec::<String>::new(),
         }));
+        self.record_reclaim();
     }
 
     /// The per-plot rent logic for one ticker pass, at `now`: auto-pay if due
@@ -2412,10 +2512,12 @@ impl Proxy {
     /// One rent-ticker pass over every owned plot, at `now`.
     async fn tick_rent(&self, now: i64) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
+        let started = Instant::now();
         let Ok(plots) = db.rent_active_plots().await else { return };
         for plot in &plots {
             self.tick_one_plot(plot, now).await;
         }
+        self.record_db_latency(started.elapsed());
     }
 
     /// Periodic rent ticker (#14): every owned plot, whether or not its owner
@@ -2558,10 +2660,10 @@ impl Proxy {
             let zones = self.zones.lock().unwrap();
             if let Some(zone) = zones.get(&spawn_zone_id) {
                 if identity.persistent {
-                    self.entity_state
-                        .lock()
-                        .unwrap()
-                        .insert(player_id.clone(), (identity.x, identity.y, identity.hp));
+                    self.entity_state.lock().unwrap().insert(
+                        player_id.clone(),
+                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp, gather: None },
+                    );
                     let _ = zone.tx.send(Message::Text(
                         json!({"type": "spawn_entity", "player_id": player_id,
                                "x": identity.x, "y": identity.y, "hp": identity.hp})
@@ -2704,7 +2806,9 @@ impl Proxy {
         if let Some(info) = info {
             if info.persistent {
                 if let Some(db) = &self.db {
-                    let (x, y, hp) = last_state.unwrap_or((identity.x, identity.y, identity.hp));
+                    let (x, y, hp) = last_state
+                        .map(|c| (c.x, c.y, c.hp))
+                        .unwrap_or((identity.x, identity.y, identity.hp));
                     match db
                         .save_character(&player_id, x as i64, y as i64, hp as i64, &info.current_zone)
                         .await
@@ -2999,6 +3103,8 @@ mod tests {
             db: None,
             sessions: Mutex::new(HashMap::new()),
             capital: mmo::world::capital(),
+            rent_reclaim_log: Mutex::new(VecDeque::new()),
+            db_write_latencies_ms: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -3253,8 +3359,8 @@ mod tests {
         assert_eq!(p.dropped_frames.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn status_snapshot_reports_zone_reported_populations() {
+    #[tokio::test]
+    async fn status_snapshot_reports_zone_reported_populations() {
         let p = test_proxy();
         let _za = add_zone(&p, "zone_a");
         let _zb = add_zone(&p, "zone_b");
@@ -3262,7 +3368,7 @@ mod tests {
         p.set_zone_population("zone_a", 5);
         p.set_zone_population("zone_b", 2);
 
-        let snap = p.status_snapshot();
+        let snap = p.status_snapshot().await;
         assert_eq!(snap["type"], "status");
         assert_eq!(snap["total_players"], 7);
 
@@ -3274,21 +3380,21 @@ mod tests {
         assert_eq!(zones[1]["players"], 2);
     }
 
-    #[test]
-    fn zone_stats_updates_population_and_total() {
+    #[tokio::test]
+    async fn zone_stats_updates_population_and_total() {
         let p = test_proxy();
         let _z = add_zone(&p, "zone_a");
         p.set_zone_population("zone_a", 9);
-        let snap = p.status_snapshot();
+        let snap = p.status_snapshot().await;
         assert_eq!(snap["zones"][0]["players"], 9);
         assert_eq!(snap["total_players"], 9);
     }
 
-    #[test]
-    fn status_snapshot_includes_dropped_frames() {
+    #[tokio::test]
+    async fn status_snapshot_includes_dropped_frames() {
         let p = test_proxy();
         p.dropped_frames.store(7, Ordering::Relaxed);
-        assert_eq!(p.status_snapshot()["dropped_frames"], 7);
+        assert_eq!(p.status_snapshot().await["dropped_frames"], 7);
     }
 
     // ----------------------------------------------------------------------
@@ -3485,6 +3591,37 @@ mod tests {
         assert_eq!(note["zone"], "zone_b");
     }
 
+    /// #16 (migration safety): a player's in-progress gather job is carried
+    /// forward across a migration rather than silently dropped — the gateway
+    /// caches it from `status_update`s (extended to report it) and includes it
+    /// in the `spawn_entity` it sends to whichever zone the player lands in.
+    #[tokio::test]
+    async fn migrate_request_carries_an_in_progress_gather_job_forward() {
+        let p = test_proxy();
+        let _left = add_zone_region(&p, "zone_a", Region { x0: 0, y0: 0, x1: 600, y1: 1200 });
+        let mut right = add_zone_region(&p, "zone_b", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
+        let _client_rx = add_client(&p, "p1", "zone_a", 8);
+
+        // The gateway already cached p1's gather job from an earlier status_update
+        // (zone_a's tick loop now reports it — see `entity_status_json`).
+        p.entity_state.lock().unwrap().insert(
+            "p1".into(),
+            EntityCache { x: 640, y: 200, hp: 100, gather: Some(("node_suburbs_tree_0".to_string(), 7)) },
+        );
+
+        let msg = json!({"type": "migrate_request", "player_id": "p1", "from": "zone_a", "x": 650, "y": 200, "hp": 100});
+        p.handle_migrate_request(&msg);
+
+        let spawn = next_zone_text(&mut right).await;
+        assert_eq!(spawn["type"], "spawn_entity");
+        assert_eq!(spawn["gather_node"], "node_suburbs_tree_0");
+        assert_eq!(spawn["gather_progress"], 7);
+
+        // The cache carries it forward too (e.g. for a *second* migration in a row).
+        let cached = p.entity_state.lock().unwrap().get("p1").unwrap().gather.clone();
+        assert_eq!(cached, Some(("node_suburbs_tree_0".to_string(), 7)));
+    }
+
     #[tokio::test]
     async fn migrate_request_for_unowned_position_is_a_noop() {
         let p = test_proxy();
@@ -3552,7 +3689,7 @@ mod tests {
         let mut drop_rx = add_zone_region(&p, "drop", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
         let mut client_rx = add_client(&p, "p1", "drop", 8);
         // p1 is at a world position inside `drop`.
-        p.entity_state.lock().unwrap().insert("p1".into(), (650, 300, 100));
+        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100, gather: None });
 
         p.merge_zones("keep", "drop").await;
 
@@ -3757,7 +3894,7 @@ mod tests {
             ))
             .unwrap();
         let cached = wait_until(
-            || proxy.entity_state.lock().unwrap().get(&pid).map(|&(x, _, _)| x) == Some(321),
+            || proxy.entity_state.lock().unwrap().get(&pid).map(|c| c.x) == Some(321),
             Duration::from_secs(2),
         )
         .await;
