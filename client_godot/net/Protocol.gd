@@ -54,6 +54,11 @@ const S_BUILD_UNLOCKED := "build.unlocked"
 
 # --- gameplay: starter plot allocation (M3) ------------------------------------
 const S_PLOT_ASSIGNED := "plot.assigned"
+## `plot.district` is bidirectional like `build.list`: the client can request a
+## refresh; the server also pushes it (hydration / district crossing / a plot
+## changing hands) with the current district's full roster (#18).
+const C_PLOT_DISTRICT := "plot.district"
+const S_PLOT_DISTRICT := "plot.district"
 
 # --- gameplay: home structures — bed, storage, crafting station (M3 #12) ------
 const C_BUILD_PLACE := "build.place"

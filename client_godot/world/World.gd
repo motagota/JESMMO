@@ -18,6 +18,7 @@ var _ground: MeshInstance3D
 var _tiles_root := Node3D.new()
 var _roads_root := Node3D.new()
 var _home_root := Node3D.new()
+var _plots_root := Node3D.new()
 var _built_static := false
 ## The last `partition`'s raw zone entries (`{x0,y0,x1,y1,district,...}`), kept
 ## around so `district_at` can answer "which district is this point in" without
@@ -28,6 +29,7 @@ func _ready() -> void:
     add_child(_tiles_root)
     add_child(_roads_root)
     add_child(_home_root)
+    add_child(_plots_root)
 
 ## Rebuild the district tiles from a `partition` message; lazily build the static
 ## ground/roads once the world size is known.
@@ -56,6 +58,17 @@ func district_at(wx: float, wy: float) -> String:
                 and wy >= float(z.get("y0", 0)) and wy < float(z.get("y1", 0)):
             return String(z.get("district", ""))
     return ""
+
+## The raw zone entry (`{x0,y0,x1,y1,district,...}`) containing world point
+## `(wx, wy)`, or `{}` if none match — the minimap needs the full bounds, not
+## just the district name `district_at` returns (#18).
+func district_rect_at(wx: float, wy: float) -> Dictionary:
+    for entry_v in _zones:
+        var z: Dictionary = entry_v
+        if wx >= float(z.get("x0", 0)) and wx < float(z.get("x1", 0)) \
+                and wy >= float(z.get("y0", 0)) and wy < float(z.get("y1", 0)):
+            return z
+    return {}
 
 func _build_ground() -> void:
     _ground = MeshInstance3D.new()
@@ -164,6 +177,60 @@ func show_home_plot(bounds: Dictionary) -> void:
     label.outline_size = 8
     label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 15.0)
     _home_root.add_child(label)
+
+## Rebuild every *other* plot from a `plot.district` roster (#18) — the
+## player's own plot (`my_plot_id`) is skipped, since `show_home_plot` already
+## draws it distinctly with a tall beacon; a second flat tile under that would
+## just clutter the same spot. Each other plot gets a flat tile + border (no
+## beacon — keeps mine the one standout landmark) and a label reading the
+## owner's name if taken, or "Available" if free.
+func apply_plot_roster(plots: Array, my_plot_id: String) -> void:
+    for child in _plots_root.get_children():
+        child.queue_free()
+
+    for entry_v in plots:
+        var p: Dictionary = entry_v
+        if String(p.get("plot_id", "")) == my_plot_id:
+            continue
+        _add_plot_marker(p.get("bounds", {}), p.get("owner_name"))
+
+func _add_plot_marker(bounds: Dictionary, owner_name) -> void:
+    var x0 := float(bounds.get("x", 0))
+    var y0 := float(bounds.get("y", 0))
+    var w := float(bounds.get("w", 0))
+    var h := float(bounds.get("h", 0))
+    if w <= 0.0 or h <= 0.0:
+        return
+    var taken := owner_name != null and String(owner_name) != ""
+    var tint := Color(0.85, 0.30, 0.25) if taken else Color(0.25, 0.85, 0.35)
+
+    var fill := MeshInstance3D.new()
+    var plane := PlaneMesh.new()
+    plane.size = Vector2(w, h) * Protocol.WORLD_SCALE
+    fill.mesh = plane
+    fill.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, _TILE_Y + 0.005)
+    var fill_mat := StandardMaterial3D.new()
+    fill_mat.albedo_color = Color(tint.r, tint.g, tint.b, 0.28)
+    fill_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+    fill.material_override = fill_mat
+    _plots_root.add_child(fill)
+
+    var bw := 1.0
+    _add_strip(_plots_root, Vector2(x0, y0), Vector2(x0 + w, y0), bw, tint)
+    _add_strip(_plots_root, Vector2(x0, y0 + h), Vector2(x0 + w, y0 + h), bw, tint)
+    _add_strip(_plots_root, Vector2(x0, y0), Vector2(x0, y0 + h), bw, tint)
+    _add_strip(_plots_root, Vector2(x0 + w, y0), Vector2(x0 + w, y0 + h), bw, tint)
+
+    var label := Label3D.new()
+    label.text = String(owner_name) if taken else "Available"
+    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.no_depth_test = true
+    label.fixed_size = true
+    label.pixel_size = 0.005
+    label.modulate = tint
+    label.outline_size = 6
+    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 4.0)
+    _plots_root.add_child(label)
 
 func _add_district_tile(z: Dictionary) -> void:
     var x0 := float(z.get("x0", 0))

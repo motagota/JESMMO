@@ -29,6 +29,7 @@ signal build_progress(order_id: String, required: Dictionary, progress: Dictiona
 signal build_completed(order_id: String, structures: Array)
 signal build_unlocked(order_ids: Array)
 signal plot_assigned(plot_id: String, district: String, bounds: Dictionary, tier: int, just_claimed: bool)
+signal plot_district(plots: Array)
 signal build_placed(structure: Dictionary)
 signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
@@ -134,6 +135,8 @@ func _handle_text(text: String) -> void:
                 msg.get("bounds", {}),
                 int(msg.get("tier", 0)),
                 bool(msg.get("just_claimed", false)))
+        Protocol.S_PLOT_DISTRICT:
+            plot_district.emit(msg.get("plots", []))
         Protocol.S_BUILD_PLACED:
             build_placed.emit(msg.get("structure", {}))
         Protocol.S_CRAFT_RECIPES:
@@ -208,6 +211,11 @@ func send_store_withdraw(item_id: String, qty: int) -> void:
 ## Request the district's build-order board (the server also pushes it unprompted).
 func send_build_list() -> void:
     _send({"type": Protocol.C_BUILD_LIST})
+
+## Request the current district's plot roster (the server also pushes it
+## unprompted on login/district-crossing/a plot changing hands).
+func send_plot_district() -> void:
+    _send({"type": Protocol.C_PLOT_DISTRICT})
 
 ## Contribute carried items to a build order (validated server-side by board proximity).
 func send_build_contribute(order_id: String, item_id: String, qty: int) -> void:
