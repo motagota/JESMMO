@@ -66,6 +66,28 @@ func nearest_bed(from: Vector2, max_dist: float) -> String:
 func nearest_crafting(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "crafting", false)
 
+## Whether a proposed footprint — `corner` (world units, top-left) sized
+## `footprint` — would overlap any already-placed home structure (bed/storage/
+## crafting). Mirrors the server's own overlap check in `apply_build_place`
+## (same top-left-corner rectangles, same per-kind footprint lookup) so the
+## client-side placement ghost can preview red/green without a round-trip.
+func overlaps_home_structure(corner: Vector2, footprint: Vector2) -> bool:
+	var x0 := corner.x
+	var y0 := corner.y
+	var x1 := x0 + footprint.x
+	var y1 := y0 + footprint.y
+	for rec in _entities.values():
+		var kind: String = rec.get("kind", "")
+		if kind != "bed" and kind != "storage" and kind != "crafting":
+			continue
+		var ewh: Vector2 = Protocol.STRUCTURE_FOOTPRINT.get(kind, Vector2(20, 20))
+		var epos: Vector2 = rec.get("wpos", Vector2.ZERO)
+		var overlap_x := x0 < epos.x + ewh.x and epos.x < x1
+		var overlap_y := y0 < epos.y + ewh.y and epos.y < y1
+		if overlap_x and overlap_y:
+			return true
+	return false
+
 func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
 	var best := ""
 	var best_d := max_dist

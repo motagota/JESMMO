@@ -196,5 +196,8 @@ func _input_dir() -> Vector2:
 func world_pos() -> Vector2:
 	return _pos
 
+func camera() -> Camera3D:
+	return _camera
+
 func facing() -> Vector2:
 	return _facing
