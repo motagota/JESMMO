@@ -223,8 +223,8 @@ reconnect just re-sends the same one — `just_claimed` distinguishes the very f
 grant, which drives the client's one-time "here's your plot" moment, from a re-send).
 `bounds` is the plot's world-space rect, letting the client draw a distinct outlined
 landmark and a compass reading back to it. Guests hold no land. Rent *enforcement*
-(lapse/reclaim) is M4 (#14); `rent_due_at`/`rent_paid_through` are seeded on claim but
-not yet acted on.
+(lapse/reclaim, #14) acts on `rent_due_at`/`rent_paid_through` seeded here — see
+`rent.*` below.
 
 ### `skill.*` — use-based skills (M2 §4.6)
 
@@ -268,12 +268,37 @@ the destination and hands off exactly like a `migrate_request`.
 
 ### `rent.*` — rent (M4 §4.7)
 
-| type | dir | fields |
-|---|---|---|
-| `rent.status` | S→C | `plot_id`, `due_at`, `paid_through`, `state` |
-| `rent.pay` | C→S | `plot_id` |
-| `rent.warning` | S→C | `plot_id`, `due_at` |
-| `rent.reclaimed` | S→C | `plot_id`, `moved_to_storage` |
+| type | dir | fields | status |
+|---|---|---|---|
+| `rent.status` | S→C | `plot_id`, `due_at`, `paid_through`, `state`, `auto_pay`, `gold` — pushed on login and after any rent-affecting action (pay, auto-pay toggle, a ticker-driven pay/lapse) | **live** |
+| `rent.pay` | C→S | `plot_id` — deduct `RENT_COST_GOLD` and extend by one rent period; must own the plot and afford it | **live** |
+| `rent.warning` | S→C | `plot_id`, `due_at` — fired once per due cycle, `RENT_WARNING_LEAD_SECS` before `due_at` | **live** |
+| `rent.reclaimed` | S→C | `plot_id`, `moved_to_storage` (always `[]` — see below) | **live** |
+| `rent.set_autopay` | C→S | `plot_id`, `enabled` — opt-in per plot, off by default | **live** |
+
+A background **rent ticker** (`Proxy::rent_monitor`, every `RENT_TICK_INTERVAL`)
+sweeps every owned plot regardless of whether its owner is currently connected —
+pushes are best-effort (silently dropped if offline; the DB row is the durable
+source of truth, picked up on next login via the hydration push above). Per plot,
+per tick: if **auto-pay** is enabled and the plot is due, try to pay from gold
+first (silently falls through to the lapse path below if unaffordable); otherwise,
+within `RENT_WARNING_LEAD_SECS` of `due_at`, send one `rent.warning` (tracked by
+`plot.warned`, cleared on payment, so it fires exactly once per cycle); otherwise
+advance the durable state machine (`active → lapsed` past due, `lapsed → reclaimed`
+past a grace period) via `Db::apply_rent_tick`.
+
+**Reclaim.** Structures on a reclaimed plot are **demolished** (deleted, and
+despawned client-side) — they belong to the land, which is what's being taken
+back. **Flair is preserved**, just unattached (`plot_id` set to `NULL`) — it's
+owned by the character, not the land, and is never destroyed. `moved_to_storage`
+is genuinely always empty: home storage is a single **character-global** stash
+(#12/#13, not plot-scoped), so nothing was ever at risk there to begin with. If
+the former owner's respawn pointed at a demolished bed, that reference is cleared
+(falls back to the default spawn). **Currency is sunk**, not refunded or handed to
+a city treasury (Phase 1's open-decision #1 — see `phase1.md` §9).
+
+There is no earning mechanic yet in Phase 1 — every character starts with a flat
+`STARTING_GOLD` balance (the `character.gold` migration column default).
 
 ### `district.*` — gated transitions (M4 §4.8)
 
@@ -309,9 +334,10 @@ since the point may belong to a different zone).
 The gateway also pushes **down** to zones, since a zone has no DB access and can't
 otherwise know where placed home structures are: **`home_structures_sync`**
 `{structures: [{id, kind, x, y}]}` (full replace — sent on zone registration and
-whenever its region changes, i.e. split/merge) and **`home_structure_added`**
+whenever its region changes, i.e. split/merge), **`home_structure_added`**
 `{id, kind, x, y}` (one newly-placed structure, sent the moment `build_place`
-succeeds). The zone caches these purely as geometry (kind + position) to gate
+succeeds), and **`home_structure_removed`** `{id}` (a rent reclaim demolished it,
+#14). The zone caches these purely as geometry (kind + position) to gate
 `store.deposit`/`store.withdraw`/`craft.make` on proximity to the *specific*
 structure (#13) — it never learns or needs to know who owns it.
 

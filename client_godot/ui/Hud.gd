@@ -11,6 +11,7 @@ var _inv: Label
 var _skill: Label
 var _gather: Label
 var _build_hint: Label
+var _rent_hint: Label
 var _gain: Label
 var _levelup: Label
 var _announce: Label
@@ -44,6 +45,9 @@ func _ready() -> void:
 	_build_hint = _line(box)
 	_build_hint.modulate = Color(0.85, 0.7, 1.0)
 	_build_hint.text = "[B] build"
+	_rent_hint = _line(box)
+	_rent_hint.modulate = Color(1.0, 0.9, 0.5)
+	_rent_hint.text = "[P] plot & rent"
 
 	# Floating gain feedback, centred-ish on screen.
 	_gain = Label.new()
@@ -156,6 +160,19 @@ func set_build_hint(active: bool, kind: String, rot: int) -> void:
 		_build_hint.text = "placing %s (%d°)   [Tab] kind  [R] rotate  [Enter] place  [Esc] cancel" % [kind, rot]
 	else:
 		_build_hint.text = "[B] build"
+
+## Rent status hint (#14): a compact one-line readout, refreshed on every
+## `rent.status` push (login, pay, auto-pay toggle, or a ticker-driven change).
+func set_rent_hint(state: String, due_at: int) -> void:
+	var now := int(Time.get_unix_time_from_system())
+	var when := ""
+	if state == "reclaimed":
+		when = "reclaimed"
+	elif now < due_at:
+		when = "due in %dh" % maxi((due_at - now) / 3600, 0)
+	else:
+		when = "OVERDUE"
+	_rent_hint.text = "rent: %s (%s)   [P] plot & rent" % [state.capitalize(), when]
 
 func flash_gain(item_id: String, qty: int) -> void:
 	_gather.text = ""

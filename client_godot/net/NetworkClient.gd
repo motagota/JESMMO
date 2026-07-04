@@ -33,6 +33,9 @@ signal build_placed(structure: Dictionary)
 signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
 signal home_respawn_set(bed_id: String)
+signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
+signal rent_warning(plot_id: String, due_at: int)
+signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -141,6 +144,18 @@ func _handle_text(text: String) -> void:
                 int(msg.get("qty", 0)))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
+        Protocol.S_RENT_STATUS:
+            rent_status.emit(
+                String(msg.get("plot_id", "")),
+                int(msg.get("due_at", 0)),
+                int(msg.get("paid_through", 0)),
+                String(msg.get("state", "")),
+                bool(msg.get("auto_pay", false)),
+                int(msg.get("gold", 0)))
+        Protocol.S_RENT_WARNING:
+            rent_warning.emit(String(msg.get("plot_id", "")), int(msg.get("due_at", 0)))
+        Protocol.S_RENT_RECLAIMED:
+            rent_reclaimed.emit(String(msg.get("plot_id", "")), msg.get("moved_to_storage", []))
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -211,3 +226,12 @@ func send_craft_make(recipe_id: String) -> void:
 ## Set a bed (must be on your own plot) as your respawn point.
 func send_home_set_respawn(bed_id: String) -> void:
     _send({"type": Protocol.C_HOME_SET_RESPAWN, "bed_id": bed_id})
+
+## Pay rent on your own plot (deducts gold server-side; validated by ownership
+## and balance).
+func send_rent_pay(plot_id: String) -> void:
+    _send({"type": Protocol.C_RENT_PAY, "plot_id": plot_id})
+
+## Toggle whether the rent ticker should auto-pay this plot when due (opt-in).
+func send_rent_set_autopay(plot_id: String, enabled: bool) -> void:
+    _send({"type": Protocol.C_RENT_SET_AUTOPAY, "plot_id": plot_id, "enabled": enabled})

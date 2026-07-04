@@ -45,9 +45,25 @@ const SPAWN_X: i32 = WORLD_SIZE / 2;
 const SPAWN_Y: i32 = WORLD_SIZE / 2;
 const SPAWN_HP: i32 = 100;
 
-/// Rent period seeded on a freshly claimed starter plot. Rent *enforcement*
-/// (lapse/reclaim) is M4 (#13); for now this just gives `rent_due_at` a value.
+/// Rent period seeded on a freshly claimed starter plot, and the period a
+/// payment (manual or auto-pay) extends it by (#14).
 const STARTER_RENT_PERIOD_SECS: i64 = 7 * 24 * 3600;
+/// Gold deducted per rent period.
+const RENT_COST_GOLD: i64 = 50;
+/// How long a lapsed plot sits in grace before it's reclaimed.
+const RENT_GRACE_SECS: i64 = 2 * 24 * 3600;
+/// How far ahead of `rent_due_at` a one-time `rent.warning` fires.
+const RENT_WARNING_LEAD_SECS: i64 = 24 * 3600;
+/// How often the rent ticker checks every owned plot.
+const RENT_TICK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Current unix time in seconds. Used by the rent ticker (#14).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Outbound queue for a trusted internal peer (zone / admin). Unbounded is fine:
 /// single consumer, head-of-line stalls are not an attack surface.
@@ -294,6 +310,17 @@ fn home_structure_status_json(s: &mmo::persistence::Structure) -> Value {
             "x": s.x, "y": s.y, "type": s.kind, "rot": s.rot,
             "built_by": s.built_by, "facing": [0, 0],
         },
+    })
+}
+
+/// A plot's rent status as `rent.status`. `gold` is the *character's* balance,
+/// not plot-scoped, but travels with rent status since it's what "can I pay"
+/// hinges on client-side (#14).
+fn rent_status_json(plot: &mmo::persistence::Plot, gold: i64) -> Value {
+    json!({
+        "type": "rent.status",
+        "plot_id": plot.id, "due_at": plot.rent_due_at, "paid_through": plot.rent_paid_through,
+        "state": plot.state, "auto_pay": plot.auto_pay, "gold": gold,
     })
 }
 
@@ -2262,6 +2289,148 @@ impl Proxy {
         }
     }
 
+    // --- Rent: ticker, pay/auto-pay, lapse -> reclaim (#14) ------------------
+
+    /// Push a character's own plot's rent status (and current gold balance) as
+    /// `rent.status`. Called on login and after any rent-affecting action.
+    async fn send_rent_status(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let gold = db.character_gold(pid).await.unwrap_or(0);
+        self.push_to_player(pid, rent_status_json(&plot, gold));
+    }
+
+    /// Apply `rent.pay`: deduct gold and extend the plot, only if `pid` owns it
+    /// and can afford `RENT_COST_GOLD`. Silent no-op otherwise — no error
+    /// protocol surface, matching `store_op`/`build_contribute`'s convention.
+    async fn apply_rent_pay(&self, pid: &str, plot_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Ok(Some(plot)) = db
+            .pay_rent_with_gold(pid, plot_id, RENT_COST_GOLD, STARTER_RENT_PERIOD_SECS, now_secs())
+            .await
+        else {
+            return;
+        };
+        let gold = db.character_gold(pid).await.unwrap_or(0);
+        self.push_to_player(pid, rent_status_json(&plot, gold));
+    }
+
+    /// Apply `rent.set_autopay`: toggle whether the ticker should auto-deduct
+    /// gold for this plot when due. Ownership-checked; silent no-op otherwise.
+    async fn apply_rent_set_autopay(&self, pid: &str, plot_id: &str, enabled: bool) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if db.set_auto_pay(pid, plot_id, enabled).await.unwrap_or(false) {
+            self.send_rent_status(pid).await;
+        }
+    }
+
+    /// Tell every zone sharding `district` that a home structure is gone (a
+    /// reclaim demolished it, #14) — the removal counterpart to
+    /// `push_home_structure_to_zones`, keeping a zone's proximity cache (#13)
+    /// from gating deposit/withdraw/craft on a structure that no longer exists.
+    fn push_home_structure_removed(&self, district: &str, structure_id: &str) {
+        let msg = json!({"type": "home_structure_removed", "id": structure_id}).to_string();
+        let zone_ids = self.zones_in_district(district);
+        let zones = self.zones.lock().unwrap();
+        for id in &zone_ids {
+            if let Some(z) = zones.get(id) {
+                let _ = z.tx.send(Message::Text(msg.clone()));
+            }
+        }
+    }
+
+    /// Carry out a plot's reclaim once `apply_rent_tick` has already made the
+    /// state transition durable: demolish its structures (flair is preserved,
+    /// unattached — see `Db::reclaim_plot_belongings`), tell bystanders and the
+    /// district's zones those structures are gone, and notify the former owner.
+    /// `moved_to_storage` is genuinely empty — home storage is character-global,
+    /// not plot-scoped (#12/#13), so nothing needed converting into it.
+    async fn reclaim_plot(&self, former_owner: &str, plot: &mmo::persistence::Plot) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Ok(deleted_ids) = db.reclaim_plot_belongings(&plot.id, former_owner).await else {
+            return;
+        };
+        for id in &deleted_ids {
+            self.broadcast_to_district(&plot.district, json!({"type": "despawn", "player_id": id}));
+            self.push_home_structure_removed(&plot.district, id);
+        }
+        self.push_to_player(former_owner, json!({
+            "type": "rent.reclaimed", "plot_id": plot.id, "moved_to_storage": Vec::<String>::new(),
+        }));
+    }
+
+    /// The per-plot rent logic for one ticker pass, at `now`: auto-pay if due
+    /// and enabled/affordable, warn once as the due date approaches, otherwise
+    /// advance the lapse/reclaim state machine. Takes `now` as a parameter
+    /// (rather than reading the clock internally) so tests can drive the whole
+    /// lapse→reclaim path with a fabricated timeline, mirroring
+    /// `Db::apply_rent_tick`'s existing testable shape.
+    async fn tick_one_plot(&self, plot: &mmo::persistence::Plot, now: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(owner) = plot.owner_character_id.clone() else { return };
+        let due = plot.rent_due_at.unwrap_or(i64::MAX);
+
+        if plot.state == "active" {
+            if now >= due && plot.auto_pay {
+                if let Ok(Some(paid)) = db
+                    .pay_rent_with_gold(&owner, &plot.id, RENT_COST_GOLD, STARTER_RENT_PERIOD_SECS, now)
+                    .await
+                {
+                    let gold = db.character_gold(&owner).await.unwrap_or(0);
+                    self.push_to_player(&owner, rent_status_json(&paid, gold));
+                    return;
+                }
+                // Couldn't afford it: fall through to the lapse path below.
+            } else if now < due
+                && now >= due.saturating_sub(RENT_WARNING_LEAD_SECS)
+                && !plot.warned
+            {
+                if db.mark_rent_warned(&plot.id).await.is_ok() {
+                    self.push_to_player(&owner, json!({
+                        "type": "rent.warning", "plot_id": plot.id, "due_at": due,
+                    }));
+                }
+                return;
+            }
+        }
+
+        let Ok(Some(new_state)) = db.apply_rent_tick(&plot.id, now, RENT_GRACE_SECS).await else {
+            return;
+        };
+        match new_state.as_str() {
+            "lapsed" if plot.state == "active" => {
+                if let Ok(Some(fresh)) = db.load_plot(&plot.id).await {
+                    let gold = db.character_gold(&owner).await.unwrap_or(0);
+                    self.push_to_player(&owner, rent_status_json(&fresh, gold));
+                }
+            }
+            "reclaimed" => self.reclaim_plot(&owner, plot).await,
+            _ => {}
+        }
+    }
+
+    /// One rent-ticker pass over every owned plot, at `now`.
+    async fn tick_rent(&self, now: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Ok(plots) = db.rent_active_plots().await else { return };
+        for plot in &plots {
+            self.tick_one_plot(plot, now).await;
+        }
+    }
+
+    /// Periodic rent ticker (#14): every owned plot, whether or not its owner
+    /// is currently connected — auto-pay if enabled and affordable, warn as the
+    /// due date approaches, and advance the lapse/reclaim state machine
+    /// otherwise. Mirrors `persistence_flush`'s interval-loop shape.
+    async fn rent_monitor(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(RENT_TICK_INTERVAL);
+        interval.tick().await; // consume the immediate first tick
+        loop {
+            interval.tick().await;
+            self.tick_rent(now_secs()).await;
+        }
+    }
+
     /// Persist a gather yield reported by a zone (`gather_yield`) and push the
     /// authoritative inventory + skill back to the client. The zone is authoritative
     /// for the *simulation* (range, depletion); the gateway owns the *durable* write,
@@ -2418,8 +2587,9 @@ impl Proxy {
 
         // Hydrate the client's gameplay state: inventory, storage, skills, the
         // district's build-order board, any already-completed city structures, the
-        // character's starter plot (allocating one on a brand-new character), and
-        // every home structure in the district (everyone's homes, not just theirs).
+        // character's starter plot (allocating one on a brand-new character),
+        // every home structure in the district (everyone's homes, not just
+        // theirs), and their own plot's rent status.
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
@@ -2428,6 +2598,7 @@ impl Proxy {
             self.send_completed_structures(&player_id).await;
             self.send_plot(&player_id).await;
             self.send_home_structures(&player_id).await;
+            self.send_rent_status(&player_id).await;
         }
 
         // Liveness: ping on an interval; if a full interval passes with no frame
@@ -2478,6 +2649,19 @@ impl Proxy {
                     if data.get("type").and_then(|v| v.as_str()) == Some("home.set_respawn") {
                         let bed_id = data.get("bed_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         self.apply_set_respawn(&player_id, &bed_id).await;
+                        continue;
+                    }
+                    // `rent.pay`/`rent.set_autopay` are both DB-ownership-checked with
+                    // no live-position dependency, so they're answered directly too.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("rent.pay") {
+                        let plot_id = data.get("plot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_rent_pay(&player_id, &plot_id).await;
+                        continue;
+                    }
+                    if data.get("type").and_then(|v| v.as_str()) == Some("rent.set_autopay") {
+                        let plot_id = data.get("plot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                        self.apply_rent_set_autopay(&player_id, &plot_id, enabled).await;
                         continue;
                     }
                     // Route to the player's zone (or buffer if mid-migration). A
@@ -2644,6 +2828,10 @@ impl Proxy {
             "[Proxy] Auto-scaling on: zones split when population > {}",
             self.split_threshold
         );
+
+        // Rent ticker: pay/auto-pay, lapse -> reclaim (#14).
+        let me = self.clone();
+        tokio::spawn(async move { me.rent_monitor().await });
 
         // Run the stdin command loop on the main task.
         self.command_listener().await;
@@ -4118,6 +4306,10 @@ mod tests {
         .unwrap();
         let pid = recv_until(ws, "welcome").await["player_id"].as_str().unwrap().to_string();
         let bounds = recv_until(ws, "plot.assigned").await["bounds"].clone();
+        // Login hydration also pushes this character's (just-claimed) rent
+        // status (#14) — drain it so a caller's next `recv_frame` isn't tripped
+        // up by the leftover.
+        recv_until(ws, "rent.status").await;
         let _ = proxy; // kept for symmetry with other test helpers that take it
         while zone.from_proxy.try_recv().is_ok() {}
         (pid, bounds)
@@ -4344,5 +4536,85 @@ mod tests {
         assert_eq!(spawn2["y"], bed_y as i64);
 
         drop(ws);
+    }
+
+    /// #14 acceptance, end to end: a plot's rent warns, lapses, then reclaims —
+    /// the plot returns to the pool (another character can claim it), the
+    /// former owner's flair survives (unattached, not deleted), and their
+    /// character-global storage is untouched throughout (it was never
+    /// plot-scoped to begin with, #12/#13).
+    #[tokio::test]
+    async fn rent_warns_lapses_and_reclaims_returning_the_plot_to_the_pool() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Tenant").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+        let plot = db.plot_for_character(&pid).await.unwrap().unwrap();
+        let due_at = plot.rent_due_at.unwrap();
+
+        // A bed (so we can prove it gets demolished) and some flair + storage
+        // (so we can prove those *don't*).
+        let placed = place_home_structure(&mut zone, &mut ws, &pid, "bed", bx + 5, by + 5).await;
+        let bed_id = placed["structure"]["id"].as_str().unwrap().to_string();
+        let flair_id = db.add_flair(&pid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
+        db.deposit_to_storage(&pid, "wood", 10).await.unwrap();
+
+        // Tick 1: just inside the warning window — one rent.warning, nothing else.
+        proxy.tick_rent(due_at - RENT_WARNING_LEAD_SECS + 10).await;
+        let warning = recv_until(&mut ws, "rent.warning").await;
+        assert_eq!(warning["plot_id"], plot.id);
+        assert!(db.load_plot(&plot.id).await.unwrap().unwrap().warned);
+
+        // Tick 2: past due (no auto-pay set) — lapses; rent.status reflects it.
+        proxy.tick_rent(due_at + 1).await;
+        let status = recv_until(&mut ws, "rent.status").await;
+        assert_eq!(status["plot_id"], plot.id);
+        assert_eq!(status["state"], "lapsed");
+
+        // Tick 3: past the grace window — reclaimed. The bed despawns, the zone
+        // drops it from its proximity cache, and the former owner is notified.
+        proxy.tick_rent(due_at + RENT_GRACE_SECS + 1).await;
+        let mut saw_despawn = false;
+        let mut reclaimed = None;
+        while reclaimed.is_none() {
+            let v = recv_frame(&mut ws).await.expect("expected despawn/rent.reclaimed");
+            match v["type"].as_str() {
+                Some("despawn") if v["player_id"] == json!(bed_id) => saw_despawn = true,
+                Some("rent.reclaimed") => reclaimed = Some(v),
+                _ => {}
+            }
+        }
+        assert!(saw_despawn, "the demolished bed should despawn for onlookers (including the owner)");
+        let reclaimed = reclaimed.unwrap();
+        assert_eq!(reclaimed["plot_id"], plot.id);
+        assert_eq!(reclaimed["moved_to_storage"], json!([]));
+
+        let removed = recv_value(&mut zone.from_proxy).await;
+        assert_eq!(removed["type"], "home_structure_removed");
+        assert_eq!(removed["id"], bed_id);
+
+        // The plot is back in the pool: no owner, and durably reclaimed.
+        assert!(db.plot_for_character(&pid).await.unwrap().is_none());
+        assert_eq!(db.load_plot(&plot.id).await.unwrap().unwrap().state, "reclaimed");
+
+        // Another character can claim the very same plot.
+        let mut ws2 = dial(&proxy).await;
+        let (_pid2, bounds2) = registered_with_plot(&proxy, &mut zone, &mut ws2, "NextTenant").await;
+        assert_eq!(bounds2, bounds, "the reclaimed plot is claimable again, at the same spot");
+
+        // The original owner keeps everything they *owned*: flair survives
+        // (unattached, not deleted), and storage was never at risk.
+        let flair = db.flair_for_character(&pid).await.unwrap();
+        assert_eq!(flair.len(), 1);
+        assert_eq!(flair[0].id, flair_id);
+        assert_eq!(flair[0].plot_id, None);
+        let stash = db.storage_for_character(&pid).await.unwrap();
+        assert_eq!(stash.iter().find(|i| i.item_id == "wood").unwrap().qty, 10);
+
+        drop(ws);
+        drop(ws2);
     }
 }

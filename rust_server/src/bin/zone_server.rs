@@ -605,6 +605,14 @@ impl ZoneServer {
                 }
                 continue;
             }
+            // A home structure was demolished (a rent reclaim, #14) — drop it so
+            // it stops gating deposit/withdraw/craft proximity.
+            if msg_type == "home_structure_removed" {
+                if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                    self.home_structures.lock().unwrap().retain(|s| s.id != id);
+                }
+                continue;
+            }
 
             let player_id = match data.get("player_id").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
@@ -1547,6 +1555,12 @@ mod tests {
         drop(hs);
         assert!(zone.near_home_structure("crafting", 700, 700));
         assert!(zone.near_storage(500, 500), "the earlier chest is still known");
+
+        // Removing one (a rent reclaim demolished it, #14) stops it gating,
+        // without disturbing the other.
+        zone.home_structures.lock().unwrap().retain(|s| s.id != "s1");
+        assert!(!zone.near_storage(500, 500), "the demolished chest no longer gates");
+        assert!(zone.near_home_structure("crafting", 700, 700), "the crafting station is unaffected");
     }
 
     #[tokio::test]

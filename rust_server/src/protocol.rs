@@ -76,10 +76,11 @@ pub const C_CRAFT_MAKE: &str = "craft.make"; // {recipe_id}
 pub const S_CRAFT_MADE: &str = "craft.made"; // {recipe_id, item_id, qty} -- feedback once craft.make succeeds
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
-pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state}
+pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}
 pub const C_RENT_PAY: &str = "rent.pay"; // {plot_id}
 pub const S_RENT_WARNING: &str = "rent.warning"; // {plot_id, due_at}
 pub const S_RENT_RECLAIMED: &str = "rent.reclaimed"; // {plot_id, moved_to_storage}
+pub const C_RENT_SET_AUTOPAY: &str = "rent.set_autopay"; // {plot_id, enabled} -- opt-in; off by default
 
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
