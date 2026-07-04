@@ -19,11 +19,14 @@ var _storage: StoragePanel
 var _inventory: InventoryPanel
 var _build: BuildPanel
 var _skills: SkillsPanel
+var _craft: CraftPanel
+var _build_place: BuildPlace
 
 var _my_id := ""
 var _seeded_position := false
 ## skill_id -> level, mirrored to the build board so it can grey gated orders.
 var _skill_levels: Dictionary = {}
+var _sleep_down := false
 
 func _ready() -> void:
     _build_environment()
@@ -56,6 +59,13 @@ func _ready() -> void:
     _skills = SkillsPanel.new()
     add_child(_skills)
 
+    _craft = CraftPanel.new()
+    _craft.visible = false
+    add_child(_craft)
+
+    _build_place = BuildPlace.new()
+    add_child(_build_place)
+
     _login = Login.new()
     _login.visible = false
     add_child(_login)
@@ -77,6 +87,17 @@ func _process(_delta: float) -> void:
     _inventory.set_forced_open(near_store)
     var near_board := _entities.nearest_build_board(_player.world_pos(), Protocol.BOARD_RANGE) != ""
     _build.show_panel(near_board)
+    var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
+    _craft.show_panel(near_craft)
+
+    # Keep the placement ghost following the player, and offer "sleep / set
+    # respawn" while standing near a bed (#12).
+    _build_place.player_pos = _player.world_pos()
+    var near_bed := _entities.nearest_bed(_player.world_pos(), Protocol.STORAGE_RANGE)
+    var sleep := Input.is_physical_key_pressed(KEY_F)
+    if sleep and not _sleep_down and near_bed != "":
+        _net.send_home_set_respawn(near_bed)
+    _sleep_down = sleep
 
 func _build_environment() -> void:
     var env := Environment.new()
@@ -112,7 +133,8 @@ func _wire_signals() -> void:
         _hud.set_inventory(items, used, capacity)
         _storage.set_inventory(items)
         _inventory.set_inventory(items, used, capacity)
-        _build.set_inventory(items))
+        _build.set_inventory(items)
+        _craft.set_inventory(items))
     _net.skill_update.connect(_on_skill_update)
     _net.skill_levelup.connect(func(skill_id, level): _hud.flash_levelup(skill_id, level))
     _net.store_update.connect(func(items): _storage.set_storage(items))
@@ -121,11 +143,18 @@ func _wire_signals() -> void:
     _net.build_completed.connect(func(order_id, _structures): _build.mark_completed(order_id))
     _net.build_unlocked.connect(func(_ids): _net.send_build_list())
     _net.plot_assigned.connect(_on_plot_assigned)
+    _net.build_placed.connect(func(structure): _hud.flash_announce("Placed %s" % String(structure.get("kind", ""))))
+    _net.craft_recipes.connect(func(recipes): _craft.set_recipes(recipes))
+    _net.craft_made.connect(func(_recipe_id, item_id, qty): _hud.flash_gain(item_id, qty))
+    _net.home_respawn_set.connect(func(_bed_id): _hud.flash_announce("Respawn point set!"))
 
     _storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
     _storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
     _inventory.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
     _build.do_contribute.connect(func(order_id, item_id, qty): _net.send_build_contribute(order_id, item_id, qty))
+    _craft.do_craft.connect(func(recipe_id): _net.send_craft_make(recipe_id))
+    _build_place.do_place.connect(func(kind, x, y, rot): _net.send_build_place(kind, x, y, rot))
+    _build_place.mode_changed.connect(func(active, kind, rot): _hud.set_build_hint(active, kind, rot))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
@@ -172,6 +201,7 @@ func _on_welcome(data: Dictionary) -> void:
     _hud.set_zone(String(data.get("zone", "—")))
     _login.show_overlay(false)
     _player.activate()
+    _net.send_craft_list() # the recipe registry is static; pull it once per session
 
 ## Gather the nearest in-range resource node (resolved from the entity manager).
 ## A starter plot was (re-)assigned: draw its outline/beacon in the world, feed

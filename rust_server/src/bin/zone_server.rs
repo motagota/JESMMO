@@ -284,6 +284,10 @@ struct ZoneServer {
     storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
     /// Authored build-order boards in this zone's region (contribution spots).
     build_boards: Mutex<Vec<mmo::world::BuildBoard>>,
+    /// Authored plot cells in this zone's region — geometry only (not ownership,
+    /// which lives in the gateway's DB); gates home-structure placement/crafting
+    /// to "standing on some plot" (#12).
+    plots: Mutex<Vec<mmo::world::PlotCell>>,
 }
 
 impl ZoneServer {
@@ -302,6 +306,7 @@ impl ZoneServer {
             gathering: Mutex::new(HashMap::new()),
             storage_points: Mutex::new(Vec::new()),
             build_boards: Mutex::new(Vec::new()),
+            plots: Mutex::new(Vec::new()),
         })
     }
 
@@ -349,6 +354,25 @@ impl ZoneServer {
         *self.build_boards.lock().unwrap() = boards;
     }
 
+    /// (Re)cache the authored plot cells inside this zone's current region —
+    /// geometry only, so the zone can gate home-structure placement/crafting to
+    /// "standing on some plot" without knowing (or needing to know) who owns it.
+    fn spawn_plots(&self) {
+        let r = *self.region.lock().unwrap();
+        let cells: Vec<mmo::world::PlotCell> = self
+            .capital
+            .plots_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1))
+            .into_iter()
+            .map(|(_, cell)| cell)
+            .collect();
+        *self.plots.lock().unwrap() = cells;
+    }
+
+    /// Whether `(px, py)` falls inside any authored plot cell in this zone.
+    fn on_a_plot(&self, px: i32, py: i32) -> bool {
+        self.plots.lock().unwrap().iter().any(|c| c.rect().contains(px, py))
+    }
+
     /// Push the current state of every node and storage point to the gateway (which
     /// broadcasts it), so a just-joined client renders them.
     fn send_all_nodes(&self) {
@@ -365,13 +389,17 @@ impl ZoneServer {
         }
     }
 
-    /// Whether `(px, py)` is within range of any storage point in this zone.
+    /// Whether `(px, py)` is within range of any storage point in this zone, **or**
+    /// standing on any plot — a home storage chest reuses the town storehouse's
+    /// deposit/withdraw messages, so "at home" is as valid as "at the storehouse"
+    /// (#12).
     fn near_storage(&self, px: i32, py: i32) -> bool {
         self.storage_points
             .lock()
             .unwrap()
             .iter()
             .any(|s| dist2(px, py, s.x, s.y) <= (STORAGE_RANGE as i64).pow(2))
+            || self.on_a_plot(px, py)
     }
 
     /// Whether `(px, py)` is within range of any build board in this zone.
@@ -428,6 +456,19 @@ impl ZoneServer {
         }
     }
 
+    /// Report a player death to the gateway, which alone knows where they should
+    /// reappear (their bed, if one's set, else the default spawn) and — since
+    /// that point may be owned by a different zone — handles the hand-off exactly
+    /// like a `migrate_request` (#12). The entity has already been removed from
+    /// this zone's map by the caller.
+    fn send_player_died(&self, id: &str, hp: i32) {
+        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+            let _ = tx.send(Message::Text(
+                json!({ "type": "player_died", "player_id": id, "hp": hp }).to_string(),
+            ));
+        }
+    }
+
     async fn handle_proxy(self: Arc<Self>, raw: TcpStream) {
         let ws = match tokio_tungstenite::accept_async(raw).await {
             Ok(ws) => ws,
@@ -481,12 +522,13 @@ impl ZoneServer {
                     "[Zone {}] Region set to ({},{})-({},{})",
                     self.zone_id, r.x0, r.y0, r.x1, r.y1
                 );
-                // A freshly-split zone gets its own mobs, nodes, storage points, and
-                // build boards.
+                // A freshly-split zone gets its own mobs, nodes, storage points,
+                // build boards, and plots.
                 self.spawn_mobs(MOBS_PER_ZONE);
                 self.spawn_nodes();
                 self.spawn_storage_points();
                 self.spawn_build_boards();
+                self.spawn_plots();
                 continue;
             }
 
@@ -627,6 +669,40 @@ impl ZoneServer {
                             let _ = tx.send(Message::Text(json!({
                                 "type": "build_contribute", "player_id": player_id,
                                 "order_id": order_id, "item_id": item_id, "qty": qty,
+                            }).to_string()));
+                        }
+                    }
+                }
+                "build.place" => {
+                    // Geometry-only gate: is the *target* point on some plot? Ownership,
+                    // footprint bounds/overlap, and the durable write are the gateway's
+                    // job (it alone knows whose plot this is) — see #12.
+                    let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let x = data.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let y = data.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let rot = data.get("rot").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if !kind.is_empty() && self.on_a_plot(x, y) {
+                        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                            let _ = tx.send(Message::Text(json!({
+                                "type": "build_place", "player_id": player_id,
+                                "kind": kind, "x": x, "y": y, "rot": rot,
+                            }).to_string()));
+                        }
+                    }
+                }
+                "craft.make" => {
+                    // Geometry-only gate: is the player standing on some plot? Whether
+                    // they actually own a crafting station there is the gateway's job.
+                    let recipe_id = data.get("recipe_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let on_plot = {
+                        let entities = self.entities.lock().unwrap();
+                        entities.get(&player_id).map(|p| self.on_a_plot(p.x, p.y)).unwrap_or(false)
+                    };
+                    if on_plot && !recipe_id.is_empty() {
+                        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                            let _ = tx.send(Message::Text(json!({
+                                "type": "craft_make", "player_id": player_id,
+                                "recipe_id": recipe_id,
                             }).to_string()));
                         }
                     }
@@ -820,14 +896,18 @@ impl ZoneServer {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in &dead_players {
-                    let (rx, ry) = region.random_point();
-                    if let Some(e) = entities.get_mut(id) {
-                        e.hp = e.max_hp;
-                        e.x = rx;
-                        e.y = ry;
-                    }
+                    // Where a player reappears (their bed, if set, else the default
+                    // spawn) is the gateway's call — and that point may belong to a
+                    // *different* zone, so this zone doesn't respawn them in place; it
+                    // reports the death and hands off, mirroring "left our region"
+                    // (#12). Removing them here (rather than leaving a stale entity)
+                    // is safe even when the gateway ends up sending them right back to
+                    // this same zone — `spawn_entity` inserts fresh either way.
+                    let max_hp = entities.get(id).map(|e| e.max_hp).unwrap_or(PLAYER_MAX_HP);
+                    entities.remove(id);
+                    despawns.push(id.clone());
                     died.push(id.clone());
-                    changed.insert(id.clone());
+                    self.send_player_died(id, max_hp);
                 }
 
                 // --- 4. Trickle mobs back (slowly, so a zone can be cleared). ---
@@ -1106,12 +1186,13 @@ impl ZoneServer {
             tokio::spawn(async move { me.register_with_proxy().await });
         }
 
-        // Seed mobs, resource nodes, storage points, and build boards, then start the
-        // 20 Hz sim.
+        // Seed mobs, resource nodes, storage points, build boards, and plots, then
+        // start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
         self.spawn_nodes();
         self.spawn_storage_points();
         self.spawn_build_boards();
+        self.spawn_plots();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -1220,6 +1301,31 @@ mod tests {
         assert!(hp < PLAYER_MAX_HP, "a wilds mob should have damaged the player (hp={hp})");
     }
 
+    // --- #12: death hands respawn off to the gateway (bed-or-fallback) --------
+
+    /// A dead player is removed from the zone's own map (not respawned in
+    /// place) and the zone reports the death to the gateway instead — the
+    /// gateway alone decides where they reappear, since that point may be a
+    /// different zone entirely (their bed).
+    #[tokio::test]
+    async fn dead_player_is_removed_and_reported_to_gateway_not_respawned_locally() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity { hp: 0, ..Entity::player(540, 540, PLAYER_MAX_HP) },
+        );
+        let packets = drive(zone.clone(), 1).await;
+
+        assert!(!zone.entities.lock().unwrap().contains_key("p1"), "the dead player should be removed, not teleported in place");
+        assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains("\"p1\"")),
+            "bystanders should see the dead player despawn from this zone");
+        assert!(packets.iter().any(|p| p.contains("\"you_died\"") && p.contains("\"p1\"")),
+            "the player's own client should learn it died");
+        assert!(packets.iter().any(|p| p.contains("\"player_died\"") && p.contains("\"p1\"")
+            && p.contains(&format!("\"hp\":{PLAYER_MAX_HP}"))),
+            "the gateway should be told the death happened, with the hp to respawn at");
+    }
+
     // --- #7: resource gathering -----------------------------------------------
 
     const CIVIC: Region = Region { x0: 400, y0: 0, x1: 800, y1: 1200 };
@@ -1321,6 +1427,26 @@ mod tests {
         assert!(zone.near_board(b.x, b.y), "on the board is in range");
         assert!(zone.near_board(b.x + BOARD_RANGE - 1, b.y), "just inside range");
         assert!(!zone.near_board(b.x + BOARD_RANGE + 20, b.y), "out of range");
+    }
+
+    #[tokio::test]
+    async fn plots_spawn_in_suburbs_and_gate_geometrically() {
+        // Suburbs band — the only district with an authored plot grid.
+        let region = Region { x0: 800, y0: 0, x1: 1200, y1: 1200 };
+        let zone = zone_for_region(region);
+        zone.spawn_plots();
+        let plots = zone.plots.lock().unwrap().clone();
+        assert_eq!(plots.len(), 24, "every starter plot sits in the suburbs band");
+        let p = plots[0];
+        assert!(zone.on_a_plot(p.x, p.y), "the plot's own corner is on the plot");
+        assert!(zone.on_a_plot(p.x + p.w / 2, p.y + p.h / 2), "the plot's centre is on the plot");
+        assert!(!zone.on_a_plot(p.x - 200, p.y), "well outside any plot");
+
+        // A civic-only region has no plots at all — nowhere gates as "on a plot".
+        let civic_zone = zone_for_region(CIVIC);
+        civic_zone.spawn_plots();
+        assert!(civic_zone.plots.lock().unwrap().is_empty());
+        assert!(!civic_zone.on_a_plot(600, 600), "no plot grid in the civic centre");
     }
 
     #[tokio::test]

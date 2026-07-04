@@ -57,6 +57,15 @@ func nearest_storage(from: Vector2, max_dist: float) -> String:
 func nearest_build_board(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "build_board", false)
 
+## The id of the nearest bed within `max_dist`, or "" if none (for the
+## sleep/set-respawn interaction, #12).
+func nearest_bed(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "bed", false)
+
+## The id of the nearest crafting station within `max_dist`, or "" if none (#12).
+func nearest_crafting(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "crafting", false)
+
 func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
 	var best := ""
 	var best_d := max_dist
@@ -93,6 +102,8 @@ func _height_for(kind: String) -> float:
 		"storage": return 0.6
 		"build_board": return 0.9
 		"structure": return 1.0
+		"bed": return 0.5
+		"crafting": return 0.9
 		_: return 1.2
 
 func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
@@ -141,6 +152,19 @@ func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
 			var kind_name := String(state.get("kind", "")).capitalize()
 			if kind_name != "":
 				_add_label(mi, kind_name, 2.6, Color(0.85, 0.95, 1.0))
+		"bed":
+			# A home bed: a low, warm-toned slab (the respawn anchor, #12).
+			var frame := BoxMesh.new()
+			frame.size = Vector3(2.0, 0.6, 1.2)
+			mi.mesh = frame
+			mi.material_override = _solid(Color(0.55, 0.35, 0.65))
+		"crafting":
+			# A home crafting station: a stout workbench.
+			var bench := BoxMesh.new()
+			bench.size = Vector3(2.0, 1.1, 1.6)
+			mi.mesh = bench
+			mi.material_override = _solid(Color(0.65, 0.45, 0.2))
+			_add_label(mi, "🛠 Craft", 1.8, Color(1.0, 0.85, 0.5))
 		_:
 			var cap := CapsuleMesh.new()
 			cap.radius = 0.6

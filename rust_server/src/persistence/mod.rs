@@ -938,6 +938,86 @@ impl Db {
             .await
     }
 
+    /// Every structure placed on any plot in `district` — every home in the
+    /// district, not just one character's — for hydrating a just-joined player
+    /// with everyone's already-built homes (#12).
+    pub async fn structures_in_district(&self, district: &str) -> Result<Vec<Structure>, DbError> {
+        sqlx::query_as::<_, Structure>(
+            "SELECT structure.* FROM structure \
+             JOIN plot ON plot.id = structure.plot_id \
+             WHERE plot.district = ? ORDER BY structure.id",
+        )
+        .bind(district)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Craft an item from `inputs` (each `(item_id, qty)`), atomically: only if
+    /// carried inventory covers *every* input are they all removed and
+    /// `output_qty` of `output_item` added (bounded by remaining carry room, same
+    /// as [`Db::add_to_inventory`]); otherwise nothing changes. Returns whether
+    /// the craft went through.
+    pub async fn craft(
+        &self,
+        character_id: &str,
+        inputs: &[(&str, i64)],
+        output_item: &str,
+        output_qty: i64,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        for (item_id, qty) in inputs {
+            let have: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+            )
+            .bind(character_id)
+            .bind(*item_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if have.unwrap_or(0) < *qty {
+                tx.commit().await?;
+                return Ok(false);
+            }
+        }
+        for (item_id, qty) in inputs {
+            remove_inventory_in_tx(&mut tx, character_id, item_id, *qty).await?;
+        }
+        add_inventory_in_tx(&mut tx, character_id, output_item, output_qty).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Set (or clear) which structure a character respawns at. `structure_id` is
+    /// trusted by the caller to be a `bed`-kind structure the character owns
+    /// (#12) — persistence just records the pointer.
+    pub async fn set_respawn_structure(
+        &self,
+        character_id: &str,
+        structure_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE character SET respawn_structure_id = ? WHERE id = ?")
+            .bind(structure_id)
+            .bind(character_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The world position of a character's respawn structure, if one is set (and
+    /// still exists). `None` means "fall back to the default spawn."
+    pub async fn respawn_point_for_character(
+        &self,
+        character_id: &str,
+    ) -> Result<Option<(i64, i64)>, DbError> {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT structure.x, structure.y FROM character \
+             JOIN structure ON structure.id = character.respawn_structure_id \
+             WHERE character.id = ?",
+        )
+        .bind(character_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Add a décor item. Flair is owned by the character and survives rent lapse.
     pub async fn add_flair(
         &self,
@@ -1512,6 +1592,63 @@ mod tests {
         assert_eq!(remaining, 0);
         let nodes = db.resource_nodes_for_district("market").await.unwrap();
         assert_eq!(nodes[0].respawn_at, Some(9999)); // respawn scheduled on empty
+    }
+
+    #[tokio::test]
+    async fn craft_is_atomic_and_bounded_by_ingredients() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 3).await.unwrap();
+
+        // Short one stone: the whole craft is a no-op, wood is untouched.
+        let ok = db.craft(&cid, &[("wood", 2), ("stone", 1)], "tool_kit", 1).await.unwrap();
+        assert!(!ok, "insufficient ingredients should not craft");
+        assert_eq!(
+            qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood"),
+            3,
+            "a failed craft must not consume any input"
+        );
+
+        // Enough wood alone: plank only needs wood.
+        let ok = db.craft(&cid, &[("wood", 2)], "plank", 2).await.unwrap();
+        assert!(ok);
+        let items = db.inventory_for_character(&cid).await.unwrap();
+        assert_eq!(qty_of(&items, "wood"), 1, "inputs are debited");
+        assert_eq!(qty_of(&items, "plank"), 2, "output is credited");
+    }
+
+    #[tokio::test]
+    async fn structures_in_district_spans_every_owning_plot() {
+        let (db, _t) = TempDb::open().await;
+        let cid_a = a_character(&db).await;
+        let cid_b = a_character(&db).await;
+        let plot_a = db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let plot_b = db.insert_unowned_plot("suburbs", 1, 0, 8, 8, 0).await.unwrap();
+        let other_district = db.insert_unowned_plot("market", 0, 0, 8, 8, 0).await.unwrap();
+        db.place_structure(&plot_a.id, "bed", 2, 3, 0, 100, Some(&cid_a), "{}").await.unwrap();
+        db.place_structure(&plot_b.id, "storage", 4, 4, 0, 100, Some(&cid_b), "{}").await.unwrap();
+        db.place_structure(&other_district.id, "bed", 1, 1, 0, 100, Some(&cid_a), "{}").await.unwrap();
+
+        let suburbs = db.structures_in_district("suburbs").await.unwrap();
+        assert_eq!(suburbs.len(), 2, "every home in the district, not just one character's");
+        assert!(suburbs.iter().any(|s| s.plot_id == plot_a.id));
+        assert!(suburbs.iter().any(|s| s.plot_id == plot_b.id));
+        assert!(!suburbs.iter().any(|s| s.plot_id == other_district.id));
+    }
+
+    #[tokio::test]
+    async fn respawn_structure_resolves_to_its_position_or_none() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        assert_eq!(db.respawn_point_for_character(&cid).await.unwrap(), None, "no bed set yet");
+
+        let plot = db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let bed = db.place_structure(&plot.id, "bed", 12, 34, 0, 100, Some(&cid), "{}").await.unwrap();
+        db.set_respawn_structure(&cid, Some(&bed.id)).await.unwrap();
+        assert_eq!(db.respawn_point_for_character(&cid).await.unwrap(), Some((12, 34)));
+
+        db.set_respawn_structure(&cid, None).await.unwrap();
+        assert_eq!(db.respawn_point_for_character(&cid).await.unwrap(), None, "clearing it falls back to no bed");
     }
 
     #[tokio::test]

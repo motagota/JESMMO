@@ -78,6 +78,13 @@ pub struct PlotCell {
     pub tier: i64,
 }
 
+impl PlotCell {
+    /// This cell's world-space bounds as a [`Rect`].
+    pub fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.x + self.w, self.y + self.h)
+    }
+}
+
 /// A named district: a region of the world with an identity and (optionally) a
 /// starter plot grid.
 #[derive(Debug, Clone)]
@@ -160,12 +167,54 @@ pub fn items() -> Vec<Item> {
     vec![
         Item { id: "wood", name: "Wood", stack_size: 100, category: "wood" },
         Item { id: "stone", name: "Stone", stack_size: 100, category: "stone" },
+        Item { id: "plank", name: "Plank", stack_size: 100, category: "crafted" },
+        Item { id: "tool_kit", name: "Tool Kit", stack_size: 100, category: "crafted" },
     ]
 }
 
 /// Look up an item definition by id.
 pub fn item(id: &str) -> Option<Item> {
     items().into_iter().find(|i| i.id == id)
+}
+
+/// A crafting recipe: `inputs` (each `item_id -> qty`) consumed to produce
+/// `output_qty` of `output_item`. Crafting is instant (no timer) — issue #12's
+/// "can craft a basic item" acceptance needs only a couple of these.
+#[derive(Debug, Clone, Copy)]
+pub struct Recipe {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub inputs: &'static [(&'static str, i64)],
+    pub output_item: &'static str,
+    pub output_qty: i64,
+}
+
+/// The Phase 1 recipe registry. Look up by id with [`recipe`].
+pub fn recipes() -> Vec<Recipe> {
+    vec![
+        Recipe { id: "plank", name: "Plank", inputs: &[("wood", 2)], output_item: "plank", output_qty: 2 },
+        Recipe {
+            id: "tool_kit", name: "Tool Kit", inputs: &[("wood", 1), ("stone", 1)],
+            output_item: "tool_kit", output_qty: 1,
+        },
+    ]
+}
+
+/// Look up a recipe definition by id.
+pub fn recipe(id: &str) -> Option<Recipe> {
+    recipes().into_iter().find(|r| r.id == id)
+}
+
+/// Fixed footprint (world units) for a home structure kind, used both by
+/// placement validation (bounds/overlap) and the client's ghost preview. `None`
+/// for anything that isn't a placeable home structure (#12).
+pub fn structure_footprint(kind: &str) -> Option<(i32, i32)> {
+    match kind {
+        "bed" => Some((20, 20)),
+        "storage" => Some((16, 16)),
+        "crafting" => Some((20, 20)),
+        _ => None,
+    }
 }
 
 /// An authored gatherable node: a fixed spawn that yields `item_id` until its
@@ -234,6 +283,17 @@ impl Capital {
         self.districts
             .iter()
             .flat_map(|d| d.plots().into_iter().map(move |c| (d.id, c)))
+            .collect()
+    }
+
+    /// Authored plot cells whose world-space rect falls inside `r` — the set a
+    /// zone owning that region should know about, purely as *geometry* (not
+    /// ownership — that's the gateway/DB's job), so it can gate "is this point on
+    /// some plot" for home-structure placement/crafting (#12).
+    pub fn plots_in(&self, r: Rect) -> Vec<(&'static str, PlotCell)> {
+        self.starter_plots()
+            .into_iter()
+            .filter(|(_, c)| r.contains(c.x, c.y) && r.contains(c.x + c.w - 1, c.y + c.h - 1))
             .collect()
     }
 
@@ -591,5 +651,52 @@ mod tests {
         }
         let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
         assert_eq!(c.build_boards_in(civic).len(), c.build_boards.len());
+    }
+
+    #[test]
+    fn recipe_registry_is_well_formed() {
+        let all = recipes();
+        assert!(!all.is_empty());
+        for r in &all {
+            assert!(!r.inputs.is_empty(), "{} has no inputs", r.id);
+            for (input_item, qty) in r.inputs {
+                assert!(item(input_item).is_some(), "{} needs unknown item {}", r.id, input_item);
+                assert!(*qty > 0);
+            }
+            assert!(item(r.output_item).is_some(), "{} produces unknown item {}", r.id, r.output_item);
+            assert!(r.output_qty > 0);
+        }
+        // Ids are unique and the lookup helper agrees with the list.
+        let mut seen = std::collections::HashSet::new();
+        for r in &all {
+            assert!(seen.insert(r.id), "duplicate recipe id {}", r.id);
+            assert_eq!(recipe(r.id).map(|found| found.id), Some(r.id));
+        }
+        assert!(recipe("nonexistent").is_none());
+    }
+
+    #[test]
+    fn structure_footprints_cover_every_placeable_home_structure() {
+        for kind in ["bed", "storage", "crafting"] {
+            let (w, h) = structure_footprint(kind).expect(kind);
+            assert!(w > 0 && h > 0, "{kind} has a degenerate footprint");
+        }
+        assert!(structure_footprint("wall").is_none(), "city structures aren't placeable homes");
+    }
+
+    #[test]
+    fn plots_in_filters_by_region_like_the_other_authored_fixtures() {
+        let c = capital();
+        let suburbs = c.districts.iter().find(|d| d.id == "suburbs").unwrap().region;
+        let in_suburbs = c.plots_in(suburbs);
+        assert_eq!(in_suburbs.len(), 24, "every starter plot sits in the suburbs");
+        // A civic-only region (no plot grid there) has none.
+        let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
+        assert!(c.plots_in(civic).is_empty());
+        // Each returned cell's rect() really is inside the queried region.
+        for (_, cell) in &in_suburbs {
+            let r = cell.rect();
+            assert!(suburbs.contains(r.x0, r.y0) && suburbs.contains(r.x1 - 1, r.y1 - 1));
+        }
     }
 }

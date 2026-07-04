@@ -271,6 +271,32 @@ fn structure_status_json(spec: &mmo::world::SeedBuildOrder) -> Value {
     })
 }
 
+/// A home structure row (`build.placed`'s `structure` field) — plain fields, not
+/// the `status_update` wrapper used for live rendering (#12).
+fn structure_json(s: &mmo::persistence::Structure) -> Value {
+    json!({
+        "id": s.id, "plot_id": s.plot_id, "kind": s.kind,
+        "x": s.x, "y": s.y, "rot": s.rot, "built_by": s.built_by,
+    })
+}
+
+/// A home structure row as a `status_update` entity. Its own `kind` *is* the
+/// entity's `state.type` (`bed`/`storage`/`crafting`) — deliberately distinct
+/// from city structures, which all share `state.type == "structure"` — so a
+/// player-placed home never collides with the "authored, never cached" bucket
+/// city structures use, and a home storage chest transparently reuses the
+/// existing `storage`-kind proximity/rendering plumbing (#12).
+fn home_structure_status_json(s: &mmo::persistence::Structure) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": s.id,
+        "state": {
+            "x": s.x, "y": s.y, "type": s.kind, "rot": s.rot,
+            "built_by": s.built_by, "facing": [0, 0],
+        },
+    })
+}
+
 impl Proxy {
     fn new(
         host: &str,
@@ -712,6 +738,32 @@ impl Proxy {
                     // A zone reports an entity left its region; route by position.
                     self.handle_migrate_request(&data);
                 }
+                Some("build_place") => {
+                    // Internal: a zone validated the target point is on some plot.
+                    // Ownership, footprint bounds/overlap, and the durable write are
+                    // authoritative here (#12).
+                    if let Some(pid) = target_player.as_deref() {
+                        let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                        let x = data.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        let y = data.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        let rot = data.get("rot").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_build_place(pid, kind, x, y, rot).await;
+                    }
+                }
+                Some("craft_make") => {
+                    // Internal: a zone validated the player is standing on some plot.
+                    // Whether they own a crafting station there is authoritative here.
+                    if let Some(pid) = target_player.as_deref() {
+                        let recipe_id = data.get("recipe_id").and_then(|v| v.as_str()).unwrap_or("");
+                        self.apply_craft_make(pid, recipe_id).await;
+                    }
+                }
+                Some("player_died") => {
+                    // A zone reports a death; the gateway alone decides where the
+                    // player reappears (their bed, if set, else the default spawn) and
+                    // hands off to whichever zone owns that point (#12).
+                    self.handle_player_died(&data).await;
+                }
                 Some("zone_stats") => {
                     // A zone reports its current population for the admin count.
                     let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -735,7 +787,7 @@ impl Proxy {
 
     /// A player left its zone's region at world (x, y). Find the zone that owns
     /// that point and hand the player to it, preserving exact world position so
-    /// the crossing is seamless. Re-point the player's client session too.
+    /// the crossing is seamless.
     fn handle_migrate_request(&self, data: &Value) {
         let pid = match data.get("player_id").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -752,18 +804,52 @@ impl Proxy {
                 return;
             }
         };
+        self.relocate_player(&pid, x, y, hp, &target);
+    }
 
-        let target_tx = self.zones.lock().unwrap().get(&target).map(|z| z.tx.clone());
+    /// A player died; the gateway alone decides where they reappear (their bed,
+    /// if `home.set_respawn` was ever called, else the default town-centre
+    /// spawn), then hands off to whichever zone owns that point — the same
+    /// primitive `handle_migrate_request` uses, since the bed may be owned by a
+    /// zone other than the one where the death happened (#12).
+    async fn handle_player_died(&self, data: &Value) {
+        let Some(pid) = data.get("player_id").and_then(|v| v.as_str()) else { return };
+        let hp = data.get("hp").and_then(|v| v.as_i64()).unwrap_or(SPAWN_HP as i64) as i32;
+
+        let (x, y) = match &self.db {
+            Some(db) => match db.respawn_point_for_character(pid).await {
+                Ok(Some((rx, ry))) => (rx as i32, ry as i32),
+                _ => (SPAWN_X, SPAWN_Y),
+            },
+            None => (SPAWN_X, SPAWN_Y),
+        };
+        let target = match self.zone_at(x, y).or_else(|| self.pick_default_zone()) {
+            Some(t) => t,
+            None => {
+                println!("[Proxy] player_died: no zone available to respawn {pid}");
+                return;
+            }
+        };
+        self.relocate_player(pid, x, y, hp, &target);
+    }
+
+    /// Place `pid` at world (x, y) in `target` zone: send it the entity, cache the
+    /// authoritative position, and follow the player's client session (re-pointing
+    /// `current_zone` and notifying it of the crossing). Shared by
+    /// `handle_migrate_request` (a live region-boundary crossing) and
+    /// `handle_player_died` (a respawn, which may also cross zones).
+    fn relocate_player(&self, pid: &str, x: i32, y: i32, hp: i32, target: &str) {
+        let target_tx = self.zones.lock().unwrap().get(target).map(|z| z.tx.clone());
         let Some(tx) = target_tx else { return };
         let _ = tx.send(Message::Text(
             json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp}).to_string(),
         ));
-        self.entity_state.lock().unwrap().insert(pid.clone(), (x, y, hp));
+        self.entity_state.lock().unwrap().insert(pid.to_string(), (x, y, hp));
 
         // Follow the player's client session (every entity is a client).
         let mut clients = self.clients.lock().unwrap();
-        if let Some(info) = clients.get_mut(&pid) {
-            info.current_zone = target.clone();
+        if let Some(info) = clients.get_mut(pid) {
+            info.current_zone = target.to_string();
             let _ = info.tx.try_send(Message::Text(
                 json!({"type": "zone_migration", "zone": target}).to_string(),
             ));
@@ -2004,6 +2090,119 @@ impl Proxy {
         }));
     }
 
+    // --- Home structures: bed, storage, crafting station (#12) --------------
+
+    /// Push every structure placed anywhere in the Suburbs (every character's
+    /// home, not just `pid`'s own) as `status_update`s, so a just-joined player
+    /// sees everyone's already-built homes. Called once on login.
+    async fn send_home_structures(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(district) = self.capital.districts.iter().find(|d| d.plot_grid.is_some()) else {
+            return;
+        };
+        if let Ok(structures) = db.structures_in_district(district.id).await {
+            for s in &structures {
+                self.push_to_player(pid, home_structure_status_json(s));
+            }
+        }
+    }
+
+    /// Apply a `build_place` reported by a zone (which validated only that the
+    /// *target* point sits on some plot — geometry, not ownership). Resolve the
+    /// caller's own plot and validate kind/bounds/overlap here, where ownership
+    /// and durable state actually live. Silent no-op on any failure — no error
+    /// protocol surface, matching `store_op`/`build_contribute`'s convention.
+    async fn apply_build_place(&self, pid: &str, kind: &str, x: i32, y: i32, rot: i64) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some((w, h)) = mmo::world::structure_footprint(kind) else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let Some(district) = self.capital.districts.iter().find(|d| d.id == plot.district) else {
+            return;
+        };
+        let Some(cell) = district
+            .plots()
+            .into_iter()
+            .find(|c| c.grid_x as i64 == plot.grid_x && c.grid_y as i64 == plot.grid_y)
+        else {
+            return;
+        };
+        let bounds = cell.rect();
+        if x < bounds.x0 || y < bounds.y0 || x + w > bounds.x1 || y + h > bounds.y1 {
+            return; // footprint would escape the owner's own plot
+        }
+        let Ok(existing) = db.structures_for_plot(&plot.id).await else { return };
+        for s in &existing {
+            let Some((ew, eh)) = mmo::world::structure_footprint(&s.kind) else { continue };
+            let overlap_x = (x as i64) < s.x + ew as i64 && s.x < (x + w) as i64;
+            let overlap_y = (y as i64) < s.y + eh as i64 && s.y < (y + h) as i64;
+            if overlap_x && overlap_y {
+                return; // would overlap something already on the plot
+            }
+        }
+        let Ok(structure) = db
+            .place_structure(&plot.id, kind, x as i64, y as i64, rot, 100, Some(pid), "{}")
+            .await
+        else {
+            return;
+        };
+        self.push_to_player(pid, json!({"type": "build.placed", "structure": structure_json(&structure)}));
+        self.broadcast_to_district(&plot.district, home_structure_status_json(&structure));
+    }
+
+    /// Apply a `craft_make` reported by a zone (which validated only that the
+    /// player is standing on some plot). Confirm they own a `crafting`-kind
+    /// structure somewhere on their own plot, then attempt the craft. Silent
+    /// no-op on failure (no station, unknown recipe, insufficient ingredients).
+    async fn apply_craft_make(&self, pid: &str, recipe_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(recipe) = mmo::world::recipe(recipe_id) else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let Ok(structures) = db.structures_for_plot(&plot.id).await else { return };
+        if !structures.iter().any(|s| s.kind == "crafting") {
+            return;
+        }
+        let Ok(true) = db.craft(pid, recipe.inputs, recipe.output_item, recipe.output_qty).await else {
+            return;
+        };
+        self.send_inventory(pid).await;
+        self.push_to_player(pid, json!({
+            "type": "craft.made", "recipe_id": recipe.id,
+            "item_id": recipe.output_item, "qty": recipe.output_qty,
+        }));
+    }
+
+    /// Answer `craft.list` with the static recipe registry. Stateless — no DB or
+    /// position involved, so this never needs to touch the zone.
+    fn send_recipes(&self, pid: &str) {
+        let recipes: Vec<Value> = mmo::world::recipes()
+            .iter()
+            .map(|r| json!({
+                "id": r.id, "name": r.name,
+                "inputs": r.inputs.iter().map(|(item, qty)| json!({"item_id": item, "qty": qty})).collect::<Vec<_>>(),
+                "output_item": r.output_item, "output_qty": r.output_qty,
+            }))
+            .collect();
+        self.push_to_player(pid, json!({"type": "craft.recipes", "recipes": recipes}));
+    }
+
+    /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
+    /// caller's own plot. Silent no-op otherwise (no error protocol surface).
+    async fn apply_set_respawn(&self, pid: &str, bed_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if bed_id.is_empty() {
+            return;
+        }
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let Ok(structures) = db.structures_for_plot(&plot.id).await else { return };
+        let is_own_bed = structures.iter().any(|s| s.id == bed_id && s.kind == "bed");
+        if !is_own_bed {
+            return;
+        }
+        if db.set_respawn_structure(pid, Some(bed_id)).await.is_ok() {
+            self.push_to_player(pid, json!({"type": "home.respawn_set", "bed_id": bed_id}));
+        }
+    }
+
     /// Persist a gather yield reported by a zone (`gather_yield`) and push the
     /// authoritative inventory + skill back to the client. The zone is authoritative
     /// for the *simulation* (range, depletion); the gateway owns the *durable* write,
@@ -2159,8 +2358,9 @@ impl Proxy {
         }
 
         // Hydrate the client's gameplay state: inventory, storage, skills, the
-        // district's build-order board, any already-completed city structures, and
-        // the character's starter plot (allocating one on a brand-new character).
+        // district's build-order board, any already-completed city structures, the
+        // character's starter plot (allocating one on a brand-new character), and
+        // every home structure in the district (everyone's homes, not just theirs).
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
@@ -2168,6 +2368,7 @@ impl Proxy {
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
             self.send_plot(&player_id).await;
+            self.send_home_structures(&player_id).await;
         }
 
         // Liveness: ping on an interval; if a full interval passes with no frame
@@ -2205,6 +2406,19 @@ impl Proxy {
                     // answer it directly rather than routing to the zone.
                     if data.get("type").and_then(|v| v.as_str()) == Some("plot.info") {
                         self.send_plot(&player_id).await;
+                        continue;
+                    }
+                    // `craft.list` is a stateless read of the static recipe registry —
+                    // no player position/proximity is relevant, so answer directly.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("craft.list") {
+                        self.send_recipes(&player_id);
+                        continue;
+                    }
+                    // `home.set_respawn` only needs DB ownership checking (is this bed
+                    // mine?), not live position, so it's answered directly too.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("home.set_respawn") {
+                        let bed_id = data.get("bed_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_set_respawn(&player_id, &bed_id).await;
                         continue;
                     }
                     // Route to the player's zone (or buffer if mid-migration). A
@@ -3825,5 +4039,197 @@ mod tests {
         );
 
         drop(ws2);
+    }
+
+    /// Register a character and return `(player_id, plot bounds)`, having already
+    /// drained the initial `spawn_entity` the registration itself sends to the
+    /// fake zone — so a test's own `zone.from_proxy.recv()` sees only messages
+    /// caused by what it does next.
+    async fn registered_with_plot(
+        proxy: &Arc<Proxy>,
+        zone: &mut FakeZone,
+        ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        name: &str,
+    ) -> (String, Value) {
+        let email = format!("{name}_{}@t.test", Uuid::new_v4().simple());
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": name}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let bounds = recv_until(ws, "plot.assigned").await["bounds"].clone();
+        let _ = proxy; // kept for symmetry with other test helpers that take it
+        while zone.from_proxy.try_recv().is_ok() {}
+        (pid, bounds)
+    }
+
+    /// #12 acceptance: a player can place a bed, storage chest, and crafting
+    /// station on their own plot; multiple structures of a kind are fine as long
+    /// as they don't overlap, but placement outside the plot's bounds, or onto
+    /// something already there, is a silent no-op.
+    #[tokio::test]
+    async fn build_place_validates_bounds_and_overlap_but_allows_multiple_per_kind() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Builder").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        // A bed well inside the plot succeeds.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "bed", "x": bx + 5, "y": by + 5, "rot": 0,
+        }).to_string())).unwrap();
+        let placed = recv_until(&mut ws, "build.placed").await;
+        assert_eq!(placed["structure"]["kind"], "bed");
+        assert_eq!(placed["structure"]["x"], bx as i64 + 5);
+
+        // A second, non-overlapping bed elsewhere on the same plot also succeeds
+        // (multiple per kind are allowed — only overlap is rejected).
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "bed", "x": bx + 40, "y": by + 40, "rot": 0,
+        }).to_string())).unwrap();
+        let placed2 = recv_until(&mut ws, "build.placed").await;
+        assert_ne!(placed2["structure"]["id"], placed["structure"]["id"]);
+
+        // Overlapping the first bed's footprint is a silent no-op.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "storage", "x": bx + 10, "y": by + 10, "rot": 0,
+        }).to_string())).unwrap();
+        assert!(recv_frame(&mut ws).await.is_none(), "overlapping placement should not succeed");
+
+        // Outside the plot's bounds entirely is also a silent no-op.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "crafting", "x": 0, "y": 0, "rot": 0,
+        }).to_string())).unwrap();
+        assert!(recv_frame(&mut ws).await.is_none(), "placement off the owner's plot should not succeed");
+
+        // Durable: exactly the two beds landed, nothing else.
+        let plot = db.plot_for_character(&pid).await.unwrap().unwrap();
+        let structures = db.structures_for_plot(&plot.id).await.unwrap();
+        assert_eq!(structures.len(), 2);
+        assert!(structures.iter().all(|s| s.kind == "bed"));
+
+        drop(ws);
+    }
+
+    /// #12 acceptance: crafting a basic item requires owning a crafting station
+    /// on your own plot and having the ingredients; either gap is a silent no-op,
+    /// and a successful craft debits inputs and credits the output atomically.
+    #[tokio::test]
+    async fn craft_make_requires_a_station_and_ingredients() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Crafter").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        // Stock plenty of wood, as gathering would. This also emits a gathering
+        // skill.update alongside inv.update (order isn't guaranteed) — drain both
+        // before asserting silence in the next step.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "wood", "qty": 4, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        let (mut saw_inv, mut saw_skill) = (false, false);
+        while !(saw_inv && saw_skill) {
+            match recv_frame(&mut ws).await.expect("expected inv.update/skill.update")["type"].as_str() {
+                Some("inv.update") => saw_inv = true,
+                Some("skill.update") => saw_skill = true,
+                _ => {}
+            }
+        }
+
+        // No crafting station yet: craft.make is a no-op.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "craft_make", "player_id": pid, "recipe_id": "plank",
+        }).to_string())).unwrap();
+        assert!(recv_frame(&mut ws).await.is_none(), "no station should mean no craft");
+
+        // Place the station, then craft succeeds (plank needs 2 wood).
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "crafting", "x": bx + 5, "y": by + 5, "rot": 0,
+        }).to_string())).unwrap();
+        recv_until(&mut ws, "build.placed").await;
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "craft_make", "player_id": pid, "recipe_id": "plank",
+        }).to_string())).unwrap();
+        // craft.made and inv.update interleave in either order — scan both.
+        let (mut made, mut inv) = (None, None);
+        while made.is_none() || inv.is_none() {
+            let v = recv_frame(&mut ws).await.expect("expected craft.made/inv.update");
+            match v["type"].as_str() {
+                Some("craft.made") => made = Some(v),
+                Some("inv.update") => inv = Some(v),
+                _ => {}
+            }
+        }
+        let made = made.unwrap();
+        assert_eq!(made["item_id"], "plank");
+        assert_eq!(made["qty"], 2);
+        let items = inv.unwrap()["items"].as_array().cloned().unwrap_or_default();
+        assert_eq!(items.iter().find(|it| it["item_id"] == "wood").unwrap()["qty"], 2, "2 wood debited");
+        assert_eq!(items.iter().find(|it| it["item_id"] == "plank").unwrap()["qty"], 2, "2 plank credited");
+
+        // Insufficient ingredients now (only 2 wood left, tool_kit needs wood+stone): no-op.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "craft_make", "player_id": pid, "recipe_id": "tool_kit",
+        }).to_string())).unwrap();
+        assert!(recv_frame(&mut ws).await.is_none(), "missing stone should mean no craft");
+
+        drop(ws);
+    }
+
+    /// #12 acceptance: a player who has set a bed respawns exactly at it (even
+    /// though the death is reported by a zone that doesn't know where beds are);
+    /// without a bed set, death falls back to the default town-centre spawn.
+    #[tokio::test]
+    async fn player_died_respawns_at_the_set_bed_or_falls_back_to_town_centre() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Sleeper").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        // Fall back to the town centre before any bed is set.
+        zone.to_proxy.send(Message::Text(
+            json!({"type": "player_died", "player_id": pid, "hp": 100}).to_string(),
+        )).unwrap();
+        let spawn = recv_value(&mut zone.from_proxy).await;
+        assert_eq!(spawn["type"], "spawn_entity");
+        assert_eq!(spawn["x"], SPAWN_X as i64);
+        assert_eq!(spawn["y"], SPAWN_Y as i64);
+
+        // Place a bed and claim it as the respawn point.
+        let (bed_x, bed_y) = (bx + 6, by + 6);
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "bed", "x": bed_x, "y": bed_y, "rot": 0,
+        }).to_string())).unwrap();
+        let placed = recv_until(&mut ws, "build.placed").await;
+        let bed_id = placed["structure"]["id"].as_str().unwrap().to_string();
+
+        ws.send(Message::Text(json!({"type": "home.set_respawn", "bed_id": bed_id}).to_string()))
+            .await
+            .unwrap();
+        let ack = recv_until(&mut ws, "home.respawn_set").await;
+        assert_eq!(ack["bed_id"], bed_id);
+
+        // Die again: this time respawn lands exactly at the bed.
+        zone.to_proxy.send(Message::Text(
+            json!({"type": "player_died", "player_id": pid, "hp": 100}).to_string(),
+        )).unwrap();
+        let spawn2 = recv_value(&mut zone.from_proxy).await;
+        assert_eq!(spawn2["type"], "spawn_entity");
+        assert_eq!(spawn2["x"], bed_x as i64);
+        assert_eq!(spawn2["y"], bed_y as i64);
+
+        drop(ws);
     }
 }
