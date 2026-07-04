@@ -215,9 +215,11 @@ authored town storehouse — see `store.*` below.
 |---|---|---|---|
 | `plot.assigned` | S→C | `plot_id`, `district`, `bounds` (`{x,y,w,h}`), `tier`, `just_claimed` — pushed on login (allocating a starter plot on a brand-new character) and in reply to `plot.info` | **live** |
 | `plot.info` | C→S | — (re-sends the character's current plot as `plot.assigned`) | **live** |
+| `plot.district` | S→C | `plots: [{plot_id, bounds, owner_id, owner_name, tier}]` — every plot in the requester's *current* district, owned or not (`owner_id`/`owner_name` are `null` for a still-free plot) | **live** (#18) |
+| `plot.district` | C→S | — (re-sends the current district's roster) | **live** (#18) |
 
-Every district that authors a **plot grid** (currently just the Suburbs, 3×8 = 24
-starter plots) is pre-seeded with `unowned` plots on boot. On login the gateway
+Every district that authors a **plot grid** (currently just the Suburbs, 12×20 =
+240 starter plots) is pre-seeded with `unowned` plots on boot. On login the gateway
 **idempotently** allocates a character's first free plot in that district (a
 reconnect just re-sends the same one — `just_claimed` distinguishes the very first
 grant, which drives the client's one-time "here's your plot" moment, from a re-send).
@@ -225,6 +227,14 @@ grant, which drives the client's one-time "here's your plot" moment, from a re-s
 landmark and a compass reading back to it. Guests hold no land. Rent *enforcement*
 (lapse/reclaim, #14) acts on `rent_due_at`/`rent_paid_through` seeded here — see
 `rent.*` below.
+
+`plot.district` (#18) is the district-wide counterpart: rather than just your own
+plot, it lists every plot in whichever district you're currently standing in, so the
+client can render everyone's land (own plot styled distinctly; others show the
+owner's name if taken, or read as free/claimable). Pushed on login, on a
+`district.enter` crossing, and in reply to an explicit request; also **broadcast**
+to everyone already in the district whenever a plot changes hands (a new claim or a
+rent reclaim), so it doesn't go stale until someone's next login/district-crossing.
 
 ### `skill.*` — use-based skills (M2 §4.6)
 

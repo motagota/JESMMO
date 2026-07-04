@@ -302,6 +302,15 @@ fn cost_json(cost: &std::collections::BTreeMap<String, i64>) -> Value {
     Value::Object(cost.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
 }
 
+/// Render one district-roster row (DB ownership + authored world-space bounds)
+/// as the client-facing `plot.district` entry (#18).
+fn plot_roster_entry_json(cell: &mmo::world::PlotCell, p: &mmo::persistence::PlotRosterRow) -> Value {
+    json!({
+        "plot_id": p.id, "owner_id": p.owner_character_id, "owner_name": p.owner_name,
+        "bounds": {"x": cell.x, "y": cell.y, "w": cell.w, "h": cell.h}, "tier": p.tier,
+    })
+}
+
 /// A completed city structure as a render entity (`status_update`, `state.type =
 /// "structure"`). Its id is stable per order kind so re-sends update in place.
 fn structure_status_json(spec: &mmo::world::SeedBuildOrder) -> Value {
@@ -2191,6 +2200,10 @@ impl Proxy {
     /// reconnect or an explicit request both just re-send the same plot.
     /// `just_claimed` tells the client whether this is the very first grant
     /// (drives the one-time "here's your plot" moment) versus a re-send.
+    /// Also broadcasts the refreshed district roster (#18): a claim always
+    /// changes some plot's ownership, so everyone else already standing in
+    /// the district should see it go from free to taken without waiting for
+    /// their own next login/district-crossing.
     async fn send_plot(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let persistent = self
@@ -2227,6 +2240,54 @@ impl Proxy {
             "bounds": {"x": cell.x, "y": cell.y, "w": cell.w, "h": cell.h},
             "tier": plot.tier, "just_claimed": !had_plot,
         }));
+        self.broadcast_plot_roster(district.id).await;
+    }
+
+    /// Push every plot in a player's district (owned or not, with owner names
+    /// resolved) as `plot.district` — lets the client render a roster of
+    /// everyone's land, not just the player's own (#18).
+    async fn send_plot_roster(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let zone_id = match self.clients.lock().unwrap().get(pid).map(|i| i.current_zone.clone()) {
+            Some(z) => z,
+            None => return,
+        };
+        let Some(district_id) = self.district_for_zone(&zone_id) else { return };
+        let Some(district) = self.capital.districts.iter().find(|d| d.id == district_id) else { return };
+        let cells = district.plots();
+        if let Ok(rows) = db.plots_for_district(&district_id).await {
+            let arr: Vec<Value> = rows
+                .iter()
+                .filter_map(|p| {
+                    cells
+                        .iter()
+                        .find(|c| c.grid_x as i64 == p.grid_x && c.grid_y as i64 == p.grid_y)
+                        .map(|cell| plot_roster_entry_json(cell, p))
+                })
+                .collect();
+            self.push_to_player(pid, json!({"type": "plot.district", "plots": arr}));
+        }
+    }
+
+    /// Broadcast the refreshed plot roster to everyone sharing `district` — a
+    /// plot just changed hands via claim or reclaim, so their view shouldn't
+    /// go stale until their next login/district-crossing.
+    async fn broadcast_plot_roster(&self, district_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(district) = self.capital.districts.iter().find(|d| d.id == district_id) else { return };
+        let cells = district.plots();
+        if let Ok(rows) = db.plots_for_district(district_id).await {
+            let arr: Vec<Value> = rows
+                .iter()
+                .filter_map(|p| {
+                    cells
+                        .iter()
+                        .find(|c| c.grid_x as i64 == p.grid_x && c.grid_y as i64 == p.grid_y)
+                        .map(|cell| plot_roster_entry_json(cell, p))
+                })
+                .collect();
+            self.broadcast_to_district(district_id, json!({"type": "plot.district", "plots": arr}));
+        }
     }
 
     // --- Home structures: bed, storage, crafting station (#12) --------------
@@ -2458,6 +2519,7 @@ impl Proxy {
             "type": "rent.reclaimed", "plot_id": plot.id, "moved_to_storage": Vec::<String>::new(),
         }));
         self.record_reclaim();
+        self.broadcast_plot_roster(&plot.district).await;
     }
 
     /// The per-plot rent logic for one ticker pass, at `now`: auto-pay if due
@@ -2741,6 +2803,12 @@ impl Proxy {
                         self.send_plot(&player_id).await;
                         continue;
                     }
+                    // `plot.district` is a pure read of the current district's plot
+                    // roster (#18) — answer it directly, same as `plot.info`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("plot.district") {
+                        self.send_plot_roster(&player_id).await;
+                        continue;
+                    }
                     // `craft.list` is a stateless read of the static recipe registry —
                     // no player position/proximity is relevant, so answer directly.
                     if data.get("type").and_then(|v| v.as_str()) == Some("craft.list") {
@@ -2776,6 +2844,7 @@ impl Proxy {
                     // actually now is, then ack so the client can drop the curtain.
                     if data.get("type").and_then(|v| v.as_str()) == Some("district.enter") {
                         self.send_build_orders(&player_id).await;
+                        self.send_plot_roster(&player_id).await;
                         self.push_to_player(&player_id, json!({"type": "district.ready"}));
                         continue;
                     }
@@ -4810,5 +4879,71 @@ mod tests {
         }
 
         drop(ws);
+    }
+
+    /// #18: `plot.district` reports every plot in the requester's current
+    /// district (owned or not, with the owner's name resolved), and a new
+    /// claim broadcasts a refreshed roster to everyone else already standing
+    /// in that district — not just on their next login/district-crossing.
+    #[tokio::test]
+    async fn plot_district_roster_shows_every_plot_and_broadcasts_on_claim() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // The harness's default zone spans the whole world, whose region
+        // *centre* resolves to Civic (no plot grid there). Add a second zone
+        // that actually covers the Suburbs, so a client tracked there sees
+        // the real roster.
+        let _suburbs_zone = add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
+
+        let email1 = format!("landowner1_{}@t.test", Uuid::new_v4().simple());
+        let mut ws1 = dial(&proxy).await;
+        ws1.send(Message::Text(
+            json!({"type": "register", "email": email1, "password": "pw12", "name": "Homesteader"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome1 = recv_until(&mut ws1, "welcome").await;
+        let pid1 = welcome1["player_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws1, "plot.assigned").await; // their own starter-plot grant
+        // Claiming that plot also broadcasts a `plot.district` (their own
+        // registration counts as "a plot changed hands" too) — drain it
+        // before requesting a fresh one, so later reads can't mistake it for
+        // the second player's later live update.
+        recv_until(&mut ws1, "plot.district").await;
+
+        // Only `current_zone` drives which district's roster resolves for
+        // this client — their character's actual x/y is irrelevant here.
+        proxy.clients.lock().unwrap().get_mut(&pid1).unwrap().current_zone = "z_suburbs".to_string();
+
+        ws1.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
+        let roster1 = recv_until(&mut ws1, "plot.district").await;
+        let plots1 = roster1["plots"].as_array().unwrap();
+        assert!(plots1.len() >= 2, "this player's plot plus at least one still-free one");
+        let mine = plots1.iter().find(|p| p["owner_id"] == pid1).expect("my own claimed plot appears");
+        assert_eq!(mine["owner_name"], "Homesteader");
+        assert!(plots1.iter().any(|p| p["owner_name"].is_null()), "at least one free plot, no owner");
+
+        // A second character logging in claims another suburbs plot — the
+        // first client (still in the suburbs shard) should see it live.
+        let email2 = format!("landowner2_{}@t.test", Uuid::new_v4().simple());
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(
+            json!({"type": "register", "email": email2, "password": "pw12", "name": "Newcomer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws2, "welcome").await;
+
+        let roster2 = recv_until(&mut ws1, "plot.district").await;
+        let plots2 = roster2["plots"].as_array().unwrap();
+        assert!(
+            plots2.iter().any(|p| p["owner_name"] == "Newcomer"),
+            "the first client sees the second player's new plot live, without re-requesting"
+        );
+
+        drop(ws1);
+        drop(ws2);
     }
 }

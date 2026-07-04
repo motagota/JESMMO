@@ -15,6 +15,7 @@ var _entities: EntityManager
 var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
+var _minimap: Minimap
 var _storage: StoragePanel
 var _inventory: InventoryPanel
 var _build: BuildPanel
@@ -48,6 +49,9 @@ func _ready() -> void:
 
     _hud = Hud.new()
     add_child(_hud)
+
+    _minimap = Minimap.new()
+    add_child(_minimap)
 
     _storage = StoragePanel.new()
     _storage.visible = false
@@ -143,6 +147,9 @@ func _wire_signals() -> void:
         _world.apply_partition(msg)
         _player.set_world_size(float(msg.get("world", 6400))))
     _net.status_update.connect(_on_status_update)
+    _net.plot_district.connect(func(plots):
+        _world.apply_plot_roster(plots, _plot_id)
+        _minimap.set_plots(plots, _plot_id))
     _net.despawn.connect(func(id): _entities.remove(id))
     _net.zone_migration.connect(func(zone): _hud.set_zone(zone))
     _net.you_died.connect(func(): _hud.set_conn("you died — respawning…"))
@@ -192,6 +199,7 @@ func _wire_signals() -> void:
     _player.gather_pressed.connect(_on_gather_pressed)
     _player.position_changed.connect(func(wx, wy):
         _hud.set_pos(wx, wy)
+        _minimap.set_player(wx, wy, _player.facing())
         _check_district_crossing(wx, wy))
 
 ## Fan a skill update out to the HUD glance line, the skills panel (progress bars),
@@ -241,6 +249,7 @@ func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _t
     var cx := float(bounds.get("x", 0)) + float(bounds.get("w", 0)) * 0.5
     var cy := float(bounds.get("y", 0)) + float(bounds.get("h", 0)) * 0.5
     _hud.set_home(cx, cy)
+    _minimap.set_home(cx, cy)
     if just_claimed:
         _hud.flash_announce("Your home plot is ready, in the %s!" % district.capitalize())
 
@@ -263,6 +272,7 @@ func _check_district_crossing(wx: float, wy: float) -> void:
         return
     var from_district := _current_district
     _current_district = d
+    _minimap.set_district_bounds(_world.district_rect_at(wx, wy))
     if from_district == "":
         return # first assignment this session — no curtain
     _transition.begin(d)

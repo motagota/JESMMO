@@ -195,3 +195,6 @@ func _input_dir() -> Vector2:
 
 func world_pos() -> Vector2:
 	return _pos
+
+func facing() -> Vector2:
+	return _facing

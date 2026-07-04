@@ -401,6 +401,22 @@ pub struct Plot {
     pub warned: bool,
 }
 
+/// One row of a district's plot roster (#18): just enough to place the plot
+/// and show who (if anyone) owns it — not the full `Plot` (rent/state detail
+/// stays a rent-status/own-plot-only concern, out of scope for a roster
+/// everyone in the district can see).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PlotRosterRow {
+    pub id: String,
+    pub owner_character_id: Option<String>,
+    pub owner_name: Option<String>,
+    pub grid_x: i64,
+    pub grid_y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub tier: i64,
+}
+
 /// A player-built structure, owned via its plot.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct Structure {
@@ -802,6 +818,26 @@ impl Db {
         )
         .bind(character_id)
         .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Every plot in `district`, owned or not, with the owner's display name
+    /// resolved — for showing players a district-wide roster (who owns what,
+    /// what's still free) rather than just their own plot (#18). A `LEFT JOIN`
+    /// (not `JOIN`) so unclaimed plots still appear, with `owner_name: None`.
+    /// Free vs. owned is `owner_character_id IS NULL` vs. not — the same rule
+    /// `claim_plot`'s free-plot query already uses; a reclaimed plot's `state`
+    /// is `"reclaimed"` (not `"unowned"`) but is equally claimable, so `state`
+    /// isn't part of the distinction.
+    pub async fn plots_for_district(&self, district: &str) -> Result<Vec<PlotRosterRow>, DbError> {
+        sqlx::query_as::<_, PlotRosterRow>(
+            "SELECT plot.id, plot.owner_character_id, character.name AS owner_name, \
+             plot.grid_x, plot.grid_y, plot.w, plot.h, plot.tier \
+             FROM plot LEFT JOIN character ON character.id = plot.owner_character_id \
+             WHERE plot.district = ?",
+        )
+        .bind(district)
+        .fetch_all(&self.pool)
         .await
     }
 
@@ -1986,6 +2022,33 @@ mod tests {
         assert!(suburbs.iter().any(|s| s.plot_id == plot_a.id));
         assert!(suburbs.iter().any(|s| s.plot_id == plot_b.id));
         assert!(!suburbs.iter().any(|s| s.plot_id == other_district.id));
+    }
+
+    #[tokio::test]
+    async fn plots_for_district_shows_every_plot_with_owner_name_or_none() {
+        let (db, _t) = TempDb::open().await;
+        let (_a, alice) = db
+            .create_account_with_character(&format!("alice_{}@t.test", Uuid::new_v4().simple()), "h", "Alice", 0, 0, 100)
+            .await
+            .unwrap();
+        // Two suburbs plots (claim_plot picks the lowest grid coord first, so
+        // this one goes to Alice) and one in a different district as a control.
+        let plot_a = db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let plot_b = db.insert_unowned_plot("suburbs", 1, 0, 8, 8, 0).await.unwrap();
+        let other_district = db.insert_unowned_plot("market", 0, 0, 8, 8, 0).await.unwrap();
+        db.claim_plot(&alice.id, "suburbs", 1000, 500).await.unwrap();
+
+        let roster = db.plots_for_district("suburbs").await.unwrap();
+        assert_eq!(roster.len(), 2, "every suburbs plot, claimed or not");
+        assert!(!roster.iter().any(|p| p.id == other_district.id), "other districts excluded");
+
+        let mine = roster.iter().find(|p| p.id == plot_a.id).expect("the claimed plot appears");
+        assert_eq!(mine.owner_character_id.as_deref(), Some(alice.id.as_str()));
+        assert_eq!(mine.owner_name.as_deref(), Some("Alice"), "owner name resolved via the join");
+
+        let free = roster.iter().find(|p| p.id == plot_b.id).expect("the still-free plot appears");
+        assert_eq!(free.owner_character_id, None);
+        assert_eq!(free.owner_name, None, "unclaimed plots have no owner name");
     }
 
     #[tokio::test]
