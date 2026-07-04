@@ -21,5 +21,19 @@ func _drive(mm) -> void:
 		{"plot_id": "p1", "bounds": {"x": 5000, "y": 100, "w": 80, "h": 80}, "owner_name": "Alice", "tier": 0},
 		{"plot_id": "p2", "bounds": {"x": 5100, "y": 200, "w": 80, "h": 80}, "owner_name": null, "tier": 0},
 	], "p1")
-	print("SMOKE_OK minimap instantiated and driven without error")
+
+	# The actual regression this test exists for: the widget's final on-screen
+	# rect must fall entirely inside the viewport, not off the edge.
+	var view = mm._view
+	var vp := root.get_visible_rect()
+	print("SMOKE: viewport=", vp, " minimap rect=", view.get_rect())
+	var rect: Rect2 = view.get_rect()
+	if rect.position.x < 0 or rect.position.y < 0 \
+			or rect.position.x + rect.size.x > vp.size.x \
+			or rect.position.y + rect.size.y > vp.size.y:
+		push_error("SMOKE_FAIL: minimap rect %s falls outside viewport %s" % [rect, vp])
+		quit(1)
+		return
+
+	print("SMOKE_OK minimap instantiated, driven, and on-screen")
 	quit(0)

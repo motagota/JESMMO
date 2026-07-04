@@ -30,9 +30,14 @@ var _view: _View
 func _ready() -> void:
 	layer = 5 # same priority as Hud — an ambient readout, not a modal panel
 	_view = _View.new()
-	_view.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT, Control.PRESET_MODE_KEEP_SIZE, int(_MARGIN))
+	# Size must be set *before* the anchor preset: PRESET_MODE_KEEP_SIZE bakes
+	# in whatever `size` already is when the preset is applied, and a brand
+	# new Control's size is (0,0) — setting `size` afterward just grows the
+	# box past the screen edge instead of moving it, which is exactly what
+	# put the widget off-screen.
 	_view.custom_minimum_size = Vector2(_SIZE, _SIZE)
 	_view.size = Vector2(_SIZE, _SIZE)
+	_view.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT, Control.PRESET_MODE_KEEP_SIZE, int(_MARGIN))
 	_view.clip_contents = true # so anything projected outside the widget is cropped for free
 	_view.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_view)
