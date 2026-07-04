@@ -2248,11 +2248,17 @@ impl Proxy {
     /// everyone's land, not just the player's own (#18).
     async fn send_plot_roster(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        let zone_id = match self.clients.lock().unwrap().get(pid).map(|i| i.current_zone.clone()) {
-            Some(z) => z,
-            None => return,
-        };
-        let Some(district_id) = self.district_for_zone(&zone_id) else { return };
+        // Resolved by the player's actual cached position, not their zone's
+        // region *centre* (`district_for_zone`) — the latter only tells
+        // apart districts when each is backed by its own zone shard (the
+        // real auto-scaled deployment model). A single zone spanning every
+        // district (the common small/dev deployment) has one fixed centre,
+        // so `district_for_zone` would report the same district regardless
+        // of where the player actually walks — invisible for `build.list`
+        // (every Phase 1 build order is in Civic anyway) but very visible
+        // here, since plots exist only in the Suburbs.
+        let Some((x, y)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
+        let Some(district_id) = self.capital.district_at(x, y).map(|d| d.id) else { return };
         let Some(district) = self.capital.districts.iter().find(|d| d.id == district_id) else { return };
         let cells = district.plots();
         if let Ok(rows) = db.plots_for_district(&district_id).await {
@@ -4913,9 +4919,15 @@ mod tests {
         // the second player's later live update.
         recv_until(&mut ws1, "plot.district").await;
 
-        // Only `current_zone` drives which district's roster resolves for
-        // this client — their character's actual x/y is irrelevant here.
+        // `current_zone` drives broadcast *reachability* (is this client in a
+        // zone touching the district), but `plot.district`'s own content is
+        // resolved from the player's actual cached position — move both into
+        // the Suburbs so the roster request below reflects it.
         proxy.clients.lock().unwrap().get_mut(&pid1).unwrap().current_zone = "z_suburbs".to_string();
+        proxy.entity_state.lock().unwrap().insert(
+            pid1.clone(),
+            EntityCache { x: 5000, y: 3000, hp: 100, gather: None },
+        );
 
         ws1.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
         let roster1 = recv_until(&mut ws1, "plot.district").await;
@@ -4945,5 +4957,56 @@ mod tests {
 
         drop(ws1);
         drop(ws2);
+    }
+
+    /// #35 regression: in a *single* zone spanning the whole world (the
+    /// common small/dev deployment — no auto-scaling split has happened),
+    /// `district_for_zone`'s region-*centre* resolution always reports Civic,
+    /// no matter where the player actually is (there's only one zone, so
+    /// `current_zone` never changes as they walk around). Left as the roster
+    /// resolution strategy, this silently overwrites the correct Suburbs
+    /// roster a player already has (from `send_plot`'s claim broadcast) with
+    /// an empty one the moment anything re-requests it (`district.enter`, an
+    /// explicit refresh) — the exact "I can't see my own plot" bug. The fix:
+    /// resolve from the player's actual cached position instead.
+    #[tokio::test]
+    async fn plot_district_resolves_by_actual_position_not_zone_centre() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let email = format!("wanderer_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Wanderer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "plot.assigned").await;
+        recv_until(&mut ws, "plot.district").await; // their own claim's broadcast
+
+        // Still tracked by the one default zone (whole-world region, centre
+        // in Civic) — only their cached position says otherwise.
+        assert_eq!(
+            proxy.clients.lock().unwrap().get(&pid).unwrap().current_zone,
+            "zone_a"
+        );
+        proxy.entity_state.lock().unwrap().insert(
+            pid.clone(),
+            EntityCache { x: 5200, y: 3000, hp: 100, gather: None },
+        );
+
+        ws.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
+        let roster = recv_until(&mut ws, "plot.district").await;
+        let plots = roster["plots"].as_array().unwrap();
+        assert!(
+            plots.iter().any(|p| p["owner_id"] == pid),
+            "the Suburbs roster (240 plots incl. their own), not Civic's empty one, \
+             even though the zone's region-centre resolves to Civic"
+        );
+
+        drop(ws);
     }
 }
