@@ -600,6 +600,7 @@ impl Proxy {
 
         println!("[Proxy] Registered zone {zone_id} at {uri} (v{version})");
         self.broadcast_partition();
+        self.sync_home_structures_to_zone(&zone_id, region).await;
     }
 
     /// Read messages coming back from a zone and route them to clients.
@@ -1328,7 +1329,7 @@ impl Proxy {
                             if keep == &a.0 { b.2 } else { a.2 },
                             if keep == &a.0 { a.2 } else { b.2 }
                         );
-                        self.merge_zones(keep, drop);
+                        self.merge_zones(keep, drop).await;
                         break 'find;
                     }
                 }
@@ -1427,9 +1428,11 @@ impl Proxy {
             );
             self.zone_order.lock().unwrap().push(new_id.clone());
         }
+        self.sync_home_structures_to_zone(&new_id, give).await;
 
         // Shrink the original zone to the `keep` half.
         self.set_zone_region(zone_id, keep);
+        self.sync_home_structures_to_zone(zone_id, keep).await;
 
         // Migrate the players who now fall in the `give` half, at their exact
         // world position (seamless — no teleport).
@@ -1472,7 +1475,7 @@ impl Proxy {
 
     /// Merge two adjacent zones: `keep` absorbs `drop`'s region and players, and
     /// `drop` is retired. The inverse of a split; reclaims an under-used server.
-    fn merge_zones(&self, keep_id: &str, drop_id: &str) {
+    async fn merge_zones(&self, keep_id: &str, drop_id: &str) {
         let (keep_tx, keep_region, drop_tx, drop_region) = {
             let zones = self.zones.lock().unwrap();
             match (zones.get(keep_id), zones.get(drop_id)) {
@@ -1514,6 +1517,7 @@ impl Proxy {
             })
             .to_string(),
         ));
+        self.sync_home_structures_to_zone(keep_id, union).await;
 
         // Move the retiring zone's players into the survivor at their positions.
         for (pid, x, y, hp) in &movers {
@@ -1856,28 +1860,36 @@ impl Proxy {
     /// notices go to exactly the players who share that district's board.
     fn broadcast_to_district(&self, district: &str, msg: Value) {
         let text = msg.to_string();
-        // Resolve the district's zones once (avoids re-locking `zones` per client).
-        let zone_ids: Vec<String> = {
-            let zones = self.zones.lock().unwrap();
-            zones
-                .iter()
-                .filter(|(_, z)| {
-                    self.capital
-                        .district_for_region(mmo::world::Rect::new(
-                            z.region.x0, z.region.y0, z.region.x1, z.region.y1,
-                        ))
-                        .map(|d| d.id)
-                        == Some(district)
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
+        let zone_ids = self.zones_in_district(district);
         let clients = self.clients.lock().unwrap();
         for info in clients.values() {
             if zone_ids.contains(&info.current_zone) {
                 self.push_to_client(info, Message::Text(text.clone()));
             }
         }
+    }
+
+    /// The ids of every zone whose region **overlaps** `district` at all — the set
+    /// a district-scoped push (build-order board, home structures) needs to reach.
+    /// Deliberately overlap, not "this zone's primary district" (which is by
+    /// region *centre* — see `district_for_zone`): a single zone can span every
+    /// district at once (e.g. the default whole-world zone before any auto-scaling
+    /// split), and it must still receive pushes for districts other than whichever
+    /// one its centre happens to fall in.
+    fn zones_in_district(&self, district: &str) -> Vec<String> {
+        let Some(target) = self.capital.districts.iter().find(|d| d.id == district) else {
+            return Vec::new();
+        };
+        let zones = self.zones.lock().unwrap();
+        zones
+            .iter()
+            .filter(|(_, z)| {
+                target.region.overlaps(mmo::world::Rect::new(
+                    z.region.x0, z.region.y0, z.region.x1, z.region.y1,
+                ))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Push the open + completed build orders for a player's district as `build.list`.
@@ -2147,6 +2159,50 @@ impl Proxy {
         };
         self.push_to_player(pid, json!({"type": "build.placed", "structure": structure_json(&structure)}));
         self.broadcast_to_district(&plot.district, home_structure_status_json(&structure));
+        self.push_home_structure_to_zones(&plot.district, &structure);
+    }
+
+    /// Tell every zone sharding `district` about one newly-placed structure, so
+    /// they can gate deposit/withdraw/craft on proximity to it without ever
+    /// touching the DB themselves (#13). The zone has no DB access; this (plus
+    /// `sync_home_structures_to_zone` on registration/split) is how it learns
+    /// where structures are.
+    fn push_home_structure_to_zones(&self, district: &str, s: &mmo::persistence::Structure) {
+        let msg = json!({
+            "type": "home_structure_added", "id": s.id, "kind": s.kind, "x": s.x, "y": s.y,
+        })
+        .to_string();
+        let zone_ids = self.zones_in_district(district);
+        let zones = self.zones.lock().unwrap();
+        for id in &zone_ids {
+            if let Some(z) = zones.get(id) {
+                let _ = z.tx.send(Message::Text(msg.clone()));
+            }
+        }
+    }
+
+    /// Push the full set of home structures inside `region` to the zone that owns
+    /// it — called whenever a zone registers or its region changes (split/merge),
+    /// mirroring how `storage_points`/`build_boards` are (re)derived on those
+    /// events, except this data lives in the DB (not static world authoring), so
+    /// the gateway must push it rather than the zone deriving it itself (#13).
+    async fn sync_home_structures_to_zone(&self, zone_id: &str, region: Region) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(district) = self.capital.districts.iter().find(|d| d.plot_grid.is_some()) else {
+            return;
+        };
+        let Ok(structures) = db.structures_in_district(district.id).await else { return };
+        let in_region: Vec<Value> = structures
+            .iter()
+            .filter(|s| region.contains(s.x as i32, s.y as i32))
+            .map(|s| json!({"id": s.id, "kind": s.kind, "x": s.x, "y": s.y}))
+            .collect();
+        let tx = self.zones.lock().unwrap().get(zone_id).map(|z| z.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(Message::Text(
+                json!({"type": "home_structures_sync", "structures": in_region}).to_string(),
+            ));
+        }
     }
 
     /// Apply a `craft_make` reported by a zone (which validated only that the
@@ -2169,6 +2225,9 @@ impl Proxy {
             "type": "craft.made", "recipe_id": recipe.id,
             "item_id": recipe.output_item, "qty": recipe.output_qty,
         }));
+        if let Ok(gain) = db.grant_skill_xp(pid, "crafting", mmo::persistence::CRAFT_XP_PER_CRAFT).await {
+            self.push_skill_gain(pid, &gain);
+        }
     }
 
     /// Answer `craft.list` with the static recipe registry. Stateless — no DB or
@@ -3295,7 +3354,7 @@ mod tests {
         // p1 is at a world position inside `drop`.
         p.entity_state.lock().unwrap().insert("p1".into(), (650, 300, 100));
 
-        p.merge_zones("keep", "drop");
+        p.merge_zones("keep", "drop").await;
 
         // The survivor is told its new region (the union of both halves)...
         let set = next_zone_text(&mut keep_rx).await;
@@ -4064,6 +4123,35 @@ mod tests {
         (pid, bounds)
     }
 
+    /// Send a `build_place` and wait for it to land, draining the two frames a
+    /// *successful* placement always produces on the client socket — `build.placed`
+    /// and the district-wide `status_update` broadcast (#12/#13; order isn't
+    /// guaranteed) — so a caller's next `recv_frame` isn't tripped up by a leftover.
+    /// Also drains the matching `home_structure_added` pushed to the zone.
+    async fn place_home_structure(
+        zone: &mut FakeZone,
+        ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        pid: &str,
+        kind: &str,
+        x: i32,
+        y: i32,
+    ) -> Value {
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": kind, "x": x, "y": y, "rot": 0,
+        }).to_string())).unwrap();
+        let (mut placed, mut saw_status) = (None, false);
+        while placed.is_none() || !saw_status {
+            let v = recv_frame(ws).await.expect("expected build.placed/status_update");
+            match v["type"].as_str() {
+                Some("build.placed") => placed = Some(v),
+                Some("status_update") => saw_status = true,
+                _ => {}
+            }
+        }
+        recv_value(&mut zone.from_proxy).await; // home_structure_added
+        placed.unwrap()
+    }
+
     /// #12 acceptance: a player can place a bed, storage chest, and crafting
     /// station on their own plot; multiple structures of a kind are fine as long
     /// as they don't overlap, but placement outside the plot's bounds, or onto
@@ -4079,19 +4167,13 @@ mod tests {
         let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
 
         // A bed well inside the plot succeeds.
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "build_place", "player_id": pid, "kind": "bed", "x": bx + 5, "y": by + 5, "rot": 0,
-        }).to_string())).unwrap();
-        let placed = recv_until(&mut ws, "build.placed").await;
+        let placed = place_home_structure(&mut zone, &mut ws, &pid, "bed", bx + 5, by + 5).await;
         assert_eq!(placed["structure"]["kind"], "bed");
         assert_eq!(placed["structure"]["x"], bx as i64 + 5);
 
         // A second, non-overlapping bed elsewhere on the same plot also succeeds
         // (multiple per kind are allowed — only overlap is rejected).
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "build_place", "player_id": pid, "kind": "bed", "x": bx + 40, "y": by + 40, "rot": 0,
-        }).to_string())).unwrap();
-        let placed2 = recv_until(&mut ws, "build.placed").await;
+        let placed2 = place_home_structure(&mut zone, &mut ws, &pid, "bed", bx + 40, by + 40).await;
         assert_ne!(placed2["structure"]["id"], placed["structure"]["id"]);
 
         // Overlapping the first bed's footprint is a silent no-op.
@@ -4115,9 +4197,40 @@ mod tests {
         drop(ws);
     }
 
-    /// #12 acceptance: crafting a basic item requires owning a crafting station
-    /// on your own plot and having the ingredients; either gap is a silent no-op,
-    /// and a successful craft debits inputs and credits the output atomically.
+    /// #13: the zone has no DB access, so the gateway pushes it the position of
+    /// every newly-placed structure (`home_structure_added`) — the mechanism that
+    /// lets the zone gate deposit/withdraw/craft on proximity to the *specific*
+    /// structure rather than just "on some plot".
+    #[tokio::test]
+    async fn build_place_pushes_the_new_structure_to_the_owning_zone() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Pusher").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_place", "player_id": pid, "kind": "crafting", "x": bx + 5, "y": by + 5, "rot": 0,
+        }).to_string())).unwrap();
+        let placed = recv_until(&mut ws, "build.placed").await;
+        let structure_id = placed["structure"]["id"].as_str().unwrap().to_string();
+
+        let pushed = recv_value(&mut zone.from_proxy).await;
+        assert_eq!(pushed["type"], "home_structure_added");
+        assert_eq!(pushed["id"], structure_id);
+        assert_eq!(pushed["kind"], "crafting");
+        assert_eq!(pushed["x"], bx as i64 + 5);
+        assert_eq!(pushed["y"], by as i64 + 5);
+
+        drop(ws);
+    }
+
+    /// #12/#13 acceptance: crafting a basic item requires owning a crafting
+    /// station on your own plot and having the ingredients; either gap is a
+    /// silent no-op, and a successful craft debits inputs, credits the output
+    /// atomically, and grants crafting XP.
     #[tokio::test]
     async fn craft_make_requires_a_station_and_ingredients() {
         let (proxy, dbf, mut zone) = proxy_with_db().await;
@@ -4151,21 +4264,20 @@ mod tests {
         assert!(recv_frame(&mut ws).await.is_none(), "no station should mean no craft");
 
         // Place the station, then craft succeeds (plank needs 2 wood).
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "build_place", "player_id": pid, "kind": "crafting", "x": bx + 5, "y": by + 5, "rot": 0,
-        }).to_string())).unwrap();
-        recv_until(&mut ws, "build.placed").await;
+        place_home_structure(&mut zone, &mut ws, &pid, "crafting", bx + 5, by + 5).await;
 
         zone.to_proxy.send(Message::Text(json!({
             "type": "craft_make", "player_id": pid, "recipe_id": "plank",
         }).to_string())).unwrap();
-        // craft.made and inv.update interleave in either order — scan both.
-        let (mut made, mut inv) = (None, None);
-        while made.is_none() || inv.is_none() {
-            let v = recv_frame(&mut ws).await.expect("expected craft.made/inv.update");
+        // craft.made, inv.update, and the crafting skill.update interleave in any
+        // order — scan all three before asserting silence in the next step.
+        let (mut made, mut inv, mut skill) = (None, None, None);
+        while made.is_none() || inv.is_none() || skill.is_none() {
+            let v = recv_frame(&mut ws).await.expect("expected craft.made/inv.update/skill.update");
             match v["type"].as_str() {
                 Some("craft.made") => made = Some(v),
                 Some("inv.update") => inv = Some(v),
+                Some("skill.update") if v["skill_id"] == "crafting" => skill = Some(v),
                 _ => {}
             }
         }
@@ -4175,6 +4287,10 @@ mod tests {
         let items = inv.unwrap()["items"].as_array().cloned().unwrap_or_default();
         assert_eq!(items.iter().find(|it| it["item_id"] == "wood").unwrap()["qty"], 2, "2 wood debited");
         assert_eq!(items.iter().find(|it| it["item_id"] == "plank").unwrap()["qty"], 2, "2 plank credited");
+        assert_eq!(
+            skill.unwrap()["xp"], mmo::persistence::CRAFT_XP_PER_CRAFT,
+            "a successful craft grants crafting XP"
+        );
 
         // Insufficient ingredients now (only 2 wood left, tool_kit needs wood+stone): no-op.
         zone.to_proxy.send(Message::Text(json!({
@@ -4209,10 +4325,7 @@ mod tests {
 
         // Place a bed and claim it as the respawn point.
         let (bed_x, bed_y) = (bx + 6, by + 6);
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "build_place", "player_id": pid, "kind": "bed", "x": bed_x, "y": bed_y, "rot": 0,
-        }).to_string())).unwrap();
-        let placed = recv_until(&mut ws, "build.placed").await;
+        let placed = place_home_structure(&mut zone, &mut ws, &pid, "bed", bed_x, bed_y).await;
         let bed_id = placed["structure"]["id"].as_str().unwrap().to_string();
 
         ws.send(Message::Text(json!({"type": "home.set_respawn", "bed_id": bed_id}).to_string()))

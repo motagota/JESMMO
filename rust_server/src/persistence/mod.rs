@@ -30,6 +30,10 @@ pub const MAX_CARRY: i64 = 50;
 /// each contributor when the order completes (see [`Db::contribute`]).
 pub const BUILD_XP_PER_UNIT: i64 = 5;
 
+/// Crafting-skill XP granted per successful `craft.make` (a flat amount per
+/// action, not per output unit — crafting is instant, not a pooled contribution).
+pub const CRAFT_XP_PER_CRAFT: i64 = 15;
+
 /// An account row (the login identity). One human, one account.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Account {
