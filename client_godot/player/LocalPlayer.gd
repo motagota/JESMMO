@@ -19,12 +19,15 @@ const _ATTACK_COOLDOWN := 0.3 # seconds; matches the server's swing cadence
 const _CAM_SMOOTH := 8.0
 
 # Predicted authoritative position in *world* units (the source of truth we render).
-var _pos := Vector2(600, 600) # default at the town centre until the first snapshot
+var _pos := Vector2(3200, 3200) # default at the town centre until the first snapshot
 var _facing := Vector2(1, 0)
 var _move_accum := 0.0
 var _attack_accum := 0.0
 var _gather_down := false
 var _active := false
+# World edge for clamping predicted movement (#17). Updated from `partition` via
+# `set_world_size` — the pre-partition default just needs to not clamp too early.
+var _world_size := 6400.0
 
 var _mesh: MeshInstance3D
 var _camera: Camera3D
@@ -51,6 +54,11 @@ func _ready() -> void:
 
 	global_position = Protocol.w2v(_pos.x, _pos.y)
 	set_process(false) # inert until the session is live
+
+## The server's current world edge (from `partition`), so local prediction
+## clamps to the same bound the server enforces instead of a stale default.
+func set_world_size(size: float) -> void:
+	_world_size = size
 
 ## Begin local control (called on `welcome`). Optionally seed the start position.
 func activate(start: Vector2 = _pos) -> void:
@@ -90,8 +98,8 @@ func _process(delta: float) -> void:
 			var dy := int(dir.y) * Protocol.MOVE_STEP
 			move_requested.emit(dx, dy)
 			# Prediction: apply the same delta now, clamped to the world.
-			_pos.x = clampf(_pos.x + dx, 0.0, 1200.0)
-			_pos.y = clampf(_pos.y + dy, 0.0, 1200.0)
+			_pos.x = clampf(_pos.x + dx, 0.0, _world_size)
+			_pos.y = clampf(_pos.y + dy, 0.0, _world_size)
 			position_changed.emit(_pos.x, _pos.y)
 
 	if Input.is_physical_key_pressed(KEY_SPACE):

@@ -139,7 +139,9 @@ func _wire_signals() -> void:
     _net.auth_ok.connect(_on_auth_ok)
     _net.auth_error.connect(_on_auth_error)
     _net.welcome.connect(_on_welcome)
-    _net.partition.connect(func(msg): _world.apply_partition(msg))
+    _net.partition.connect(func(msg):
+        _world.apply_partition(msg)
+        _player.set_world_size(float(msg.get("world", 6400))))
     _net.status_update.connect(_on_status_update)
     _net.despawn.connect(func(id): _entities.remove(id))
     _net.zone_migration.connect(func(zone): _hud.set_zone(zone))

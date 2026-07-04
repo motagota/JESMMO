@@ -108,7 +108,7 @@ const MOVE_TICK := 0.06
 ## Accept the server's position as a correction only past this drift (units), so
 ## local prediction stays smooth between authoritative snapshots.
 const RECONCILE_DRIFT := 30.0
-## World units -> metres in the 3D scene (1200-unit world -> 120 m).
+## World units -> metres in the 3D scene (6400-unit world -> 640 m).
 const WORLD_SCALE := 0.1
 
 ## Map a server world position `(wx, wy)` to a ground-plane point in the 3D scene.
