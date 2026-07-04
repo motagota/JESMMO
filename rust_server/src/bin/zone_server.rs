@@ -263,15 +263,23 @@ fn in_melee_arc(px: i32, py: i32, fx: i32, fy: i32, mx: i32, my: i32) -> bool {
     (vx * fx as f64 + vy * fy as f64) / (d * fl) >= MELEE_ARC_COS
 }
 
-fn entity_status_json(id: &str, e: &Entity) -> Value {
+/// `gathering` is the entity's current `GatherJob`, if any — included so the
+/// gateway's migration cache can resume it on a split/merge/rolling-update
+/// rather than silently dropping it (#16).
+fn entity_status_json(id: &str, e: &Entity, gathering: Option<&GatherJob>) -> Value {
+    let mut state = json!({
+        "x": e.x, "y": e.y, "hp": e.hp, "max_hp": e.max_hp,
+        "type": e.kind.as_str(),
+        "facing": [e.facing.0, e.facing.1],
+    });
+    if let Some(job) = gathering {
+        state["gather_node"] = json!(job.node_id);
+        state["gather_progress"] = json!(job.progress);
+    }
     json!({
         "type": "status_update",
         "player_id": id,
-        "state": {
-            "x": e.x, "y": e.y, "hp": e.hp, "max_hp": e.max_hp,
-            "type": e.kind.as_str(),
-            "facing": [e.facing.0, e.facing.1],
-        },
+        "state": state,
     })
 }
 
@@ -673,6 +681,18 @@ impl ZoneServer {
                     let (x, y) = clamp_world(x, y);
                     self.entities.lock().unwrap().insert(player_id.clone(), Entity::player(x, y, hp));
                     println!("[Zone {}] Received player {player_id} at ({x}, {y})", self.zone_id);
+                    // Resume an in-progress gather job carried over from a migration
+                    // (#16) — only if the node actually exists here (it might not, if
+                    // the split/merge moved the player away from it).
+                    if let Some(node_id) = data.get("gather_node").and_then(|v| v.as_str()) {
+                        let progress = data.get("gather_progress").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        if self.nodes.lock().unwrap().contains_key(node_id) {
+                            self.gathering.lock().unwrap().insert(
+                                player_id.clone(),
+                                GatherJob { node_id: node_id.to_string(), progress },
+                            );
+                        }
+                    }
                     self.send_status_update(&player_id).await;
                     // Persistent players spawn this way (not via player_join), so they
                     // must also be sent the gatherable nodes, storage points, and build
@@ -1061,13 +1081,17 @@ impl ZoneServer {
                     }
                 }
 
-                // --- 6. Build outbound entity packets while holding the lock. ---
+                // --- 6. Build outbound entity packets while holding the lock.
+                // `gathering` locked after `entities` (consistent order, matching
+                // step 7 below) so each packet can include an in-progress gather
+                // job — the gateway caches it to resume on migration (#16).
+                let gathering = self.gathering.lock().unwrap();
                 for id in &changed {
                     if let Some(e) = entities.get(id) {
-                        packets.push(entity_status_json(id, e).to_string());
+                        packets.push(entity_status_json(id, e, gathering.get(id)).to_string());
                     }
                 }
-            } // entities lock released here
+            } // entities (and gathering) lock released here
 
             // --- 7. Resource gathering + node respawn. ---
             // Locks taken after `entities` (consistent order) to avoid deadlock.
@@ -1250,8 +1274,9 @@ impl ZoneServer {
         };
         let packet = {
             let entities = self.entities.lock().unwrap();
+            let gathering = self.gathering.lock().unwrap();
             match entities.get(player_id) {
-                Some(e) => entity_status_json(player_id, e),
+                Some(e) => entity_status_json(player_id, e, gathering.get(player_id)),
                 None => return,
             }
         };

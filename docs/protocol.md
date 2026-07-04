@@ -367,3 +367,13 @@ position via `spawn_entity` to whichever zone owns that point (routed by
 `zone_at`); a guest/new player uses `player_join` (the zone picks a spawn point).
 The gateway persists each durable character's `(x, y, hp)` periodically and on
 disconnect, so logout/restart restores the player where they were.
+
+**Migration safety note (#16).** `status_update`'s `state` can carry an
+in-progress gather job (`gather_node`, `gather_progress`) alongside position,
+so the gateway's per-entity migration cache always reflects it; `spawn_entity`
+carries those same two fields when present, and the receiving zone resumes the
+`GatherJob` (only if that node still exists in its map — silent no-op
+otherwise). This makes `split_zone`/`merge_zones`/`rolling_update` — the
+gateway-initiated hand-offs, as opposed to an ordinary boundary-crossing
+`migrate_request`, which can never fire mid-gather since gathering requires
+standing still — never silently drop a player's progress toward a unit.
