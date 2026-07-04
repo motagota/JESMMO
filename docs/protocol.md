@@ -165,9 +165,12 @@ Carried inventory has a finite **carry capacity** (`MAX_CARRY`); storage is unbo
 and does **not** count against it. Gathering stops yielding into a full inventory;
 depositing frees it. Deposit/withdraw are gated server-side on standing near a
 **storage point** (an authored town storehouse in M2; per-plot home `storage`
-structures in #12 add more, reusing these same messages). Like gather, the **zone**
-validates proximity and emits an internal `store_op` to the gateway, which performs
-the durable transactional transfer and pushes the updated `inv.update` / `store.update`.
+structures in #12/#13 add more, reusing these same messages). Like gather, the
+**zone** validates proximity — to the town storehouse, or to a specific placed home
+chest (#13; the gateway pushes the zone every home structure's position, since the
+zone has no DB access — see `home_structures_sync`/`home_structure_added` below) —
+and emits an internal `store_op` to the gateway, which performs the durable
+transactional transfer and pushes the updated `inv.update` / `store.update`.
 
 ### `build.*` — build orders & placement (M2 §4.3, M3 §4.5)
 
@@ -220,7 +223,7 @@ reconnect just re-sends the same one — `just_claimed` distinguishes the very f
 grant, which drives the client's one-time "here's your plot" moment, from a re-send).
 `bounds` is the plot's world-space rect, letting the client draw a distinct outlined
 landmark and a compass reading back to it. Guests hold no land. Rent *enforcement*
-(lapse/reclaim) is M4 (#13); `rent_due_at`/`rent_paid_through` are seeded on claim but
+(lapse/reclaim) is M4 (#14); `rent_due_at`/`rent_paid_through` are seeded on claim but
 not yet acted on.
 
 ### `skill.*` — use-based skills (M2 §4.6)
@@ -238,14 +241,23 @@ not yet acted on.
 | `home.respawn_set` | S→C | `bed_id` — ack once validated | **live** |
 | `craft.list` | C→S | — (request the recipe registry) | **live** |
 | `craft.recipes` | S→C | `recipes[]` (`{id, name, inputs: [{item_id, qty}], output_item, output_qty}`) | **live** |
-| `craft.make` | C→S | `recipe_id` — must own a `crafting`-kind structure on your own plot | **live** |
-| `craft.made` | S→C | `recipe_id`, `item_id`, `qty` — feedback once the craft succeeds (`inv.update` follows separately) | **live** |
+| `craft.make` | C→S | `recipe_id` — must be standing near a `crafting`-kind structure (#13) that's on your own plot | **live** |
+| `craft.made` | S→C | `recipe_id`, `item_id`, `qty` — feedback once the craft succeeds (`inv.update` and a `crafting` `skill.update` follow separately) | **live** |
 
 The starter recipes (`mmo::world::recipes()`): `plank` (2 wood → 2 plank) and
 `tool_kit` (1 wood + 1 stone → 1 tool_kit). Crafting is instant (no timer) and
-atomic — `craft.make` either succeeds (ingredients debited, output credited) or is
-a silent no-op (no station, unknown recipe, insufficient ingredients); there's no
-error protocol surface, matching `store.deposit`/`build.contribute`'s convention.
+atomic — `craft.make` either succeeds (ingredients debited, output credited, flat
+`crafting`-skill XP granted per craft — `CRAFT_XP_PER_CRAFT`) or is a silent no-op
+(not near a station, unknown recipe, insufficient ingredients); there's no error
+protocol surface, matching `store.deposit`/`build.contribute`'s convention.
+
+**Proximity (#13).** Both `store.deposit`/`store.withdraw` at a home chest and
+`craft.make` require standing near the *specific* placed structure — not just
+anywhere on the plot (#12's original, looser scope). Since the zone has no DB
+access, it can't look up where structures are on its own; the gateway pushes their
+positions down (see `home_structures_sync`/`home_structure_added` below), and the
+zone gates purely on that cached geometry. Ownership/durable state (whose plot is
+this, do the ingredients check out) stays gateway-side either way.
 
 **Bed-based respawn.** A character's respawn point is whichever bed they last set
 via `home.set_respawn` (`character.respawn_structure_id`); with none set, death
@@ -287,18 +299,28 @@ skill XP → `inv.update`/`skill.update`), **`store_op`**
 `build.unlocked`), **`build_place`** `{player_id, kind, x, y, rot}` (the zone only
 confirmed the target is on *some* plot; the gateway resolves ownership/bounds/overlap
 → `build.placed`), **`craft_make`** `{player_id, recipe_id}` (the zone only confirmed
-the player is standing on *some* plot; the gateway confirms station ownership and
-attempts the craft → `inv.update`/`craft.made`), and **`player_died`**
-`{player_id, hp}` (the zone removed the dead player from its own map rather than
-respawning them in place; the gateway resolves the respawn point — a set bed, or the
-default spawn — and relocates them exactly like a `migrate_request`, since the point
-may belong to a different zone). Resource nodes, storage points, build boards,
-completed city structures, and home structures are synced to clients as
-`status_update`s with `state.type` `"resource"` / `"storage"` / `"build_board"` /
-`"structure"` (city) / `"bed"` / `"storage"` / `"crafting"` (home — note a home
-storage chest deliberately shares `"storage"` with the authored town storehouse, so
-it reuses the same rendering and proximity plumbing). See `proxy.rs` and
-`zone_server.rs`.
+the player is standing near *a* crafting station; the gateway confirms it's on their
+own plot and attempts the craft → `inv.update`/`craft.made`/`skill.update`), and
+**`player_died`** `{player_id, hp}` (the zone removed the dead player from its own map
+rather than respawning them in place; the gateway resolves the respawn point — a set
+bed, or the default spawn — and relocates them exactly like a `migrate_request`,
+since the point may belong to a different zone).
+
+The gateway also pushes **down** to zones, since a zone has no DB access and can't
+otherwise know where placed home structures are: **`home_structures_sync`**
+`{structures: [{id, kind, x, y}]}` (full replace — sent on zone registration and
+whenever its region changes, i.e. split/merge) and **`home_structure_added`**
+`{id, kind, x, y}` (one newly-placed structure, sent the moment `build_place`
+succeeds). The zone caches these purely as geometry (kind + position) to gate
+`store.deposit`/`store.withdraw`/`craft.make` on proximity to the *specific*
+structure (#13) — it never learns or needs to know who owns it.
+
+Resource nodes, storage points, build boards, completed city structures, and home
+structures are synced to clients as `status_update`s with `state.type` `"resource"` /
+`"storage"` / `"build_board"` / `"structure"` (city) / `"bed"` / `"storage"` /
+`"crafting"` (home — note a home storage chest deliberately shares `"storage"` with
+the authored town storehouse, so it reuses the same rendering and proximity
+plumbing). See `proxy.rs` and `zone_server.rs`.
 
 **M0 note on positions.** A returning character is recreated at its exact saved
 position via `spawn_entity` to whichever zone owns that point (routed by

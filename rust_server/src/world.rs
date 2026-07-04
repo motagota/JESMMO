@@ -40,6 +40,14 @@ impl Rect {
     pub fn area(&self) -> i64 {
         (self.x1 - self.x0) as i64 * (self.y1 - self.y0) as i64
     }
+    /// Whether this rect shares any area with `other` (both half-open). Unlike
+    /// [`Capital::district_for_region`] (which picks the *one* district a region's
+    /// *centre* falls in, for labeling), this is for "does any part of this zone's
+    /// region fall in this district at all" — needed when a single zone spans
+    /// multiple districts (e.g. the default whole-world zone before any split).
+    pub fn overlaps(&self, other: Rect) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
 }
 
 /// Whether a district is a safe hub (no PvP / mob aggression) or open wilds. The
@@ -651,6 +659,23 @@ mod tests {
         }
         let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
         assert_eq!(c.build_boards_in(civic).len(), c.build_boards.len());
+    }
+
+    #[test]
+    fn rect_overlaps_detects_any_shared_area() {
+        let suburbs = Rect::new(800, 0, 1200, 1200);
+        // A single whole-world zone overlaps every district, even though its
+        // *centre* (600,600) falls only in civic — this is the case `overlaps`
+        // exists for (#13).
+        let whole_world = Rect::new(0, 0, WORLD_SIZE, WORLD_SIZE);
+        assert!(whole_world.overlaps(suburbs));
+        // Two districts that only share a boundary edge (half-open) don't overlap.
+        let civic = Rect::new(400, 0, 800, 1200);
+        assert!(!civic.overlaps(suburbs));
+        // A region entirely inside the suburbs overlaps it.
+        assert!(Rect::new(900, 100, 1000, 200).overlaps(suburbs));
+        // A region entirely elsewhere does not.
+        assert!(!Rect::new(0, 0, 100, 100).overlaps(suburbs));
     }
 
     #[test]

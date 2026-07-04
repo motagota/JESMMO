@@ -64,6 +64,9 @@ const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use 
 // --- Build orders -------------------------------------------------------------
 const BOARD_RANGE: i32 = 60; // must be within this of a build board to contribute
 
+// --- Home structures (#13) -----------------------------------------------------
+const HOME_STRUCTURE_RANGE: i32 = 60; // must be within this of a placed bed/storage/crafting
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -160,6 +163,18 @@ struct ResourceNode {
     qty: i64,
     max_qty: i64,
     respawn_timer: i32, // ticks until refill while depleted (qty == 0)
+}
+
+/// A placed home structure's identity/position, as pushed by the gateway (the
+/// only party with DB access — see `home_structures_sync`/`home_structure_added`
+/// below). The zone only needs kind+position for proximity gating; ownership
+/// and everything else durable stays gateway-side (#13).
+#[derive(Clone)]
+struct HomeStructureRef {
+    id: String,
+    kind: String,
+    x: i32,
+    y: i32,
 }
 
 /// An in-progress gather: which node a player is working and how far along the
@@ -285,9 +300,13 @@ struct ZoneServer {
     /// Authored build-order boards in this zone's region (contribution spots).
     build_boards: Mutex<Vec<mmo::world::BuildBoard>>,
     /// Authored plot cells in this zone's region — geometry only (not ownership,
-    /// which lives in the gateway's DB); gates home-structure placement/crafting
-    /// to "standing on some plot" (#12).
+    /// which lives in the gateway's DB); gates home-structure placement to
+    /// "on some plot" (#12).
     plots: Mutex<Vec<mmo::world::PlotCell>>,
+    /// Placed home structures (bed/storage/crafting) in this zone's region, as
+    /// pushed by the gateway — gates deposit/withdraw/craft to "near the
+    /// specific structure", not just "on some plot" (#13).
+    home_structures: Mutex<Vec<HomeStructureRef>>,
 }
 
 impl ZoneServer {
@@ -307,6 +326,7 @@ impl ZoneServer {
             storage_points: Mutex::new(Vec::new()),
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
+            home_structures: Mutex::new(Vec::new()),
         })
     }
 
@@ -390,16 +410,16 @@ impl ZoneServer {
     }
 
     /// Whether `(px, py)` is within range of any storage point in this zone, **or**
-    /// standing on any plot — a home storage chest reuses the town storehouse's
-    /// deposit/withdraw messages, so "at home" is as valid as "at the storehouse"
-    /// (#12).
+    /// a placed home storage chest — a home chest reuses the town storehouse's
+    /// deposit/withdraw messages, so "at your chest" is as valid as "at the
+    /// storehouse" (#12, tightened to per-structure proximity in #13).
     fn near_storage(&self, px: i32, py: i32) -> bool {
         self.storage_points
             .lock()
             .unwrap()
             .iter()
             .any(|s| dist2(px, py, s.x, s.y) <= (STORAGE_RANGE as i64).pow(2))
-            || self.on_a_plot(px, py)
+            || self.near_home_structure("storage", px, py)
     }
 
     /// Whether `(px, py)` is within range of any build board in this zone.
@@ -409,6 +429,18 @@ impl ZoneServer {
             .unwrap()
             .iter()
             .any(|b| dist2(px, py, b.x, b.y) <= (BOARD_RANGE as i64).pow(2))
+    }
+
+    /// Whether `(px, py)` is within range of a placed home structure of `kind`
+    /// (`bed`/`storage`/`crafting`). The gateway pushes these as they're placed
+    /// and on registration/split (`home_structures_sync`/`home_structure_added`)
+    /// since it alone has DB access to know where they are (#13).
+    fn near_home_structure(&self, kind: &str, px: i32, py: i32) -> bool {
+        self.home_structures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.kind == kind && dist2(px, py, s.x, s.y) <= (HOME_STRUCTURE_RANGE as i64).pow(2))
     }
 
     /// Whether this zone sits in a `safe` capital district (by its region centre,
@@ -523,12 +555,54 @@ impl ZoneServer {
                     self.zone_id, r.x0, r.y0, r.x1, r.y1
                 );
                 // A freshly-split zone gets its own mobs, nodes, storage points,
-                // build boards, and plots.
+                // build boards, and plots. Home structures are cleared here (rather
+                // than re-derived locally, since they live in the gateway's DB, not
+                // static world authoring) and repopulated by the `home_structures_sync`
+                // the gateway sends right after a region change (#13).
                 self.spawn_mobs(MOBS_PER_ZONE);
                 self.spawn_nodes();
                 self.spawn_storage_points();
                 self.spawn_build_boards();
                 self.spawn_plots();
+                *self.home_structures.lock().unwrap() = Vec::new();
+                continue;
+            }
+
+            // The gateway telling us which home structures (bed/storage/crafting)
+            // sit in our region — either a full replace (registration/split) or one
+            // newly placed structure to add (#13).
+            if msg_type == "home_structures_sync" {
+                let structures = data.get("structures").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let parsed: Vec<HomeStructureRef> = structures
+                    .iter()
+                    .filter_map(|s| {
+                        Some(HomeStructureRef {
+                            id: s.get("id")?.as_str()?.to_string(),
+                            kind: s.get("kind")?.as_str()?.to_string(),
+                            x: s.get("x")?.as_i64()? as i32,
+                            y: s.get("y")?.as_i64()? as i32,
+                        })
+                    })
+                    .collect();
+                *self.home_structures.lock().unwrap() = parsed;
+                continue;
+            }
+            if msg_type == "home_structure_added" {
+                if let (Some(id), Some(kind), Some(x), Some(y)) = (
+                    data.get("id").and_then(|v| v.as_str()),
+                    data.get("kind").and_then(|v| v.as_str()),
+                    data.get("x").and_then(|v| v.as_i64()),
+                    data.get("y").and_then(|v| v.as_i64()),
+                ) {
+                    let mut hs = self.home_structures.lock().unwrap();
+                    hs.retain(|s| s.id != id); // upsert: replace if already known
+                    hs.push(HomeStructureRef {
+                        id: id.to_string(),
+                        kind: kind.to_string(),
+                        x: x as i32,
+                        y: y as i32,
+                    });
+                }
                 continue;
             }
 
@@ -691,14 +765,16 @@ impl ZoneServer {
                     }
                 }
                 "craft.make" => {
-                    // Geometry-only gate: is the player standing on some plot? Whether
-                    // they actually own a crafting station there is the gateway's job.
+                    // Proximity gate: is the player near *a* crafting station? Whose
+                    // plot it's on, and the actual craft, are the gateway's job (#13).
                     let recipe_id = data.get("recipe_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let on_plot = {
+                    let near_station = {
                         let entities = self.entities.lock().unwrap();
-                        entities.get(&player_id).map(|p| self.on_a_plot(p.x, p.y)).unwrap_or(false)
+                        entities.get(&player_id)
+                            .map(|p| self.near_home_structure("crafting", p.x, p.y))
+                            .unwrap_or(false)
                     };
-                    if on_plot && !recipe_id.is_empty() {
+                    if near_station && !recipe_id.is_empty() {
                         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
                             let _ = tx.send(Message::Text(json!({
                                 "type": "craft_make", "player_id": player_id,
@@ -1447,6 +1523,30 @@ mod tests {
         civic_zone.spawn_plots();
         assert!(civic_zone.plots.lock().unwrap().is_empty());
         assert!(!civic_zone.on_a_plot(600, 600), "no plot grid in the civic centre");
+    }
+
+    /// #13: deposit/withdraw and crafting are gated on proximity to a *specific*
+    /// placed home structure (not just anywhere on the plot), and the gateway's
+    /// full replace (`home_structures_sync`) vs incremental add
+    /// (`home_structure_added`) both update the zone's live cache correctly.
+    #[tokio::test]
+    async fn home_structures_gate_storage_and_crafting_by_proximity() {
+        let zone = zone_for_region(CIVIC);
+        *zone.home_structures.lock().unwrap() = vec![
+            HomeStructureRef { id: "s1".to_string(), kind: "storage".to_string(), x: 500, y: 500 },
+        ];
+        assert!(zone.near_storage(500, 500), "on the chest");
+        assert!(zone.near_storage(500 + HOME_STRUCTURE_RANGE - 1, 500), "just inside range");
+        assert!(!zone.near_storage(500 + HOME_STRUCTURE_RANGE + 20, 500), "out of range");
+        assert!(!zone.near_home_structure("crafting", 500, 500), "wrong kind");
+
+        // Incrementally adding a crafting station (as placement would) makes it
+        // gate too, without disturbing the existing storage entry.
+        let mut hs = zone.home_structures.lock().unwrap();
+        hs.push(HomeStructureRef { id: "s2".to_string(), kind: "crafting".to_string(), x: 700, y: 700 });
+        drop(hs);
+        assert!(zone.near_home_structure("crafting", 700, 700));
+        assert!(zone.near_storage(500, 500), "the earlier chest is still known");
     }
 
     #[tokio::test]
