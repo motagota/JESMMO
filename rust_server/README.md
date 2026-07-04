@@ -49,8 +49,11 @@ The gateway now has durable identity. On connect it asks the client to authentic
 The database is created automatically on first run:
 
 - Default: a `mmo_dev.db` SQLite file in the working directory.
-- Override with `DATABASE_URL` (e.g. a Postgres URL for staging/prod — the schema
-  is driver-agnostic; see `migrations/`).
+- Override with `DATABASE_URL` to point at a different SQLite file
+  (e.g. `sqlite://my_other.db`). **SQLite only for now** — `Db::connect` is
+  built on `SqlitePool`, so a Postgres URL will not work despite the schema
+  in `migrations/` being written to be driver-portable. Postgres support for
+  staging/prod is tracked as future work.
 
 The load-test bots and any older client keep working without changes: a client that
 sends gameplay frames without authenticating is treated as a guest.
