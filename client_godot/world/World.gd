@@ -12,7 +12,7 @@ const _GROUND_Y := 0.0
 const _TILE_Y := 0.02   # district tiles sit just above the ground to avoid z-fighting
 const _ROAD_Y := 0.05
 
-var world_size := 1200.0
+var world_size := 6400.0
 
 var _ground: MeshInstance3D
 var _tiles_root := Node3D.new()

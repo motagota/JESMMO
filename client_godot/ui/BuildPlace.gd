@@ -19,7 +19,7 @@ const _COLORS := {
 
 var active := false
 ## The player's current world position, kept in sync by `Main` every frame.
-var player_pos := Vector2(600, 600)
+var player_pos := Vector2(3200, 3200)
 
 var _kind_index := 0
 var _rot := 0

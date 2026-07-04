@@ -13,9 +13,10 @@
 //!
 //! `WORLD_SIZE` mirrors the gateway/zone constant; keep them in sync.
 
-/// Edge length of the (square) world, in world units. Mirrors the same constant in
-/// `proxy.rs` / `zone_server.rs`.
-pub const WORLD_SIZE: i32 = 1200;
+/// Edge length of the (square) world, in world units (1 unit = 1 meter). Mirrors
+/// the same constant in `proxy.rs` / `zone_server.rs`. 6400x6400 = ~41 km²,
+/// matching the design's ~40 km² capital footprint (`MMO.md` §7).
+pub const WORLD_SIZE: i32 = 6400;
 
 /// A half-open rectangle of the world: `[x0, x1) x [y0, y1)`. (Mirror of the
 /// gateway's private `Region`, exposed here as authored geometry.)
@@ -335,37 +336,39 @@ impl Capital {
     }
 }
 
-/// The Phase 1 capital: three named districts tiling the 1200x1200 world as
-/// vertical bands, a main avenue connecting their centres, a starter plot grid in
-/// the suburbs, a town-centre spawn at the world centre, and the first build order
+/// The Phase 1 capital: five named districts tiling the 6400x6400 (~41 km²) world
+/// in a plus/cross layout — a central Civic Centre with Market/Suburbs bands to its
+/// west/east and Craftworks/Old Quarter bands to its north/south — a main avenue and
+/// a cross-street connecting every district centre, a starter plot grid in the
+/// suburbs, a town-centre spawn at the world centre, and the first build order
 /// (the Town Well) on the civic centre board.
 pub fn capital() -> Capital {
-    let third = WORLD_SIZE / 3; // 400
+    // A plus/cross tiling: west/east bands span the full height; the middle column
+    // (between them) splits into north/centre/south. Exact tiling, verified in
+    // `districts_tile_the_world_without_gaps_or_overlap`.
+    let side = WORLD_SIZE / 4; // 1600 — west/east band width, north/south band height
+    let mid0 = side; // 1600
+    let mid1 = WORLD_SIZE - side; // 4800
 
     let market = District {
         id: "market",
         name: "Market District",
-        region: Rect::new(0, 0, third, WORLD_SIZE),
-        safety: Safety::Safe,
-        plot_grid: None,
-    };
-    let civic = District {
-        id: "civic",
-        name: "Civic Centre",
-        region: Rect::new(third, 0, 2 * third, WORLD_SIZE),
+        region: Rect::new(0, 0, side, WORLD_SIZE),
         safety: Safety::Safe,
         plot_grid: None,
     };
     let suburbs = District {
         id: "suburbs",
         name: "Starter Suburbs",
-        region: Rect::new(2 * third, 0, WORLD_SIZE, WORLD_SIZE),
+        region: Rect::new(mid1, 0, WORLD_SIZE, WORLD_SIZE),
         safety: Safety::Safe,
-        // A generous starter grid: 3 columns x 8 rows = 24 plots, inset from the
-        // band edges. plot 80 + gap 40 -> 120 per cell; 3 cols span 320 < 400.
+        // A generous starter grid: 12 columns x 20 rows = 240 plots (10x Phase 1's
+        // original 24, for a ~28x bigger world — plots stay scarce/premium, not an
+        // attempt at the design doc's long-term ~100k-plot figure). plot 80 + gap 40
+        // -> 120 per cell; 12 cols span 1400 < 1600, 20 rows span 2360 < 6400.
         plot_grid: Some(PlotGrid {
-            cols: 3,
-            rows: 8,
+            cols: 12,
+            rows: 20,
             margin: 40,
             plot_w: 80,
             plot_h: 80,
@@ -373,16 +376,41 @@ pub fn capital() -> Capital {
             tier: 0,
         }),
     };
+    let civic = District {
+        id: "civic",
+        name: "Civic Centre",
+        region: Rect::new(mid0, mid0, mid1, mid1),
+        safety: Safety::Safe,
+        plot_grid: None,
+    };
+    let craftworks = District {
+        id: "craftworks",
+        name: "Craftworks Quarter",
+        region: Rect::new(mid0, 0, mid1, side),
+        safety: Safety::Safe,
+        plot_grid: None,
+    };
+    let old_quarter = District {
+        id: "old_quarter",
+        name: "Old Quarter",
+        region: Rect::new(mid0, mid1, mid1, WORLD_SIZE),
+        safety: Safety::Safe,
+        plot_grid: None,
+    };
 
     // Town centre at the world centre, inside the Civic Centre band. This is the
     // spawn anchor and where the first build-order board lives.
     let town_centre = (WORLD_SIZE / 2, WORLD_SIZE / 2);
 
-    // Main avenue: connects the three district centres at the world's mid-latitude.
+    // Main avenue (market <-> suburbs, through the town centre's latitude) and a
+    // civic cross-street (full height, through the town centre's longitude). Both
+    // district centres of every band lie on one of these two lines (craftworks and
+    // old_quarter's centres share the town centre's x; market and suburbs' centres
+    // share its y), so all five districts read as connected with just these two
+    // segments — verified in `capital_has_roads_and_the_build_order_tech_tree`.
     let mid_y = WORLD_SIZE / 2;
     let roads = vec![
         RoadSegment { x0: market.region.centre().0, y0: mid_y, x1: suburbs.region.centre().0, y1: mid_y },
-        // A civic cross-street north-south through the town centre.
         RoadSegment { x0: town_centre.0, y0: 0, x1: town_centre.0, y1: WORLD_SIZE },
     ];
 
@@ -443,20 +471,33 @@ pub fn capital() -> Capital {
     ];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
-    // spawn finds wood immediately) plus wood/stone scattered through the
-    // districts. Ids are stable so a node keeps its identity across respawns.
+    // spawn finds wood immediately) plus wood/stone spread through every
+    // district's now much larger footprint. Ids are stable so a node keeps its
+    // identity across respawns.
     let resource_nodes = vec![
         ResourceNodeSpawn { id: "node_civic_tree_0", district: "civic", item_id: "wood", x: tcx - 60, y: tcy - 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_tree_1", district: "civic", item_id: "wood", x: tcx + 60, y: tcy - 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_tree_2", district: "civic", item_id: "wood", x: tcx - 60, y: tcy + 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_tree_3", district: "civic", item_id: "wood", x: tcx + 60, y: tcy + 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_rock_0", district: "civic", item_id: "stone", x: tcx, y: tcy - 110, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_tree_0", district: "market", item_id: "wood", x: 180, y: 400, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 250, y: 760, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 120, y: 600, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 1000, y: 300, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 1050, y: 900, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 1120, y: 600, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_0", district: "market", item_id: "wood", x: 400, y: 800, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 1000, y: 2400, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 600, y: 4000, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_2", district: "market", item_id: "wood", x: 1200, y: 5200, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_rock_1", district: "market", item_id: "stone", x: 300, y: 6000, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 5200, y: 700, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 5900, y: 2200, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 5400, y: 3600, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_2", district: "suburbs", item_id: "wood", x: 6000, y: 5000, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_rock_1", district: "suburbs", item_id: "stone", x: 5100, y: 6100, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_tree_0", district: "craftworks", item_id: "wood", x: 2000, y: 400, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_rock_0", district: "craftworks", item_id: "stone", x: 3200, y: 900, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_tree_1", district: "craftworks", item_id: "wood", x: 4400, y: 500, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_rock_1", district: "craftworks", item_id: "stone", x: 2800, y: 1300, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_tree_0", district: "old_quarter", item_id: "wood", x: 2000, y: 5200, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_rock_0", district: "old_quarter", item_id: "stone", x: 3200, y: 5900, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_tree_1", district: "old_quarter", item_id: "wood", x: 4400, y: 5400, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_rock_1", district: "old_quarter", item_id: "stone", x: 2800, y: 6100, qty: 5 },
     ];
 
     // A public town storehouse beside the town centre (the M2 stash). Per-plot
@@ -478,7 +519,7 @@ pub fn capital() -> Capital {
     }];
 
     Capital {
-        districts: vec![market, civic, suburbs],
+        districts: vec![market, civic, suburbs, craftworks, old_quarter],
         roads,
         town_centre,
         build_orders,
@@ -523,11 +564,13 @@ mod tests {
     fn district_lookup_by_point_and_region() {
         let c = capital();
         assert_eq!(c.district_at(10, 10).unwrap().id, "market");
-        assert_eq!(c.district_at(600, 600).unwrap().id, "civic");
-        assert_eq!(c.district_at(1100, 600).unwrap().id, "suburbs");
+        assert_eq!(c.district_at(3200, 3200).unwrap().id, "civic");
+        assert_eq!(c.district_at(5500, 3200).unwrap().id, "suburbs");
+        assert_eq!(c.district_at(3200, 800).unwrap().id, "craftworks");
+        assert_eq!(c.district_at(3200, 5600).unwrap().id, "old_quarter");
         assert!(c.district_at(WORLD_SIZE, 0).is_none()); // outside (half-open)
         // Region centre routing survives shard geometry.
-        let r = Rect::new(800, 0, 1200, 600);
+        let r = Rect::new(5000, 0, 5400, 600);
         assert_eq!(c.district_for_region(r).unwrap().id, "suburbs");
     }
 
@@ -536,7 +579,7 @@ mod tests {
         let c = capital();
         let suburbs = c.districts.iter().find(|d| d.id == "suburbs").unwrap();
         let cells = suburbs.plots();
-        assert_eq!(cells.len(), 24); // 3 x 8
+        assert_eq!(cells.len(), 240); // 12 x 20
         for cell in &cells {
             assert!(
                 suburbs.region.contains(cell.x, cell.y)
@@ -551,7 +594,7 @@ mod tests {
             assert!(seen.insert((cell.grid_x, cell.grid_y)), "duplicate grid cell");
         }
         // Only the suburbs carry a grid; the capital total matches.
-        assert_eq!(c.starter_plots().len(), 24);
+        assert_eq!(c.starter_plots().len(), 240);
     }
 
     #[test]
@@ -714,7 +757,7 @@ mod tests {
         let c = capital();
         let suburbs = c.districts.iter().find(|d| d.id == "suburbs").unwrap().region;
         let in_suburbs = c.plots_in(suburbs);
-        assert_eq!(in_suburbs.len(), 24, "every starter plot sits in the suburbs");
+        assert_eq!(in_suburbs.len(), 240, "every starter plot sits in the suburbs");
         // A civic-only region (no plot grid there) has none.
         let civic = c.districts.iter().find(|d| d.id == "civic").unwrap().region;
         assert!(c.plots_in(civic).is_empty());

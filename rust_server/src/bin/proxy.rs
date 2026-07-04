@@ -97,7 +97,8 @@ const SPLIT_COOLDOWN: Duration = Duration::from_secs(8);
 const AUTOSCALE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Edge length of the (square) world. Zones own rectangular sub-regions of it.
-const WORLD_SIZE: i32 = 1200;
+/// Mirrors `mmo::world::WORLD_SIZE` / `zone_server.rs`'s copy — keep in sync.
+const WORLD_SIZE: i32 = 6400;
 
 /// A half-open rectangular region of the world: [x0, x1) x [y0, y1).
 #[derive(Clone, Copy)]
@@ -4023,9 +4024,9 @@ mod tests {
     async fn partition_labels_districts() {
         let proxy = test_proxy();
         // Three shards, one per authored district band.
-        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 400, y1: 1200 });
-        add_zone_region(&proxy, "z_civic", Region { x0: 400, y0: 0, x1: 800, y1: 1200 });
-        add_zone_region(&proxy, "z_suburbs", Region { x0: 800, y0: 0, x1: 1200, y1: 1200 });
+        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 1600, y1: 6400 });
+        add_zone_region(&proxy, "z_civic", Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 });
+        add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
 
         let snap = proxy.partition_snapshot();
         let by_zone = |zid: &str| -> String {

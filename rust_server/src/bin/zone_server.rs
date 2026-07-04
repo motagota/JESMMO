@@ -26,7 +26,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-const WORLD_SIZE: i32 = 1200;
+/// Mirrors `mmo::world::WORLD_SIZE` / `proxy.rs`'s copy — keep in sync.
+const WORLD_SIZE: i32 = 6400;
 
 // --- Simulation / combat tuning ------------------------------------------------
 const TICK_MS: u64 = 50; // 20 Hz authoritative simulation
@@ -1380,13 +1381,15 @@ mod tests {
     #[test]
     fn safe_in_capital_wilds_outside() {
         // Each authored district band is safe.
-        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 400, y1: 1200 }).is_safe()); // market
-        assert!(zone_for_region(Region { x0: 400, y0: 0, x1: 800, y1: 1200 }).is_safe()); // civic
-        assert!(zone_for_region(Region { x0: 800, y0: 0, x1: 1200, y1: 1200 }).is_safe()); // suburbs
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 1600, y1: 6400 }).is_safe()); // market
+        assert!(zone_for_region(Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 }).is_safe()); // civic
+        assert!(zone_for_region(Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 }).is_safe()); // suburbs
+        assert!(zone_for_region(Region { x0: 1600, y0: 0, x1: 4800, y1: 1600 }).is_safe()); // craftworks
+        assert!(zone_for_region(Region { x0: 1600, y0: 4800, x1: 4800, y1: 6400 }).is_safe()); // old_quarter
         // The default whole-world zone is safe (centre is the Civic Centre).
-        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 1200, y1: 1200 }).is_safe());
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 6400, y1: 6400 }).is_safe());
         // A region whose centre falls outside the authored capital is wilds.
-        assert!(!zone_for_region(Region { x0: 600, y0: 600, x1: 2000, y1: 2000 }).is_safe());
+        assert!(!zone_for_region(Region { x0: 6600, y0: 6600, x1: 8000, y1: 8000 }).is_safe());
     }
 
     /// Acceptance (#5): in the safe capital, a mob sitting on top of a player deals
@@ -1394,8 +1397,8 @@ mod tests {
     #[tokio::test]
     async fn safe_zone_deals_no_player_damage() {
         // Civic Centre band, centred on the town centre — safe.
-        let region = Region { x0: 400, y0: 0, x1: 800, y1: 1200 };
-        let hp = run_with_player_and_adjacent_mob(region, "p1", (600, 600), 8).await;
+        let region = Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (3200, 3200), 8).await;
         assert_eq!(hp, PLAYER_MAX_HP, "a player took damage inside the safe capital");
     }
 
@@ -1404,9 +1407,9 @@ mod tests {
     #[tokio::test]
     async fn wilds_zone_damages_player() {
         // A region whose centre is outside the capital -> wilds. It still contains
-        // the (600,600) spot so the mob can reach the player.
-        let region = Region { x0: 600, y0: 600, x1: 2000, y1: 2000 };
-        let hp = run_with_player_and_adjacent_mob(region, "p1", (600, 600), 8).await;
+        // the player's spot so the mob can reach them.
+        let region = Region { x0: 6600, y0: 6600, x1: 8000, y1: 8000 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (6650, 6650), 8).await;
         assert!(hp < PLAYER_MAX_HP, "a wilds mob should have damaged the player (hp={hp})");
     }
 
@@ -1421,7 +1424,7 @@ mod tests {
         let zone = zone_for_region(CIVIC);
         zone.entities.lock().unwrap().insert(
             "p1".to_string(),
-            Entity { hp: 0, ..Entity::player(540, 540, PLAYER_MAX_HP) },
+            Entity { hp: 0, ..Entity::player(3200, 3200, PLAYER_MAX_HP) },
         );
         let packets = drive(zone.clone(), 1).await;
 
@@ -1437,8 +1440,8 @@ mod tests {
 
     // --- #7: resource gathering -----------------------------------------------
 
-    const CIVIC: Region = Region { x0: 400, y0: 0, x1: 800, y1: 1200 };
-    const TREE: &str = "node_civic_tree_0"; // authored at (540, 540), wood, qty 5
+    const CIVIC: Region = Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 };
+    const TREE: &str = "node_civic_tree_0"; // authored at (3140, 3140), wood, qty 5
 
     /// Civic zone with its authored nodes spawned and a player standing on the tree.
     fn civic_zone_on_tree() -> Arc<ZoneServer> {
@@ -1446,7 +1449,7 @@ mod tests {
         zone.spawn_nodes();
         zone.entities.lock().unwrap().insert(
             "p1".to_string(),
-            Entity::player(540, 540, PLAYER_MAX_HP),
+            Entity::player(3140, 3140, PLAYER_MAX_HP),
         );
         zone
     }
@@ -1514,7 +1517,7 @@ mod tests {
     async fn gather_out_of_range_is_cancelled() {
         let zone = civic_zone_on_tree();
         // Move the player far from the tree (still in-region, but out of gather range).
-        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 780;
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 3400;
         zone.gathering.lock().unwrap().insert(
             "p1".to_string(),
             GatherJob { node_id: TREE.to_string(), progress: 0 },
@@ -1541,11 +1544,11 @@ mod tests {
     #[tokio::test]
     async fn plots_spawn_in_suburbs_and_gate_geometrically() {
         // Suburbs band — the only district with an authored plot grid.
-        let region = Region { x0: 800, y0: 0, x1: 1200, y1: 1200 };
+        let region = Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 };
         let zone = zone_for_region(region);
         zone.spawn_plots();
         let plots = zone.plots.lock().unwrap().clone();
-        assert_eq!(plots.len(), 24, "every starter plot sits in the suburbs band");
+        assert_eq!(plots.len(), 240, "every starter plot sits in the suburbs band");
         let p = plots[0];
         assert!(zone.on_a_plot(p.x, p.y), "the plot's own corner is on the plot");
         assert!(zone.on_a_plot(p.x + p.w / 2, p.y + p.h / 2), "the plot's centre is on the plot");
@@ -1555,7 +1558,7 @@ mod tests {
         let civic_zone = zone_for_region(CIVIC);
         civic_zone.spawn_plots();
         assert!(civic_zone.plots.lock().unwrap().is_empty());
-        assert!(!civic_zone.on_a_plot(600, 600), "no plot grid in the civic centre");
+        assert!(!civic_zone.on_a_plot(3200, 3200), "no plot grid in the civic centre");
     }
 
     /// #13: deposit/withdraw and crafting are gated on proximity to a *specific*
