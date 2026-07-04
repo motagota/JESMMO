@@ -29,6 +29,10 @@ signal build_progress(order_id: String, required: Dictionary, progress: Dictiona
 signal build_completed(order_id: String, structures: Array)
 signal build_unlocked(order_ids: Array)
 signal plot_assigned(plot_id: String, district: String, bounds: Dictionary, tier: int, just_claimed: bool)
+signal build_placed(structure: Dictionary)
+signal craft_recipes(recipes: Array)
+signal craft_made(recipe_id: String, item_id: String, qty: int)
+signal home_respawn_set(bed_id: String)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -126,6 +130,17 @@ func _handle_text(text: String) -> void:
                 msg.get("bounds", {}),
                 int(msg.get("tier", 0)),
                 bool(msg.get("just_claimed", false)))
+        Protocol.S_BUILD_PLACED:
+            build_placed.emit(msg.get("structure", {}))
+        Protocol.S_CRAFT_RECIPES:
+            craft_recipes.emit(msg.get("recipes", []))
+        Protocol.S_CRAFT_MADE:
+            craft_made.emit(
+                String(msg.get("recipe_id", "")),
+                String(msg.get("item_id", "")),
+                int(msg.get("qty", 0)))
+        Protocol.S_HOME_RESPAWN_SET:
+            home_respawn_set.emit(String(msg.get("bed_id", "")))
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -179,3 +194,20 @@ func send_build_list() -> void:
 ## Contribute carried items to a build order (validated server-side by board proximity).
 func send_build_contribute(order_id: String, item_id: String, qty: int) -> void:
     _send({"type": Protocol.C_BUILD_CONTRIBUTE, "order_id": order_id, "item_id": item_id, "qty": qty})
+
+## Place a home structure at a world position (validated server-side: on your own
+## plot, in bounds, no overlap).
+func send_build_place(kind: String, x: int, y: int, rot: int) -> void:
+    _send({"type": Protocol.C_BUILD_PLACE, "kind": kind, "x": x, "y": y, "rot": rot})
+
+## Request the static recipe registry.
+func send_craft_list() -> void:
+    _send({"type": Protocol.C_CRAFT_LIST})
+
+## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
+func send_craft_make(recipe_id: String) -> void:
+    _send({"type": Protocol.C_CRAFT_MAKE, "recipe_id": recipe_id})
+
+## Set a bed (must be on your own plot) as your respawn point.
+func send_home_set_respawn(bed_id: String) -> void:
+    _send({"type": Protocol.C_HOME_SET_RESPAWN, "bed_id": bed_id})

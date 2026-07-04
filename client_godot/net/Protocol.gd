@@ -55,6 +55,27 @@ const S_BUILD_UNLOCKED := "build.unlocked"
 # --- gameplay: starter plot allocation (M3) ------------------------------------
 const S_PLOT_ASSIGNED := "plot.assigned"
 
+# --- gameplay: home structures — bed, storage, crafting station (M3 #12) ------
+const C_BUILD_PLACE := "build.place"
+const S_BUILD_PLACED := "build.placed"
+const C_HOME_SET_RESPAWN := "home.set_respawn"
+const S_HOME_RESPAWN_SET := "home.respawn_set"
+const C_CRAFT_LIST := "craft.list"
+const S_CRAFT_RECIPES := "craft.recipes"
+const C_CRAFT_MAKE := "craft.make"
+const S_CRAFT_MADE := "craft.made"
+
+## Fixed footprint (world units) for each placeable home structure kind — mirrors
+## `mmo::world::structure_footprint`. Used for the ghost preview and to keep the
+## client's sense of "fits on the plot" in sync with the server's.
+const STRUCTURE_FOOTPRINT := {
+    "bed": Vector2(20, 20),
+    "storage": Vector2(16, 16),
+    "crafting": Vector2(20, 20),
+}
+## World-unit grid step the placement ghost snaps to.
+const PLACE_GRID := 10
+
 ## Must be within this many world units of a node to gather it (mirrors the server).
 const GATHER_RANGE := 50.0
 ## Must be within this of a storage point to deposit/withdraw (mirrors the server).

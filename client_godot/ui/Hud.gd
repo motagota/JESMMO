@@ -10,6 +10,7 @@ var _status: Label
 var _inv: Label
 var _skill: Label
 var _gather: Label
+var _build_hint: Label
 var _gain: Label
 var _levelup: Label
 var _announce: Label
@@ -40,6 +41,9 @@ func _ready() -> void:
 	_skill.text = "gathering: Lv 0    [K] skills"
 	_gather = _line(box)
 	_gather.modulate = Color(0.8, 1.0, 0.6)
+	_build_hint = _line(box)
+	_build_hint.modulate = Color(0.85, 0.7, 1.0)
+	_build_hint.text = "[B] build"
 
 	# Floating gain feedback, centred-ish on screen.
 	_gain = Label.new()
@@ -144,6 +148,14 @@ func set_gather_progress(pct: int) -> void:
 		_gather.text = ""
 	else:
 		_gather.text = "gathering… %d%%" % pct
+
+## Build/place mode hint (#12): `active` shows the current kind/rotation and the
+## controls; inactive clears the line.
+func set_build_hint(active: bool, kind: String, rot: int) -> void:
+	if active:
+		_build_hint.text = "placing %s (%d°)   [Tab] kind  [R] rotate  [Enter] place  [Esc] cancel" % [kind, rot]
+	else:
+		_build_hint.text = "[B] build"
 
 func flash_gain(item_id: String, qty: int) -> void:
 	_gather.text = ""

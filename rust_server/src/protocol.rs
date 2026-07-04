@@ -60,7 +60,7 @@ pub const C_BUILD_PLACE: &str = "build.place"; // {kind, x, y, rot}
 pub const S_BUILD_PLACED: &str = "build.placed"; // {structure}
 
 // --- plot.*  (M3 §4.4) ----------------------------------------------------------
-pub const S_PLOT_ASSIGNED: &str = "plot.assigned"; // {plot_id, district, bounds, tier}
+pub const S_PLOT_ASSIGNED: &str = "plot.assigned"; // {plot_id, district, bounds, tier, just_claimed}
 pub const C_PLOT_INFO: &str = "plot.info"; // -> current plot details
 
 // --- skill.*  (M2 §4.6) ---------------------------------------------------------
@@ -69,8 +69,11 @@ pub const S_SKILL_LEVELUP: &str = "skill.levelup"; // {skill_id, level}
 
 // --- craft.* / home.*  (M3 §4.5) ------------------------------------------------
 pub const C_HOME_SET_RESPAWN: &str = "home.set_respawn"; // {bed_id}
+pub const S_HOME_RESPAWN_SET: &str = "home.respawn_set"; // {bed_id} -- ack once the bed is validated as the caller's own
 pub const C_CRAFT_LIST: &str = "craft.list"; // -> available recipes
+pub const S_CRAFT_RECIPES: &str = "craft.recipes"; // {recipes: [{id, name, inputs, output_item, output_qty}]}
 pub const C_CRAFT_MAKE: &str = "craft.make"; // {recipe_id}
+pub const S_CRAFT_MADE: &str = "craft.made"; // {recipe_id, item_id, qty} -- feedback once craft.make succeeds
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state}
