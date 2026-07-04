@@ -52,6 +52,9 @@ const S_BUILD_PROGRESS := "build.progress"
 const S_BUILD_COMPLETED := "build.completed"
 const S_BUILD_UNLOCKED := "build.unlocked"
 
+# --- gameplay: starter plot allocation (M3) ------------------------------------
+const S_PLOT_ASSIGNED := "plot.assigned"
+
 ## Must be within this many world units of a node to gather it (mirrors the server).
 const GATHER_RANGE := 50.0
 ## Must be within this of a storage point to deposit/withdraw (mirrors the server).
@@ -73,16 +76,16 @@ const WORLD_SCALE := 0.1
 ## Map a server world position `(wx, wy)` to a ground-plane point in the 3D scene.
 ## The server's Y axis becomes the scene's Z axis; height (Y) is gameplay-flat.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
-	return Vector3(wx * WORLD_SCALE, y, wy * WORLD_SCALE)
+    return Vector3(wx * WORLD_SCALE, y, wy * WORLD_SCALE)
 
 ## Mirror of the server's XP → level curve (`persistence::level_for_xp`): level n at
 ## 100·n² xp. Kept here so the skills panel can render progress-to-next-level and the
 ## build board can grey orders the player can't yet contribute to.
 static func level_for_xp(xp: int) -> int:
-	if xp <= 0:
-		return 0
-	return int(floor(sqrt(float(xp) / 100.0)))
+    if xp <= 0:
+        return 0
+    return int(floor(sqrt(float(xp) / 100.0)))
 
 ## Total xp required to reach the start of `level`'s band (inverse of level_for_xp).
 static func xp_for_level(level: int) -> int:
-	return 100 * level * level
+    return 100 * level * level

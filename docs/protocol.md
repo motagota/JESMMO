@@ -196,10 +196,20 @@ Contributing persists only for logged-in characters (guests are a no-op).
 
 ### `plot.*` — plots (M3 §4.4)
 
-| type | dir | fields |
-|---|---|---|
-| `plot.assigned` | S→C | `plot_id`, `district`, `bounds`, `tier` |
-| `plot.info` | C→S | — (current plot details) |
+| type | dir | fields | status |
+|---|---|---|---|
+| `plot.assigned` | S→C | `plot_id`, `district`, `bounds` (`{x,y,w,h}`), `tier`, `just_claimed` — pushed on login (allocating a starter plot on a brand-new character) and in reply to `plot.info` | **live** |
+| `plot.info` | C→S | — (re-sends the character's current plot as `plot.assigned`) | **live** |
+
+Every district that authors a **plot grid** (currently just the Suburbs, 3×8 = 24
+starter plots) is pre-seeded with `unowned` plots on boot. On login the gateway
+**idempotently** allocates a character's first free plot in that district (a
+reconnect just re-sends the same one — `just_claimed` distinguishes the very first
+grant, which drives the client's one-time "here's your plot" moment, from a re-send).
+`bounds` is the plot's world-space rect, letting the client draw a distinct outlined
+landmark and a compass reading back to it. Guests hold no land. Rent *enforcement*
+(lapse/reclaim) is M4 (#13); `rent_due_at`/`rent_paid_through` are seeded on claim but
+not yet acted on.
 
 ### `skill.*` — use-based skills (M2 §4.6)
 

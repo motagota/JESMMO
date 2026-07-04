@@ -45,6 +45,10 @@ const SPAWN_X: i32 = WORLD_SIZE / 2;
 const SPAWN_Y: i32 = WORLD_SIZE / 2;
 const SPAWN_HP: i32 = 100;
 
+/// Rent period seeded on a freshly claimed starter plot. Rent *enforcement*
+/// (lapse/reclaim) is M4 (#13); for now this just gives `rent_due_at` a value.
+const STARTER_RENT_PERIOD_SECS: i64 = 7 * 24 * 3600;
+
 /// Outbound queue for a trusted internal peer (zone / admin). Unbounded is fine:
 /// single consumer, head-of-line stalls are not an attack surface.
 type Tx = mpsc::UnboundedSender<Message>;
@@ -1954,6 +1958,52 @@ impl Proxy {
         }
     }
 
+    // --- Starter plot allocation (#11) --------------------------------------
+
+    /// Idempotently allocate a character's starter plot (in the district that
+    /// authors a plot grid — currently just the Suburbs) and push it as
+    /// `plot.assigned`. Called on login and in answer to `plot.info`, so a
+    /// reconnect or an explicit request both just re-send the same plot.
+    /// `just_claimed` tells the client whether this is the very first grant
+    /// (drives the one-time "here's your plot" moment) versus a re-send.
+    async fn send_plot(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return; // guests hold no land
+        }
+        let Some(district) = self.capital.districts.iter().find(|d| d.plot_grid.is_some()) else {
+            return;
+        };
+        let had_plot = matches!(db.plot_for_character(pid).await, Ok(Some(_)));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let Ok(Some(plot)) = db.claim_plot(pid, district.id, STARTER_RENT_PERIOD_SECS, now).await
+        else {
+            return; // pool exhausted
+        };
+        let Some(cell) = district
+            .plots()
+            .into_iter()
+            .find(|c| c.grid_x as i64 == plot.grid_x && c.grid_y as i64 == plot.grid_y)
+        else {
+            return;
+        };
+        self.push_to_player(pid, json!({
+            "type": "plot.assigned", "plot_id": plot.id, "district": plot.district,
+            "bounds": {"x": cell.x, "y": cell.y, "w": cell.w, "h": cell.h},
+            "tier": plot.tier, "just_claimed": !had_plot,
+        }));
+    }
+
     /// Persist a gather yield reported by a zone (`gather_yield`) and push the
     /// authoritative inventory + skill back to the client. The zone is authoritative
     /// for the *simulation* (range, depletion); the gateway owns the *durable* write,
@@ -2109,13 +2159,15 @@ impl Proxy {
         }
 
         // Hydrate the client's gameplay state: inventory, storage, skills, the
-        // district's build-order board, and any already-completed city structures.
+        // district's build-order board, any already-completed city structures, and
+        // the character's starter plot (allocating one on a brand-new character).
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
+            self.send_plot(&player_id).await;
         }
 
         // Liveness: ping on an interval; if a full interval passes with no frame
@@ -2147,6 +2199,12 @@ impl Proxy {
                     // it directly rather than routing to the zone.
                     if data.get("type").and_then(|v| v.as_str()) == Some("build.list") {
                         self.send_build_orders(&player_id).await;
+                        continue;
+                    }
+                    // `plot.info` is a pure re-send of the character's current plot —
+                    // answer it directly rather than routing to the zone.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("plot.info") {
+                        self.send_plot(&player_id).await;
                         continue;
                     }
                     // Route to the player's zone (or buffer if mid-migration). A
@@ -3712,6 +3770,60 @@ mod tests {
             .unwrap();
         let welcome = recv_until(&mut ws2, "welcome").await;
         assert_eq!(welcome["player_id"], pid, "token resumed the same character");
+        drop(ws2);
+    }
+
+    /// #11 acceptance: a brand-new character is handed a distinct, outlined starter
+    /// plot in the Suburbs on first login (with `bounds` it can walk back to); a
+    /// reconnect re-sends the *same* plot rather than granting a second one.
+    #[tokio::test]
+    async fn starter_plot_allocated_on_first_login_and_idempotent_on_reconnect() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let email = format!("plot_{}@t.test", Uuid::new_v4().simple());
+        let mut ws1 = dial(&proxy).await;
+        ws1.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Settler"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws1, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+        let assigned = recv_until(&mut ws1, "plot.assigned").await;
+        assert_eq!(assigned["district"], "suburbs");
+        assert_eq!(assigned["just_claimed"], true);
+        let bounds = &assigned["bounds"];
+        assert!(bounds["w"].as_i64().unwrap() > 0 && bounds["h"].as_i64().unwrap() > 0);
+        let plot_id = assigned["plot_id"].as_str().unwrap().to_string();
+
+        // Disconnect and wait for the gateway to release the character.
+        drop(ws1);
+        let freed = wait_until(
+            || !proxy.clients.lock().unwrap().contains_key(&pid),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(freed);
+
+        // Reconnect: the same plot comes back, flagged as not a fresh grant.
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(
+            json!({"type": "login", "email": email, "password": "pw12"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let again = recv_until(&mut ws2, "plot.assigned").await;
+        assert_eq!(again["plot_id"], json!(plot_id), "reconnect should not grant a second plot");
+        assert_eq!(again["just_claimed"], false);
+
+        // Durable: only one plot is owned by this character.
+        assert_eq!(
+            db.plot_for_character(&pid).await.unwrap().map(|p| p.id),
+            Some(plot_id)
+        );
+
         drop(ws2);
     }
 }
