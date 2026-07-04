@@ -12,16 +12,20 @@ var _skill: Label
 var _gather: Label
 var _gain: Label
 var _levelup: Label
+var _announce: Label
 
 var conn := "connecting…"
 var zone := "—"
 var pos := Vector2.ZERO
+var _home := Vector2.ZERO
+var _has_home := false
 
 ## skill_id -> {level, xp}, so each skill renders on the one line independently.
 var _skills: Dictionary = {}
 
 var _gain_tween: Tween
 var _levelup_tween: Tween
+var _announce_tween: Tween
 
 func _ready() -> void:
 	layer = 5
@@ -51,6 +55,14 @@ func _ready() -> void:
 	_levelup.modulate = Color(1.0, 0.85, 0.2, 0.0)
 	add_child(_levelup)
 
+	# Onboarding announcements (e.g. "your plot is ready"), just above the
+	# level-up banner; a distinct blue so it doesn't read as a skill milestone.
+	_announce = Label.new()
+	_announce.add_theme_font_size_override("font_size", 30)
+	_announce.position = Vector2(420, 260)
+	_announce.modulate = Color(0.55, 0.85, 1.0, 0.0)
+	add_child(_announce)
+
 	_refresh_status()
 
 func _line(parent: Control) -> Label:
@@ -73,10 +85,35 @@ func set_pos(wx: float, wy: float) -> void:
 	pos = Vector2(wx, wy)
 	_refresh_status()
 
+## The player's home plot centre (from `plot.assigned`), so the status line can
+## show a distance/compass reading back to it (#11).
+func set_home(wx: float, wy: float) -> void:
+	_home = Vector2(wx, wy)
+	_has_home = true
+	_refresh_status()
+
 func _refresh_status() -> void:
 	if _status:
-		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)   |   [E] gather" % [
-			conn, zone, int(round(pos.x)), int(round(pos.y))]
+		var home_part := ""
+		if _has_home:
+			home_part = "   |   home: %s %dm" % [_compass(_home - pos), int(round(pos.distance_to(_home)))]
+		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] gather" % [
+			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part]
+
+## A rough compass heading from the player toward `delta` (world units).
+func _compass(delta: Vector2) -> String:
+	if delta.length() < 1.0:
+		return "here"
+	var heading := ""
+	if delta.y < -1.0:
+		heading += "N"
+	elif delta.y > 1.0:
+		heading += "S"
+	if delta.x > 1.0:
+		heading += "E"
+	elif delta.x < -1.0:
+		heading += "W"
+	return heading
 
 # --- gameplay -----------------------------------------------------------------
 
@@ -125,3 +162,14 @@ func flash_levelup(skill_id: String, level: int) -> void:
 		_levelup_tween.kill()
 	_levelup_tween = create_tween()
 	_levelup_tween.tween_property(_levelup, "modulate:a", 0.0, 2.0)
+
+## A one-shot onboarding banner (e.g. the "here's your plot" moment) that lingers
+## briefly before fading, longer than the levelup flash since it's read once ever.
+func flash_announce(text: String) -> void:
+	_announce.text = text
+	_announce.modulate.a = 1.0
+	if _announce_tween and _announce_tween.is_valid():
+		_announce_tween.kill()
+	_announce_tween = create_tween()
+	_announce_tween.tween_interval(1.5)
+	_announce_tween.tween_property(_announce, "modulate:a", 0.0, 2.0)
