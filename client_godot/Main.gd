@@ -22,9 +22,11 @@ var _skills: SkillsPanel
 var _craft: CraftPanel
 var _build_place: BuildPlace
 var _rent: RentPanel
+var _transition: DistrictTransition
 
 var _my_id := ""
 var _plot_id := ""
+var _current_district := ""
 var _seeded_position := false
 ## skill_id -> level, mirrored to the build board so it can grey gated orders.
 var _skill_levels: Dictionary = {}
@@ -71,6 +73,9 @@ func _ready() -> void:
 
     _rent = RentPanel.new()
     add_child(_rent)
+
+    _transition = DistrictTransition.new()
+    add_child(_transition)
 
     _login = Login.new()
     _login.visible = false
@@ -164,6 +169,7 @@ func _wire_signals() -> void:
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))
     _net.rent_reclaimed.connect(func(_plot_id_arg, _moved): _hud.flash_announce(
         "Your plot lapsed — your belongings are safe in storage, flair untouched."))
+    _net.district_ready.connect(func(): _transition.mark_server_ready())
 
     _storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
     _storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
@@ -182,7 +188,9 @@ func _wire_signals() -> void:
     _player.move_requested.connect(func(dx, dy): _net.send_move(dx, dy))
     _player.attack_requested.connect(func(dx, dy): _net.send_attack(dx, dy))
     _player.gather_pressed.connect(_on_gather_pressed)
-    _player.position_changed.connect(func(wx, wy): _hud.set_pos(wx, wy))
+    _player.position_changed.connect(func(wx, wy):
+        _hud.set_pos(wx, wy)
+        _check_district_crossing(wx, wy))
 
 ## Fan a skill update out to the HUD glance line, the skills panel (progress bars),
 ## and the build board (which greys orders above the player's current level).
@@ -234,14 +242,31 @@ func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _t
     if just_claimed:
         _hud.flash_announce("Your home plot is ready, in the %s!" % district.capitalize())
 
-## Gather the nearest in-range resource node (resolved from the entity manager).
-
 ## Feed a `rent.status` push (login, pay, auto-pay toggle, or a ticker-driven
 ## change) to both the HUD's compact hint and the toggleable rent panel (#14).
 func _on_rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int) -> void:
     _hud.set_rent_hint(state, due_at)
     _rent.set_status(plot_id, due_at, paid_through, state, auto_pay, gold)
 
+## The client already knows every zone's district from `partition`, so it
+## detects a gate crossing itself (comparing the live position against those
+## tiles) rather than waiting on the server. Shows the transition curtain and
+## announces it (`district.enter`); the actual position/zone handoff already
+## happened via the ordinary seamless migrate-request path (#15). The first
+## district assignment (on spawn/reconnect) is silent — nothing to "transition"
+## into yet.
+func _check_district_crossing(wx: float, wy: float) -> void:
+    var d := _world.district_at(wx, wy)
+    if d == "" or d == _current_district:
+        return
+    var from_district := _current_district
+    _current_district = d
+    if from_district == "":
+        return # first assignment this session — no curtain
+    _transition.begin(d)
+    _net.send_district_enter(from_district, d)
+
+## Gather the nearest in-range resource node (resolved from the entity manager).
 func _on_gather_pressed() -> void:
     var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
     if node_id != "":

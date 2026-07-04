@@ -19,6 +19,10 @@ var _tiles_root := Node3D.new()
 var _roads_root := Node3D.new()
 var _home_root := Node3D.new()
 var _built_static := false
+## The last `partition`'s raw zone entries (`{x0,y0,x1,y1,district,...}`), kept
+## around so `district_at` can answer "which district is this point in" without
+## a server round-trip — the client already has everything it needs (#15).
+var _zones: Array = []
 
 func _ready() -> void:
     add_child(_tiles_root)
@@ -37,9 +41,21 @@ func apply_partition(msg: Dictionary) -> void:
     for child in _tiles_root.get_children():
         child.queue_free()
 
-    for entry_v in msg.get("zones", []):
+    _zones = msg.get("zones", [])
+    for entry_v in _zones:
         var z: Dictionary = entry_v
         _add_district_tile(z)
+
+## The district name containing world point `(wx, wy)`, or "" if it falls
+## outside every known zone tile (shouldn't happen — the capital tiles the
+## whole world) or before the first `partition` arrives (#15).
+func district_at(wx: float, wy: float) -> String:
+    for entry_v in _zones:
+        var z: Dictionary = entry_v
+        if wx >= float(z.get("x0", 0)) and wx < float(z.get("x1", 0)) \
+                and wy >= float(z.get("y0", 0)) and wy < float(z.get("y1", 0)):
+            return String(z.get("district", ""))
+    return ""
 
 func _build_ground() -> void:
     _ground = MeshInstance3D.new()

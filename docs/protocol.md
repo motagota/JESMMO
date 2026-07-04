@@ -302,10 +302,24 @@ There is no earning mechanic yet in Phase 1 — every character starts with a fl
 
 ### `district.*` — gated transitions (M4 §4.8)
 
-| type | dir | fields |
-|---|---|---|
-| `district.enter` | C→S | `from`, `to` |
-| `district.ready` | S→C | — (zone loaded; resume control) |
+| type | dir | fields | status |
+|---|---|---|---|
+| `district.enter` | C→S | `from`, `to` — the client announces it crossed a district gate | **live** |
+| `district.ready` | S→C | — (district-scoped content refreshed; resume control) | **live** |
+
+The actual position/zone handoff is unrelated to this handshake and already
+happens seamlessly via the existing `migrate_request`/`zone_migration` machinery
+(#4) the moment a player's position crosses *any* zone-region boundary, district
+gate or not. `district.*` is purely the **client-facing transition curtain**:
+the client already knows every zone's district from `partition`, so it detects a
+district crossing itself (comparing its live position against the district
+tiles it's already drawing), shows a brief transition screen, and sends
+`district.enter` — the gateway refreshes district-scoped content for wherever
+the player actually now is (currently just the build board, `build.list`; other
+per-character state like inventory/skills/plot/rent isn't district-scoped and
+needs no refresh) and acks `district.ready`, so the client drops the curtain.
+There's no real "loading" work server-side in Phase 1 (the client enforces a
+minimum curtain duration itself so an instant round-trip doesn't just flash).
 
 ---
 
