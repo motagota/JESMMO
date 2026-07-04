@@ -2664,6 +2664,18 @@ impl Proxy {
                         self.apply_rent_set_autopay(&player_id, &plot_id, enabled).await;
                         continue;
                     }
+                    // `district.enter` is the client announcing (self-detected from the
+                    // `partition` it already has) that it crossed a district gate and is
+                    // showing a transition curtain. The actual position/zone handoff
+                    // already happened via the ordinary migrate-request path — this is
+                    // purely the client-facing load/ready handshake (#15): refresh the
+                    // district-scoped content (the build board) for wherever the player
+                    // actually now is, then ack so the client can drop the curtain.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("district.enter") {
+                        self.send_build_orders(&player_id).await;
+                        self.push_to_player(&player_id, json!({"type": "district.ready"}));
+                        continue;
+                    }
                     // Route to the player's zone (or buffer if mid-migration). A
                     // false result means the client is no longer tracked.
                     if !self.route_client_frame(&player_id, data) {
@@ -4616,5 +4628,49 @@ mod tests {
 
         drop(ws);
         drop(ws2);
+    }
+
+    /// #15 acceptance: the actual position/zone handoff already happens via the
+    /// ordinary migrate-request path (unchanged) — `district.enter` is purely the
+    /// client-facing load/ready handshake for the transition curtain: it refreshes
+    /// district-scoped content (the build board, for wherever the player actually
+    /// is) and acks so the client knows it can drop the curtain.
+    #[tokio::test]
+    async fn district_enter_refreshes_the_build_board_and_acks_ready() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let email = format!("d_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Traveler"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "district.enter", "from": "suburbs", "to": "civic"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // build.list and district.ready interleave in either order — scan both.
+        let (mut saw_orders, mut saw_ready) = (false, false);
+        while !(saw_orders && saw_ready) {
+            let v = recv_frame(&mut ws).await.expect("expected build.list/district.ready");
+            match v["type"].as_str() {
+                Some("build.list") => {
+                    let orders = v["orders"].as_array().cloned().unwrap_or_default();
+                    assert!(orders.iter().any(|o| o["kind"] == "town_well"), "the civic board's content");
+                    saw_orders = true;
+                }
+                Some("district.ready") => saw_ready = true,
+                _ => {}
+            }
+        }
+
+        drop(ws);
     }
 }

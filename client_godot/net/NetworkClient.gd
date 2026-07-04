@@ -36,6 +36,7 @@ signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
+signal district_ready
 
 var url := "ws://127.0.0.1:8766"
 
@@ -156,6 +157,8 @@ func _handle_text(text: String) -> void:
             rent_warning.emit(String(msg.get("plot_id", "")), int(msg.get("due_at", 0)))
         Protocol.S_RENT_RECLAIMED:
             rent_reclaimed.emit(String(msg.get("plot_id", "")), msg.get("moved_to_storage", []))
+        Protocol.S_DISTRICT_READY:
+            district_ready.emit()
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -235,3 +238,10 @@ func send_rent_pay(plot_id: String) -> void:
 ## Toggle whether the rent ticker should auto-pay this plot when due (opt-in).
 func send_rent_set_autopay(plot_id: String, enabled: bool) -> void:
     _send({"type": Protocol.C_RENT_SET_AUTOPAY, "plot_id": plot_id, "enabled": enabled})
+
+## Announce a self-detected district crossing (the client already knows every
+## zone's district from `partition`). The gateway refreshes district-scoped
+## content and acks `district.ready` (#15); the actual position/zone handoff
+## already happened via the ordinary migrate-request path.
+func send_district_enter(from_district: String, to_district: String) -> void:
+    _send({"type": Protocol.C_DISTRICT_ENTER, "from": from_district, "to": to_district})

@@ -72,6 +72,16 @@ const S_RENT_WARNING := "rent.warning"
 const S_RENT_RECLAIMED := "rent.reclaimed"
 const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 
+# --- gameplay: gated district transitions (M4 #15) ----------------------------
+## The position/zone handoff itself is unrelated (see `S_ZONE_MIGRATION`) — this
+## is purely the client-facing load/ready handshake for the transition curtain.
+const C_DISTRICT_ENTER := "district.enter"
+const S_DISTRICT_READY := "district.ready"
+
+## Minimum time the transition curtain stays up, so an instant round-trip
+## doesn't just flash (there's no real server-side loading in Phase 1).
+const DISTRICT_TRANSITION_MIN_SECS := 0.6
+
 ## Fixed footprint (world units) for each placeable home structure kind — mirrors
 ## `mmo::world::structure_footprint`. Used for the ghost preview and to keep the
 ## client's sense of "fits on the plot" in sync with the server's.
