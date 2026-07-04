@@ -157,7 +157,7 @@ func set_gather_progress(pct: int) -> void:
 ## controls; inactive clears the line.
 func set_build_hint(active: bool, kind: String, rot: int) -> void:
 	if active:
-		_build_hint.text = "placing %s (%d°)   [Tab] kind  [R] rotate  [Enter] place  [Esc] cancel" % [kind, rot]
+		_build_hint.text = "placing %s (%d°)   [Tab] kind  [R] rotate  [click/Enter] place  [Esc] cancel" % [kind, rot]
 	else:
 		_build_hint.text = "[B] build"
 

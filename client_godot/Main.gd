@@ -27,6 +27,7 @@ var _transition: DistrictTransition
 
 var _my_id := ""
 var _plot_id := ""
+var _plot_bounds: Dictionary = {}
 var _current_district := ""
 var _seeded_position := false
 ## skill_id -> level, mirrored to the build board so it can grey gated orders.
@@ -105,9 +106,13 @@ func _process(_delta: float) -> void:
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
 
-    # Keep the placement ghost following the player, and offer "sleep / set
+    # Feed the placement ghost the camera (to raycast the mouse onto the
+    # ground), the player's own plot bounds, and the live entity roster (both
+    # needed for its red/green validity preview), and offer "sleep / set
     # respawn" while standing near a bed (#12).
-    _build_place.player_pos = _player.world_pos()
+    _build_place.camera = _player.camera()
+    _build_place.plot_bounds = _plot_bounds
+    _build_place.entities = _entities
     var near_bed := _entities.nearest_bed(_player.world_pos(), Protocol.STORAGE_RANGE)
     var sleep := Input.is_physical_key_pressed(KEY_F)
     if sleep and not _sleep_down and near_bed != "":
@@ -245,6 +250,7 @@ func _on_welcome(data: Dictionary) -> void:
 ## the very first grant — flash the onboarding banner (#11).
 func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _tier: int, just_claimed: bool) -> void:
     _plot_id = plot_id
+    _plot_bounds = bounds
     _world.show_home_plot(bounds)
     var cx := float(bounds.get("x", 0)) + float(bounds.get("w", 0)) * 0.5
     var cy := float(bounds.get("y", 0)) + float(bounds.get("h", 0)) * 0.5
