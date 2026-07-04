@@ -65,6 +65,13 @@ const S_CRAFT_RECIPES := "craft.recipes"
 const C_CRAFT_MAKE := "craft.make"
 const S_CRAFT_MADE := "craft.made"
 
+# --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
+const S_RENT_STATUS := "rent.status"
+const C_RENT_PAY := "rent.pay"
+const S_RENT_WARNING := "rent.warning"
+const S_RENT_RECLAIMED := "rent.reclaimed"
+const C_RENT_SET_AUTOPAY := "rent.set_autopay"
+
 ## Fixed footprint (world units) for each placeable home structure kind — mirrors
 ## `mmo::world::structure_footprint`. Used for the ghost preview and to keep the
 ## client's sense of "fits on the plot" in sync with the server's.

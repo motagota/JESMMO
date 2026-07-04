@@ -143,6 +143,31 @@ async fn add_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, q
     Ok(())
 }
 
+/// Advance `p`'s paid-through/due dates by one rent period, restore `active`
+/// state (clearing a lapse), and clear the `warned` flag for the new cycle.
+/// Shared by [`Db::pay_rent`] (no currency check) and [`Db::pay_rent_with_gold`]
+/// (#14), so both extend a plot identically once payment is otherwise settled.
+async fn pay_rent_in_tx(tx: &mut Tx<'_>, mut p: Plot, rent_period_secs: i64, now: i64) -> Result<Plot, DbError> {
+    // Extend from the later of "now" and the existing paid-through, so paying
+    // early stacks time rather than losing it.
+    let base = p.rent_paid_through.unwrap_or(now).max(now);
+    let paid_through = base;
+    let due = base + rent_period_secs;
+    sqlx::query(
+        "UPDATE plot SET rent_paid_through = ?, rent_due_at = ?, state = 'active', warned = 0 WHERE id = ?",
+    )
+    .bind(paid_through)
+    .bind(due)
+    .bind(&p.id)
+    .execute(&mut **tx)
+    .await?;
+    p.rent_paid_through = Some(paid_through);
+    p.rent_due_at = Some(due);
+    p.state = "active".to_string();
+    p.warned = false;
+    Ok(p)
+}
+
 async fn remove_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<i64, DbError> {
     let cur: Option<i64> = sqlx::query_scalar(
         "SELECT SUM(qty) FROM storage_item WHERE character_id = ? AND item_id = ?",
@@ -258,6 +283,18 @@ impl Db {
         .await
     }
 
+    /// A character's current gold balance (#14). Not part of [`Character`] since
+    /// nothing besides rent reads it yet — kept as a dedicated scalar lookup to
+    /// avoid touching every `Character`-constructing call site for a field only
+    /// the rent system needs.
+    pub async fn character_gold(&self, character_id: &str) -> Result<i64, DbError> {
+        let gold: Option<i64> = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(gold.unwrap_or(0))
+    }
+
     pub async fn touch_login(&self, account_id: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE account SET last_login = ? WHERE id = ?")
             .bind(now_secs())
@@ -355,6 +392,13 @@ pub struct Plot {
     pub rent_due_at: Option<i64>,
     pub rent_paid_through: Option<i64>,
     pub state: String,
+    /// Whether the ticker should try to auto-deduct gold when rent comes due,
+    /// rather than requiring an explicit `rent.pay` (#14; opt-in, default off).
+    pub auto_pay: bool,
+    /// Whether `rent.warning` has already been sent for the *current* due cycle
+    /// (cleared whenever rent is paid) — keeps the ticker from re-warning every
+    /// tick within the warning window.
+    pub warned: bool,
 }
 
 /// A player-built structure, owned via its plot.
@@ -369,6 +413,20 @@ pub struct Structure {
     pub hp: i64,
     pub built_by: Option<String>,
     pub data: String,
+}
+
+/// A décor item. Flair is owned by the *character*, not the plot — `plot_id` is
+/// `NULL` while unattached (e.g. after a rent reclaim rehomes it, #14) so it's
+/// never destroyed, only detached from land the character no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Flair {
+    pub id: String,
+    pub owner_character_id: String,
+    pub plot_id: Option<String>,
+    pub item_id: String,
+    pub x: i64,
+    pub y: i64,
+    pub rot: i64,
 }
 
 /// The outcome of a [`Db::contribute`] call: what moved, the order's cost/progress
@@ -725,6 +783,8 @@ impl Db {
             rent_due_at: None,
             rent_paid_through: None,
             state: "unowned".to_string(),
+            auto_pay: false,
+            warned: false,
         })
     }
 
@@ -807,7 +867,9 @@ impl Db {
     }
 
     /// Pay rent on a plot: advance the paid-through and due dates by one period and
-    /// restore `active` state (clearing a lapse). Returns the updated plot.
+    /// restore `active` state (clearing a lapse). Returns the updated plot. No
+    /// currency involved — used by tests/admin tooling; the real player-facing
+    /// path is [`Db::pay_rent_with_gold`] (#14).
     pub async fn pay_rent(
         &self,
         plot_id: &str,
@@ -819,28 +881,142 @@ impl Db {
             .bind(plot_id)
             .fetch_optional(&mut *tx)
             .await?;
-        let Some(mut p) = plot else {
+        let Some(p) = plot else {
             tx.commit().await?;
             return Ok(None);
         };
-        // Extend from the later of "now" and the existing paid-through, so paying
-        // early stacks time rather than losing it.
-        let base = p.rent_paid_through.unwrap_or(now).max(now);
-        let paid_through = base;
-        let due = base + rent_period_secs;
-        sqlx::query(
-            "UPDATE plot SET rent_paid_through = ?, rent_due_at = ?, state = 'active' WHERE id = ?",
+        let updated = pay_rent_in_tx(&mut tx, p, rent_period_secs, now).await?;
+        tx.commit().await?;
+        Ok(Some(updated))
+    }
+
+    /// Pay rent by deducting `cost` gold from `character_id` — only if they own
+    /// `plot_id` and can afford it. Atomic: an ownership mismatch or insufficient
+    /// balance mutates nothing and returns `None` (#14).
+    pub async fn pay_rent_with_gold(
+        &self,
+        character_id: &str,
+        plot_id: &str,
+        cost: i64,
+        rent_period_secs: i64,
+        now: i64,
+    ) -> Result<Option<Plot>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let plot = sqlx::query_as::<_, Plot>("SELECT * FROM plot WHERE id = ?")
+            .bind(plot_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(p) = plot else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        if p.owner_character_id.as_deref() != Some(character_id) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let gold: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if gold < cost {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+            .bind(cost)
+            .bind(character_id)
+            .execute(&mut *tx)
+            .await?;
+        let updated = pay_rent_in_tx(&mut tx, p, rent_period_secs, now).await?;
+        tx.commit().await?;
+        Ok(Some(updated))
+    }
+
+    /// Toggle whether the rent ticker should try to auto-deduct gold for
+    /// `plot_id` when it comes due (#14; opt-in, default off). Ownership-checked;
+    /// returns `false` (no-op) if `character_id` doesn't own the plot.
+    pub async fn set_auto_pay(
+        &self,
+        character_id: &str,
+        plot_id: &str,
+        enabled: bool,
+    ) -> Result<bool, DbError> {
+        let owner: Option<Option<String>> =
+            sqlx::query_scalar("SELECT owner_character_id FROM plot WHERE id = ?")
+                .bind(plot_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(owner) = owner else { return Ok(false) };
+        if owner.as_deref() != Some(character_id) {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE plot SET auto_pay = ? WHERE id = ?")
+            .bind(enabled)
+            .bind(plot_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    /// Mark that `rent.warning` has been sent for a plot's current due cycle, so
+    /// the ticker doesn't re-send it every tick within the warning window (#14).
+    /// Cleared automatically whenever rent is paid ([`pay_rent_in_tx`]).
+    pub async fn mark_rent_warned(&self, plot_id: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE plot SET warned = 1 WHERE id = ?")
+            .bind(plot_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every owned plot still subject to rent (`active` or `lapsed`) — the
+    /// ticker's per-tick source of truth (#14). Cheap: Phase 1 has 24 plots total.
+    pub async fn rent_active_plots(&self) -> Result<Vec<Plot>, DbError> {
+        sqlx::query_as::<_, Plot>(
+            "SELECT * FROM plot WHERE owner_character_id IS NOT NULL AND state IN ('active','lapsed')",
         )
-        .bind(paid_through)
-        .bind(due)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The gameplay side-effects of a plot reclaiming — call right after
+    /// [`Db::apply_rent_tick`] reports `"reclaimed"` (that call owns the pure
+    /// state transition: `owner_character_id`/`rent_*` cleared, `state =
+    /// 'reclaimed'`). Flair on the plot is **preserved**, just unattached
+    /// (`plot_id = NULL`) — it's owned by the character, not the land. Structures
+    /// are **deleted** — they belong to the land itself, which is what's being
+    /// reclaimed. If the former owner's respawn pointed at one of the deleted
+    /// beds, that's cleared too (no dangling reference). Returns the deleted
+    /// structure ids, so the gateway can despawn them client-side and drop them
+    /// from each zone's proximity cache (#13).
+    pub async fn reclaim_plot_belongings(
+        &self,
+        plot_id: &str,
+        former_owner: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE flair SET plot_id = NULL WHERE plot_id = ?")
+            .bind(plot_id)
+            .execute(&mut *tx)
+            .await?;
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM structure WHERE plot_id = ?")
+            .bind(plot_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE character SET respawn_structure_id = NULL \
+             WHERE id = ? AND respawn_structure_id IN (SELECT id FROM structure WHERE plot_id = ?)",
+        )
+        .bind(former_owner)
         .bind(plot_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM structure WHERE plot_id = ?")
+            .bind(plot_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
-        p.rent_paid_through = Some(paid_through);
-        p.rent_due_at = Some(due);
-        p.state = "active".to_string();
-        Ok(Some(p))
+        Ok(ids)
     }
 
     /// Advance a plot's rent state for the current time. `active` → `lapsed` once
@@ -1047,6 +1223,23 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    pub async fn flair_for_plot(&self, plot_id: &str) -> Result<Vec<Flair>, DbError> {
+        sqlx::query_as::<_, Flair>("SELECT * FROM flair WHERE plot_id = ? ORDER BY id")
+            .bind(plot_id)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Every flair a character owns, attached or not (`plot_id` is `NULL` while
+    /// unattached — e.g. after a rent reclaim rehomes it, #14). Flair is never
+    /// destroyed, so this is the character's full décor collection.
+    pub async fn flair_for_character(&self, owner_character_id: &str) -> Result<Vec<Flair>, DbError> {
+        sqlx::query_as::<_, Flair>("SELECT * FROM flair WHERE owner_character_id = ? ORDER BY id")
+            .bind(owner_character_id)
+            .fetch_all(&self.pool)
+            .await
     }
 
     // --- Build orders & resource nodes -----------------------------------
@@ -1566,6 +1759,106 @@ mod tests {
         let other = a_character(&db).await;
         let p = db.claim_plot(&other, "suburbs", 1000, 5000).await.unwrap().unwrap();
         assert_eq!(p.id, plot.id);
+    }
+
+    #[tokio::test]
+    async fn pay_rent_with_gold_is_atomic_and_ownership_checked() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let other = a_character(&db).await;
+        db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let plot = db.claim_plot(&cid, "suburbs", 1000, 0).await.unwrap().unwrap();
+        let starting_gold = db.character_gold(&cid).await.unwrap();
+        assert_eq!(starting_gold, 500, "the migration's starting balance");
+
+        // Someone else can't pay your rent.
+        assert!(db.pay_rent_with_gold(&other, &plot.id, 50, 1000, 100).await.unwrap().is_none());
+        assert_eq!(db.character_gold(&cid).await.unwrap(), starting_gold, "no mutation on the wrong owner");
+
+        // More than the balance: no-op, no partial deduction.
+        assert!(db.pay_rent_with_gold(&cid, &plot.id, starting_gold + 1, 1000, 100).await.unwrap().is_none());
+        assert_eq!(db.character_gold(&cid).await.unwrap(), starting_gold);
+
+        // Lapse it first, so paying also has to clear the lapse + the warned flag.
+        db.apply_rent_tick(&plot.id, 1500, 500).await.unwrap();
+        db.mark_rent_warned(&plot.id).await.unwrap();
+        assert_eq!(db.load_plot(&plot.id).await.unwrap().unwrap().state, "lapsed");
+
+        let paid = db.pay_rent_with_gold(&cid, &plot.id, 50, 1000, 2000).await.unwrap().unwrap();
+        assert_eq!(paid.state, "active");
+        assert!(!paid.warned, "paying resets the warning flag for the new cycle");
+        assert_eq!(paid.rent_due_at, Some(3000));
+        assert_eq!(db.character_gold(&cid).await.unwrap(), starting_gold - 50, "cost deducted exactly once");
+    }
+
+    #[tokio::test]
+    async fn set_auto_pay_is_ownership_checked() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let other = a_character(&db).await;
+        db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let plot = db.claim_plot(&cid, "suburbs", 1000, 0).await.unwrap().unwrap();
+        assert!(!plot.auto_pay, "off by default");
+
+        assert!(!db.set_auto_pay(&other, &plot.id, true).await.unwrap(), "not the owner");
+        assert!(!db.load_plot(&plot.id).await.unwrap().unwrap().auto_pay);
+
+        assert!(db.set_auto_pay(&cid, &plot.id, true).await.unwrap());
+        assert!(db.load_plot(&plot.id).await.unwrap().unwrap().auto_pay);
+    }
+
+    #[tokio::test]
+    async fn rent_active_plots_only_returns_owned_active_or_lapsed_plots() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        db.insert_unowned_plot("suburbs", 1, 0, 8, 8, 0).await.unwrap();
+        db.insert_unowned_plot("suburbs", 2, 0, 8, 8, 0).await.unwrap();
+        let owned = db.claim_plot(&cid, "suburbs", 1000, 0).await.unwrap().unwrap();
+
+        let active = db.rent_active_plots().await.unwrap();
+        assert_eq!(active.len(), 1, "unowned plots aren't subject to rent");
+        assert_eq!(active[0].id, owned.id);
+
+        db.apply_rent_tick(&owned.id, 1500, 500).await.unwrap(); // -> lapsed
+        assert_eq!(db.rent_active_plots().await.unwrap().len(), 1, "lapsed still counts, until reclaimed");
+
+        db.apply_rent_tick(&owned.id, 3000, 500).await.unwrap(); // -> reclaimed
+        assert!(db.rent_active_plots().await.unwrap().is_empty(), "reclaimed drops out (no owner)");
+    }
+
+    #[tokio::test]
+    async fn reclaim_plot_belongings_preserves_flair_and_clears_structures_and_respawn() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
+        let plot = db.claim_plot(&cid, "suburbs", 1000, 0).await.unwrap().unwrap();
+        let bed = db.place_structure(&plot.id, "bed", 2, 3, 0, 100, Some(&cid), "{}").await.unwrap();
+        db.place_structure(&plot.id, "storage", 4, 4, 0, 100, Some(&cid), "{}").await.unwrap();
+        let flair_id = db.add_flair(&cid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
+        db.set_respawn_structure(&cid, Some(&bed.id)).await.unwrap();
+        db.deposit_to_storage(&cid, "wood", 10).await.unwrap();
+
+        let deleted = db.reclaim_plot_belongings(&plot.id, &cid).await.unwrap();
+        assert_eq!(deleted.len(), 2, "both structures are reported as deleted");
+        assert!(deleted.contains(&bed.id));
+
+        assert!(db.structures_for_plot(&plot.id).await.unwrap().is_empty(), "structures are gone");
+        let flair = db.flair_for_plot(&plot.id).await.unwrap();
+        assert!(flair.is_empty(), "no longer attached to the (former) plot");
+        // But it isn't destroyed — still exists, owned, just unattached.
+        let all_flair = db.flair_for_character(&cid).await.unwrap();
+        assert_eq!(all_flair.len(), 1, "flair is preserved, not deleted");
+        assert_eq!(all_flair[0].id, flair_id);
+        assert_eq!(all_flair[0].plot_id, None);
+        assert_eq!(all_flair[0].owner_character_id, cid);
+
+        // The respawn bed was demolished — the dangling reference is cleared.
+        assert_eq!(db.respawn_point_for_character(&cid).await.unwrap(), None);
+
+        // Storage (character-global, never plot-scoped — #12/#13) was never touched.
+        let stash = db.storage_for_character(&cid).await.unwrap();
+        assert_eq!(stash.iter().find(|i| i.item_id == "wood").unwrap().qty, 10);
     }
 
     #[tokio::test]

@@ -21,12 +21,15 @@ var _build: BuildPanel
 var _skills: SkillsPanel
 var _craft: CraftPanel
 var _build_place: BuildPlace
+var _rent: RentPanel
 
 var _my_id := ""
+var _plot_id := ""
 var _seeded_position := false
 ## skill_id -> level, mirrored to the build board so it can grey gated orders.
 var _skill_levels: Dictionary = {}
 var _sleep_down := false
+var _rent_panel_down := false
 
 func _ready() -> void:
     _build_environment()
@@ -66,6 +69,9 @@ func _ready() -> void:
     _build_place = BuildPlace.new()
     add_child(_build_place)
 
+    _rent = RentPanel.new()
+    add_child(_rent)
+
     _login = Login.new()
     _login.visible = false
     add_child(_login)
@@ -98,6 +104,12 @@ func _process(_delta: float) -> void:
     if sleep and not _sleep_down and near_bed != "":
         _net.send_home_set_respawn(near_bed)
     _sleep_down = sleep
+
+    # Rent isn't tied to standing at a fixture — toggle the panel with a keypress.
+    var rent_key := Input.is_physical_key_pressed(KEY_P)
+    if rent_key and not _rent_panel_down:
+        _rent.show_panel(not _rent.visible)
+    _rent_panel_down = rent_key
 
 func _build_environment() -> void:
     var env := Environment.new()
@@ -147,6 +159,11 @@ func _wire_signals() -> void:
     _net.craft_recipes.connect(func(recipes): _craft.set_recipes(recipes))
     _net.craft_made.connect(func(_recipe_id, item_id, qty): _hud.flash_gain(item_id, qty))
     _net.home_respawn_set.connect(func(_bed_id): _hud.flash_announce("Respawn point set!"))
+    _net.rent_status.connect(_on_rent_status)
+    _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
+        "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))
+    _net.rent_reclaimed.connect(func(_plot_id_arg, _moved): _hud.flash_announce(
+        "Your plot lapsed — your belongings are safe in storage, flair untouched."))
 
     _storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
     _storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
@@ -155,6 +172,8 @@ func _wire_signals() -> void:
     _craft.do_craft.connect(func(recipe_id): _net.send_craft_make(recipe_id))
     _build_place.do_place.connect(func(kind, x, y, rot): _net.send_build_place(kind, x, y, rot))
     _build_place.mode_changed.connect(func(active, kind, rot): _hud.set_build_hint(active, kind, rot))
+    _rent.do_pay.connect(func(plot_id): _net.send_rent_pay(plot_id))
+    _rent.do_set_autopay.connect(func(plot_id, enabled): _net.send_rent_set_autopay(plot_id, enabled))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
@@ -203,17 +222,25 @@ func _on_welcome(data: Dictionary) -> void:
     _player.activate()
     _net.send_craft_list() # the recipe registry is static; pull it once per session
 
-## Gather the nearest in-range resource node (resolved from the entity manager).
-## A starter plot was (re-)assigned: draw its outline/beacon in the world, feed
-## the HUD compass, and — only on the very first grant — flash the onboarding
-## banner (#11).
-func _on_plot_assigned(_plot_id: String, district: String, bounds: Dictionary, _tier: int, just_claimed: bool) -> void:
+## A starter plot was (re-)assigned: remember its id (for rent.pay/autopay),
+## draw its outline/beacon in the world, feed the HUD compass, and — only on
+## the very first grant — flash the onboarding banner (#11).
+func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _tier: int, just_claimed: bool) -> void:
+    _plot_id = plot_id
     _world.show_home_plot(bounds)
     var cx := float(bounds.get("x", 0)) + float(bounds.get("w", 0)) * 0.5
     var cy := float(bounds.get("y", 0)) + float(bounds.get("h", 0)) * 0.5
     _hud.set_home(cx, cy)
     if just_claimed:
         _hud.flash_announce("Your home plot is ready, in the %s!" % district.capitalize())
+
+## Gather the nearest in-range resource node (resolved from the entity manager).
+
+## Feed a `rent.status` push (login, pay, auto-pay toggle, or a ticker-driven
+## change) to both the HUD's compact hint and the toggleable rent panel (#14).
+func _on_rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int) -> void:
+    _hud.set_rent_hint(state, due_at)
+    _rent.set_status(plot_id, due_at, paid_through, state, auto_pay, gold)
 
 func _on_gather_pressed() -> void:
     var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
