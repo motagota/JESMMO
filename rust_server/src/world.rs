@@ -262,6 +262,86 @@ pub struct BuildBoard {
     pub y: i32,
 }
 
+/// Grid cells per axis for the authored terrain heightmap, spanning the whole
+/// `WORLD_SIZE` square (so each cell is `WORLD_SIZE / TERRAIN_RESOLUTION` units
+/// wide). Mirrored by the client's ground mesh — see `docs/protocol.md`'s
+/// `terrain.*` section.
+pub const TERRAIN_RESOLUTION: i32 = 48;
+/// Peak height of the terrain's gentle rolling hills, in the same units as
+/// world x/y (purely cosmetic — nothing gameplay-relevant reads this).
+pub const TERRAIN_AMPLITUDE: f32 = 4.0;
+/// Coarse control-grid resolution the fine grid is upsampled from (divides
+/// `TERRAIN_RESOLUTION` evenly: `48 / 8 = 6`) — only these 81 points are
+/// independently random, so hills stay broad rather than a jagged sheet.
+const TERRAIN_COARSE_RESOLUTION: i32 = 8;
+const TERRAIN_SEED: u32 = 1337;
+
+/// A grid of authored terrain heights (purely cosmetic — the server has no
+/// other concept of height/elevation; nothing gameplay-relevant reads this).
+/// `resolution` cells per axis; `heights` is `(resolution+1)^2` values,
+/// row-major/y-major: `heights[gy * (resolution+1) + gx]`.
+#[derive(Debug, Clone)]
+pub struct Terrain {
+    pub resolution: i32,
+    pub heights: Vec<f32>,
+}
+
+/// A small deterministic integer hash (splitmix-style: multiply/XOR/shift),
+/// mapped to `[-1, 1]`. Deliberately not `rand` — that's for non-reproducible
+/// runtime randomness (bot wander, gather rolls); this needs the *same*
+/// output every boot, and ideally would be trivial to reproduce in another
+/// language if ever needed, unlike a full noise library.
+fn hash_corner(gx: i32, gy: i32, seed: u32) -> f32 {
+    let mut h = (gx as u32)
+        .wrapping_mul(374_761_393)
+        .wrapping_add((gy as u32).wrapping_mul(668_265_263))
+        .wrapping_add(seed.wrapping_mul(2_246_822_519));
+    h = (h ^ (h >> 15)).wrapping_mul(2_246_822_519);
+    h = (h ^ (h >> 13)).wrapping_mul(3_266_489_917);
+    h ^= h >> 16;
+    (h as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+/// Build the fine `(resolution+1)^2` terrain grid: hash a coarse control grid,
+/// then bilinearly upsample it. Only the coarse-generation method needs to
+/// live here — once generated, the fine grid is just sent to clients as plain
+/// numbers, so nothing about *how* it was made needs to be reproduced
+/// client-side, only the final values.
+fn generate_terrain(resolution: i32, coarse_resolution: i32, amplitude: f32, seed: u32) -> Terrain {
+    let coarse_n = coarse_resolution + 1;
+    let mut coarse = vec![0.0f32; (coarse_n * coarse_n) as usize];
+    for cy in 0..coarse_n {
+        for cx in 0..coarse_n {
+            coarse[(cy * coarse_n + cx) as usize] = hash_corner(cx, cy, seed) * amplitude;
+        }
+    }
+
+    let fine_n = resolution + 1;
+    let mut heights = vec![0.0f32; (fine_n * fine_n) as usize];
+    for gy in 0..fine_n {
+        for gx in 0..fine_n {
+            // Map this fine corner into coarse-grid space and bilinearly
+            // sample. Plain bilinear (not the triangle-planar split the
+            // client uses for the fine grid) is fine here — only the
+            // resulting fine-grid values are ever transmitted or compared.
+            let cxf = gx as f32 * coarse_resolution as f32 / resolution as f32;
+            let cyf = gy as f32 * coarse_resolution as f32 / resolution as f32;
+            let cx0 = (cxf.floor() as i32).min(coarse_resolution - 1).max(0);
+            let cy0 = (cyf.floor() as i32).min(coarse_resolution - 1).max(0);
+            let fx = cxf - cx0 as f32;
+            let fy = cyf - cy0 as f32;
+            let h00 = coarse[(cy0 * coarse_n + cx0) as usize];
+            let h10 = coarse[(cy0 * coarse_n + cx0 + 1) as usize];
+            let h01 = coarse[((cy0 + 1) * coarse_n + cx0) as usize];
+            let h11 = coarse[((cy0 + 1) * coarse_n + cx0 + 1) as usize];
+            let h0 = h00 + (h10 - h00) * fx;
+            let h1 = h01 + (h11 - h01) * fx;
+            heights[(gy * fine_n + gx) as usize] = h0 + (h1 - h0) * fy;
+        }
+    }
+    Terrain { resolution, heights }
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -272,6 +352,7 @@ pub struct Capital {
     pub resource_nodes: Vec<ResourceNodeSpawn>,
     pub storage_points: Vec<StoragePoint>,
     pub build_boards: Vec<BuildBoard>,
+    pub terrain: Terrain,
 }
 
 impl Capital {
@@ -526,6 +607,7 @@ pub fn capital() -> Capital {
         resource_nodes,
         storage_points,
         build_boards,
+        terrain: generate_terrain(TERRAIN_RESOLUTION, TERRAIN_COARSE_RESOLUTION, TERRAIN_AMPLITUDE, TERRAIN_SEED),
     }
 }
 
@@ -750,6 +832,61 @@ mod tests {
             assert!(w > 0 && h > 0, "{kind} has a degenerate footprint");
         }
         assert!(structure_footprint("wall").is_none(), "city structures aren't placeable homes");
+    }
+
+    #[test]
+    fn terrain_is_the_right_shape_deterministic_and_in_bounds() {
+        let t1 = capital().terrain;
+        let expected_len = ((TERRAIN_RESOLUTION + 1) * (TERRAIN_RESOLUTION + 1)) as usize;
+        assert_eq!(t1.heights.len(), expected_len, "(resolution+1)^2 grid corners");
+        assert_eq!(t1.resolution, TERRAIN_RESOLUTION);
+
+        // Deterministic: authoring the capital again produces byte-identical
+        // terrain (same seed every boot) — every connected client, and the
+        // server itself, must agree on the same surface.
+        let t2 = capital().terrain;
+        assert_eq!(t1.heights, t2.heights, "terrain must be identical across calls");
+
+        // Every height stays within the authored amplitude.
+        for (i, h) in t1.heights.iter().enumerate() {
+            assert!(
+                h.abs() <= TERRAIN_AMPLITUDE + 0.001,
+                "corner {i} height {h} exceeds the +/-{TERRAIN_AMPLITUDE} amplitude"
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_is_smooth_not_a_jagged_sheet() {
+        // Adjacent fine-grid corners should differ by a modest fraction of the
+        // amplitude -- confirms the coarse-grid upsampling actually smoothed
+        // things, rather than every corner being independently random (which
+        // would let neighbours swing from -amplitude to +amplitude).
+        let t = capital().terrain;
+        let n = (t.resolution + 1) as usize;
+        let max_step = TERRAIN_AMPLITUDE * 0.5; // generous, well under the 2*amplitude worst case
+        for gy in 0..n {
+            for gx in 0..n - 1 {
+                let a = t.heights[gy * n + gx];
+                let b = t.heights[gy * n + gx + 1];
+                assert!(
+                    (a - b).abs() <= max_step,
+                    "horizontal neighbours at ({gx},{gy}) differ by {} > {max_step}",
+                    (a - b).abs()
+                );
+            }
+        }
+        for gy in 0..n - 1 {
+            for gx in 0..n {
+                let a = t.heights[gy * n + gx];
+                let b = t.heights[(gy + 1) * n + gx];
+                assert!(
+                    (a - b).abs() <= max_step,
+                    "vertical neighbours at ({gx},{gy}) differ by {} > {max_step}",
+                    (a - b).abs()
+                );
+            }
+        }
     }
 
     #[test]

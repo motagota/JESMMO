@@ -95,19 +95,21 @@ Any client-supplied `player_id` is ignored — the gateway stamps the real one.
 
 ## The Capital (world content)
 
-The world is the authored **Capital** (`mmo::world::capital()`): a 1200×1200 space
-tiled into three named districts as vertical bands, all **safe** (zero-PvP) for
-Phase 1. The capital starts **empty** — authored ground, roads, and a plot grid,
-but no buildings; structures appear only as players complete build orders / build
-homes.
+The world is the authored **Capital** (`mmo::world::capital()`): a 6400×6400 space
+(~41 km², matching the design's ~40 km² target — see `MMO.md` §7) tiled into five
+named districts in a plus/cross layout, all **safe** (zero-PvP) for Phase 1. The
+capital starts **empty** — authored ground, roads, and a plot grid, but no
+buildings; structures appear only as players complete build orders / build homes.
 
 | district | id | region `[x0,x1) × [y0,y1)` | notes |
 |---|---|---|---|
-| Market District | `market` | `[0,400) × [0,1200)` | |
-| Civic Centre | `civic` | `[400,800) × [0,1200)` | town centre + first build-order board |
-| Starter Suburbs | `suburbs` | `[800,1200) × [0,1200)` | starter plot grid (3×8 = 24 plots) |
+| Market District | `market` | `[0,1600) × [0,6400)` | west band |
+| Starter Suburbs | `suburbs` | `[4800,6400) × [0,6400)` | east band; starter plot grid (12×20 = 240 plots) |
+| Civic Centre | `civic` | `[1600,4800) × [1600,4800)` | centre; town centre + first build-order board |
+| Craftworks Quarter | `craftworks` | `[1600,4800) × [0,1600)` | north band |
+| Old Quarter | `old_quarter` | `[1600,4800) × [4800,6400)` | south band |
 
-- **Town centre / spawn:** world centre `(600, 600)`, inside the Civic Centre.
+- **Town centre / spawn:** world centre `(3200, 3200)`, inside the Civic Centre.
 - **District identity is keyed to world geometry**, not to sim processes. The
   gateway labels each shard's `district` and `safety` in `partition` by its region
   centre, so the capital stays correctly named however the world is split/merged.
@@ -253,6 +255,25 @@ rent reclaim), so it doesn't go stale until someone's next login/district-crossi
 | `craft.recipes` | S→C | `recipes[]` (`{id, name, inputs: [{item_id, qty}], output_item, output_qty}`) | **live** |
 | `craft.make` | C→S | `recipe_id` — must be standing near a `crafting`-kind structure (#13) that's on your own plot | **live** |
 | `craft.made` | S→C | `recipe_id`, `item_id`, `qty` — feedback once the craft succeeds (`inv.update` and a `crafting` `skill.update` follow separately) | **live** |
+
+### `terrain.*` — cosmetic ground heightmap (#54)
+
+Purely visual: the server has no other concept of elevation, and every
+gameplay position stays 2D (`x`, `y`). The heightmap is authored once on
+`Capital` (deterministic, same every boot) and is static for the whole
+session, so it's requested once (like `craft.list`) rather than pushed
+proactively or folded into `partition` (which is rebroadcast on every zone
+split/merge/capture — too frequent for a several-KB static payload).
+
+| type | dir | fields | status |
+|---|---|---|---|
+| `terrain.list` | C→S | — (request the authored heightmap grid) | **live** |
+| `terrain.data` | S→C | `resolution` (grid cells per axis), `world_size`, `heights` (`(resolution+1)^2` floats, row-major/y-major: `heights[gy*(resolution+1)+gx]`, in the same units as world x/y) | **live** |
+
+Clients reconstruct the ground surface by treating each grid cell as two
+triangles (split along the `(0,0)`–`(1,1)` diagonal) and must use the exact
+same triangle-planar interpolation for both the rendered mesh and any height
+lookup (e.g. placing entities on the ground), so the two can never disagree.
 
 The starter recipes (`mmo::world::recipes()`): `plank` (2 wood → 2 plank) and
 `tool_kit` (1 wood + 1 stone → 1 tool_kit). Crafting is instant (no timer) and

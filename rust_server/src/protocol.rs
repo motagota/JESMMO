@@ -75,6 +75,10 @@ pub const S_CRAFT_RECIPES: &str = "craft.recipes"; // {recipes: [{id, name, inpu
 pub const C_CRAFT_MAKE: &str = "craft.make"; // {recipe_id}
 pub const S_CRAFT_MADE: &str = "craft.made"; // {recipe_id, item_id, qty} -- feedback once craft.make succeeds
 
+// --- terrain.* — cosmetic heightmap (#54) ---------------------------------------
+pub const C_TERRAIN_LIST: &str = "terrain.list"; // -> the authored heightmap grid
+pub const S_TERRAIN_DATA: &str = "terrain.data"; // {resolution, world_size, heights: [f32; (resolution+1)^2]}
+
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}
 pub const C_RENT_PAY: &str = "rent.pay"; // {plot_id}
