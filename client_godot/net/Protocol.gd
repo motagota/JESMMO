@@ -116,10 +116,33 @@ const RECONCILE_DRIFT := 30.0
 ## World units -> metres in the 3D scene (6400-unit world -> 640 m).
 const WORLD_SCALE := 0.1
 
-## Map a server world position `(wx, wy)` to a ground-plane point in the 3D scene.
-## The server's Y axis becomes the scene's Z axis; height (Y) is gameplay-flat.
+## Amplitude of the terrain's gentle rolling hills, in scene units (Y is
+## unscaled by `WORLD_SCALE` — see `w2v` — so this is a literal height).
+const _TERRAIN_AMPLITUDE := 4.0
+static var _terrain_noise: FastNoiseLite
+
+## Deterministic ground height at world point `(wx, wy)` — purely cosmetic
+## (the server has no concept of height at all; every position is 2D), used
+## to keep the ground mesh, and everything placed on it via `w2v`, from
+## looking dead flat. Broad, gentle rolling hills: a low noise frequency
+## relative to the 6400-unit world, so features span whole districts rather
+## than looking like tiny bumps.
+static func terrain_height(wx: float, wy: float) -> float:
+    if _terrain_noise == null:
+        _terrain_noise = FastNoiseLite.new()
+        _terrain_noise.seed = 1337
+        _terrain_noise.noise_type = FastNoiseLite.TYPE_PERLIN
+        _terrain_noise.frequency = 0.0006
+        _terrain_noise.fractal_octaves = 3
+    return _terrain_noise.get_noise_2d(wx, wy) * _TERRAIN_AMPLITUDE
+
+## Map a server world position `(wx, wy)` to a ground-plane point in the 3D
+## scene. The server's Y axis becomes the scene's Z axis; `y` is a height
+## *above* the (now not-quite-flat) terrain surface, so every existing caller
+## passing "how high above the ground" keeps working unchanged, automatically
+## following the terrain everywhere it's placed.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
-    return Vector3(wx * WORLD_SCALE, y, wy * WORLD_SCALE)
+    return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy), wy * WORLD_SCALE)
 
 ## Mirror of the server's XP → level curve (`persistence::level_for_xp`): level n at
 ## 100·n² xp. Kept here so the skills panel can render progress-to-next-level and the

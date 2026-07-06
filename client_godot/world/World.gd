@@ -11,6 +11,7 @@ extends Node3D
 const _GROUND_Y := 0.0
 const _TILE_Y := 0.02   # district tiles sit just above the ground to avoid z-fighting
 const _ROAD_Y := 0.05
+const _GROUND_RESOLUTION := 48  # grid cells per axis across the whole world
 
 var world_size := 6400.0
 
@@ -70,15 +71,42 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
             return z
     return {}
 
+## A grid mesh (not a flat `PlaneMesh`) so the ground actually shows
+## `Protocol.terrain_height`'s gentle rolling hills instead of looking dead
+## flat — every vertex is placed via the same `w2v` everything else already
+## goes through, so it's automatically consistent with where props/entities
+## sit on it.
 func _build_ground() -> void:
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    var step := world_size / float(_GROUND_RESOLUTION)
+    for gy in range(_GROUND_RESOLUTION):
+        for gx in range(_GROUND_RESOLUTION):
+            var wx0 := gx * step
+            var wy0 := gy * step
+            var wx1 := wx0 + step
+            var wy1 := wy0 + step
+            var p00 := Protocol.w2v(wx0, wy0, _GROUND_Y)
+            var p10 := Protocol.w2v(wx1, wy0, _GROUND_Y)
+            var p01 := Protocol.w2v(wx0, wy1, _GROUND_Y)
+            var p11 := Protocol.w2v(wx1, wy1, _GROUND_Y)
+            # Two triangles per grid cell.
+            st.add_vertex(p00)
+            st.add_vertex(p11)
+            st.add_vertex(p10)
+            st.add_vertex(p00)
+            st.add_vertex(p01)
+            st.add_vertex(p11)
+    st.index() # share vertices between adjacent triangles for smooth normals
+    st.generate_normals()
+
     _ground = MeshInstance3D.new()
-    var plane := PlaneMesh.new()
-    plane.size = Vector2(world_size, world_size) * Protocol.WORLD_SCALE
-    _ground.mesh = plane
-    # PlaneMesh is centred on its origin; shift so world (0,0) is a corner.
-    _ground.position = Protocol.w2v(world_size * 0.5, world_size * 0.5, _GROUND_Y)
+    _ground.mesh = st.commit()
     var mat := StandardMaterial3D.new()
     mat.albedo_color = Color(0.10, 0.14, 0.10)
+    # Winding direction of a heightmap grid is easy to get backwards; disable
+    # culling so the ground reads correctly from above either way.
+    mat.cull_mode = BaseMaterial3D.CULL_DISABLED
     _ground.material_override = mat
     add_child(_ground)
 
