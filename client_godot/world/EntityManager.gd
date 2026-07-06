@@ -28,7 +28,21 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 	var wx := float(state.get("x", 0))
 	var wy := float(state.get("y", 0))
 	var kind := String(state.get("type", "player"))
-	var target := Protocol.w2v(wx, wy, _height_for(kind))
+
+	# Player-placed home structures (bed/storage/crafting) report their
+	# top-left corner (matching the server's placement/validation math in
+	# `apply_build_place`), not a centre point -- render the mesh offset by
+	# half the footprint so it actually sits over the validated rect instead
+	# of spilling outside the plot. `wpos` (below, used for proximity/overlap
+	# checks) stays the raw corner the server reports and gates by, matching
+	# `near_home_structure`'s own distance check server-side. Distinguished
+	# from the authored point-fixture versions (the civic storehouse/build
+	# board share the same `kind` strings but carry no footprint) by
+	# `built_by`, which only a home structure's status update includes.
+	var render_pos := Vector2(wx, wy)
+	if state.has("built_by") and Protocol.STRUCTURE_FOOTPRINT.has(kind):
+		render_pos += Protocol.STRUCTURE_FOOTPRINT[kind] * 0.5
+	var target := Protocol.w2v(render_pos.x, render_pos.y, _height_for(kind))
 
 	if not _entities.has(id):
 		_entities[id] = {

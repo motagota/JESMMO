@@ -60,5 +60,26 @@ func _drive(bp, em, cam: Camera3D) -> void:
 	assert(not bp._is_valid_placement(Vector2(5030, 110), Vector2(20, 20)), \
 		"in-bounds but overlapping the chest should be invalid via the full check")
 
+	# A placed home structure (carries `built_by`, matching
+	# `home_structure_status_json`) should render offset by half its footprint
+	# -- centred over the corner+size rect the server validated -- while its
+	# `wpos` (used for proximity/overlap) stays the raw corner, matching the
+	# server's own `near_home_structure` distance check.
+	em.upsert("bed1", "zone_a", {"x": 5020.0, "y": 120.0, "type": "bed", "built_by": "alice"})
+	var bed_rec: Dictionary = em._entities["bed1"]
+	var bed_footprint: Vector2 = Protocol.STRUCTURE_FOOTPRINT["bed"]
+	var expected_render := Protocol.w2v(5020.0 + bed_footprint.x * 0.5, 120.0 + bed_footprint.y * 0.5, em._height_for("bed"))
+	assert(bed_rec["node"].position.distance_to(expected_render) < 0.001, \
+		"a home structure should render offset to its footprint centre, got %s want %s" % [bed_rec["node"].position, expected_render])
+	assert(bed_rec["wpos"] == Vector2(5020.0, 120.0), "wpos should stay the raw corner regardless of the render offset")
+
+	# The authored point-fixture version (no `built_by`) should render at the
+	# raw position, unshifted -- it has no footprint/corner concept at all.
+	em.upsert("storehouse1", "zone_a", {"x": 5040.0, "y": 160.0, "type": "storage"})
+	var store_rec: Dictionary = em._entities["storehouse1"]
+	var expected_store_render := Protocol.w2v(5040.0, 160.0, em._height_for("storage"))
+	assert(store_rec["node"].position.distance_to(expected_store_render) < 0.001, \
+		"an authored point-fixture should render unshifted, got %s want %s" % [store_rec["node"].position, expected_store_render])
+
 	print("SMOKE_OK build-place validity check matches expected rectangle math")
 	quit(0)
