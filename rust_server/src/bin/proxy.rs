@@ -1891,27 +1891,45 @@ impl Proxy {
         interval.tick().await; // consume the immediate first tick
         loop {
             interval.tick().await;
-            let targets: Vec<(String, String, i32, i32, i32)> = {
-                let clients = self.clients.lock().unwrap();
-                let state = self.entity_state.lock().unwrap();
-                clients
-                    .values()
-                    .filter(|i| i.persistent)
-                    .filter_map(|i| {
-                        state
-                            .get(&i.player_id)
-                            .map(|c| (i.player_id.clone(), i.current_zone.clone(), c.x, c.y, c.hp))
-                    })
-                    .collect()
-            };
-            for (id, district, x, y, hp) in targets {
-                let started = Instant::now();
-                let _ = db
-                    .save_character(&id, x as i64, y as i64, hp as i64, &district)
-                    .await;
-                self.record_db_latency(started.elapsed());
-            }
+            self.flush_once(&db).await;
         }
+    }
+
+    /// One pass of the periodic persistence flush: save every connected durable
+    /// character's last-known cached position. Factored out of
+    /// `persistence_flush`'s loop so a graceful shutdown (#44) can run exactly
+    /// this same pass once, on demand, instead of waiting for the next tick.
+    async fn flush_once(&self, db: &Db) {
+        let targets: Vec<(String, String, i32, i32, i32)> = {
+            let clients = self.clients.lock().unwrap();
+            let state = self.entity_state.lock().unwrap();
+            clients
+                .values()
+                .filter(|i| i.persistent)
+                .filter_map(|i| {
+                    state
+                        .get(&i.player_id)
+                        .map(|c| (i.player_id.clone(), i.current_zone.clone(), c.x, c.y, c.hp))
+                })
+                .collect()
+        };
+        for (id, district, x, y, hp) in targets {
+            let started = Instant::now();
+            let _ = db
+                .save_character(&id, x as i64, y as i64, hp as i64, &district)
+                .await;
+            self.record_db_latency(started.elapsed());
+        }
+    }
+
+    /// Best-effort final persistence pass on graceful shutdown (#44). Logout
+    /// and migration already flush write-through; this covers the
+    /// write-behind position/hp state the periodic ticker would otherwise
+    /// only save on its next (up to 10s away) tick, so a clean stop never
+    /// loses more than what was already in flight.
+    async fn final_flush(&self) {
+        let Some(db) = self.db.clone() else { return };
+        self.flush_once(&db).await;
     }
 
     /// Send one JSON message to whichever connected client owns `pid`.
@@ -3025,8 +3043,47 @@ impl Proxy {
         let me = self.clone();
         tokio::spawn(async move { me.rent_monitor().await });
 
-        // Run the stdin command loop on the main task.
-        self.command_listener().await;
+        // Run the stdin command loop on the main task, alongside a listener for
+        // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
+        // whichever comes first ends the process, but either way we get one
+        // last chance to flush write-behind state before exiting (#44).
+        tokio::select! {
+            _ = self.clone().command_listener() => {
+                println!("[Proxy] stdin closed, shutting down");
+            }
+            _ = shutdown_signal() => {
+                println!("[Proxy] Shutdown signal received");
+            }
+        }
+        self.final_flush().await;
+        println!("[Proxy] Persistence flushed, exiting");
+    }
+}
+
+/// Resolves on Ctrl+C, or (on Unix) SIGTERM — the two signals a graceful stop
+/// (a terminal interrupt, or a process manager like systemd/Docker/k8s asking
+/// the process to shut down) is expected to send (#44). Windows has no SIGTERM
+/// equivalent that Tokio exposes, so that branch never resolves there.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
 
@@ -3926,6 +3983,64 @@ mod tests {
         assert!(auth::register(&db2, &email, "pw12", "Dup", 0, 0, 100).await.is_err());
 
         drop(db2);
+    }
+
+    /// #44: a graceful shutdown must not lose the write-behind position/hp the
+    /// periodic ticker would otherwise sit on for up to 10s — `final_flush`
+    /// saves it immediately instead of waiting for the next tick.
+    #[tokio::test]
+    async fn final_flush_saves_cached_position_immediately() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+
+        let email = format!("shutdown_{}@t.test", Uuid::new_v4().simple());
+        let ch = auth::register(&db, &email, "pw12", "Hero", 100, 200, 100).await.unwrap();
+
+        // Simulate a connected player whose cached (moved-since-last-flush)
+        // position has never made it to the periodic ticker yet.
+        proxy.clients.lock().unwrap().insert(
+            ch.id.clone(),
+            ClientInfo {
+                player_id: ch.id.clone(),
+                current_zone: "zone_a".to_string(),
+                tx: mpsc::channel(8).0,
+                persistent: true,
+            },
+        );
+        proxy.entity_state.lock().unwrap().insert(
+            ch.id.clone(),
+            EntityCache { x: 4242, y: 1337, hp: 55, gather: None },
+        );
+
+        proxy.final_flush().await;
+
+        let saved = db.character_by_id(&ch.id).await.unwrap().expect("character exists");
+        assert_eq!((saved.x, saved.y, saved.hp), (4242, 1337, 55), "the cached position was saved immediately, not left for the next 10s tick");
+    }
+
+    /// A guest (non-persistent) connection has nothing to save — `final_flush`
+    /// must skip it rather than erroring on a character row that doesn't exist.
+    #[tokio::test]
+    async fn final_flush_skips_non_persistent_clients() {
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
+        proxy.clients.lock().unwrap().insert(
+            "guest_1".to_string(),
+            ClientInfo {
+                player_id: "guest_1".to_string(),
+                current_zone: "zone_a".to_string(),
+                tx: mpsc::channel(8).0,
+                persistent: false,
+            },
+        );
+        proxy.entity_state.lock().unwrap().insert(
+            "guest_1".to_string(),
+            EntityCache { x: 1, y: 2, hp: 100, gather: None },
+        );
+
+        // Should not panic, and should leave no character row behind.
+        proxy.final_flush().await;
+        let db = &proxy.db.as_ref().unwrap();
+        assert!(db.character_by_id("guest_1").await.unwrap().is_none());
     }
 
     /// End-to-end through the real gateway handshake: register, have the zone
