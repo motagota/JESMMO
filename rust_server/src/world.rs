@@ -342,6 +342,103 @@ fn generate_terrain(resolution: i32, coarse_resolution: i32, amplitude: f32, see
     Terrain { resolution, heights }
 }
 
+/// World-unit margin around a district's plot field over which the terrain
+/// blends from the flattened plateau back to its natural rolling-hill
+/// height (#55) — plots need level ground to build on (a sloped plot would
+/// clip its flat markers/structures into the hill on one side and leave
+/// them floating on the other), and a hard step at the plot field's outer
+/// edge would look worse than a gentle blend.
+const PLOT_FLATTEN_MARGIN: f32 = 100.0;
+
+/// Distance from world point `(px, py)` to the nearest edge of `r` (0.0 if
+/// the point is inside it).
+fn dist_to_rect(px: f32, py: f32, r: Rect) -> f32 {
+    let dx = (r.x0 as f32 - px).max(px - r.x1 as f32).max(0.0);
+    let dy = (r.y0 as f32 - py).max(py - r.y1 as f32).max(0.0);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Bilinearly sample the fine terrain grid at an arbitrary world point.
+/// Used only to pick a natural-looking flat target height for a plot field
+/// (matching the surrounding rolling-hill trend at its centre) — not the
+/// client-facing interpolation (that's `Protocol.terrain_height`'s
+/// triangle-planar split on the final, already-flattened grid).
+fn sample_height_bilinear(heights: &[f32], resolution: i32, world_size: f32, wx: f32, wy: f32) -> f32 {
+    let fine_n = resolution + 1;
+    let step = world_size / resolution as f32;
+    let gxf = (wx / step).clamp(0.0, resolution as f32);
+    let gyf = (wy / step).clamp(0.0, resolution as f32);
+    let gx0 = (gxf.floor() as i32).min(resolution - 1).max(0);
+    let gy0 = (gyf.floor() as i32).min(resolution - 1).max(0);
+    let fx = gxf - gx0 as f32;
+    let fy = gyf - gy0 as f32;
+    let h00 = heights[(gy0 * fine_n + gx0) as usize];
+    let h10 = heights[(gy0 * fine_n + gx0 + 1) as usize];
+    let h01 = heights[((gy0 + 1) * fine_n + gx0) as usize];
+    let h11 = heights[((gy0 + 1) * fine_n + gx0 + 1) as usize];
+    let h0 = h00 + (h10 - h00) * fx;
+    let h1 = h01 + (h11 - h01) * fx;
+    h0 + (h1 - h0) * fy
+}
+
+/// Flatten the terrain under every district's starter plot grid, plus a
+/// smoothing margin around it (#55), so plots sit on level ground instead of
+/// whatever slope the rolling hills happen to leave there. One flat target
+/// height per *district* (not per individual plot) — sampled from the
+/// natural terrain at the whole plot field's centre — so neighbouring plots
+/// share exactly the same plateau with no seams between them; only the
+/// field's outer boundary blends back into the natural terrain.
+fn flatten_terrain_for_plots(heights: &mut [f32], resolution: i32, world_size: f32, districts: &[District]) {
+    struct Field {
+        rect: Rect,
+        target: f32,
+    }
+
+    let base = heights.to_vec(); // pre-flatten, so each field's target reflects the *natural* terrain
+    let mut fields = Vec::new();
+    for d in districts {
+        let cells = d.plots();
+        if cells.is_empty() {
+            continue;
+        }
+        let x0 = cells.iter().map(|c| c.x).min().unwrap();
+        let y0 = cells.iter().map(|c| c.y).min().unwrap();
+        let x1 = cells.iter().map(|c| c.x + c.w).max().unwrap();
+        let y1 = cells.iter().map(|c| c.y + c.h).max().unwrap();
+        let rect = Rect::new(x0, y0, x1, y1);
+        let (cx, cy) = rect.centre();
+        let target = sample_height_bilinear(&base, resolution, world_size, cx as f32, cy as f32);
+        fields.push(Field { rect, target });
+    }
+    if fields.is_empty() {
+        return;
+    }
+
+    let fine_n = resolution + 1;
+    let step = world_size / resolution as f32;
+    for gy in 0..fine_n {
+        for gx in 0..fine_n {
+            let wx = gx as f32 * step;
+            let wy = gy as f32 * step;
+            let mut best_weight = 0.0f32;
+            let mut best_target = 0.0f32;
+            for field in &fields {
+                let d = dist_to_rect(wx, wy, field.rect);
+                let t = (1.0 - d / PLOT_FLATTEN_MARGIN).clamp(0.0, 1.0);
+                let weight = t * t * (3.0 - 2.0 * t); // smoothstep
+                if weight > best_weight {
+                    best_weight = weight;
+                    best_target = field.target;
+                }
+            }
+            if best_weight > 0.0 {
+                let idx = (gy * fine_n + gx) as usize;
+                heights[idx] = heights[idx] * (1.0 - best_weight) + best_target * best_weight;
+            }
+        }
+    }
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -479,6 +576,14 @@ pub fn capital() -> Capital {
         plot_grid: None,
     };
 
+    // Cloned (not moved) so `market`/`civic`/`suburbs` stay available below
+    // for roads/build orders, and the originals still move into `Capital`'s
+    // own `districts` field at the end unaffected.
+    let districts_for_terrain =
+        vec![market.clone(), civic.clone(), suburbs.clone(), craftworks.clone(), old_quarter.clone()];
+    let mut terrain = generate_terrain(TERRAIN_RESOLUTION, TERRAIN_COARSE_RESOLUTION, TERRAIN_AMPLITUDE, TERRAIN_SEED);
+    flatten_terrain_for_plots(&mut terrain.heights, TERRAIN_RESOLUTION, WORLD_SIZE as f32, &districts_for_terrain);
+
     // Town centre at the world centre, inside the Civic Centre band. This is the
     // spawn anchor and where the first build-order board lives.
     let town_centre = (WORLD_SIZE / 2, WORLD_SIZE / 2);
@@ -607,7 +712,7 @@ pub fn capital() -> Capital {
         resource_nodes,
         storage_points,
         build_boards,
-        terrain: generate_terrain(TERRAIN_RESOLUTION, TERRAIN_COARSE_RESOLUTION, TERRAIN_AMPLITUDE, TERRAIN_SEED),
+        terrain,
     }
 }
 
@@ -861,8 +966,12 @@ mod tests {
         // Adjacent fine-grid corners should differ by a modest fraction of the
         // amplitude -- confirms the coarse-grid upsampling actually smoothed
         // things, rather than every corner being independently random (which
-        // would let neighbours swing from -amplitude to +amplitude).
-        let t = capital().terrain;
+        // would let neighbours swing from -amplitude to +amplitude). Tests
+        // `generate_terrain` directly (not `capital().terrain`) since that's
+        // specifically what this property is about; the deliberately flat
+        // plateaus `flatten_terrain_for_plots` carves into `capital().terrain`
+        // are a separate, intentional feature covered by their own test below.
+        let t = generate_terrain(TERRAIN_RESOLUTION, TERRAIN_COARSE_RESOLUTION, TERRAIN_AMPLITUDE, TERRAIN_SEED);
         let n = (t.resolution + 1) as usize;
         let max_step = TERRAIN_AMPLITUDE * 0.5; // generous, well under the 2*amplitude worst case
         for gy in 0..n {
@@ -886,6 +995,54 @@ mod tests {
                     (a - b).abs()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plot_field_is_flattened_so_plots_sit_on_level_ground() {
+        // #55: the suburbs starter plot field (240 plots) should be a level
+        // plateau in `capital().terrain` -- entities/markers are placed via
+        // `Protocol.w2v`, which follows this same heightmap, so a sloped plot
+        // field would clip structures on one side and float them on the other.
+        let c = capital();
+        let suburbs = c.districts.iter().find(|d| d.id == "suburbs").unwrap();
+        let cells = suburbs.plots();
+        let x0 = cells.iter().map(|cell| cell.x).min().unwrap();
+        let y0 = cells.iter().map(|cell| cell.y).min().unwrap();
+        let x1 = cells.iter().map(|cell| cell.x + cell.w).max().unwrap();
+        let y1 = cells.iter().map(|cell| cell.y + cell.h).max().unwrap();
+
+        let t = &c.terrain;
+        let n = t.resolution + 1;
+        let step = WORLD_SIZE as f32 / t.resolution as f32;
+
+        // Every fine-grid corner well inside the plot field's bounding box
+        // (a full margin in from every edge, so we're only sampling corners
+        // guaranteed to be at full flatten weight) must be *exactly* level.
+        let mut interior_heights = Vec::new();
+        for gy in 0..n {
+            for gx in 0..n {
+                let wx = gx as f32 * step;
+                let wy = gy as f32 * step;
+                if wx >= x0 as f32 + PLOT_FLATTEN_MARGIN
+                    && wx <= x1 as f32 - PLOT_FLATTEN_MARGIN
+                    && wy >= y0 as f32 + PLOT_FLATTEN_MARGIN
+                    && wy <= y1 as f32 - PLOT_FLATTEN_MARGIN
+                {
+                    interior_heights.push(t.heights[(gy * n + gx) as usize]);
+                }
+            }
+        }
+        assert!(
+            !interior_heights.is_empty(),
+            "expected at least one fine-grid corner well inside the plot field"
+        );
+        let first = interior_heights[0];
+        for h in &interior_heights {
+            assert!(
+                (h - first).abs() < 0.001,
+                "plot field interior isn't flat: {first} vs {h}"
+            );
         }
     }
 
