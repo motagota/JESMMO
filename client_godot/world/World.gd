@@ -182,8 +182,9 @@ func show_home_plot(bounds: Dictionary) -> void:
 ## player's own plot (`my_plot_id`) is skipped, since `show_home_plot` already
 ## draws it distinctly with a tall beacon; a second flat tile under that would
 ## just clutter the same spot. Each other plot gets a flat tile + border (no
-## beacon — keeps mine the one standout landmark) and a label reading the
-## owner's name if taken, or "Available" if free.
+## beacon — keeps mine the one standout landmark): green with nothing further
+## to say if it's free, red with a small signpost naming the owner if it's
+## taken.
 func apply_plot_roster(plots: Array, my_plot_id: String) -> void:
     for child in _plots_root.get_children():
         child.queue_free()
@@ -221,15 +222,46 @@ func _add_plot_marker(bounds: Dictionary, owner_name) -> void:
     _add_strip(_plots_root, Vector2(x0, y0), Vector2(x0, y0 + h), bw, tint)
     _add_strip(_plots_root, Vector2(x0 + w, y0), Vector2(x0 + w, y0 + h), bw, tint)
 
+    # A free plot just reads as green — nothing more to say about it. Only a
+    # taken one gets a signpost naming the owner.
+    if taken:
+        _add_signpost(x0 + w * 0.5, y0 + h * 0.5, String(owner_name), tint)
+
+## A small sign — a thin post with a name-plank on top — for a taken plot,
+## instead of a large floating label; a district full of claimed plots
+## shouldn't turn into a wall of oversized text.
+func _add_signpost(cx: float, cy: float, owner_name: String, tint: Color) -> void:
+    var post := MeshInstance3D.new()
+    var post_mesh := CylinderMesh.new()
+    post_mesh.top_radius = 0.15
+    post_mesh.bottom_radius = 0.15
+    post_mesh.height = 2.2
+    post.mesh = post_mesh
+    post.position = Protocol.w2v(cx, cy, 1.1)
+    var post_mat := StandardMaterial3D.new()
+    post_mat.albedo_color = Color(0.4, 0.3, 0.22)
+    post.material_override = post_mat
+    _plots_root.add_child(post)
+
+    var plank := MeshInstance3D.new()
+    var plank_mesh := BoxMesh.new()
+    plank_mesh.size = Vector3(1.4, 0.6, 0.08)
+    plank.mesh = plank_mesh
+    plank.position = Protocol.w2v(cx, cy, 2.1)
+    var plank_mat := StandardMaterial3D.new()
+    plank_mat.albedo_color = tint
+    plank.material_override = plank_mat
+    _plots_root.add_child(plank)
+
     var label := Label3D.new()
-    label.text = String(owner_name) if taken else "Available"
+    label.text = owner_name
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
     label.no_depth_test = true
     label.fixed_size = true
-    label.pixel_size = 0.005
-    label.modulate = tint
-    label.outline_size = 6
-    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 4.0)
+    label.pixel_size = 0.0025
+    label.modulate = Color(1, 1, 1)
+    label.outline_size = 4
+    label.position = Protocol.w2v(cx, cy, 2.15)
     _plots_root.add_child(label)
 
 func _add_district_tile(z: Dictionary) -> void:
