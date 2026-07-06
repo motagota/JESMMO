@@ -2264,22 +2264,16 @@ impl Proxy {
     /// Push every plot in a player's district (owned or not, with owner names
     /// resolved) as `plot.district` — lets the client render a roster of
     /// everyone's land, not just the player's own (#18).
-    async fn send_plot_roster(&self, pid: &str) {
+    /// Push every plot in `district_id` (owned or not, with owner names
+    /// resolved) to `pid` as `plot.district`. Takes the district directly
+    /// rather than deriving it, so callers that already know it (`send_plot_roster`
+    /// below; `district.enter`'s handler, which trusts the client's own
+    /// self-reported crossing) can't race a lagging position cache (#48).
+    async fn send_plot_roster_for(&self, pid: &str, district_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        // Resolved by the player's actual cached position, not their zone's
-        // region *centre* (`district_for_zone`) — the latter only tells
-        // apart districts when each is backed by its own zone shard (the
-        // real auto-scaled deployment model). A single zone spanning every
-        // district (the common small/dev deployment) has one fixed centre,
-        // so `district_for_zone` would report the same district regardless
-        // of where the player actually walks — invisible for `build.list`
-        // (every Phase 1 build order is in Civic anyway) but very visible
-        // here, since plots exist only in the Suburbs.
-        let Some((x, y)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
-        let Some(district_id) = self.capital.district_at(x, y).map(|d| d.id) else { return };
         let Some(district) = self.capital.districts.iter().find(|d| d.id == district_id) else { return };
         let cells = district.plots();
-        if let Ok(rows) = db.plots_for_district(&district_id).await {
+        if let Ok(rows) = db.plots_for_district(district_id).await {
             let arr: Vec<Value> = rows
                 .iter()
                 .filter_map(|p| {
@@ -2291,6 +2285,30 @@ impl Proxy {
                 .collect();
             self.push_to_player(pid, json!({"type": "plot.district", "plots": arr}));
         }
+    }
+
+    /// `send_plot_roster_for`, with the district resolved from the player's
+    /// own cached position — for callers with no better context (an explicit
+    /// `plot.district` request). Resolved by position, not the zone's region
+    /// *centre* (`district_for_zone`) — the latter only tells apart districts
+    /// when each is backed by its own zone shard (the real auto-scaled
+    /// deployment model). A single zone spanning every district (the common
+    /// small/dev deployment) has one fixed centre, so `district_for_zone`
+    /// would report the same district regardless of where the player actually
+    /// walks — invisible for `build.list` (every Phase 1 build order is in
+    /// Civic anyway) but very visible here, since plots exist only in the
+    /// Suburbs.
+    ///
+    /// **Not** used by `district.enter` (see its handler): the player's
+    /// position cache (`entity_state`) is updated asynchronously from the
+    /// zone's own status broadcasts, and can still read the *previous*
+    /// district for a moment right when the client's own (instant,
+    /// self-detected) crossing message arrives — #48, reproduced by sending
+    /// `district.enter` immediately after movement with no settling delay.
+    async fn send_plot_roster(&self, pid: &str) {
+        let Some((x, y)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
+        let Some(district_id) = self.capital.district_at(x, y).map(|d| d.id) else { return };
+        self.send_plot_roster_for(pid, district_id).await;
     }
 
     /// Broadcast the refreshed plot roster to everyone sharing `district` — a
@@ -2864,11 +2882,20 @@ impl Proxy {
                     // showing a transition curtain. The actual position/zone handoff
                     // already happened via the ordinary migrate-request path — this is
                     // purely the client-facing load/ready handshake (#15): refresh the
-                    // district-scoped content (the build board) for wherever the player
-                    // actually now is, then ack so the client can drop the curtain.
+                    // district-scoped content (the build board, the plot roster) for
+                    // wherever the player actually now is, then ack so the client can drop
+                    // the curtain. The plot roster trusts the client's self-reported `to`
+                    // directly (#48) rather than re-deriving it from the position cache,
+                    // which updates asynchronously and can still read the *previous*
+                    // district for a moment right as this message arrives — a read-only,
+                    // non-authoritative query, so there's nothing to gain from re-deriving
+                    // it server-side, only a race to lose.
                     if data.get("type").and_then(|v| v.as_str()) == Some("district.enter") {
                         self.send_build_orders(&player_id).await;
-                        self.send_plot_roster(&player_id).await;
+                        match data.get("to").and_then(|v| v.as_str()) {
+                            Some(to) => self.send_plot_roster_for(&player_id, to).await,
+                            None => self.send_plot_roster(&player_id).await,
+                        }
                         self.push_to_player(&player_id, json!({"type": "district.ready"}));
                         continue;
                     }
@@ -5121,6 +5148,53 @@ mod tests {
             "the Suburbs roster (240 plots incl. their own), not Civic's empty one, \
              even though the zone's region-centre resolves to Civic"
         );
+
+        drop(ws);
+    }
+
+    /// #48: `district.enter` fires the instant the *client* detects it crossed
+    /// a district gate — before the gateway's own position cache (updated
+    /// asynchronously from the zone's status broadcasts) necessarily reflects
+    /// it. If `district.enter`'s roster push re-derived the district from that
+    /// cache (like the plain `plot.district` request does), it could read the
+    /// *previous* district for a moment and hand back an empty/wrong roster —
+    /// reproduced against a real client by sending `district.enter` immediately
+    /// after movement with no settling delay. The fix: trust the client's own
+    /// self-reported `to` directly for this read-only query.
+    #[tokio::test]
+    async fn district_enter_plot_roster_is_correct_even_with_a_stale_position_cache() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let email = format!("racer_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Racer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "plot.assigned").await;
+        recv_until(&mut ws, "plot.district").await; // their own claim's broadcast
+
+        // Simulate the race directly: the cache still says Civic (the town
+        // centre spawn point) even though the client has already announced it
+        // crossed into the Suburbs.
+        proxy.entity_state.lock().unwrap().insert(
+            pid.clone(),
+            EntityCache { x: 3200, y: 3200, hp: 100, gather: None },
+        );
+
+        ws.send(Message::Text(
+            json!({"type": "district.enter", "from": "civic", "to": "suburbs"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let roster = recv_until(&mut ws, "plot.district").await;
+        let plots = roster["plots"].as_array().unwrap();
+        assert_eq!(plots.len(), 240, "the Suburbs roster, trusting `to` directly, not the stale Civic-reading cache");
 
         drop(ws);
     }
