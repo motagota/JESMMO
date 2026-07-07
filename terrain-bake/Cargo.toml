@@ -3,9 +3,29 @@ name = "terrain-bake"
 version = "0.1.0"
 edition = "2021"
 
+# Shared library: the pipeline stages, config, grid, caching, and debug-dump
+# logic used by the CLI binary — kept testable as plain functions, not
+# buried inside main().
+[lib]
+name = "terrain_bake"
+path = "src/lib.rs"
+
+[[bin]]
+name = "terrain-bake"
+path = "src/main.rs"
+
 # Offline bake tool: DEM (or, for now, a synthetic placeholder — #59) -> the
 # tiled artifact terrain-common reads. Never linked into the server binary,
-# so heavier offline-only dependencies (gdal, image, rayon, noise) belong here,
-# not in terrain-common.
+# so heavier offline-only dependencies (gdal, image, rayon) belong here, not
+# in terrain-common.
 [dependencies]
 terrain-common = { path = "../terrain-common" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Stable, deterministic content hashing for the stage cache — std's
+# DefaultHasher (SipHash) is explicitly *not* guaranteed stable across Rust
+# versions, which would silently invalidate every cache (or worse, collide)
+# after a toolchain upgrade.
+sha2 = "0.10"
