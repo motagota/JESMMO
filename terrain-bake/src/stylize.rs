@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use crate::config::StylizeConfig;
 use crate::grid::Grid;
+use crate::water::WaterMask;
 
 /// A binary hand-painted footprint (design doc's `capital_flatten.png`):
 /// white = inside, anything else = outside. Distinct from `water::
@@ -113,6 +114,28 @@ pub fn compress_horizontal(grid: &Grid, scale: f32) -> Grid {
             let src_x = (gx as f32 / scale).min((grid.width - 1) as f32);
             let src_y = (gy as f32 / scale).min((grid.height - 1) as f32);
             out.set(gx, gy, bilinear_sample(grid, src_x, src_y));
+        }
+    }
+    out
+}
+
+/// The mask counterpart to [`compress_horizontal`] — nearest-neighbor, not
+/// bilinear (a water/land decision doesn't blend), so a mask computed before
+/// stylization (the water-mask stage, #60) can be brought into alignment
+/// with the now-compressed grid for export (#62) without re-running
+/// threshold/open/close/flood-fill against the resampled heights.
+pub fn compress_mask_horizontal(mask: &WaterMask, scale: f32) -> WaterMask {
+    if scale == 1.0 {
+        return mask.clone();
+    }
+    let new_width = ((mask.width as f32) * scale).round().max(1.0) as usize;
+    let new_height = ((mask.height as f32) * scale).round().max(1.0) as usize;
+    let mut out = WaterMask::new(new_width, new_height);
+    for gy in 0..new_height {
+        for gx in 0..new_width {
+            let src_x = ((gx as f32 / scale).round() as usize).min(mask.width - 1);
+            let src_y = ((gy as f32 / scale).round() as usize).min(mask.height - 1);
+            out.set(gx, gy, mask.get(src_x, src_y));
         }
     }
     out
@@ -256,6 +279,21 @@ mod tests {
         grid.set(1, 1, 42.0);
         let out = compress_horizontal(&grid, 1.0);
         assert_eq!(out, grid);
+    }
+
+    #[test]
+    fn mask_compression_matches_grid_compression_dimensions_and_stays_nearest_neighbor() {
+        let mut mask = WaterMask::new(10, 4);
+        for gy in 0..4 {
+            for gx in 5..10 {
+                mask.set(gx, gy, true); // east half is water
+            }
+        }
+        let compressed = compress_mask_horizontal(&mask, 0.5);
+        assert_eq!((compressed.width, compressed.height), (5, 2));
+        // Still reads as land in the west, water in the east half.
+        assert!(!compressed.get(0, 0));
+        assert!(compressed.get(4, 0));
     }
 
     #[test]

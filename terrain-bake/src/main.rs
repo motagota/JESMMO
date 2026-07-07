@@ -1,8 +1,8 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
-//! `--stage ingest`/`water`/`stylize` do something (#59, #60, #61); `all`
-//! runs every stage that exists so far. `detail`/`erode`/`classify`/`export`
-//! are reserved for #65/#66/#67/#62.
+//! `--stage ingest`/`water`/`stylize`/`export` do something (#59, #60, #61,
+//! #62); `all` runs every stage that exists so far. `detail`/`erode`/
+//! `classify` are reserved for #65/#66/#67.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use terrain_bake::{
     cache,
     config::Config,
-    dump,
+    dump, export,
     grid::Grid,
     stylize::{self, FootprintMask},
     synth,
@@ -63,10 +63,17 @@ fn main() {
             let grid = run_ingest(&config, cli.force, debug_dump);
             run_water(&config, grid, debug_dump);
         }
-        Stage::All | Stage::Stylize => {
+        Stage::Stylize => {
             let grid = run_ingest(&config, cli.force, debug_dump);
             let (grid, _mask) = run_water(&config, grid, debug_dump);
             run_stylize(&config, grid, debug_dump);
+        }
+        Stage::All | Stage::Export => {
+            let grid = run_ingest(&config, cli.force, debug_dump);
+            let (grid, mask) = run_water(&config, grid, debug_dump);
+            let stylized = run_stylize(&config, grid, debug_dump);
+            let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
+            run_export(&config, stylized, stylized_mask);
         }
         other => {
             eprintln!("[terrain-bake] --stage {other:?} isn't implemented yet — see the terrain pipeline epic (#56)");
@@ -174,4 +181,21 @@ fn run_stylize(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>
         }
     }
     out
+}
+
+fn run_export(config: &Config, grid: Grid, mask: WaterMask) {
+    let artifact = export::export_artifact(&grid, &mask, config);
+    let out_dir = PathBuf::from(&config.export.out_dir);
+    if let Err(e) = export::write_artifact(&artifact, &out_dir) {
+        eprintln!("[terrain-bake] failed to write artifact to {}: {e}", out_dir.display());
+        std::process::exit(1);
+    }
+    println!(
+        "[terrain-bake] export: wrote {} tiles ({}x{} tile grid) to {}, bake_hash {}",
+        artifact.height_tiles.len(),
+        artifact.manifest.tiles.0,
+        artifact.manifest.tiles.1,
+        out_dir.display(),
+        &artifact.manifest.bake_hash[..12],
+    );
 }
