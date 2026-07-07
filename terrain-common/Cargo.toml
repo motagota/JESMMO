@@ -1,0 +1,13 @@
+[package]
+name = "terrain-common"
+version = "0.1.0"
+edition = "2021"
+
+# Shared by the server (rust_server) and the offline bake tool (terrain-bake):
+# the tile binary format, manifest parsing, and the canonical `sample_height`
+# used everywhere "how high is the ground at (x,y)" needs answering. Deliberately
+# dependency-light — this is compiled into the server binary, so no gdal/image/
+# rayon here (those stay in terrain-bake, which is offline-only).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

@@ -21,6 +21,11 @@ the proxy listens on the same ports as the Python version.
 cargo build --release
 ```
 
+This crate is now a member of the repo-root Cargo workspace (alongside `terrain-common`
+and `terrain-bake` — see the terrain pipeline epic, issue #56). Building/testing from
+here works unchanged; `cargo build --workspace` / `cargo test --workspace` from the repo
+root builds everything at once.
+
 ## Run
 
 In separate terminals:

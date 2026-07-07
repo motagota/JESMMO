@@ -1,0 +1,11 @@
+[package]
+name = "terrain-bake"
+version = "0.1.0"
+edition = "2021"
+
+# Offline bake tool: DEM (or, for now, a synthetic placeholder — #59) -> the
+# tiled artifact terrain-common reads. Never linked into the server binary,
+# so heavier offline-only dependencies (gdal, image, rayon, noise) belong here,
+# not in terrain-common.
+[dependencies]
+terrain-common = { path = "../terrain-common" }
