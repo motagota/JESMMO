@@ -151,6 +151,9 @@ func _wire_signals() -> void:
     _net.partition.connect(func(msg):
         _world.apply_partition(msg)
         _player.set_world_size(float(msg.get("world", 6400))))
+    _net.terrain_data.connect(func(resolution, world_size, heights):
+        Protocol.apply_terrain_data(resolution, world_size, heights)
+        _world.on_terrain_data())
     _net.status_update.connect(_on_status_update)
     _net.plot_district.connect(func(plots):
         _world.apply_plot_roster(plots, _plot_id)
@@ -244,6 +247,7 @@ func _on_welcome(data: Dictionary) -> void:
     _login.show_overlay(false)
     _player.activate()
     _net.send_craft_list() # the recipe registry is static; pull it once per session
+    _net.send_terrain_list() # the heightmap is static; pull it once per session
 
 ## A starter plot was (re-)assigned: remember its id (for rent.pay/autopay),
 ## draw its outline/beacon in the world, feed the HUD compass, and — only on

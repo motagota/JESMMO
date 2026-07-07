@@ -20,6 +20,13 @@ var _roads_root := Node3D.new()
 var _home_root := Node3D.new()
 var _plots_root := Node3D.new()
 var _built_static := false
+## `partition` and `terrain.data` (#54) are two independent round-trips with
+## no guaranteed arrival order. Building the ground before the real
+## heightmap lands would permanently bake in the flat `0.0` fallback (since
+## `_built_static` only ever builds once), so both must have arrived before
+## the static ground/roads are built.
+var _partition_received := false
+var _terrain_ready := false
 ## The last `partition`'s raw zone entries (`{x0,y0,x1,y1,district,...}`), kept
 ## around so `district_at` can answer "which district is this point in" without
 ## a server round-trip — the client already has everything it needs (#15).
@@ -32,18 +39,33 @@ func _ready() -> void:
     add_child(_plots_root)
 
 ## Rebuild the district tiles from a `partition` message; lazily build the static
-## ground/roads once the world size is known.
+## ground/roads once the world size and the terrain heightmap are both known.
 func apply_partition(msg: Dictionary) -> void:
     world_size = float(msg.get("world", world_size))
-    if not _built_static:
-        _build_ground()
-        _build_roads()
-        _built_static = true
+    _partition_received = true
+    _maybe_build_static()
+    _zones = msg.get("zones", [])
+    _rebuild_tiles()
 
+## The terrain heightmap (#54) arrived — build the ground/roads if the
+## world size (from `partition`) is already known too. `_maybe_build_static`
+## only ever builds once both flags are set, so the ground is never built
+## with the flat `0.0` fallback and in need of a later redraw.
+func on_terrain_data() -> void:
+    _terrain_ready = true
+    _maybe_build_static()
+
+func _maybe_build_static() -> void:
+    if _built_static or not _partition_received or not _terrain_ready:
+        return
+    _build_ground()
+    _build_roads()
+    _built_static = true
+
+func _rebuild_tiles() -> void:
     for child in _tiles_root.get_children():
         child.queue_free()
 
-    _zones = msg.get("zones", [])
     for entry_v in _zones:
         var z: Dictionary = entry_v
         _add_district_tile(z)
@@ -70,15 +92,51 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
             return z
     return {}
 
+## A grid mesh (not a flat `PlaneMesh`) so the ground actually shows
+## `Protocol.terrain_height`'s gentle rolling hills instead of looking dead
+## flat — every vertex is placed via the same `w2v` everything else already
+## goes through, so it's automatically consistent with where props/entities
+## sit on it.
 func _build_ground() -> void:
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    # Must match the server's grid exactly (#54) — the client's height
+    # lookups (`Protocol.terrain_height`) interpolate the *same* received
+    # grid, so a mismatched local resolution here would make the rendered
+    # surface disagree with where entities are placed on it.
+    var resolution := Protocol.terrain_resolution()
+    var step := world_size / float(resolution)
+    for gy in range(resolution):
+        for gx in range(resolution):
+            var wx0 := gx * step
+            var wy0 := gy * step
+            var wx1 := wx0 + step
+            var wy1 := wy0 + step
+            var p00 := Protocol.w2v(wx0, wy0, _GROUND_Y)
+            var p10 := Protocol.w2v(wx1, wy0, _GROUND_Y)
+            var p01 := Protocol.w2v(wx0, wy1, _GROUND_Y)
+            var p11 := Protocol.w2v(wx1, wy1, _GROUND_Y)
+            # Two triangles per grid cell, wound so generated normals point
+            # up (verified by tests/smoke_terrain.gd — Godot's generate_normals
+            # gave downward-facing normals for the opposite order).
+            st.add_vertex(p00)
+            st.add_vertex(p10)
+            st.add_vertex(p11)
+            st.add_vertex(p00)
+            st.add_vertex(p11)
+            st.add_vertex(p01)
+    st.index() # share vertices between adjacent triangles for smooth normals
+    st.generate_normals()
+
     _ground = MeshInstance3D.new()
-    var plane := PlaneMesh.new()
-    plane.size = Vector2(world_size, world_size) * Protocol.WORLD_SCALE
-    _ground.mesh = plane
-    # PlaneMesh is centred on its origin; shift so world (0,0) is a corner.
-    _ground.position = Protocol.w2v(world_size * 0.5, world_size * 0.5, _GROUND_Y)
+    _ground.mesh = st.commit()
     var mat := StandardMaterial3D.new()
     mat.albedo_color = Color(0.10, 0.14, 0.10)
+    # The two triangles per cell (p00,p11,p10 / p00,p01,p11) already wind so
+    # generated normals point up (verified by tests/smoke_terrain.gd) — no
+    # need for BaseMaterial3D.CULL_DISABLED, which was a previous defensive
+    # guess and, by letting backfaces render, is the likely cause of the
+    # washed-out/"translucent" look reported against the noise-based terrain.
     _ground.material_override = mat
     add_child(_ground)
 

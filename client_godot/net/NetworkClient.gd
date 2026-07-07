@@ -33,6 +33,7 @@ signal plot_district(plots: Array)
 signal build_placed(structure: Dictionary)
 signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
+signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -146,6 +147,13 @@ func _handle_text(text: String) -> void:
                 String(msg.get("recipe_id", "")),
                 String(msg.get("item_id", "")),
                 int(msg.get("qty", 0)))
+        Protocol.S_TERRAIN_DATA:
+            var raw_heights: Array = msg.get("heights", [])
+            var packed := PackedFloat32Array()
+            packed.resize(raw_heights.size())
+            for i in range(raw_heights.size()):
+                packed[i] = float(raw_heights[i])
+            terrain_data.emit(int(msg.get("resolution", 0)), float(msg.get("world_size", 0.0)), packed)
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -229,6 +237,11 @@ func send_build_place(kind: String, x: int, y: int, rot: int) -> void:
 ## Request the static recipe registry.
 func send_craft_list() -> void:
     _send({"type": Protocol.C_CRAFT_LIST})
+
+## Request the authored terrain heightmap (#54) — static and session-long, so
+## sent once, same pattern as `send_craft_list`.
+func send_terrain_list() -> void:
+    _send({"type": Protocol.C_TERRAIN_LIST})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

@@ -2474,6 +2474,21 @@ impl Proxy {
         self.push_to_player(pid, json!({"type": "craft.recipes", "recipes": recipes}));
     }
 
+    /// Answer `terrain.list` with the authored heightmap grid (#54). Stateless
+    /// and static (same every boot) — sent once per session rather than
+    /// folded into `partition` (which gets rebroadcast on every zone
+    /// split/merge/capture; the terrain payload is too large to wastefully
+    /// resend on every one of those).
+    fn send_terrain(&self, pid: &str) {
+        let terrain = &self.capital.terrain;
+        self.push_to_player(pid, json!({
+            "type": "terrain.data",
+            "resolution": terrain.resolution,
+            "world_size": WORLD_SIZE,
+            "heights": terrain.heights,
+        }));
+    }
+
     /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
     /// caller's own plot. Silent no-op otherwise (no error protocol surface).
     async fn apply_set_respawn(&self, pid: &str, bed_id: &str) {
@@ -2855,6 +2870,12 @@ impl Proxy {
                     // no player position/proximity is relevant, so answer directly.
                     if data.get("type").and_then(|v| v.as_str()) == Some("craft.list") {
                         self.send_recipes(&player_id);
+                        continue;
+                    }
+                    // `terrain.list` is a stateless read of the static heightmap
+                    // grid (#54) — same reasoning as `craft.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.list") {
+                        self.send_terrain(&player_id);
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -5195,6 +5216,36 @@ mod tests {
         let roster = recv_until(&mut ws, "plot.district").await;
         let plots = roster["plots"].as_array().unwrap();
         assert_eq!(plots.len(), 240, "the Suburbs roster, trusting `to` directly, not the stale Civic-reading cache");
+
+        drop(ws);
+    }
+
+    /// #54: `terrain.list` answers with the same authored heightmap grid
+    /// `capital()` holds server-side — stateless, no DB/position involved,
+    /// same shape as `craft.list`/`craft.recipes`.
+    #[tokio::test]
+    async fn terrain_list_answers_with_the_authored_heightmap() {
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
+
+        let email = format!("surveyor_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Surveyor"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.list"}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.data").await;
+
+        let expected = mmo::world::capital().terrain;
+        assert_eq!(msg["resolution"].as_i64().unwrap(), expected.resolution as i64);
+        let heights: Vec<f64> = msg["heights"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert_eq!(heights.len(), expected.heights.len());
+        for (got, want) in heights.iter().zip(expected.heights.iter()) {
+            assert!((*got - *want as f64).abs() < 0.0001, "heightmap sent over the wire must match capital()'s exactly");
+        }
 
         drop(ws);
     }
