@@ -89,3 +89,8 @@ pub const C_RENT_SET_AUTOPAY: &str = "rent.set_autopay"; // {plot_id, enabled} -
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control
+
+// --- mayor.*  (city build orders commissioned at runtime, e.g. roads) ----------
+// Restricted to the account with `role = "mayor"`; rejected for everyone else.
+pub const C_MAYOR_BUILD_CREATE: &str = "mayor.build_create"; // {district, kind, structure_kind, required_json, x, y, x1?, y1?}
+pub const S_MAYOR_BUILD_ERROR: &str = "mayor.build_error"; // {message} -- rejected (not mayor / not on city land)

@@ -1,15 +1,17 @@
 //! The authored Capital — Phase 1 world content (issue #4).
 //!
 //! The capital is **authored data**, not code that runs a simulation. It defines
-//! the named districts that tile the world, the road graph, the starter plot grid,
-//! the town-centre spawn anchor, and the first build order. Crucially this identity
-//! is keyed to *regions of the world*, independent of how many zone processes back
-//! them (a busy district may be split across several sims, or several districts may
-//! share one) — the gateway maps a point/region to its district by geometry.
+//! the named districts that tile the world, the starter plot grid, and the
+//! town-centre spawn anchor. Crucially this identity is keyed to *regions of the
+//! world*, independent of how many zone processes back them (a busy district may be
+//! split across several sims, or several districts may share one) — the gateway
+//! maps a point/region to its district by geometry.
 //!
-//! The capital starts **empty**: this module authors the ground (district rects),
-//! the road graph, and the plot grid, but **no buildings**. Structures only appear
-//! as players complete build orders and build homes (M2/M3). See phase1.md §3.1-3.2.
+//! The capital starts **empty**: this module authors the ground (district rects)
+//! and the plot grid, but **no buildings and no roads**. Structures — including
+//! roads — only appear as players complete build orders (commissioned at runtime
+//! by the mayor, see `mayor.build_create`) and build homes (M2/M3). See
+//! phase1.md §3.1-3.2.
 //!
 //! `WORLD_SIZE` mirrors the gateway/zone constant; keep them in sync.
 
@@ -125,16 +127,6 @@ impl District {
         }
         cells
     }
-}
-
-/// A straight authored road segment (the road *graph* is the set of these). Data
-/// only — drawn by the client; the server doesn't simulate roads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoadSegment {
-    pub x0: i32,
-    pub y0: i32,
-    pub x1: i32,
-    pub y1: i32,
 }
 
 /// A seed build order: the city quests that exist the moment the capital boots.
@@ -443,7 +435,6 @@ fn flatten_terrain_for_plots(heights: &mut [f32], resolution: i32, world_size: f
 #[derive(Debug, Clone)]
 pub struct Capital {
     pub districts: Vec<District>,
-    pub roads: Vec<RoadSegment>,
     pub town_centre: (i32, i32),
     pub build_orders: Vec<SeedBuildOrder>,
     pub resource_nodes: Vec<ResourceNodeSpawn>,
@@ -516,10 +507,10 @@ impl Capital {
 
 /// The Phase 1 capital: five named districts tiling the 6400x6400 (~41 km²) world
 /// in a plus/cross layout — a central Civic Centre with Market/Suburbs bands to its
-/// west/east and Craftworks/Old Quarter bands to its north/south — a main avenue and
-/// a cross-street connecting every district centre, a starter plot grid in the
-/// suburbs, a town-centre spawn at the world centre, and the first build order
-/// (the Town Well) on the civic centre board.
+/// west/east and Craftworks/Old Quarter bands to its north/south — a starter plot
+/// grid in the suburbs, a town-centre spawn at the world centre, and a civic build
+/// board. No roads and no build orders are authored; both start empty and are
+/// built at runtime (roads via mayor-issued build orders).
 pub fn capital() -> Capital {
     // A plus/cross tiling: west/east bands span the full height; the middle column
     // (between them) splits into north/centre/south. Exact tiling, verified in
@@ -587,74 +578,12 @@ pub fn capital() -> Capital {
     // Town centre at the world centre, inside the Civic Centre band. This is the
     // spawn anchor and where the first build-order board lives.
     let town_centre = (WORLD_SIZE / 2, WORLD_SIZE / 2);
-
-    // Main avenue (market <-> suburbs, through the town centre's latitude) and a
-    // civic cross-street (full height, through the town centre's longitude). Both
-    // district centres of every band lie on one of these two lines (craftworks and
-    // old_quarter's centres share the town centre's x; market and suburbs' centres
-    // share its y), so all five districts read as connected with just these two
-    // segments — verified in `capital_has_roads_and_the_build_order_tech_tree`.
-    let mid_y = WORLD_SIZE / 2;
-    let roads = vec![
-        RoadSegment { x0: market.region.centre().0, y0: mid_y, x1: suburbs.region.centre().0, y1: mid_y },
-        RoadSegment { x0: town_centre.0, y0: 0, x1: town_centre.0, y1: WORLD_SIZE },
-    ];
-
-    // The city tech tree, all in the Civic Centre so one town-centre board demonstrates
-    // the whole loop: the Town Well is open from boot; finishing it unlocks the Wall
-    // Section, which unlocks the Market Stall. Structures appear near the town centre on
-    // completion. Costs are small so the headline demo fills quickly.
     let (tcx, tcy) = town_centre;
-    let build_orders = vec![
-        SeedBuildOrder {
-            district: civic.id,
-            kind: "town_well",
-            required_json: r#"{"wood":20,"stone":10}"#,
-            prereq: None,
-            structure_kind: "well",
-            structure_x: tcx,
-            structure_y: tcy - 40,
-            required_skill: None,
-            required_level: 0,
-        },
-        SeedBuildOrder {
-            district: civic.id,
-            kind: "wall_section",
-            required_json: r#"{"stone":30}"#,
-            prereq: Some("town_well"),
-            structure_kind: "wall",
-            structure_x: tcx - 100,
-            structure_y: tcy,
-            required_skill: None,
-            required_level: 0,
-        },
-        SeedBuildOrder {
-            district: civic.id,
-            kind: "market_stall",
-            required_json: r#"{"wood":40}"#,
-            prereq: Some("wall_section"),
-            structure_kind: "stall",
-            structure_x: tcx + 100,
-            structure_y: tcy - 40,
-            required_skill: None,
-            required_level: 0,
-        },
-        // Skill-gated tier: open from boot but greyed until the contributor reaches
-        // Building 1 — which a solo player earns by completing the Town Well. This is
-        // the headline #10 demo: a threshold un-greys a previously locked structure,
-        // independent of the well→wall→market prerequisite chain.
-        SeedBuildOrder {
-            district: civic.id,
-            kind: "watchtower",
-            required_json: r#"{"wood":30,"stone":20}"#,
-            prereq: None,
-            structure_kind: "watchtower",
-            structure_x: tcx + 60,
-            structure_y: tcy + 80,
-            required_skill: Some("building"),
-            required_level: 1,
-        },
-    ];
+
+    // No authored build orders: the capital starts with none. City work (starting
+    // with dirt paths) is commissioned at runtime by the mayor via `mayor.build_create`
+    // rather than authored here — see `Db::insert_build_order`'s placement fields.
+    let build_orders: Vec<SeedBuildOrder> = vec![];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
     // spawn finds wood immediately) plus wood/stone spread through every
@@ -706,7 +635,6 @@ pub fn capital() -> Capital {
 
     Capital {
         districts: vec![market, civic, suburbs, craftworks, old_quarter],
-        roads,
         town_centre,
         build_orders,
         resource_nodes,
@@ -834,47 +762,10 @@ mod tests {
     }
 
     #[test]
-    fn capital_has_roads_and_the_build_order_tech_tree() {
+    fn capital_authors_no_roads_or_build_orders() {
         let c = capital();
-        assert!(!c.roads.is_empty(), "the capital should have an authored road graph");
-        // The Town Well is open from boot; the rest of the chain is gated behind it.
-        let well = c.build_orders.iter().find(|o| o.kind == "town_well").expect("town_well");
-        assert_eq!(well.district, "civic");
-        assert_eq!(well.prereq, None, "the first order must be open from boot");
-        // required_json is valid JSON.
-        let v: serde_json::Value = serde_json::from_str(well.required_json).unwrap();
-        assert!(v.get("wood").is_some());
-        // Every non-root order names a prereq that is itself an authored order, and every
-        // order authors a structure spec. This keeps the unlock graph well-formed.
-        for o in &c.build_orders {
-            let _: serde_json::Value = serde_json::from_str(o.required_json).unwrap();
-            assert!(!o.structure_kind.is_empty(), "{} has no structure", o.kind);
-            if let Some(p) = o.prereq {
-                assert!(c.build_orders.iter().any(|b| b.kind == p),
-                    "{} depends on unknown order {}", o.kind, p);
-            }
-        }
-        // town_well unlocks wall_section unlocks market_stall.
-        assert!(c.build_orders.iter().any(|o| o.kind == "wall_section" && o.prereq == Some("town_well")));
-        assert!(c.build_orders.iter().any(|o| o.kind == "market_stall" && o.prereq == Some("wall_section")));
-
-        // A skill gate is `Some(skill)` iff its level is positive, and a positive gate is
-        // reachable: the required level never exceeds what completing the Town Well grants
-        // solo (so the headline demo — a threshold un-greying a structure — is achievable).
-        let well_units: i64 = serde_json::from_str::<serde_json::Value>(well.required_json)
-            .unwrap().as_object().unwrap().values().map(|v| v.as_i64().unwrap()).sum();
-        let well_level = crate::persistence::level_for_xp(well_units * crate::persistence::BUILD_XP_PER_UNIT);
-        for o in &c.build_orders {
-            assert_eq!(o.required_skill.is_some(), o.required_level > 0,
-                "{}: skill gate and level must agree", o.kind);
-            assert!(o.required_level <= well_level,
-                "{} gates at Building {} but the Town Well only grants Building {}",
-                o.kind, o.required_level, well_level);
-        }
-        // The authored gated demo order exists: open from boot yet greyed until Building 1.
-        let tower = c.build_orders.iter().find(|o| o.kind == "watchtower").expect("watchtower");
-        assert_eq!(tower.prereq, None, "the gated demo is open from boot, gated only by skill");
-        assert_eq!((tower.required_skill, tower.required_level), (Some("building"), 1));
+        // Roads and city work are commissioned at runtime by the mayor now, not authored.
+        assert!(c.build_orders.is_empty(), "the capital should start with no seeded build orders");
     }
 
     #[test]

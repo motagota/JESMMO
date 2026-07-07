@@ -39,6 +39,7 @@ signal rent_status(plot_id: String, due_at: int, paid_through: int, state: Strin
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
 signal district_ready
+signal mayor_build_error(message: String)
 
 var url := "ws://127.0.0.1:8766"
 
@@ -170,6 +171,8 @@ func _handle_text(text: String) -> void:
             rent_reclaimed.emit(String(msg.get("plot_id", "")), msg.get("moved_to_storage", []))
         Protocol.S_DISTRICT_READY:
             district_ready.emit()
+        Protocol.S_MAYOR_BUILD_ERROR:
+            mayor_build_error.emit(String(msg.get("message", "that build order was rejected")))
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -266,3 +269,14 @@ func send_rent_set_autopay(plot_id: String, enabled: bool) -> void:
 ## already happened via the ordinary migrate-request path.
 func send_district_enter(from_district: String, to_district: String) -> void:
     _send({"type": Protocol.C_DISTRICT_ENTER, "from": from_district, "to": to_district})
+
+## Commission a city build order (mayor-only; the server rejects anyone else with
+## `mayor.build_error`). `x1`/`y1` are the end point of a segment-shaped structure
+## (e.g. a dirt path); omit them (pass `x`/`y` again) for a point structure.
+func send_mayor_build_create(district: String, kind: String, structure_kind: String,
+        required_json: String, x: int, y: int, x1: int, y1: int) -> void:
+    _send({
+        "type": Protocol.C_MAYOR_BUILD_CREATE, "district": district, "kind": kind,
+        "structure_kind": structure_kind, "required_json": required_json,
+        "x": x, "y": y, "x1": x1, "y1": y1,
+    })
