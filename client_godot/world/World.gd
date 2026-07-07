@@ -1,16 +1,19 @@
-## The 3D capital: a ground plane, the authored district tiles, and the main
-## roads, all rebuilt from the gateway's `partition` message.
+## The 3D capital: a ground plane, the authored district tiles, and the
+## town-centre marker, all rebuilt from the gateway's `partition` message.
 ##
-## The capital starts empty — this draws the ground and districts (named, tinted
-## by safety) plus a couple of authored roads and a town-centre marker. Structures
-## (homes, the build-order board models) arrive with later milestones; the data to
-## place them comes over the wire then.
+## The capital starts empty — no roads are authored; this draws the ground and
+## districts (named, tinted by safety) plus a town-centre marker. Roads are real,
+## buildable content now (mayor-issued dirt paths, see `upsert_dirt_road`), and
+## other structures arrive as build orders complete.
 class_name World
 extends Node3D
 
 const _GROUND_Y := 0.0
 const _TILE_Y := 0.02   # district tiles sit just above the ground to avoid z-fighting
 const _ROAD_Y := 0.05
+const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
+const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
+const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
 
 var world_size := 6400.0
 
@@ -31,6 +34,10 @@ var _terrain_ready := false
 ## around so `district_at` can answer "which district is this point in" without
 ## a server round-trip — the client already has everything it needs (#15).
 var _zones: Array = []
+## Rendered dirt-road segments, keyed by their `status_update` id
+## (`structure_<build order kind>`) — a road is static once built, so a repeat
+## update (e.g. a re-broadcast on district re-entry) is a no-op, not a rebuild.
+var _dirt_roads: Dictionary = {}
 
 func _ready() -> void:
     add_child(_tiles_root)
@@ -59,7 +66,7 @@ func _maybe_build_static() -> void:
     if _built_static or not _partition_received or not _terrain_ready:
         return
     _build_ground()
-    _build_roads()
+    _build_town_centre_marker()
     _built_static = true
 
 func _rebuild_tiles() -> void:
@@ -140,15 +147,8 @@ func _build_ground() -> void:
     _ground.material_override = mat
     add_child(_ground)
 
-func _build_roads() -> void:
-    # Mirrors mmo::world::capital(): a main avenue across the mid-latitude and a
-    # civic cross-street through the town centre at the world's centre.
+func _build_town_centre_marker() -> void:
     var mid := world_size * 0.5
-    var road := Color(0.20, 0.20, 0.22)
-    _add_strip(_roads_root, Vector2(0, mid), Vector2(world_size, mid), 24.0, road)        # avenue
-    _add_strip(_roads_root, Vector2(mid, 0), Vector2(mid, world_size), 24.0, road)        # cross-street
-
-    # Town-centre marker (the spawn anchor / first build-order board).
     var marker := MeshInstance3D.new()
     var cyl := CylinderMesh.new()
     cyl.top_radius = 6.0 * Protocol.WORLD_SCALE
@@ -160,6 +160,57 @@ func _build_roads() -> void:
     mm.albedo_color = Color(0.95, 0.85, 0.30)
     marker.material_override = mm
     _roads_root.add_child(marker)
+
+## Render a completed `dirt_road` build order — a segment from `(x,y)` to
+## `(x1,y1)` — as a real road: a multi-vertex ribbon, not a single rigid box.
+## Every cross-section along the segment is placed with its own `Protocol.w2v`
+## sample (exactly like `_build_ground`'s per-vertex grid), so the path actually
+## follows the terrain's hills its whole length instead of floating/clipping
+## between two flat endpoints. `id` is the `status_update` id
+## (`structure_<build order kind>`) — idempotent, since a road never moves.
+func upsert_dirt_road(id: String, state: Dictionary) -> void:
+    if _dirt_roads.has(id):
+        return
+    var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
+    var b := Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))
+    _dirt_roads[id] = _build_road_ribbon(a, b)
+
+func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
+    var length := a.distance_to(b)
+    var segments := maxi(1, ceili(length / _ROAD_SEGMENT_STEP))
+    var dir := (b - a).normalized() if length > 0.001 else Vector2.RIGHT
+    var perp := Vector2(-dir.y, dir.x) * (_ROAD_WIDTH * 0.5)
+
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    var prev_left := Vector3.ZERO
+    var prev_right := Vector3.ZERO
+    for i in range(segments + 1):
+        var t := float(i) / float(segments)
+        var p := a.lerp(b, t)
+        var left := Protocol.w2v(p.x + perp.x, p.y + perp.y, _ROAD_Y)
+        var right := Protocol.w2v(p.x - perp.x, p.y - perp.y, _ROAD_Y)
+        if i > 0:
+            # Mirrors `_build_ground`'s winding (p00,p10,p11 / p00,p11,p01) so
+            # generated normals point up here too.
+            st.add_vertex(prev_left)
+            st.add_vertex(left)
+            st.add_vertex(right)
+            st.add_vertex(prev_left)
+            st.add_vertex(right)
+            st.add_vertex(prev_right)
+        prev_left = left
+        prev_right = right
+    st.index()
+    st.generate_normals()
+
+    var strip := MeshInstance3D.new()
+    strip.mesh = st.commit()
+    var mat := StandardMaterial3D.new()
+    mat.albedo_color = _ROAD_COLOR
+    strip.material_override = mat
+    _roads_root.add_child(strip)
+    return strip
 
 func _add_strip(parent: Node3D, a: Vector2, b: Vector2, width: float, color: Color) -> void:
     var strip := MeshInstance3D.new()

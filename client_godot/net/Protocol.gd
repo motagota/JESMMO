@@ -81,6 +81,12 @@ const S_RENT_WARNING := "rent.warning"
 const S_RENT_RECLAIMED := "rent.reclaimed"
 const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 
+# --- gameplay: mayor-commissioned city build orders (e.g. dirt paths) --------
+## Restricted server-side to the account with `role == "mayor"` (see `welcome`'s
+## `role` field); rejected with `S_MAYOR_BUILD_ERROR` for everyone else.
+const C_MAYOR_BUILD_CREATE := "mayor.build_create"
+const S_MAYOR_BUILD_ERROR := "mayor.build_error"
+
 # --- gameplay: gated district transitions (M4 #15) ----------------------------
 ## The position/zone handoff itself is unrelated (see `S_ZONE_MIGRATION`) — this
 ## is purely the client-facing load/ready handshake for the transition curtain.

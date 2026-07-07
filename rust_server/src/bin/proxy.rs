@@ -45,6 +45,37 @@ const SPAWN_X: i32 = WORLD_SIZE / 2;
 const SPAWN_Y: i32 = WORLD_SIZE / 2;
 const SPAWN_HP: i32 = 100;
 
+/// The one seeded mayor login — a normal account, just with `role = 'mayor'`, so
+/// there's always a known way to commission city build orders.
+const MAYOR_EMAIL: &str = "mayor@capital.town";
+const MAYOR_PASSWORD: &str = "mayor12345";
+
+/// Must be within this of a build board — or a build order's own placement — to
+/// contribute to it.
+const BOARD_RANGE: i32 = 60;
+
+fn dist2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
+    let dx = (ax - bx) as i64;
+    let dy = (ay - by) as i64;
+    dx * dx + dy * dy
+}
+
+/// Squared distance from `(px,py)` to the segment `(x0,y0)-(x1,y1)` (clamped
+/// projection), for gating proximity to a segment-shaped structure like a road.
+fn point_segment_dist2(px: i32, py: i32, x0: i32, y0: i32, x1: i32, y1: i32) -> i64 {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len2 = (dx as i64).pow(2) + (dy as i64).pow(2);
+    if len2 == 0 {
+        return dist2(px, py, x0, y0);
+    }
+    let t = (((px - x0) as i64 * dx as i64 + (py - y0) as i64 * dy as i64) as f64 / len2 as f64)
+        .clamp(0.0, 1.0);
+    let cx = x0 as f64 + t * dx as f64;
+    let cy = y0 as f64 + t * dy as f64;
+    let (ddx, ddy) = (px as f64 - cx, py as f64 - cy);
+    (ddx * ddx + ddy * ddy) as i64
+}
+
 /// Rent period seeded on a freshly claimed starter plot, and the period a
 /// payment (manual or auto-pay) extends it by (#14).
 const STARTER_RENT_PERIOD_SECS: i64 = 7 * 24 * 3600;
@@ -194,6 +225,9 @@ struct ClientInfo {
     /// True when `player_id` is a durable character backed by the database, so its
     /// position is written back on flush/disconnect. Guests are ephemeral.
     persistent: bool,
+    /// Cached from the account at login (`"player"` or `"mayor"`) so gating
+    /// `mayor.build_create` doesn't need a DB round trip per message.
+    role: String,
 }
 
 /// The cached last-known state of an entity, as reported by its owning zone's
@@ -217,6 +251,8 @@ struct Identity {
     y: i32,
     hp: i32,
     persistent: bool,
+    /// `"player"` (default) or `"mayor"` — gates `mayor.build_create`.
+    role: String,
     /// A legacy/bot client may send a gameplay frame instead of authenticating;
     /// we treat it as a guest and carry that first frame so it isn't dropped.
     pending: Option<Value>,
@@ -313,13 +349,14 @@ fn plot_roster_entry_json(cell: &mmo::world::PlotCell, p: &mmo::persistence::Plo
 
 /// A completed city structure as a render entity (`status_update`, `state.type =
 /// "structure"`). Its id is stable per order kind so re-sends update in place.
-fn structure_status_json(spec: &mmo::world::SeedBuildOrder) -> Value {
+/// A live-render `status_update` for a completed build order's own placement.
+fn structure_status_json(kind: &str, p: &mmo::persistence::BuildPlacement) -> Value {
     json!({
         "type": "status_update",
-        "player_id": format!("structure_{}", spec.kind),
+        "player_id": format!("structure_{}", kind),
         "state": {
-            "x": spec.structure_x, "y": spec.structure_y,
-            "type": "structure", "kind": spec.structure_kind, "facing": [0, 0],
+            "x": p.x, "y": p.y, "x1": p.x1, "y1": p.y1,
+            "type": "structure", "kind": p.structure_kind, "facing": [0, 0],
         },
     })
 }
@@ -1810,16 +1847,25 @@ impl Proxy {
                     // No database configured: fall back to a guest session.
                     None => return Some(guest_identity(None)),
                     Some(db) => {
-                        if kind == protocol::C_REGISTER {
+                        let ch = if kind == protocol::C_REGISTER {
                             let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             auth::register(
                                 db, email, password, name,
                                 SPAWN_X as i64, SPAWN_Y as i64, SPAWN_HP as i64,
                             )
                             .await
-                            .map(persistent_identity)
                         } else {
-                            auth::login(db, email, password).await.map(persistent_identity)
+                            auth::login(db, email, password).await
+                        };
+                        match ch {
+                            Ok(ch) => {
+                                let role = db
+                                    .role_for_account(&ch.account_id)
+                                    .await
+                                    .unwrap_or_else(|_| "player".to_string());
+                                Ok(persistent_identity(ch, role))
+                            }
+                            Err(e) => Err(e),
                         }
                     }
                 }
@@ -1877,7 +1923,11 @@ impl Proxy {
         let character_id = self.sessions.lock().unwrap().get(token).cloned()?;
         let db = self.db.as_ref()?;
         let ch = db.character_by_id(&character_id).await.ok()??;
-        Some(persistent_identity(ch))
+        let role = db
+            .role_for_account(&ch.account_id)
+            .await
+            .unwrap_or_else(|_| "player".to_string());
+        Some(persistent_identity(ch, role))
     }
 
     /// Periodically persist every connected durable character's last-known state,
@@ -2078,22 +2128,12 @@ impl Proxy {
     /// `build_order`; positions are authored).
     async fn send_completed_structures(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        let mut districts: Vec<&str> = self.capital.build_orders.iter().map(|o| o.district).collect();
-        districts.sort_unstable();
-        districts.dedup();
-        let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for d in districts {
-            if let Ok(orders) = db.build_orders_for_district(d).await {
-                for o in orders {
-                    if o.state == "completed" {
-                        completed.insert(o.kind);
-                    }
+        for d in &self.capital.districts {
+            let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
+            for o in orders.iter().filter(|o| o.state == "completed") {
+                if let Some(p) = o.placement() {
+                    self.push_to_player(pid, structure_status_json(&o.kind, &p));
                 }
-            }
-        }
-        for spec in &self.capital.build_orders {
-            if completed.contains(spec.kind) {
-                self.push_to_player(pid, structure_status_json(spec));
             }
         }
     }
@@ -2114,6 +2154,37 @@ impl Proxy {
         if !persistent {
             return;
         }
+        // Proximity gate: near a build board in the order's district, or near the
+        // order's own placement (e.g. a mayor-commissioned dirt path built well away
+        // from the civic board). The gateway's live position cache (updated on every
+        // status_update, same as the zone's tick) is fresh enough for this check.
+        let Ok(Some(order)) = db.build_order_by_id(order_id).await else { return };
+        let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
+        let near_board = self
+            .capital
+            .districts
+            .iter()
+            .find(|d| d.id == order.district)
+            .map(|d| self.capital.build_boards_in(d.region))
+            .unwrap_or_default()
+            .iter()
+            .any(|b| dist2(px, py, b.x, b.y) <= (BOARD_RANGE as i64).pow(2));
+        let near_order = match (order.x, order.y) {
+            (Some(ox), Some(oy)) => {
+                let d2 = match (order.x1, order.y1) {
+                    (Some(ox1), Some(oy1)) => point_segment_dist2(
+                        px, py, ox as i32, oy as i32, ox1 as i32, oy1 as i32,
+                    ),
+                    _ => dist2(px, py, ox as i32, oy as i32),
+                };
+                d2 <= (BOARD_RANGE as i64).pow(2)
+            }
+            _ => false,
+        };
+        if !near_board && !near_order {
+            return;
+        }
+
         let res = match db.contribute(pid, order_id, item_id, qty).await {
             Ok(r) => r,
             Err(_) => return,
@@ -2139,18 +2210,18 @@ impl Proxy {
             }
         }
 
-        // The authored structure for this order kind.
-        let spec = self.capital.build_orders.iter().find(|o| o.kind == res.kind).copied();
-        let structures: Vec<Value> = spec
+        // This order's own placement (set at creation — mayor-commissioned or authored).
+        let structures: Vec<Value> = res
+            .placement
             .iter()
-            .map(|s| json!({"kind": s.structure_kind, "x": s.structure_x, "y": s.structure_y}))
+            .map(|p| json!({"kind": p.structure_kind, "x": p.x, "y": p.y, "x1": p.x1, "y1": p.y1}))
             .collect();
         self.broadcast_to_district(&res.district, json!({
             "type": "build.completed", "order_id": order_id, "structures": structures,
         }));
-        // Render the new building for every connected client.
-        if let Some(s) = spec {
-            let entity = structure_status_json(&s).to_string();
+        // Render the new structure for every connected client.
+        if let Some(p) = &res.placement {
+            let entity = structure_status_json(&res.kind, p).to_string();
             let clients = self.clients.lock().unwrap();
             for info in clients.values() {
                 self.push_to_client(info, Message::Text(entity.clone()));
@@ -2178,6 +2249,88 @@ impl Proxy {
         }
         // Refresh the board for the district (the newly opened orders now appear).
         self.broadcast_build_list(&res.district).await;
+    }
+
+    /// Whether `(x,y)` falls inside a currently-owned plot — i.e. is *not*
+    /// city-owned land. Districts without an authored plot grid (everywhere but
+    /// the suburbs today) have no ownable plots at all, so every point in them is
+    /// city land.
+    async fn on_owned_plot(&self, x: i32, y: i32, db: &Db) -> bool {
+        let Some(district) = self.capital.district_at(x, y) else { return false };
+        if district.plot_grid.is_none() {
+            return false;
+        }
+        let cells = district.plots();
+        let Ok(rows) = db.plots_for_district(district.id).await else { return false };
+        rows.iter().filter(|p| p.owner_character_id.is_some()).any(|p| {
+            cells.iter().any(|c| {
+                c.grid_x as i64 == p.grid_x && c.grid_y as i64 == p.grid_y && c.rect().contains(x, y)
+            })
+        })
+    }
+
+    /// Handle `mayor.build_create`: only the seeded mayor account may commission
+    /// city work, and only on city-owned land (not inside anyone's claimed plot).
+    /// Otherwise this mirrors authored seeding — an open build order any player
+    /// can then contribute to via the ordinary `build.contribute` path.
+    async fn apply_mayor_build_create(&self, pid: &str, data: Value) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "mayor" {
+            self.push_to_player(pid, json!({
+                "type": protocol::S_MAYOR_BUILD_ERROR,
+                "message": "only the mayor may commission city work",
+            }));
+            return;
+        }
+
+        let district = data.get("district").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let structure_kind = data.get("structure_kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let required_json = data.get("required_json").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+        let (Some(x), Some(y)) = (
+            data.get("x").and_then(|v| v.as_i64()),
+            data.get("y").and_then(|v| v.as_i64()),
+        ) else {
+            self.push_to_player(pid, json!({
+                "type": protocol::S_MAYOR_BUILD_ERROR, "message": "x/y are required",
+            }));
+            return;
+        };
+        let x1 = data.get("x1").and_then(|v| v.as_i64());
+        let y1 = data.get("y1").and_then(|v| v.as_i64());
+        if district.is_empty() || kind.is_empty() || structure_kind.is_empty() {
+            self.push_to_player(pid, json!({
+                "type": protocol::S_MAYOR_BUILD_ERROR,
+                "message": "district, kind, and structure_kind are required",
+            }));
+            return;
+        }
+
+        // City land only: check the start point, the end point (for a segment),
+        // and its midpoint against every currently-owned plot.
+        let mut check_points = vec![(x as i32, y as i32)];
+        if let (Some(x1), Some(y1)) = (x1, y1) {
+            check_points.push((x1 as i32, y1 as i32));
+            check_points.push((((x + x1) / 2) as i32, ((y + y1) / 2) as i32));
+        }
+        for (px, py) in check_points {
+            if self.on_owned_plot(px, py, &db).await {
+                self.push_to_player(pid, json!({
+                    "type": protocol::S_MAYOR_BUILD_ERROR,
+                    "message": "that land is privately owned",
+                }));
+                return;
+            }
+        }
+
+        let placement = Some(mmo::persistence::BuildPlacement { structure_kind, x, y, x1, y1 });
+        match db.insert_build_order(&district, &kind, &required_json, "open", now_secs(), None, 0, placement).await {
+            Ok(_) => self.broadcast_build_list(&district).await,
+            Err(_) => self.push_to_player(pid, json!({
+                "type": protocol::S_MAYOR_BUILD_ERROR, "message": "failed to create the order",
+            })),
+        }
     }
 
     /// Emit a `skill.update` for a just-granted skill, plus a `skill.levelup` when the
@@ -2757,6 +2910,7 @@ impl Proxy {
                 current_zone: spawn_zone_id.clone(),
                 tx,
                 persistent: identity.persistent,
+                role: identity.role.clone(),
             },
         );
 
@@ -2768,6 +2922,7 @@ impl Proxy {
                 "zone": spawn_zone_id,
                 "protocol_version": PROTOCOL_VERSION,
                 "name": identity.name.clone(),
+                "role": identity.role.clone(),
             })
             .to_string(),
         ));
@@ -2896,6 +3051,13 @@ impl Proxy {
                         let plot_id = data.get("plot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
                         self.apply_rent_set_autopay(&player_id, &plot_id, enabled).await;
+                        continue;
+                    }
+                    // `mayor.build_create` is role- and DB-ownership-checked (is this
+                    // caller the mayor? is the target city land?), no live-position
+                    // dependency, so it's answered directly too.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("mayor.build_create") {
+                        self.apply_mayor_build_create(&player_id, data).await;
                         continue;
                     }
                     // `district.enter` is the client announcing (self-detected from the
@@ -3145,12 +3307,13 @@ fn guest_identity(pending: Option<Value>) -> Identity {
         y: SPAWN_Y,
         hp: SPAWN_HP,
         persistent: false,
+        role: "player".to_string(),
         pending,
     }
 }
 
-/// Build a durable identity from a loaded/created character row.
-fn persistent_identity(ch: mmo::persistence::Character) -> Identity {
+/// Build a durable identity from a loaded/created character row and its account's role.
+fn persistent_identity(ch: mmo::persistence::Character, role: String) -> Identity {
     Identity {
         character_id: ch.id,
         name: ch.name,
@@ -3158,6 +3321,7 @@ fn persistent_identity(ch: mmo::persistence::Character) -> Identity {
         y: ch.y as i32,
         hp: ch.hp as i32,
         persistent: true,
+        role,
         pending: None,
     }
 }
@@ -3232,6 +3396,13 @@ async fn main() {
             match db.seed_capital(&mmo::world::capital(), now).await {
                 Ok(()) => println!("[Proxy] Capital seeded ({} starter plots)", mmo::world::capital().starter_plots().len()),
                 Err(e) => println!("[Proxy] WARNING: capital seeding failed: {e}"),
+            }
+            // Seed the one mayor login (idempotent — a no-op once the account exists).
+            let mayor_hash = auth::hash_password(MAYOR_PASSWORD).unwrap_or_default();
+            let (tcx, tcy) = mmo::world::capital().town_centre;
+            match db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", tcx as i64, tcy as i64, SPAWN_HP as i64, now).await {
+                Ok(()) => println!("[Proxy] Mayor account ready ({MAYOR_EMAIL})"),
+                Err(e) => println!("[Proxy] WARNING: mayor seeding failed: {e}"),
             }
             Some(Arc::new(db))
         }
@@ -3327,6 +3498,7 @@ mod tests {
                 current_zone: zone.to_string(),
                 tx,
                 persistent: false,
+                role: "player".to_string(),
             },
         );
         rx
@@ -3341,6 +3513,7 @@ mod tests {
                 current_zone: zone.to_string(),
                 tx,
                 persistent: false,
+                role: "player".to_string(),
             },
             rx,
         )
@@ -4053,6 +4226,7 @@ mod tests {
                 current_zone: "zone_a".to_string(),
                 tx: mpsc::channel(8).0,
                 persistent: true,
+                role: "player".to_string(),
             },
         );
         proxy.entity_state.lock().unwrap().insert(
@@ -4078,6 +4252,7 @@ mod tests {
                 current_zone: "zone_a".to_string(),
                 tx: mpsc::channel(8).0,
                 persistent: false,
+                role: "player".to_string(),
             },
         );
         proxy.entity_state.lock().unwrap().insert(
@@ -4494,23 +4669,26 @@ mod tests {
         drop(ws);
     }
 
-    /// #9 headline: pooling gathered items into the Town Well fills it, then completion
-    /// pays building XP, spawns the structure, and unlocks the next order — the full
-    /// gateway path a zone's `build_contribute` drives.
+    /// #9 headline: pooling gathered items into a build order fills it, then
+    /// completion pays building XP and spawns the structure — the full gateway
+    /// path a zone's `build_contribute` drives. Build orders are commissioned at
+    /// runtime now (by the mayor in practice; inserted directly here to isolate
+    /// this from `mayor.build_create`'s own gating, covered separately).
     #[tokio::test]
-    async fn build_contribute_completes_order_pays_xp_and_unlocks() {
+    async fn build_contribute_completes_order_pays_xp() {
         let (proxy, dbf, zone) = proxy_with_db().await;
-        // Seed the capital's build-order tech tree into the shared db file.
         let db = Db::connect(dbf.url()).await.unwrap();
-        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
-        let well_id = db
-            .build_orders_for_district("civic")
+        let (tcx, tcy) = mmo::world::capital().town_centre;
+        let order = db
+            .insert_build_order(
+                "civic", "test_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "well".to_string(),
+                    x: tcx as i64, y: (tcy - 40) as i64, x1: None, y1: None,
+                }),
+            )
             .await
-            .unwrap()
-            .into_iter()
-            .find(|o| o.kind == "town_well")
-            .unwrap()
-            .id;
+            .unwrap();
 
         let email = format!("b_{}@t.test", Uuid::new_v4().simple());
         let mut ws = dial(&proxy).await;
@@ -4521,7 +4699,13 @@ mod tests {
         .unwrap();
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
-        // Stock exactly the Town Well's cost (wood 20 + stone 10), as gathering would.
+        // Stand at the order's own location so the gateway's proximity gate passes.
+        proxy.entity_state.lock().unwrap().insert(
+            pid.clone(),
+            EntityCache { x: tcx, y: tcy - 40, hp: 100, gather: None },
+        );
+
+        // Stock exactly the well's cost (wood 20 + stone 10), as gathering would.
         for (item, qty) in [("wood", 20), ("stone", 10)] {
             zone.to_proxy
                 .send(Message::Text(json!({
@@ -4530,26 +4714,25 @@ mod tests {
                 }).to_string()))
                 .unwrap();
         }
-        // Contribute both items to the well (zone already validated board proximity).
+        // Contribute both items to the well.
         for (item, qty) in [("wood", 20), ("stone", 10)] {
             zone.to_proxy
                 .send(Message::Text(json!({
                     "type": "build_contribute", "player_id": pid,
-                    "order_id": well_id, "item_id": item, "qty": qty,
+                    "order_id": order.id, "item_id": item, "qty": qty,
                 }).to_string()))
                 .unwrap();
         }
 
-        // Expect: progress, completion (with the well structure), a building skill gain,
-        // a building level-up (30 units → 150 XP → Building 1), and the wall_section
-        // unlock. Frames interleave — scan once, check all.
-        let (mut progressed, mut completed, mut built_xp, mut leveled, mut unlocked) =
-            (false, false, false, false, false);
+        // Expect: progress, completion (with the well structure), a building skill
+        // gain, and a building level-up (30 units → 150 XP → Building 1). Frames
+        // interleave — scan once, check all.
+        let (mut progressed, mut completed, mut built_xp, mut leveled) = (false, false, false, false);
         for _ in 0..80 {
             let Some(v) = recv_frame(&mut ws).await else { break };
             match v["type"].as_str() {
-                Some("build.progress") if v["order_id"] == json!(well_id) => progressed = true,
-                Some("build.completed") if v["order_id"] == json!(well_id) => {
+                Some("build.progress") if v["order_id"] == json!(order.id) => progressed = true,
+                Some("build.completed") if v["order_id"] == json!(order.id) => {
                     let structs = v["structures"].as_array().cloned().unwrap_or_default();
                     assert!(structs.iter().any(|s| s["kind"] == "well"), "well structure missing");
                     completed = true;
@@ -4563,24 +4746,176 @@ mod tests {
                     assert_eq!(v["level"].as_i64(), Some(1), "well completion reaches Building 1");
                     leveled = true;
                 }
-                Some("build.unlocked") => unlocked = true,
                 _ => {}
             }
-            if progressed && completed && built_xp && leveled && unlocked {
+            if progressed && completed && built_xp && leveled {
                 break;
             }
         }
         assert!(progressed, "never saw build.progress");
-        assert!(completed, "the Town Well never completed");
+        assert!(completed, "the order never completed");
         assert!(built_xp, "contributor never gained building XP");
         assert!(leveled, "contributor never got a building level-up");
-        assert!(unlocked, "the dependent order never unlocked");
 
-        // Durable: the order is completed and wall_section is now open.
+        // Durable: the order is completed.
         let orders = db.build_orders_for_district("civic").await.unwrap();
-        assert_eq!(orders.iter().find(|o| o.id == well_id).unwrap().state, "completed");
-        assert_eq!(orders.iter().find(|o| o.kind == "wall_section").unwrap().state, "open");
+        assert_eq!(orders.iter().find(|o| o.id == order.id).unwrap().state, "completed");
 
+        drop(ws);
+    }
+
+    /// A regular player has no city-building authority: `mayor.build_create` is
+    /// rejected outright, and no order is created.
+    #[tokio::test]
+    async fn mayor_build_create_rejects_non_mayor() {
+        let (proxy, dbf, _zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        let email = format!("p_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Regular"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({
+            "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
+            "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
+            "x": 3200, "y": 3200, "x1": 3300, "y1": 3200,
+        }).to_string()))
+        .await
+        .unwrap();
+
+        let err = recv_until(&mut ws, "mayor.build_error").await;
+        assert!(err["message"].as_str().unwrap().contains("mayor"));
+        assert!(db.build_orders_for_district("civic").await.unwrap().is_empty());
+
+        drop(ws);
+    }
+
+    /// The mayor may not commission work on land someone already owns — only on
+    /// city-owned land (#55/dirt paths: this is the "city owned" gate).
+    #[tokio::test]
+    async fn mayor_build_create_rejects_privately_owned_land() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+        let mayor_hash = auth::hash_password("h").unwrap();
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+            .await
+            .unwrap();
+
+        // A regular player claims their starter suburbs plot.
+        let mut owner_ws = dial(&proxy).await;
+        let (_pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut owner_ws, "Tenant").await;
+        let (px, py) = (
+            bounds["x"].as_i64().unwrap() + bounds["w"].as_i64().unwrap() / 2,
+            bounds["y"].as_i64().unwrap() + bounds["h"].as_i64().unwrap() / 2,
+        );
+
+        let mut mayor_ws = dial(&proxy).await;
+        mayor_ws.send(Message::Text(
+            json!({"type": "login", "email": MAYOR_EMAIL, "password": "h"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut mayor_ws, "welcome").await;
+
+        mayor_ws.send(Message::Text(json!({
+            "type": "mayor.build_create", "district": "suburbs", "kind": "dirt_path",
+            "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
+            "x": px, "y": py,
+        }).to_string()))
+        .await
+        .unwrap();
+
+        let err = recv_until(&mut mayor_ws, "mayor.build_error").await;
+        assert!(err["message"].as_str().unwrap().contains("owned"));
+        assert!(db.build_orders_for_district("suburbs").await.unwrap().is_empty());
+
+        drop(owner_ws);
+        drop(mayor_ws);
+    }
+
+    /// The headline path: the mayor commissions a dirt path on city land, and any
+    /// player standing near it (not the civic board) can fill it, spawning a
+    /// segment-shaped `dirt_road` structure.
+    #[tokio::test]
+    async fn mayor_build_create_dirt_path_then_contribute_completes() {
+        let (proxy, dbf, zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        let mayor_hash = auth::hash_password("h").unwrap();
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+            .await
+            .unwrap();
+
+        let mut mayor_ws = dial(&proxy).await;
+        mayor_ws.send(Message::Text(
+            json!({"type": "login", "email": MAYOR_EMAIL, "password": "h"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut mayor_ws, "welcome").await;
+
+        // Well clear of the civic build board (town_centre - 30, +10) and of any
+        // plot grid (only the suburbs has one) — plainly city land.
+        let (x0, y0, x1, y1) = (3200, 1000, 3300, 1000);
+        mayor_ws.send(Message::Text(json!({
+            "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
+            "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
+            "x": x0, "y": y0, "x1": x1, "y1": y1,
+        }).to_string()))
+        .await
+        .unwrap();
+        // Login hydration already sent one (empty) `build.list` before the create
+        // was processed — keep waiting until one actually lists the new order.
+        let order_id = loop {
+            let listed = recv_until(&mut mayor_ws, "build.list").await;
+            let found = listed["orders"].as_array().unwrap().iter()
+                .find(|o| o["kind"] == "dirt_path")
+                .map(|o| o["order_id"].as_str().unwrap().to_string());
+            if let Some(id) = found {
+                break id;
+            }
+        };
+
+        let email = format!("w_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Worker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Stand at the path's start point, nowhere near the civic board.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100, gather: None });
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "stone", "qty": 5, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "build_contribute", "player_id": pid,
+            "order_id": order_id, "item_id": "stone", "qty": 5,
+        }).to_string())).unwrap();
+
+        let mut completed = false;
+        for _ in 0..40 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            if v["type"] == "build.completed" && v["order_id"] == json!(order_id) {
+                let structs = v["structures"].as_array().cloned().unwrap_or_default();
+                assert!(structs.iter().any(|s| {
+                    s["kind"] == "dirt_road" && s["x"] == json!(x0) && s["x1"] == json!(x1)
+                }), "dirt_road segment missing from build.completed: {structs:?}");
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "the dirt path never completed");
+
+        drop(mayor_ws);
         drop(ws);
     }
 
@@ -5015,7 +5350,11 @@ mod tests {
     async fn district_enter_refreshes_the_build_board_and_acks_ready() {
         let (proxy, dbf, _zone) = proxy_with_db().await;
         let db = Db::connect(dbf.url()).await.unwrap();
-        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+        // A runtime-commissioned order (as `mayor.build_create` would insert) so
+        // there's civic content for `build.list` to report.
+        db.insert_build_order("civic", "test_well", r#"{"wood":20}"#, "open", 0, None, 0, None)
+            .await
+            .unwrap();
 
         let email = format!("d_{}@t.test", Uuid::new_v4().simple());
         let mut ws = dial(&proxy).await;
@@ -5039,7 +5378,7 @@ mod tests {
             match v["type"].as_str() {
                 Some("build.list") => {
                     let orders = v["orders"].as_array().cloned().unwrap_or_default();
-                    assert!(orders.iter().any(|o| o["kind"] == "town_well"), "the civic board's content");
+                    assert!(orders.iter().any(|o| o["kind"] == "test_well"), "the civic board's content");
                     saw_orders = true;
                 }
                 Some("district.ready") => saw_ready = true,

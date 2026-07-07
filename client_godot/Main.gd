@@ -22,6 +22,7 @@ var _build: BuildPanel
 var _skills: SkillsPanel
 var _craft: CraftPanel
 var _build_place: BuildPlace
+var _mayor_road: MayorRoad
 var _rent: RentPanel
 var _transition: DistrictTransition
 
@@ -76,6 +77,9 @@ func _ready() -> void:
     _build_place = BuildPlace.new()
     add_child(_build_place)
 
+    _mayor_road = MayorRoad.new()
+    add_child(_mayor_road)
+
     _rent = RentPanel.new()
     add_child(_rent)
 
@@ -113,6 +117,7 @@ func _process(_delta: float) -> void:
     _build_place.camera = _player.camera()
     _build_place.plot_bounds = _plot_bounds
     _build_place.entities = _entities
+    _mayor_road.camera = _player.camera()
     var near_bed := _entities.nearest_bed(_player.world_pos(), Protocol.STORAGE_RANGE)
     var sleep := Input.is_physical_key_pressed(KEY_F)
     if sleep and not _sleep_down and near_bed != "":
@@ -195,6 +200,11 @@ func _wire_signals() -> void:
     _craft.do_craft.connect(func(recipe_id): _net.send_craft_make(recipe_id))
     _build_place.do_place.connect(func(kind, x, y, rot): _net.send_build_place(kind, x, y, rot))
     _build_place.mode_changed.connect(func(active, kind, rot): _hud.set_build_hint(active, kind, rot))
+    _mayor_road.do_create.connect(_on_mayor_road_create)
+    _mayor_road.mode_changed.connect(func(active, has_start):
+        if active:
+            _hud.flash_announce("Mayor: click the end point" if has_start else "Mayor: click the start point"))
+    _net.mayor_build_error.connect(func(message): _hud.flash_announce("Mayor: %s" % message))
     _rent.do_pay.connect(func(plot_id): _net.send_rent_pay(plot_id))
     _rent.do_set_autopay.connect(func(plot_id, enabled): _net.send_rent_set_autopay(plot_id, enabled))
 
@@ -248,6 +258,20 @@ func _on_welcome(data: Dictionary) -> void:
     _player.activate()
     _net.send_craft_list() # the recipe registry is static; pull it once per session
     _net.send_terrain_list() # the heightmap is static; pull it once per session
+    _mayor_road.is_mayor = String(data.get("role", "player")) == "mayor"
+    if _mayor_road.is_mayor:
+        _hud.flash_announce("You are the mayor — press M to commission a dirt path")
+
+## A mayor-drawn dirt path (#55): pick the district from its start point and
+## commission it with a flat cost — any player can then fill it, same as any
+## other build order. `kind` just needs to be unique per order (there's no
+## authored tech tree to key into here).
+func _on_mayor_road_create(x0: int, y0: int, x1: int, y1: int) -> void:
+    var district := _world.district_at(x0, y0)
+    if district == "":
+        return
+    var kind := "dirt_path_%d_%d" % [Time.get_ticks_msec(), randi() % 100000]
+    _net.send_mayor_build_create(district, kind, "dirt_road", "{\"stone\":5}", x0, y0, x1, y1)
 
 ## A starter plot was (re-)assigned: remember its id (for rent.pay/autopay),
 ## draw its outline/beacon in the world, feed the HUD compass, and — only on
@@ -304,6 +328,11 @@ func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
             _player.reconcile(state)
         if zone != "":
             _hud.set_zone(zone)
+    elif String(state.get("type", "")) == "structure" and String(state.get("kind", "")) == "dirt_road":
+        # A segment structure (start + end point), not a single-point one — the
+        # world (which owns terrain sampling) renders it as a ribbon, not the
+        # generic single-point block `EntityManager` draws for other structures.
+        _world.upsert_dirt_road(id, state)
     else:
         _entities.upsert(id, zone, state)
 

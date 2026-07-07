@@ -40,6 +40,9 @@ pub struct Account {
     pub id: String,
     pub email: String,
     pub pw_hash: String,
+    /// `"player"` (default) or `"mayor"`. The mayor may commission city build orders
+    /// on city-owned land via `mayor.build_create`; everyone else cannot.
+    pub role: String,
 }
 
 /// A character row (the in-world entity). One per account in Phase 1. Its `id` is
@@ -202,10 +205,66 @@ impl Db {
     }
 
     pub async fn find_account_by_email(&self, email: &str) -> Result<Option<Account>, DbError> {
-        sqlx::query_as::<_, Account>("SELECT id, email, pw_hash FROM account WHERE email = ?")
+        sqlx::query_as::<_, Account>("SELECT id, email, pw_hash, role FROM account WHERE email = ?")
             .bind(email)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    /// An account's role (`"player"` or `"mayor"`), by its id.
+    pub async fn role_for_account(&self, account_id: &str) -> Result<String, DbError> {
+        sqlx::query_scalar("SELECT role FROM account WHERE id = ?")
+            .bind(account_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Idempotently seed the one mayor account (by email) with `role = 'mayor'`, so
+    /// there's always a known login that can commission city build orders. A no-op
+    /// if the email is already registered (never overwrites an existing account).
+    pub async fn seed_mayor_account(
+        &self,
+        email: &str,
+        pw_hash: &str,
+        name: &str,
+        x: i64,
+        y: i64,
+        hp: i64,
+        now: i64,
+    ) -> Result<(), DbError> {
+        if self.find_account_by_email(email).await?.is_some() {
+            return Ok(());
+        }
+        let account_id = Uuid::new_v4().to_string();
+        let char_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO account (id, email, pw_hash, role, created_at, last_login) \
+             VALUES (?, ?, ?, 'mayor', ?, ?)",
+        )
+        .bind(&account_id)
+        .bind(email)
+        .bind(pw_hash)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO character (id, account_id, name, x, y, hp, district, created_at, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)",
+        )
+        .bind(&char_id)
+        .bind(&account_id)
+        .bind(name)
+        .bind(x)
+        .bind(y)
+        .bind(hp)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Create an account and its single character in one transaction. Spawn
@@ -251,7 +310,12 @@ impl Db {
         tx.commit().await?;
 
         Ok((
-            Account { id: account_id.clone(), email: email.to_string(), pw_hash: pw_hash.to_string() },
+            Account {
+                id: account_id.clone(),
+                email: email.to_string(),
+                pw_hash: pw_hash.to_string(),
+                role: "player".to_string(),
+            },
             Character {
                 id: char_id,
                 account_id,
@@ -465,6 +529,21 @@ pub struct ContributeResult {
     /// On completion, `(character_id, total_units)` for each contributor (for lump-sum
     /// building XP). Empty otherwise.
     pub contributors: Vec<(String, i64)>,
+    /// The completed order's own placement, if it carried one (copied from the row so
+    /// the gateway can spawn the structure without a second query).
+    pub placement: Option<BuildPlacement>,
+}
+
+/// Where a build order's structure appears on completion, and what kind it is.
+/// `x1`/`y1` are set only for a segment-shaped structure (e.g. a road), with
+/// `x`/`y` as its start point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildPlacement {
+    pub structure_kind: String,
+    pub x: i64,
+    pub y: i64,
+    pub x1: Option<i64>,
+    pub y1: Option<i64>,
 }
 
 /// A district-scoped city build quest.
@@ -483,6 +562,26 @@ pub struct BuildOrder {
     /// per-character); the client greys the order for players below the threshold.
     pub required_skill: Option<String>,
     pub required_level: i64,
+    /// This order's own placement (e.g. commissioned at runtime by the mayor), if
+    /// any. `None` for orders spawning no structure or relying on authored content.
+    pub structure_kind: Option<String>,
+    pub x: Option<i64>,
+    pub y: Option<i64>,
+    pub x1: Option<i64>,
+    pub y1: Option<i64>,
+}
+
+impl BuildOrder {
+    /// This order's placement, if it carries one (`structure_kind` + `x`/`y` all set).
+    pub fn placement(&self) -> Option<BuildPlacement> {
+        Some(BuildPlacement {
+            structure_kind: self.structure_kind.clone()?,
+            x: self.x?,
+            y: self.y?,
+            x1: self.x1,
+            y1: self.y1,
+        })
+    }
 }
 
 /// A gatherable resource node.
@@ -1289,12 +1388,18 @@ impl Db {
         now: i64,
         required_skill: Option<&str>,
         required_level: i64,
+        placement: Option<BuildPlacement>,
     ) -> Result<BuildOrder, DbError> {
         let id = Uuid::new_v4().to_string();
+        let (structure_kind, x, y, x1, y1) = match &placement {
+            Some(p) => (Some(p.structure_kind.as_str()), Some(p.x), Some(p.y), p.x1, p.y1),
+            None => (None, None, None, None, None),
+        };
         sqlx::query(
             "INSERT INTO build_order \
-             (id, district, kind, required_json, progress_json, state, issued_at, required_skill, required_level) \
-             VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?)",
+             (id, district, kind, required_json, progress_json, state, issued_at, required_skill, required_level, \
+              structure_kind, x, y, x1, y1) \
+             VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(district)
@@ -1304,6 +1409,11 @@ impl Db {
         .bind(now)
         .bind(required_skill)
         .bind(required_level)
+        .bind(structure_kind)
+        .bind(x)
+        .bind(y)
+        .bind(x1)
+        .bind(y1)
         .execute(&self.pool)
         .await?;
         Ok(BuildOrder {
@@ -1317,6 +1427,11 @@ impl Db {
             completed_at: None,
             required_skill: required_skill.map(|s| s.to_string()),
             required_level,
+            structure_kind: placement.as_ref().map(|p| p.structure_kind.clone()),
+            x: placement.as_ref().map(|p| p.x),
+            y: placement.as_ref().map(|p| p.y),
+            x1: placement.as_ref().and_then(|p| p.x1),
+            y1: placement.as_ref().and_then(|p| p.y1),
         })
     }
 
@@ -1382,6 +1497,7 @@ impl Db {
             district: order.district.clone(),
             completed: false,
             contributors: Vec::new(),
+            placement: order.placement(),
         };
 
         // Only open orders accept contributions; locked/completed ones are a no-op
@@ -1482,6 +1598,15 @@ impl Db {
         .bind(district)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// A single build order by id (e.g. to check its placement before gating a
+    /// contribution on proximity to it).
+    pub async fn build_order_by_id(&self, id: &str) -> Result<Option<BuildOrder>, DbError> {
+        sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     /// Persist updated contribution progress (and optionally completion) for an order.
@@ -1618,6 +1743,13 @@ impl Db {
                 // Root orders (no prereq) open at boot; tech-tree dependents seed
                 // `locked` and are opened when their prerequisite completes.
                 let state = if o.prereq.is_none() { "open" } else { "locked" };
+                let placement = Some(BuildPlacement {
+                    structure_kind: o.structure_kind.to_string(),
+                    x: o.structure_x as i64,
+                    y: o.structure_y as i64,
+                    x1: None,
+                    y1: None,
+                });
                 self.insert_build_order(
                     o.district,
                     o.kind,
@@ -1626,6 +1758,7 @@ impl Db {
                     now,
                     o.required_skill,
                     o.required_level,
+                    placement,
                 )
                 .await?;
             }
@@ -1966,7 +2099,7 @@ mod tests {
         db.add_flair(&cid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
 
         let order = db
-            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100, None, 0)
+            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100, None, 0, None)
             .await
             .unwrap();
         db.save_build_order_progress(&order.id, r#"{"wood":20}"#, "completed", Some(200))
@@ -2074,17 +2207,12 @@ mod tests {
         db.seed_capital(&cap, 100).await.unwrap();
         let plots = db.plot_count().await.unwrap();
         assert_eq!(plots, cap.starter_plots().len() as i64);
-        let civic_orders = cap.build_orders.iter().filter(|o| o.district == "civic").count();
-        let seeded = db.build_orders_for_district("civic").await.unwrap();
-        assert_eq!(seeded.len(), civic_orders);
-        // The root order is open; tech-tree dependents seed locked.
-        assert_eq!(seeded.iter().find(|o| o.kind == "town_well").unwrap().state, "open");
-        assert_eq!(seeded.iter().find(|o| o.kind == "wall_section").unwrap().state, "locked");
+        // No build orders are authored — city work is commissioned at runtime.
+        assert!(db.build_orders_for_district("civic").await.unwrap().is_empty());
 
-        // Re-seed (simulating a restart): no duplicate plots or orders.
+        // Re-seed (simulating a restart): no duplicate plots.
         db.seed_capital(&cap, 200).await.unwrap();
         assert_eq!(db.plot_count().await.unwrap(), plots);
-        assert_eq!(db.build_orders_for_district("civic").await.unwrap().len(), civic_orders);
 
         // A fresh character can claim one of the seeded starter plots.
         let cid = a_character(&db).await;
@@ -2099,7 +2227,7 @@ mod tests {
     async fn build_order_pools_contributions_and_completes() {
         let (db, _t) = TempDb::open().await;
         let order = db
-            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0)
+            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0, None)
             .await
             .unwrap();
 
@@ -2139,7 +2267,7 @@ mod tests {
     #[tokio::test]
     async fn open_build_order_unlocks_a_locked_dependent() {
         let (db, _t) = TempDb::open().await;
-        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0, None, 0)
+        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0, None, 0, None)
             .await
             .unwrap();
         // Unlock flips it open and returns it; a second call is a no-op.
@@ -2148,7 +2276,7 @@ mod tests {
         assert!(db.open_build_order("civic", "wall_section").await.unwrap().is_none());
         // A locked order rejects contributions until opened.
         let locked = db
-            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0, None, 0)
+            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0, None, 0, None)
             .await
             .unwrap();
         let cid = a_character(&db).await;
@@ -2162,7 +2290,7 @@ mod tests {
         let (db, _t) = TempDb::open().await;
         // An open order that still requires Building 1 to contribute to.
         let order = db
-            .insert_build_order("civic", "watchtower", r#"{"wood":30}"#, "open", 0, Some("building"), 1)
+            .insert_build_order("civic", "watchtower", r#"{"wood":30}"#, "open", 0, Some("building"), 1, None)
             .await
             .unwrap();
         let cid = a_character(&db).await;

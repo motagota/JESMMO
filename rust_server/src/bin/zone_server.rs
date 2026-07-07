@@ -62,9 +62,6 @@ const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 // --- Storage ------------------------------------------------------------------
 const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use it
 
-// --- Build orders -------------------------------------------------------------
-const BOARD_RANGE: i32 = 60; // must be within this of a build board to contribute
-
 // --- Home structures (#13) -----------------------------------------------------
 const HOME_STRUCTURE_RANGE: i32 = 60; // must be within this of a placed bed/storage/crafting
 
@@ -431,15 +428,6 @@ impl ZoneServer {
             || self.near_home_structure("storage", px, py)
     }
 
-    /// Whether `(px, py)` is within range of any build board in this zone.
-    fn near_board(&self, px: i32, py: i32) -> bool {
-        self.build_boards
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|b| dist2(px, py, b.x, b.y) <= (BOARD_RANGE as i64).pow(2))
-    }
-
     /// Whether `(px, py)` is within range of a placed home structure of `kind`
     /// (`bed`/`storage`/`crafting`). The gateway pushes these as they're placed
     /// and on registration/split (`home_structures_sync`/`home_structure_added`)
@@ -757,17 +745,15 @@ impl ZoneServer {
                     }
                 }
                 "build.contribute" => {
-                    // Validate the player is at a build board; the gateway (city
-                    // authority) performs the durable pooled contribution and pushes
-                    // the result.
+                    // Proximity (a build board, or the order's own placement — e.g. a
+                    // mayor-commissioned dirt path far from any board) is validated by
+                    // the gateway (city authority), which knows every order's location
+                    // and keeps a live position cache; the zone only checks the request
+                    // is well-formed before forwarding.
                     let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let at_board = {
-                        let entities = self.entities.lock().unwrap();
-                        entities.get(&player_id).map(|p| self.near_board(p.x, p.y)).unwrap_or(false)
-                    };
-                    if at_board && qty > 0 && !order_id.is_empty() && !item_id.is_empty() {
+                    if qty > 0 && !order_id.is_empty() && !item_id.is_empty() {
                         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
                             let _ = tx.send(Message::Text(json!({
                                 "type": "build_contribute", "player_id": player_id,
@@ -1530,15 +1516,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_board_spawns_in_civic_and_gates_by_range() {
+    async fn build_board_spawns_in_civic() {
+        // Proximity gating for build.contribute now lives at the gateway (it knows
+        // every order's placement, not just authored boards); the zone just spawns
+        // the authored board entities for rendering.
         let zone = zone_for_region(CIVIC);
         zone.spawn_build_boards();
         let boards = zone.build_boards.lock().unwrap().clone();
         assert!(!boards.is_empty(), "the civic centre has an authored build board");
-        let b = boards[0];
-        assert!(zone.near_board(b.x, b.y), "on the board is in range");
-        assert!(zone.near_board(b.x + BOARD_RANGE - 1, b.y), "just inside range");
-        assert!(!zone.near_board(b.x + BOARD_RANGE + 20, b.y), "out of range");
     }
 
     #[tokio::test]
