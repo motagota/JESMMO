@@ -1,8 +1,8 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
-//! `--stage ingest` and `--stage water` do something (#59, #60); `all` runs
-//! every stage that exists so far. `stylize`/`detail`/`erode`/`classify`/
-//! `export` are reserved for #61/#65/#66/#67/#62.
+//! `--stage ingest`/`water`/`stylize` do something (#59, #60, #61); `all`
+//! runs every stage that exists so far. `detail`/`erode`/`classify`/`export`
+//! are reserved for #65/#66/#67/#62.
 
 use std::path::PathBuf;
 
@@ -13,8 +13,9 @@ use terrain_bake::{
     config::Config,
     dump,
     grid::Grid,
+    stylize::{self, FootprintMask},
     synth,
-    water::{self, OverrideMask},
+    water::{self, OverrideMask, WaterMask},
 };
 
 #[derive(Parser)]
@@ -58,9 +59,14 @@ fn main() {
         Stage::Ingest => {
             run_ingest(&config, cli.force, debug_dump);
         }
-        Stage::All | Stage::Water => {
+        Stage::Water => {
             let grid = run_ingest(&config, cli.force, debug_dump);
             run_water(&config, grid, debug_dump);
+        }
+        Stage::All | Stage::Stylize => {
+            let grid = run_ingest(&config, cli.force, debug_dump);
+            let (grid, _mask) = run_water(&config, grid, debug_dump);
+            run_stylize(&config, grid, debug_dump);
         }
         other => {
             eprintln!("[terrain-bake] --stage {other:?} isn't implemented yet — see the terrain pipeline epic (#56)");
@@ -100,7 +106,7 @@ fn run_ingest(config: &Config, force: bool, debug_dump: Option<&std::path::Path>
     result.grid
 }
 
-fn run_water(config: &Config, mut grid: Grid, debug_dump: Option<&std::path::Path>) {
+fn run_water(config: &Config, mut grid: Grid, debug_dump: Option<&std::path::Path>) -> (Grid, WaterMask) {
     let overrides = match &config.water.override_mask {
         Some(path) => match OverrideMask::from_luma_png(std::path::Path::new(path)) {
             Ok(m) => m,
@@ -133,4 +139,39 @@ fn run_water(config: &Config, mut grid: Grid, debug_dump: Option<&std::path::Pat
             }
         }
     }
+    (grid, mask)
+}
+
+fn run_stylize(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>) -> Grid {
+    let footprint = match &config.stylize.capital_flatten_mask {
+        Some(path) => match FootprintMask::from_luma_png(std::path::Path::new(path)) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to load capital flatten mask {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => FootprintMask::none(grid.width, grid.height),
+    };
+    let out = stylize::run_stylize_stage(&grid, &config.stylize, &footprint);
+    println!(
+        "[terrain-bake] stylize: {}x{} cells (horizontal_scale {}, vertical_curve_exp {}, vertical_scale {})",
+        out.width, out.height, config.stylize.horizontal_scale, config.stylize.vertical_curve_exp, config.stylize.vertical_scale,
+    );
+
+    if let Some(dir) = debug_dump {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[terrain-bake] failed to create {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        let path = dir.join("stylize_hillshade.png");
+        match dump::write_hillshade_png(&out, &path) {
+            Ok(()) => println!("[terrain-bake] wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    out
 }

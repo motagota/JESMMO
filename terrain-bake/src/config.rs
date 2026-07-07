@@ -16,6 +16,8 @@ pub struct Config {
     /// deliberate deviation from the doc's config layout.
     #[serde(default)]
     pub water: WaterConfig,
+    #[serde(default)]
+    pub stylize: StylizeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +71,42 @@ impl Default for WaterConfig {
             min_river_width_m: 20.0,
             clamp_epsilon_m: 0.2,
             override_mask: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StylizeConfig {
+    /// Uniform horizontal resample factor — e.g. `0.4` turns a 60km real
+    /// span into a 24km game world (design doc §5.3). `1.0` is a no-op.
+    pub horizontal_scale: f32,
+    /// Power-curve exponent applied to normalized height (`(h/h_max)^exp *
+    /// h_max`) before `vertical_scale` — reshapes the *distribution* of
+    /// relief (e.g. flattening the coastal plain while steepening the
+    /// ranges) independent of the flat multiply. `1.0` is a no-op (leaves
+    /// the normalized distribution untouched).
+    pub vertical_curve_exp: f32,
+    /// Flat multiplier applied after the curve — e.g. `2.5` turns Mt
+    /// Coot-tha's real 287m into ~700m in-game. `1.0` is a no-op.
+    pub vertical_scale: f32,
+    /// Hand-painted capital-footprint PNG (design doc's `capital_flatten.png`):
+    /// white = inside the footprint (flattened to one target height sampled
+    /// from the footprint's own average natural height), smoothly blended
+    /// back to natural terrain over `capital_flatten_margin_m`. `None` skips
+    /// flattening entirely.
+    #[serde(default)]
+    pub capital_flatten_mask: Option<String>,
+    pub capital_flatten_margin_m: f32,
+}
+
+impl Default for StylizeConfig {
+    fn default() -> Self {
+        StylizeConfig {
+            horizontal_scale: 1.0,
+            vertical_curve_exp: 1.0,
+            vertical_scale: 1.0,
+            capital_flatten_mask: None,
+            capital_flatten_margin_m: 150.0,
         }
     }
 }
