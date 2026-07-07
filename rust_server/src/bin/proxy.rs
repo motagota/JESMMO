@@ -2627,18 +2627,33 @@ impl Proxy {
         self.push_to_player(pid, json!({"type": "craft.recipes", "recipes": recipes}));
     }
 
-    /// Answer `terrain.list` with the authored heightmap grid (#54). Stateless
-    /// and static (same every boot) — sent once per session rather than
-    /// folded into `partition` (which gets rebroadcast on every zone
+    /// Answer `terrain.list` with the heightmap grid (#54), now sampled from
+    /// the baked terrain artifact (#63) rather than an in-process generator.
+    /// Stateless and static (same every boot) — sent once per session rather
+    /// than folded into `partition` (which gets rebroadcast on every zone
     /// split/merge/capture; the terrain payload is too large to wastefully
     /// resend on every one of those).
+    ///
+    /// The wire shape is unchanged from the old synthetic generator — a flat
+    /// `(TERRAIN_RESOLUTION+1)^2` grid — deliberately decoupled from the
+    /// artifact's own internal tile/cell resolution (see
+    /// `mmo::world::loaded_terrain`'s doc comment for why).
     fn send_terrain(&self, pid: &str) {
         let terrain = &self.capital.terrain;
+        let resolution = mmo::world::TERRAIN_RESOLUTION;
+        let fine_n = (resolution + 1) as usize;
+        let step = WORLD_SIZE as f32 / resolution as f32;
+        let mut heights = Vec::with_capacity(fine_n * fine_n);
+        for gy in 0..fine_n {
+            for gx in 0..fine_n {
+                heights.push(terrain.sample_height(gx as f32 * step, gy as f32 * step));
+            }
+        }
         self.push_to_player(pid, json!({
             "type": "terrain.data",
-            "resolution": terrain.resolution,
+            "resolution": resolution,
             "world_size": WORLD_SIZE,
-            "heights": terrain.heights,
+            "heights": heights,
         }));
     }
 
@@ -5579,11 +5594,26 @@ mod tests {
         let msg = recv_until(&mut ws, "terrain.data").await;
 
         let expected = mmo::world::capital().terrain;
-        assert_eq!(msg["resolution"].as_i64().unwrap(), expected.resolution as i64);
+        let resolution = mmo::world::TERRAIN_RESOLUTION;
+        assert_eq!(msg["resolution"].as_i64().unwrap(), resolution as i64);
         let heights: Vec<f64> = msg["heights"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
-        assert_eq!(heights.len(), expected.heights.len());
-        for (got, want) in heights.iter().zip(expected.heights.iter()) {
-            assert!((*got - *want as f64).abs() < 0.0001, "heightmap sent over the wire must match capital()'s exactly");
+        let fine_n = (resolution + 1) as usize;
+        assert_eq!(heights.len(), fine_n * fine_n);
+
+        // Every sent corner must match an independent `sample_height` call
+        // against the same loaded artifact — the wire message and
+        // `capital()` must never disagree (that mismatch is exactly the bug
+        // class #54 fixed).
+        let step = WORLD_SIZE as f32 / resolution as f32;
+        for gy in 0..fine_n {
+            for gx in 0..fine_n {
+                let want = expected.sample_height(gx as f32 * step, gy as f32 * step);
+                let got = heights[gy * fine_n + gx];
+                assert!(
+                    (got - want as f64).abs() < 0.0001,
+                    "heightmap sent over the wire must match capital()'s exactly at ({gx},{gy})"
+                );
+            }
         }
 
         drop(ws);

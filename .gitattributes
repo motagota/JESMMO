@@ -1,0 +1,3 @@
+# Baked terrain tiles are binary — never subject to CRLF normalization,
+# regardless of git's own content-sniffing heuristic (issue #63).
+artifacts/**/*.bin binary

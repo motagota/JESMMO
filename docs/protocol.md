@@ -256,14 +256,22 @@ rent reclaim), so it doesn't go stale until someone's next login/district-crossi
 | `craft.make` | C→S | `recipe_id` — must be standing near a `crafting`-kind structure (#13) that's on your own plot | **live** |
 | `craft.made` | S→C | `recipe_id`, `item_id`, `qty` — feedback once the craft succeeds (`inv.update` and a `crafting` `skill.update` follow separately) | **live** |
 
-### `terrain.*` — cosmetic ground heightmap (#54)
+### `terrain.*` — cosmetic ground heightmap (#54, #63)
 
 Purely visual: the server has no other concept of elevation, and every
-gameplay position stays 2D (`x`, `y`). The heightmap is authored once on
-`Capital` (deterministic, same every boot) and is static for the whole
-session, so it's requested once (like `craft.list`) rather than pushed
-proactively or folded into `partition` (which is rebroadcast on every zone
-split/merge/capture — too frequent for a several-KB static payload).
+gameplay position stays 2D (`x`, `y`). Heights are loaded once at boot from
+the baked terrain artifact (`terrain-bake`/`terrain-common`, the terrain
+pipeline epic #56 — see the repo-root `terrain.toml`) rather than generated
+in-process, and are static for the whole session, so the grid is requested
+once (like `craft.list`) rather than pushed proactively or folded into
+`partition` (which is rebroadcast on every zone split/merge/capture — too
+frequent for a several-KB static payload). The wire grid's resolution
+(`mmo::world::TERRAIN_RESOLUTION`) is deliberately decoupled from the baked
+artifact's own internal tile/cell resolution — the server samples
+`terrain_common::Terrain::sample_height` at a fixed `(resolution+1)^2` grid
+regardless of how detailed the underlying bake is, so a future higher-fidelity
+bake never grows this payload (see `mmo::world::loaded_terrain`'s doc
+comment).
 
 | type | dir | fields | status |
 |---|---|---|---|

@@ -41,6 +41,20 @@ cargo run --release --bin zone_server zone_b 9002 ws://127.0.0.1:8764
 
 Then open `../client/client.html` in a browser.
 
+### Terrain artifact
+
+The proxy loads authoritative terrain heights from the baked artifact at
+`../artifacts/world_v1/` (relative to this crate) at boot — panics with a clear
+message if it's missing. It's checked into the repo; regenerate it after
+changing `../terrain.toml` with:
+
+```sh
+cargo run -p terrain-bake -- --config ../terrain.toml
+```
+
+(from this directory) or `cargo run -p terrain-bake -- --config terrain.toml`
+from the repo root. Override the artifact location with `TERRAIN_DATA_DIR`.
+
 ## Accounts & persistence (M0)
 
 The gateway now has durable identity. On connect it asks the client to authenticate

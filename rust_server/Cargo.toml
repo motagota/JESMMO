@@ -42,3 +42,6 @@ rand = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 # Password hashing for accounts.
 argon2 = "0.5"
+# Authoritative terrain heights, loaded from the artifact `terrain-bake` produces
+# (issue #63) — the same tile format/sampler the offline bake tool uses.
+terrain-common = { path = "../terrain-common" }

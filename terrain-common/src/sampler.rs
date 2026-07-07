@@ -35,6 +35,7 @@ impl From<TileError> for LoadError {
     fn from(e: TileError) -> Self { LoadError::Tile(e) }
 }
 
+#[derive(Debug)]
 pub struct Terrain {
     manifest: Manifest,
     height_tiles: HashMap<(i32, i32), HeightTile>,

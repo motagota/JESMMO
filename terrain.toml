@@ -1,0 +1,49 @@
+# Production terrain config for the Phase 1 capital (issue #63). Bounds match
+# `mmo::world::WORLD_SIZE` (6400x6400) exactly — this isn't real GIS data
+# being compressed down to game scale (that's what `horizontal_scale` is for
+# once real DEM ingest, #69, lands); it's authoring the same purely-cosmetic
+# heightmap the old in-process synthetic generator used to produce, just
+# baked offline now so the server and (eventually, #64) the client load the
+# same artifact instead of each computing their own.
+#
+# Regenerate with (from the repo root):
+#   cargo run -p terrain-bake -- --config terrain.toml
+#
+# then commit the resulting `artifacts/world_v1/` directory alongside this
+# file — the server loads it at boot (see `rust_server::world::loaded_terrain`).
+
+[source]
+bounds_utm    = [0.0, 0.0, 6400.0, 6400.0]
+working_res_m = 25.0
+target_res_m  = 25.0
+seed          = 1337
+
+[export]
+tile_size = 256
+out_dir   = "artifacts/world_v1/"
+
+[water]
+# Comfortably below every height this config produces (see [stylize]) so the
+# water mask stays empty — this capital has no water/lake gameplay concept
+# today; nothing should read as "water" until that's an intentional feature.
+sea_level_m = -50.0
+open_close_radius = 1
+min_river_width_m = 20.0
+clamp_epsilon_m = 0.2
+
+[stylize]
+horizontal_scale = 1.0
+vertical_curve_exp = 1.0
+# Tames the synthetic placeholder's default ~300m west-high/east-low shape
+# down to the old synthetic generator's gentle-rolling-hills feel (was +/-4
+# world units of amplitude) rather than shipping dramatic mountains for what
+# is still cosmetic-only, non-DEM-derived relief.
+vertical_scale = 0.1
+# Flattens the suburbs starter-plot field (240 plots, world.rs's `suburbs`
+# district) so plots sit on level ground — mirrors the old
+# `flatten_terrain_for_plots` (#55), now authored once at bake time instead
+# of computed in-process on every boot. Mask rect in grid cells (25m/cell):
+# x:[190,252), y:[0,100) — covers the plot field's world-space bounding box
+# x:[4840,6240], y:[40,2400] with margin to spare.
+capital_flatten_mask = "masks/capital_flatten.png"
+capital_flatten_margin_m = 100.0
