@@ -3,14 +3,11 @@
 //! heights, movement validation) and the offline `terrain-bake` tool (writes
 //! the tiles this crate reads) — the whole point is one height-at-(x,y)
 //! answer, not two independently-implemented ones.
-//!
-//! Currently a scaffold (#57): the tile binary format, manifest parsing, and
-//! `sample_height` land in #58.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        // Placeholder until #58 lands the real tile format + sampler tests.
-    }
-}
+pub mod manifest;
+pub mod sampler;
+pub mod tile;
+
+pub use manifest::{HeightEncoding, Manifest, ManifestError};
+pub use sampler::{LoadError, Terrain};
+pub use tile::{decode_height, encode_height, nav, HeightTile, MetaTile, TileError};
