@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use crate::grid::Grid;
+use crate::water::WaterMask;
 
 /// Fixed light direction for the shading, normalized: mostly overhead with a
 /// bit of raking angle from the northwest so relief actually reads. Not
@@ -39,6 +40,21 @@ pub fn write_hillshade_png(grid: &Grid, path: &Path) -> Result<(), image::ImageE
     img.save(path)
 }
 
+/// Binary black/white water-mask dump (design doc §8): black = water,
+/// white = land — the same convention `water::OverrideMask::from_luma_png`
+/// reads hand-painted masks with, so a dumped mask and a hand-authored one
+/// look the same way round in an image editor.
+pub fn write_water_mask_png(mask: &WaterMask, path: &Path) -> Result<(), image::ImageError> {
+    let mut img = image::GrayImage::new(mask.width as u32, mask.height as u32);
+    for gy in 0..mask.height {
+        for gx in 0..mask.width {
+            let v = if mask.get(gx, gy) { 0 } else { 255 };
+            img.put_pixel(gx as u32, gy as u32, image::Luma([v]));
+        }
+    }
+    img.save(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +85,18 @@ mod tests {
         let img = image::open(&path).unwrap().to_luma8();
         let first = img.get_pixel(0, 0)[0];
         assert!(img.pixels().all(|p| p[0] == first));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn water_mask_dump_is_binary_black_and_white() {
+        let mut mask = WaterMask::new(3, 2);
+        mask.set(1, 0, true);
+        let path = std::env::temp_dir().join(format!("terrain-bake-dump-water-{}.png", std::process::id()));
+        write_water_mask_png(&mask, &path).unwrap();
+        let img = image::open(&path).unwrap().to_luma8();
+        assert_eq!(img.get_pixel(1, 0)[0], 0, "water cell must be black");
+        assert_eq!(img.get_pixel(0, 0)[0], 255, "land cell must be white");
         std::fs::remove_file(&path).ok();
     }
 }

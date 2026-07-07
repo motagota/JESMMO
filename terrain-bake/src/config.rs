@@ -1,6 +1,6 @@
 //! `terrain.toml` (design doc §4). Only the sections needed so far
-//! (`[source]`, `[export]`) — `[stylize]`/`[detail]`/`[erosion]`/`[classify]`
-//! land with their respective stages (#61, #65, #66, #67).
+//! (`[source]`, `[export]`, `[water]`) — `[stylize]`/`[detail]`/`[erosion]`/
+//! `[classify]` land with their respective stages (#61, #65, #66, #67).
 
 use std::path::Path;
 
@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub source: SourceConfig,
     pub export: ExportConfig,
+    /// The design doc's sketch places `sea_level_m` under `[stylize]`; it's
+    /// needed by the water-mask stage (#60), which runs before stylization
+    /// (#61) in the pipeline, so it lives here instead — the only
+    /// deliberate deviation from the doc's config layout.
+    #[serde(default)]
+    pub water: WaterConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +37,40 @@ pub struct SourceConfig {
 pub struct ExportConfig {
     pub tile_size: u32,
     pub out_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterConfig {
+    pub sea_level_m: f32,
+    /// Structuring-element radius (cells) for the open-then-close pass that
+    /// removes single-cell shoreline noise (design doc §5.2).
+    pub open_close_radius: u32,
+    /// Minimum guaranteed navigable river width, honored via the hand-mask
+    /// override (a human paints extra width in; the pipeline's job is to
+    /// never let flood-fill/clamping undo that) — design doc §5.2's "Rivers"
+    /// note.
+    pub min_river_width_m: f32,
+    /// How far above sea level an inland depression (thresholded as water,
+    /// then reclassified as land by the edge flood-fill) gets clamped to —
+    /// keeps it from rendering as an accidental sub-sea-level lake.
+    pub clamp_epsilon_m: f32,
+    /// Optional hand-painted override PNG (design doc §5.2's
+    /// `bay_cleanup.png`): a grayscale image where white forces land, black
+    /// forces water, and anything else leaves the derived mask alone.
+    #[serde(default)]
+    pub override_mask: Option<String>,
+}
+
+impl Default for WaterConfig {
+    fn default() -> Self {
+        WaterConfig {
+            sea_level_m: 0.0,
+            open_close_radius: 1,
+            min_river_width_m: 20.0,
+            clamp_epsilon_m: 0.2,
+            override_mask: None,
+        }
+    }
 }
 
 #[derive(Debug)]
