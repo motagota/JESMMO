@@ -1,10 +1,11 @@
-# Production terrain config for the Phase 1 capital (issue #63). Bounds match
-# `mmo::world::WORLD_SIZE` (6400x6400) exactly — this isn't real GIS data
-# being compressed down to game scale (that's what `horizontal_scale` is for
-# once real DEM ingest, #69, lands); it's authoring the same purely-cosmetic
-# heightmap the old in-process synthetic generator used to produce, just
-# baked offline now so the server and (eventually, #64) the client load the
-# same artifact instead of each computing their own.
+# Production terrain config for the Phase 1 capital. Real DEM ingest (#69):
+# `dem_data/brisbane_capital_25m.grid` is a real Geoscience Australia 5m
+# LiDAR DTM, reprojected to UTM zone 56S, cropped to the 6.4km x 6.4km
+# `bounds_utm` rectangle below, resampled to 25m, with `tools/convert_dem.py`
+# (see `terrain-bake/README.md`). Gentle real relief (~78m total range, mean
+# slope ~3deg, max ~27deg over this footprint) — a real hill/valley pocket
+# just west of central Brisbane, not the dramatic D'Aguilar Range foothills
+# `terrain-bake/testdata/brisbane_demo.toml`'s test fixture uses.
 #
 # Regenerate with (from the repo root):
 #   cargo run -p terrain-bake -- --config terrain.toml
@@ -13,7 +14,8 @@
 # file — the server loads it at boot (see `rust_server::world::loaded_terrain`).
 
 [source]
-bounds_utm    = [0.0, 0.0, 6400.0, 6400.0]
+dem_path      = "dem_data/brisbane_capital_25m.grid"
+bounds_utm    = [501049.0, 6966659.0, 507449.0, 6973059.0]
 working_res_m = 25.0
 target_res_m  = 25.0
 seed          = 1337
@@ -23,10 +25,10 @@ tile_size = 256
 out_dir   = "artifacts/world_v1/"
 
 [water]
-# Comfortably below every height this config produces (see [stylize]) so the
-# water mask stays empty — this capital has no water/lake gameplay concept
-# today; nothing should read as "water" until that's an intentional feature.
-sea_level_m = -50.0
+# Comfortably below this AOI's real minimum (~0.1m) so the water mask stays
+# empty — this capital has no water/lake gameplay concept today; nothing
+# should read as "water" until that's an intentional feature.
+sea_level_m = -10.0
 open_close_radius = 1
 min_river_width_m = 20.0
 clamp_epsilon_m = 0.2
@@ -34,26 +36,26 @@ clamp_epsilon_m = 0.2
 [stylize]
 horizontal_scale = 1.0
 vertical_curve_exp = 1.0
-# Tames the synthetic placeholder's default ~300m west-high/east-low shape
-# down to the old synthetic generator's gentle-rolling-hills feel (was +/-4
-# world units of amplitude) rather than shipping dramatic mountains for what
-# is still cosmetic-only, non-DEM-derived relief.
-vertical_scale = 0.1
+# Real relief this gentle (~78m over 6.4km) doesn't need taming the way the
+# old synthetic placeholder's exaggerated shape did -- 1.0 keeps real,
+# unscaled meters.
+vertical_scale = 1.0
 # Flattens the suburbs starter-plot field (240 plots, world.rs's `suburbs`
-# district) so plots sit on level ground — mirrors the old
-# `flatten_terrain_for_plots` (#55), now authored once at bake time instead
-# of computed in-process on every boot. Mask rect in grid cells (25m/cell):
-# x:[190,252), y:[0,100) — covers the plot field's world-space bounding box
-# x:[4840,6240], y:[40,2400] with margin to spare.
+# district) so plots sit on level ground -- mirrors the old
+# `flatten_terrain_for_plots` (#55), authored once at bake time. Mask rect in
+# grid cells (25m/cell): x:[190,252), y:[0,100) -- covers the plot field's
+# world-space bounding box x:[4840,6240], y:[40,2400] with margin to spare.
+# Unchanged from the synthetic bake: this mechanically flattens whatever
+# footprint it's given regardless of the underlying terrain, real or not.
 capital_flatten_mask = "masks/capital_flatten.png"
 capital_flatten_margin_m = 100.0
 
 [detail]
-# Small-scale texture on top of the broad rolling hills (#65) -- kept modest
-# (base_amp_m well under the ~33m whole-terrain range) since this is still
-# cosmetic-only relief, not meant to look rocky/dramatic. Skipped entirely
-# inside the water mask (empty here anyway) and the capital_flatten
-# footprint, so the buildable plot field stays exactly level.
+# Small-scale texture on top of the real relief (#65) -- kept modest so it
+# adds fine texture (this AOI was resampled from 5m down to 25m, smoothing
+# some real micro-relief out) without overwhelming the real shape underneath.
+# Skipped entirely inside the water mask (empty here anyway) and the
+# capital_flatten footprint, so the buildable plot field stays exactly level.
 octaves = 3
 base_amp_m = 0.6
 slope_amp_curve = 1.5
@@ -63,10 +65,9 @@ base_wavelength_m = 60.0
 seed = 4242
 
 [erosion]
-# Design doc defaults. Expected to be a near-no-op on this particular bake --
-# this terrain barely exaggerates (vertical_scale 0.1 above) so there are no
-# real "cliffs" for thermal erosion to clean up -- but the stage is real and
-# exercised, ready for whenever a future bake pushes exaggeration further.
+# Design doc defaults. A true no-op on this bake -- this AOI's steepest real
+# slope (~27deg) never reaches the 55deg talus threshold -- but the stage is
+# real and exercised, ready for a future bake with steeper real terrain.
 enabled = true
 max_natural_slope = 55.0
 thermal_iters = 40
@@ -74,12 +75,8 @@ hydraulic_iters = 0
 hydraulic_strength = 0.1
 
 [classify]
-# No water and no interesting biome variation exists in this cosmetic-only
-# capital bake yet (no real DEM, see [source]'s comment) -- one catch-all
-# rule keeps every cell "plains" explicitly rather than relying on the empty-
-# rules-list fallback, so this section documents the choice instead of
-# silently defaulting. Nav flags still come from the real per-cell slope
-# check (walkable_max_slope), not a placeholder -- verified against this bake
-# that no cell exceeds it (rolling hills, not cliffs).
-rules = [{ biome = "plains" }]
+# Real slope variation now exists (mean ~3deg, up to ~27deg) -- unlike the
+# old synthetic bake's near-uniform slope, a slope-based rule actually means
+# something here: steeper knolls read as forest, the rest as plains.
+rules = [{ biome = "forest", min_slope = 8.0 }, { biome = "plains" }]
 walkable_max_slope = 60.0
