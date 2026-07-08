@@ -8,6 +8,7 @@
 //! classification (#67) plug in here the same way.
 
 pub mod cache;
+pub mod classify;
 pub mod config;
 pub mod detail;
 pub mod dump;

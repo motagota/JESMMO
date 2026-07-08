@@ -72,3 +72,14 @@ max_natural_slope = 55.0
 thermal_iters = 40
 hydraulic_iters = 0
 hydraulic_strength = 0.1
+
+[classify]
+# No water and no interesting biome variation exists in this cosmetic-only
+# capital bake yet (no real DEM, see [source]'s comment) -- one catch-all
+# rule keeps every cell "plains" explicitly rather than relying on the empty-
+# rules-list fallback, so this section documents the choice instead of
+# silently defaulting. Nav flags still come from the real per-cell slope
+# check (walkable_max_slope), not a placeholder -- verified against this bake
+# that no cell exceeds it (rolling hills, not cliffs).
+rules = [{ biome = "plains" }]
+walkable_max_slope = 60.0

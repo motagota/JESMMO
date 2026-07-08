@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use crate::classify::{self, Classification};
 use crate::grid::Grid;
 use crate::water::WaterMask;
 
@@ -55,6 +56,31 @@ pub fn write_water_mask_png(mask: &WaterMask, path: &Path) -> Result<(), image::
     img.save(path)
 }
 
+/// Palette-colored biome-map dump (design doc §5.6/§8): one flat color per
+/// biome id, matching the registry order in `classify.rs`, so a glance at the
+/// image tells you which rule fired without cross-referencing the legend.
+fn biome_color(biome: u8) -> [u8; 3] {
+    match biome {
+        classify::BIOME_WATER => [40, 90, 200],
+        classify::BIOME_MANGROVE => [80, 120, 70],
+        classify::BIOME_BEACH => [230, 210, 150],
+        classify::BIOME_FOREST => [30, 110, 40],
+        classify::BIOME_PLAINS => [170, 200, 110],
+        _ => [255, 0, 255], // unregistered id — should never happen, magenta so it's obvious if it does
+    }
+}
+
+pub fn write_biome_map_png(classification: &Classification, path: &Path) -> Result<(), image::ImageError> {
+    let mut img = image::RgbImage::new(classification.width as u32, classification.height as u32);
+    for gy in 0..classification.height {
+        for gx in 0..classification.width {
+            let color = biome_color(classification.biome_at(gx, gy));
+            img.put_pixel(gx as u32, gy as u32, image::Rgb(color));
+        }
+    }
+    img.save(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +123,19 @@ mod tests {
         let img = image::open(&path).unwrap().to_luma8();
         assert_eq!(img.get_pixel(1, 0)[0], 0, "water cell must be black");
         assert_eq!(img.get_pixel(0, 0)[0], 255, "land cell must be white");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn biome_map_dump_uses_a_distinct_color_per_biome() {
+        let mask = WaterMask::new(2, 1);
+        let mut classification = Classification::from_water_mask(&mask);
+        classification.biome[0] = classify::BIOME_WATER;
+        classification.biome[1] = classify::BIOME_FOREST;
+        let path = std::env::temp_dir().join(format!("terrain-bake-dump-biome-{}.png", std::process::id()));
+        write_biome_map_png(&classification, &path).unwrap();
+        let img = image::open(&path).unwrap().to_rgb8();
+        assert_ne!(img.get_pixel(0, 0), img.get_pixel(1, 0), "different biomes must render distinct colors");
         std::fs::remove_file(&path).ok();
     }
 }

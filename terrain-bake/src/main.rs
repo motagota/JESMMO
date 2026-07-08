@@ -1,8 +1,7 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
-//! `--stage ingest`/`water`/`stylize`/`detail`/`erode`/`export` do something
-//! (#59, #60, #61, #65, #66, #62); `all` runs every stage that exists so
-//! far. `classify` is reserved for #67.
+//! `--stage ingest`/`water`/`stylize`/`detail`/`erode`/`classify`/`export`
+//! do something (#59, #60, #61, #65, #66, #67, #62); `all` runs every stage.
 
 use std::path::PathBuf;
 
@@ -10,6 +9,7 @@ use clap::{Parser, ValueEnum};
 
 use terrain_bake::{
     cache,
+    classify::{self, BiomeOverrideMask, Classification},
     config::Config,
     detail, dump, erosion, export,
     grid::Grid,
@@ -83,6 +83,15 @@ fn main() {
             let (detailed, _mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
             run_erode(&config, detailed, debug_dump);
         }
+        Stage::Classify => {
+            let grid = run_ingest(&config, cli.force, debug_dump);
+            let (grid, mask) = run_water(&config, grid, debug_dump);
+            let (grid, footprint) = run_stylize(&config, grid, debug_dump);
+            let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
+            let (detailed, detailed_mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
+            let eroded = run_erode(&config, detailed, debug_dump);
+            run_classify(&config, &eroded, detailed_mask, debug_dump);
+        }
         Stage::All | Stage::Export => {
             let grid = run_ingest(&config, cli.force, debug_dump);
             let (grid, mask) = run_water(&config, grid, debug_dump);
@@ -90,11 +99,8 @@ fn main() {
             let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
             let (detailed, detailed_mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
             let eroded = run_erode(&config, detailed, debug_dump);
-            run_export(&config, eroded, detailed_mask);
-        }
-        other => {
-            eprintln!("[terrain-bake] --stage {other:?} isn't implemented yet — see the terrain pipeline epic (#56)");
-            std::process::exit(1);
+            let classification = run_classify(&config, &eroded, detailed_mask, debug_dump);
+            run_export(&config, eroded, classification);
         }
     }
 }
@@ -266,8 +272,45 @@ fn run_erode(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>) 
     out
 }
 
-fn run_export(config: &Config, grid: Grid, mask: WaterMask) {
-    let artifact = export::export_artifact(&grid, &mask, config);
+fn run_classify(config: &Config, grid: &Grid, mask: WaterMask, debug_dump: Option<&std::path::Path>) -> Classification {
+    let overrides = match &config.classify.override_map {
+        Some(path) => match BiomeOverrideMask::from_luma_png(std::path::Path::new(path)) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to load biome override map {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => BiomeOverrideMask::none(grid.width, grid.height),
+    };
+    let classification = classify::run_classify_stage(grid, &mask, &config.classify, &overrides);
+    println!(
+        "[terrain-bake] classify: {}x{} cells (walkable_max_slope {}deg, {} rules)",
+        classification.width,
+        classification.height,
+        config.classify.walkable_max_slope,
+        config.classify.rules.len(),
+    );
+
+    if let Some(dir) = debug_dump {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[terrain-bake] failed to create {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        let path = dir.join("biome_map.png");
+        match dump::write_biome_map_png(&classification, &path) {
+            Ok(()) => println!("[terrain-bake] wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    classification
+}
+
+fn run_export(config: &Config, grid: Grid, classification: Classification) {
+    let artifact = export::export_artifact(&grid, &classification, config);
     let out_dir = PathBuf::from(&config.export.out_dir);
     if let Err(e) = export::write_artifact(&artifact, &out_dir) {
         eprintln!("[terrain-bake] failed to write artifact to {}: {e}", out_dir.display());

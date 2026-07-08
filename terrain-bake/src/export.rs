@@ -1,23 +1,18 @@
 //! Tile & manifest export (design doc §6, §5.6): the stage that actually
 //! produces the artifact `terrain-common` reads. Landed early (design doc
-//! §10 item 4, before detail/erosion/classification are polished) so
-//! server/client integration isn't blocked on the remaining stages —
-//! biome id is a placeholder constant until classification (#67) lands, and
-//! nav flags derive from the water mask alone (walkable = not water) until
-//! slope-based walkability is added.
+//! §10 item 4, before detail/erosion/classification were polished) so
+//! server/client integration didn't need to wait for those — biome id and
+//! nav flags now come from the real classification stage (#67) rather than
+//! a placeholder constant.
 
 use std::path::Path;
 
-use terrain_common::{encode_height, nav, HeightEncoding, HeightTile, Manifest, MetaTile};
+use terrain_common::{encode_height, HeightEncoding, HeightTile, Manifest, MetaTile};
 
+use crate::classify::Classification;
 use crate::config::Config;
 use crate::grid::Grid;
 use crate::hash::sha256_hex;
-use crate::water::WaterMask;
-
-/// Placeholder biome id every cell gets until classification (#67) assigns
-/// real ones.
-const PLACEHOLDER_BIOME: u8 = 0;
 
 pub struct ExportedArtifact {
     pub manifest: Manifest,
@@ -25,14 +20,15 @@ pub struct ExportedArtifact {
     pub meta_tiles: Vec<MetaTile>,
 }
 
-/// Tile `grid` (already stylized) and `mask` (compressed to match, see
-/// `stylize::compress_mask_horizontal`) into the export artifact. `mask` may
-/// be smaller/larger than an exact multiple of `tile_size` — corner/cell
-/// indices past the grid's actual extent clamp to its far edge (the same
-/// convention `terrain_common::Terrain::locate` uses for the world's outer
-/// boundary), so a not-yet-upsampled-to-target-resolution working grid (no
-/// detail-synthesis stage yet, #65) still tiles cleanly.
-pub fn export_artifact(grid: &Grid, mask: &WaterMask, config: &Config) -> ExportedArtifact {
+/// Tile `grid` (already stylized/detailed/eroded) and `classification`
+/// (biome id + nav flags per cell, already resampled to match `grid` — see
+/// `stylize::compress_mask_horizontal`-style helpers) into the export
+/// artifact. Either input may be smaller/larger than an exact multiple of
+/// `tile_size` — corner/cell indices past the actual extent clamp to the far
+/// edge (the same convention `terrain_common::Terrain::locate` uses for the
+/// world's outer boundary), so a working grid that isn't an exact multiple
+/// of the tile size still tiles cleanly.
+pub fn export_artifact(grid: &Grid, classification: &Classification, config: &Config) -> ExportedArtifact {
     let tile_size = config.export.tile_size as usize;
     let tiles_x = grid.width.div_ceil(tile_size).max(1);
     let tiles_y = grid.height.div_ceil(tile_size).max(1);
@@ -64,10 +60,9 @@ pub fn export_artifact(grid: &Grid, mask: &WaterMask, config: &Config) -> Export
             let mut mt = MetaTile::new(tx as i32, ty as i32, tile_size);
             for gy in 0..tile_size {
                 for gx in 0..tile_size {
-                    let wx = (tx * tile_size + gx).min(mask.width - 1);
-                    let wy = (ty * tile_size + gy).min(mask.height - 1);
-                    let flags = if mask.get(wx, wy) { nav::WATER } else { nav::WALKABLE | nav::BUILDABLE };
-                    mt.set(gx, gy, PLACEHOLDER_BIOME, flags);
+                    let wx = (tx * tile_size + gx).min(classification.width - 1);
+                    let wy = (ty * tile_size + gy).min(classification.height - 1);
+                    mt.set(gx, gy, classification.biome_at(wx, wy), classification.nav_flags_at(wx, wy));
                 }
             }
             meta_tiles.push(mt);
@@ -119,7 +114,8 @@ pub fn write_artifact(artifact: &ExportedArtifact, out_dir: &Path) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DetailConfig, ErosionConfig, ExportConfig, SourceConfig, StylizeConfig, WaterConfig};
+    use crate::config::{ClassifyConfig, DetailConfig, ErosionConfig, ExportConfig, SourceConfig, StylizeConfig, WaterConfig};
+    use crate::water::WaterMask;
 
     fn test_config(tile_size: u32, out_dir: &str) -> Config {
         Config {
@@ -135,6 +131,7 @@ mod tests {
             stylize: StylizeConfig::default(),
             detail: DetailConfig::default(),
             erosion: ErosionConfig::default(),
+            classify: ClassifyConfig::default(),
         }
     }
 
@@ -154,8 +151,9 @@ mod tests {
         let config = test_config(4, dir.to_str().unwrap());
         let grid = ramp_grid(10, 6, 10.0);
         let mask = WaterMask::new(grid.width, grid.height);
+        let classification = Classification::from_water_mask(&mask);
 
-        let artifact = export_artifact(&grid, &mask, &config);
+        let artifact = export_artifact(&grid, &classification, &config);
         write_artifact(&artifact, &dir).unwrap();
 
         let terrain = terrain_common::Terrain::load_dir(&dir).unwrap();
@@ -174,8 +172,9 @@ mod tests {
         let grid = ramp_grid(8, 8, 10.0);
         let mut mask = WaterMask::new(8, 8);
         mask.set(1, 1, true);
+        let classification = Classification::from_water_mask(&mask);
 
-        let artifact = export_artifact(&grid, &mask, &config);
+        let artifact = export_artifact(&grid, &classification, &config);
         write_artifact(&artifact, &dir).unwrap();
         let terrain = terrain_common::Terrain::load_dir(&dir).unwrap();
 
@@ -196,7 +195,8 @@ mod tests {
         let config = test_config(4, dir.to_str().unwrap());
         let grid = ramp_grid(10, 10, 10.0);
         let mask = WaterMask::new(grid.width, grid.height);
-        let artifact = export_artifact(&grid, &mask, &config);
+        let classification = Classification::from_water_mask(&mask);
+        let artifact = export_artifact(&grid, &classification, &config);
 
         for ty in 0..3usize {
             for tx in 0..2usize {
@@ -220,9 +220,10 @@ mod tests {
         let config = test_config(4, dir.to_str().unwrap());
         let grid = ramp_grid(9, 7, 10.0);
         let mask = WaterMask::new(grid.width, grid.height);
+        let classification = Classification::from_water_mask(&mask);
 
-        let artifact_a = export_artifact(&grid, &mask, &config);
-        let artifact_b = export_artifact(&grid, &mask, &config);
+        let artifact_a = export_artifact(&grid, &classification, &config);
+        let artifact_b = export_artifact(&grid, &classification, &config);
 
         assert_eq!(artifact_a.manifest.bake_hash, artifact_b.manifest.bake_hash);
         assert_eq!(artifact_a.manifest, artifact_b.manifest);

@@ -22,6 +22,8 @@ pub struct Config {
     pub detail: DetailConfig,
     #[serde(default)]
     pub erosion: ErosionConfig,
+    #[serde(default)]
+    pub classify: ClassifyConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,6 +183,49 @@ impl Default for ErosionConfig {
             hydraulic_iters: 0,
             hydraulic_strength: 0.1,
         }
+    }
+}
+
+/// One classification rule (design doc §5.6): a cell matches if *every*
+/// specified (`Some`) condition holds; unspecified conditions are ignored.
+/// Rules are tried in list order, first match wins — a trailing rule with
+/// no conditions (`{ biome = "plains" }`) acts as the catch-all default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassifyRule {
+    pub biome: String,
+    #[serde(default)]
+    pub min_height: Option<f32>,
+    #[serde(default)]
+    pub max_height: Option<f32>,
+    /// Degrees (matches `erosion.max_natural_slope`'s convention).
+    #[serde(default)]
+    pub min_slope: Option<f32>,
+    #[serde(default)]
+    pub max_slope: Option<f32>,
+    #[serde(default)]
+    pub min_water_dist: Option<f32>,
+    #[serde(default)]
+    pub max_water_dist: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassifyConfig {
+    #[serde(default)]
+    pub rules: Vec<ClassifyRule>,
+    /// Hand-painted biome override (design doc's indexed-palette
+    /// `biome_overrides.png`, simplified here to a grayscale PNG whose pixel
+    /// value *is* the biome id — see `classify::BiomeOverrideMask` for the
+    /// exact convention). Applied after the rule list; wins outright.
+    #[serde(default)]
+    pub override_map: Option<String>,
+    /// Degrees; a cell at or under this slope is nav-flagged walkable (and,
+    /// in v1, buildable — see `classify::run_classify_stage`).
+    pub walkable_max_slope: f32,
+}
+
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        ClassifyConfig { rules: Vec::new(), override_map: None, walkable_max_slope: 60.0 }
     }
 }
 
