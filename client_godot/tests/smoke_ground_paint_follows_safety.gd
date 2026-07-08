@@ -12,7 +12,11 @@ func _initialize() -> void:
 	var stride := resolution + 1
 	var heights := PackedFloat32Array()
 	heights.resize(stride * stride)
-	Protocol.apply_terrain_data(resolution, world_size, heights) # flat is fine -- only colors matter here
+	# Flat is fine -- only safety colors matter here -- but must sit above
+	# _RIVER_HEIGHT_THRESHOLD_M, or every vertex would paint river-brown
+	# instead (see smoke_ground_paint_river.gd for that behavior).
+	heights.fill(50.0)
+	Protocol.apply_terrain_data(resolution, world_size, heights)
 
 	var world = load("res://world/World.gd").new()
 	root.add_child(world)

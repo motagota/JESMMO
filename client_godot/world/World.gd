@@ -22,6 +22,17 @@ const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
 const _GROUND_BASE_COLOR := Color(0.10, 0.14, 0.10)
 const _GROUND_SAFE_COLOR := Color(0.11, 0.22, 0.14)
 const _GROUND_WILDS_COLOR := Color(0.20, 0.13, 0.11)
+## Purely a visual read of the real DEM's own elevation (issue #69's
+## production bake) — no server round-trip, no nav/biome data needed. Below
+## this height (meters, same AHD reference the baked heightmap already uses)
+## paints as river silt-brown instead of the safety tint, tracing the real
+## Brisbane River channel's real elevation footprint (~7.5% of this AOI sits
+## below 2m). Deliberately just a color, not a nav-blocking water mask
+## (terrain.toml's [water].sea_level_m stays low) — the real Brisbane River
+## is famously muddy brown, not blue, so this is truer to the place than a
+## generic water-blue would have been anyway.
+const _RIVER_HEIGHT_THRESHOLD_M := 2.0
+const _RIVER_COLOR := Color(0.35, 0.27, 0.16)
 
 var world_size := 6400.0
 
@@ -110,13 +121,18 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
             return z
     return {}
 
-## The ground-paint color for world point `(wx, wy)`: the base ground color,
-## tinted toward green (safe) or red (wilds) per whichever zone contains it.
-## Safety is a static property of a district's identity (`Safety::Safe`/
-## `Wilds` in `world.rs`, never redrawn by later re-partitioning/zone-splits
-## — only the shard boundaries change, not which world positions are safe),
-## so painting this once at ground-build time never goes stale.
+## The ground-paint color for world point `(wx, wy)`: river silt-brown below
+## the real terrain's own river-channel elevation, otherwise the base ground
+## color tinted toward green (safe) or red (wilds) per whichever zone
+## contains it. Safety is a static property of a district's identity
+## (`Safety::Safe`/`Wilds` in `world.rs`, never redrawn by later
+## re-partitioning/zone-splits — only the shard boundaries change, not which
+## world positions are safe), so painting this once at ground-build time
+## never goes stale.
 func _ground_color_at(wx: float, wy: float) -> Color:
+    if Protocol.terrain_height(wx, wy) < _RIVER_HEIGHT_THRESHOLD_M:
+        return _RIVER_COLOR
+
     # Clamp to just inside the world bounds: a vertex sampled exactly at the
     # world's far edge (`wx == world_size` or `wy == world_size`, which
     # `_build_ground`'s last row/column of vertices always does) would
