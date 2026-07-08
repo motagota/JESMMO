@@ -14,6 +14,7 @@ const _ROAD_Y := 0.05
 const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
 const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
 const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
+const _TILE_SEGMENT_STEP := 160.0  # world units per district-tile subdivision — see _add_district_tile
 
 var world_size := 6400.0
 
@@ -373,6 +374,14 @@ func _add_signpost(cx: float, cy: float, owner_name: String, tint: Color) -> voi
     label.position = Protocol.w2v(cx, cy, 2.15)
     _plots_root.add_child(label)
 
+## A district tile can span a large fraction of the whole world (districts
+## are quadrants/halves of `WORLD_SIZE`) -- with real DEM terrain (issue #69)
+## carrying far more relief than the old synthetic placeholder, a single flat
+## `PlaneMesh` sampled at just the tile's center visibly floats above/through
+## the real ground everywhere else in the tile. Subdivided into a
+## terrain-following grid instead, the same technique `_build_ground` and
+## `_build_road_ribbon` already use, so the tint overlay actually hugs the
+## surface underneath it.
 func _add_district_tile(z: Dictionary) -> void:
     var x0 := float(z.get("x0", 0))
     var y0 := float(z.get("y0", 0))
@@ -383,11 +392,31 @@ func _add_district_tile(z: Dictionary) -> void:
     if w <= 0.0 or h <= 0.0:
         return
 
+    var cols := maxi(1, ceili(w / _TILE_SEGMENT_STEP))
+    var rows := maxi(1, ceili(h / _TILE_SEGMENT_STEP))
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    for gy in range(rows):
+        for gx in range(cols):
+            var wx0 := x0 + w * (float(gx) / float(cols))
+            var wy0 := y0 + h * (float(gy) / float(rows))
+            var wx1 := x0 + w * (float(gx + 1) / float(cols))
+            var wy1 := y0 + h * (float(gy + 1) / float(rows))
+            var p00 := Protocol.w2v(wx0, wy0, _TILE_Y)
+            var p10 := Protocol.w2v(wx1, wy0, _TILE_Y)
+            var p01 := Protocol.w2v(wx0, wy1, _TILE_Y)
+            var p11 := Protocol.w2v(wx1, wy1, _TILE_Y)
+            st.add_vertex(p00)
+            st.add_vertex(p10)
+            st.add_vertex(p11)
+            st.add_vertex(p00)
+            st.add_vertex(p11)
+            st.add_vertex(p01)
+    st.index()
+    st.generate_normals()
+
     var tile := MeshInstance3D.new()
-    var plane := PlaneMesh.new()
-    plane.size = Vector2(w, h) * Protocol.WORLD_SCALE
-    tile.mesh = plane
-    tile.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, _TILE_Y)
+    tile.mesh = st.commit()
 
     var safe := String(z.get("safety", "wilds")) == "safe"
     var mat := StandardMaterial3D.new()
