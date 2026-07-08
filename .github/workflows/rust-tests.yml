@@ -1,0 +1,25 @@
+name: Rust tests
+
+# No CI existed before the terrain pipeline epic (#56); this is that harness
+# (issue #68). Runs the full workspace suite (not path-filtered to
+# terrain-common/terrain-bake) on every push/PR — it's a handful of seconds,
+# and rust_server regressions matter just as much as terrain ones.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked

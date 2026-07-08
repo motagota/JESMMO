@@ -211,10 +211,22 @@ fn classify_cell(height: f32, slope_deg: f32, water_dist_m: f32, rules: &[Classi
 }
 
 /// The full stage: classify every cell from height/slope/water-distance via
-/// the ordered rule list, let `overrides` win where painted, and compute nav
-/// flags from the water mask + `walkable_max_slope` (v1: buildable ==
-/// walkable — no separate buildability rule yet; that's the land/rent
-/// system's call to refine later).
+/// the ordered rule list, force the water biome wherever `mask` says water
+/// (see below), let `overrides` win where painted, and compute nav flags
+/// from the water mask + `walkable_max_slope` (v1: buildable == walkable —
+/// no separate buildability rule yet; that's the land/rent system's call to
+/// refine later).
+///
+/// `mask` and `grid` can disagree about "is this cell water": the mask is
+/// computed early (design doc's ingest -> water ordering), while `grid` is
+/// whatever later stages (stylize/detail/erosion) leave behind, and erosion
+/// in particular can raise a cell's height back above a rule's water
+/// threshold by redistributing mass from a neighbor. Since the mask is nav's
+/// source of truth (a mask-water cell is always nav-flagged `WATER`,
+/// unconditionally, below), letting the rule list independently re-derive
+/// "water" from post-erosion height risks a cell that's impassable water for
+/// navigation but labeled a land biome for rendering — so the mask wins the
+/// biome call too, before `overrides` gets the final word.
 pub fn run_classify_stage(
     grid: &Grid,
     mask: &WaterMask,
@@ -231,8 +243,9 @@ pub fn run_classify_stage(
             let height = grid.get(gx, gy);
             let slope_deg = slope_deg_at(grid, gx, gy);
             let water_dist_m = water_dist_cells[idx] * grid.cell_size_m;
+            let is_water = mask.get(gx, gy);
 
-            let mut b = classify_cell(height, slope_deg, water_dist_m, &config.rules);
+            let mut b = if is_water { BIOME_WATER } else { classify_cell(height, slope_deg, water_dist_m, &config.rules) };
             if gx < overrides.width && gy < overrides.height {
                 if let Some(ov) = overrides.get(gx, gy) {
                     b = ov;
@@ -240,7 +253,6 @@ pub fn run_classify_stage(
             }
             biome[idx] = b;
 
-            let is_water = mask.get(gx, gy);
             let walkable = !is_water && slope_deg <= config.walkable_max_slope;
             let mut flags = 0u8;
             if is_water {
@@ -313,6 +325,25 @@ mod tests {
             }
         }
         g
+    }
+
+    #[test]
+    fn mask_water_wins_the_biome_even_when_post_erosion_height_disagrees() {
+        // Regression for a real full-pipeline finding (issue #68's
+        // validation harness): erosion runs after the water mask is
+        // computed and can raise a cell's height back above a rule's water
+        // threshold, so classifying biome purely from height/slope/water-
+        // dist can disagree with the mask -- leaving a nav-flagged-WATER
+        // cell labeled a land biome. The mask must win the biome call too.
+        let grid = flat_grid(4, 4, 10.0, 50.0); // well above any height-based "water" rule
+        let mut mask = WaterMask::new(4, 4);
+        mask.set(1, 1, true);
+        let config = ClassifyConfig { rules: design_doc_rules(), override_map: None, walkable_max_slope: 60.0 };
+        let overrides = BiomeOverrideMask::none(4, 4);
+
+        let out = run_classify_stage(&grid, &mask, &config, &overrides);
+        assert_eq!(out.biome_at(1, 1), BIOME_WATER, "mask-water cell must read back as the water biome regardless of height");
+        assert_eq!(out.biome_at(0, 0), BIOME_PLAINS, "non-water cells still use the rule list");
     }
 
     #[test]
