@@ -61,3 +61,14 @@ lacunarity = 2.0
 gain = 0.5
 base_wavelength_m = 60.0
 seed = 4242
+
+[erosion]
+# Design doc defaults. Expected to be a near-no-op on this particular bake --
+# this terrain barely exaggerates (vertical_scale 0.1 above) so there are no
+# real "cliffs" for thermal erosion to clean up -- but the stage is real and
+# exercised, ready for whenever a future bake pushes exaggeration further.
+enabled = true
+max_natural_slope = 55.0
+thermal_iters = 40
+hydraulic_iters = 0
+hydraulic_strength = 0.1

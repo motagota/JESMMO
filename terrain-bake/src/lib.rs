@@ -11,6 +11,7 @@ pub mod cache;
 pub mod config;
 pub mod detail;
 pub mod dump;
+pub mod erosion;
 pub mod export;
 pub mod grid;
 pub mod hash;

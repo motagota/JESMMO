@@ -20,6 +20,8 @@ pub struct Config {
     pub stylize: StylizeConfig,
     #[serde(default)]
     pub detail: DetailConfig,
+    #[serde(default)]
+    pub erosion: ErosionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,6 +147,39 @@ impl Default for DetailConfig {
             gain: 0.5,
             base_wavelength_m: 100.0,
             seed: 4242,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErosionConfig {
+    /// `false` (the default) is a no-op — real DEM data is already
+    /// naturally eroded (design doc §5.5); this stage exists to clean up
+    /// artifacts stylization's vertical exaggeration introduces, not to
+    /// simulate erosion in general.
+    pub enabled: bool,
+    /// Degrees; only cells steeper than this (talus angle) get thermally
+    /// eroded.
+    pub max_natural_slope: f32,
+    pub thermal_iters: u32,
+    /// `0` (the default) disables the hydraulic pass — off by default per
+    /// the design doc ("real DEM is pre-eroded"); the hook exists for later.
+    pub hydraulic_iters: u32,
+    /// Fraction of each steepest-descent height difference hydraulic
+    /// erosion moves per iteration (no talus threshold, unlike thermal —
+    /// water erodes regardless of angle). Not in the design doc's sketch,
+    /// needed to parametrize the hook.
+    pub hydraulic_strength: f32,
+}
+
+impl Default for ErosionConfig {
+    fn default() -> Self {
+        ErosionConfig {
+            enabled: false,
+            max_natural_slope: 55.0,
+            thermal_iters: 0,
+            hydraulic_iters: 0,
+            hydraulic_strength: 0.1,
         }
     }
 }

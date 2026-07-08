@@ -1,8 +1,8 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
-//! `--stage ingest`/`water`/`stylize`/`detail`/`export` do something (#59,
-//! #60, #61, #65, #62); `all` runs every stage that exists so far.
-//! `erode`/`classify` are reserved for #66/#67.
+//! `--stage ingest`/`water`/`stylize`/`detail`/`erode`/`export` do something
+//! (#59, #60, #61, #65, #66, #62); `all` runs every stage that exists so
+//! far. `classify` is reserved for #67.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use terrain_bake::{
     cache,
     config::Config,
-    detail, dump, export,
+    detail, dump, erosion, export,
     grid::Grid,
     stylize::{self, FootprintMask},
     synth,
@@ -75,13 +75,22 @@ fn main() {
             let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
             run_detail(&config, grid, stylized_mask, footprint, debug_dump);
         }
+        Stage::Erode => {
+            let grid = run_ingest(&config, cli.force, debug_dump);
+            let (grid, mask) = run_water(&config, grid, debug_dump);
+            let (grid, footprint) = run_stylize(&config, grid, debug_dump);
+            let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
+            let (detailed, _mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
+            run_erode(&config, detailed, debug_dump);
+        }
         Stage::All | Stage::Export => {
             let grid = run_ingest(&config, cli.force, debug_dump);
             let (grid, mask) = run_water(&config, grid, debug_dump);
             let (grid, footprint) = run_stylize(&config, grid, debug_dump);
             let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
             let (detailed, detailed_mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
-            run_export(&config, detailed, detailed_mask);
+            let eroded = run_erode(&config, detailed, debug_dump);
+            run_export(&config, eroded, detailed_mask);
         }
         other => {
             eprintln!("[terrain-bake] --stage {other:?} isn't implemented yet — see the terrain pipeline epic (#56)");
@@ -226,6 +235,35 @@ fn run_detail(
     let scale = grid.cell_size_m / config.source.target_res_m;
     let out_mask = stylize::compress_mask_horizontal(&mask, scale);
     (out, out_mask)
+}
+
+fn run_erode(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>) -> Grid {
+    let out = erosion::run_erosion_stage(&grid, &config.erosion);
+    println!(
+        "[terrain-bake] erode: {}x{} cells (enabled {}, max_natural_slope {}deg, thermal_iters {}, hydraulic_iters {})",
+        out.width,
+        out.height,
+        config.erosion.enabled,
+        config.erosion.max_natural_slope,
+        config.erosion.thermal_iters,
+        config.erosion.hydraulic_iters,
+    );
+
+    if let Some(dir) = debug_dump {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[terrain-bake] failed to create {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        let path = dir.join("erode_hillshade.png");
+        match dump::write_hillshade_png(&out, &path) {
+            Ok(()) => println!("[terrain-bake] wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    out
 }
 
 fn run_export(config: &Config, grid: Grid, mask: WaterMask) {

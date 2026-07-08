@@ -1,5 +1,5 @@
 format_version = 1
-bake_hash = "b29d5f5de3e91a44d958eefac9cc7be0a09a5543b0be37f2901efe4edae8351e"
+bake_hash = "7d813b3e4760d94cde943c333a21c459c75e3991f5051a3d240eac1d5e79d4a7"
 world_size_m = [6400.0, 6400.0]
 tile_size = 256
 cell_size_m = 25.0
