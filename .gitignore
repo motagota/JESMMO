@@ -28,3 +28,14 @@ server/*_err.txt
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Raw DEM source data (issue #69): large (100MB+) GeoTIFFs a human downloads
+# from a portal like Geoscience Australia's ELVIS -- never committed. The
+# small pre-converted `.grid` fixture `convert_dem.py` produces from one of
+# these *is* committed (see terrain-bake/testdata/).
+*.tif
+*.tiff
+
+# Regenerable bake output from the real-DEM demo config (issue #69) -- the
+# committed .grid input + .toml config regenerate it; not the output itself.
+terrain-bake/testdata/*_out/

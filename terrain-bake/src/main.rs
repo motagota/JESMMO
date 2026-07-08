@@ -1,7 +1,9 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
 //! `--stage ingest`/`water`/`stylize`/`detail`/`erode`/`classify`/`export`
-//! do something (#59, #60, #61, #65, #66, #67, #62); `all` runs every stage.
+//! do something; `all` runs every stage. Ingest uses a real DEM when
+//! `[source].dem_path` is set, the synthetic placeholder otherwise (#69) —
+//! see `terrain_bake::ingest`.
 
 use std::path::PathBuf;
 
@@ -13,8 +15,8 @@ use terrain_bake::{
     config::Config,
     detail, dump, erosion, export,
     grid::Grid,
+    ingest,
     stylize::{self, FootprintMask},
-    synth,
     water::{self, OverrideMask, WaterMask},
 };
 
@@ -108,7 +110,13 @@ fn main() {
 fn run_ingest(config: &Config, force: bool, debug_dump: Option<&std::path::Path>) -> Grid {
     let hash = config.source.content_hash();
     let out_dir = PathBuf::from(&config.export.out_dir);
-    let result = cache::cached_stage(&out_dir, "ingest", &hash, force, || synth::synthesize(&config.source));
+    let result = cache::cached_stage(&out_dir, "ingest", &hash, force, || match ingest::run_ingest(&config.source) {
+        Ok(grid) => grid,
+        Err(e) => {
+            eprintln!("[terrain-bake] ingest failed: {e}");
+            std::process::exit(1);
+        }
+    });
 
     println!(
         "[terrain-bake] ingest: {} ({}x{} cells at {}m, hash {})",

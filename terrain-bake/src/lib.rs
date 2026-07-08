@@ -2,10 +2,11 @@
 //! Library half of the crate — plain, testable functions; `main.rs` is a
 //! thin CLI wrapper around these.
 //!
-//! Ingest (#59, against a synthetic placeholder rather than a real GeoTIFF
-//! DEM — that's #69), the water mask (#60), stylization (#61), export
-//! (#62), and detail synthesis (#65) exist so far. Erosion (#66) and
-//! classification (#67) plug in here the same way.
+//! Every stage in the design doc's pipeline exists now: ingest (#59
+//! synthetic placeholder, #69 real DEM), the water mask (#60), stylization
+//! (#61), detail synthesis (#65), erosion (#66), classification (#67), and
+//! export (#62). `tests/pipeline_validation.rs` (#68) drives all of them
+//! end-to-end.
 
 pub mod cache;
 pub mod classify;
@@ -16,6 +17,7 @@ pub mod erosion;
 pub mod export;
 pub mod grid;
 pub mod hash;
+pub mod ingest;
 pub mod stylize;
 pub mod synth;
 pub mod water;

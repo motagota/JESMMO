@@ -4,8 +4,10 @@
 //! sequence from a single config the way `main.rs`'s `Stage::All` does, so a
 //! regression that only shows up from a *real* stage's output feeding the
 //! next stage (as opposed to a hand-built fixture) has somewhere to be
-//! caught. Four checks, matching the issue's acceptance criteria exactly:
-//! determinism, golden samples, seam, nav sanity.
+//! caught. Four checks, matching issue #68's acceptance criteria exactly:
+//! determinism, golden samples, seam, nav sanity — plus a fifth
+//! (`real_dem_ingest_flows_through_every_stage_unmodified`) added for #69,
+//! proving a real DEM needs zero changes to any of these stages.
 
 use terrain_bake::classify::{self, BiomeOverrideMask};
 use terrain_bake::config::{
@@ -51,7 +53,14 @@ fn test_config(out_dir: &str) -> Config {
 /// Runs every stage in sequence, exactly like `main.rs`'s `Stage::All`, and
 /// returns the final grid (for direct sampling) plus the exported artifact.
 fn run_pipeline(config: &Config) -> (Grid, export::ExportedArtifact) {
-    let mut grid = synth::synthesize(&config.source);
+    run_pipeline_from_grid(config, synth::synthesize(&config.source))
+}
+
+/// Same as [`run_pipeline`], but starting from an already-ingested grid —
+/// lets the real-DEM test (#69) drive water/stylize/detail/erosion/
+/// classify/export exactly the way every synthetic-fixture test here does,
+/// proving those stages don't need to change for real data.
+fn run_pipeline_from_grid(config: &Config, mut grid: Grid) -> (Grid, export::ExportedArtifact) {
     let overrides = OverrideMask::none(grid.width, grid.height);
     let mask = water::run_water_mask_stage(&mut grid, &config.water, &overrides);
 
@@ -258,4 +267,39 @@ fn debug_dump_writers_run_without_crashing_at_every_stage_boundary() {
         assert!(dump_dir.join(name).exists());
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn real_dem_ingest_flows_through_every_stage_unmodified() {
+    // Issue #69's own acceptance criterion, made durable: a real DEM (not
+    // the synthetic placeholder) runs through water/stylize/detail/erosion/
+    // classify/export with zero code differences from every other test in
+    // this file. `testdata/brisbane_hills_demo.grid` is a real 320x320-cell
+    // slice of the D'Aguilar Range foothills, pre-converted by
+    // `tools/convert_dem.py` from a real Geoscience Australia 5m DTM (see
+    // `README.md`).
+    let fixture = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/brisbane_hills_demo.grid"));
+    let grid = terrain_bake::ingest::load_dem_grid(fixture).expect("committed DEM fixture must load");
+    assert_eq!((grid.width, grid.height), (320, 320));
+
+    let dir = std::env::temp_dir().join(format!("terrain-bake-pv-real-dem-{}", std::process::id()));
+    let mut config = test_config(dir.to_str().unwrap());
+    config.source.working_res_m = grid.cell_size_m;
+    config.source.target_res_m = grid.cell_size_m; // no upsampling -- this test is about real data flowing through, not detail synthesis
+    config.water.sea_level_m = -10.0; // this AOI's real height range is ~29m..411m, comfortably above
+
+    let (final_grid, artifact) = run_pipeline_from_grid(&config, grid);
+
+    // Real terrain, not the synthetic placeholder's shape: sanity-check the
+    // height range is plausible hill country, not some degenerate all-zero
+    // or NaN-contaminated output.
+    let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &h in &final_grid.heights {
+        assert!(h.is_finite(), "real-DEM ingest produced a non-finite height");
+        min = min.min(h);
+        max = max.max(h);
+    }
+    assert!(min > 0.0 && max < 500.0, "height range {min}..{max} isn't plausible for this AOI");
+    assert!(!artifact.height_tiles.is_empty());
+    assert!(!artifact.meta_tiles.is_empty());
 }
