@@ -1,20 +1,27 @@
-## The 3D capital: a ground plane, the authored district tiles, and the
+## The 3D capital: a ground plane, painted by district safety, and the
 ## town-centre marker, all rebuilt from the gateway's `partition` message.
 ##
-## The capital starts empty — no roads are authored; this draws the ground and
-## districts (named, tinted by safety) plus a town-centre marker. Roads are real,
-## buildable content now (mayor-issued dirt paths, see `upsert_dirt_road`), and
-## other structures arrive as build orders complete.
+## The capital starts empty — no roads are authored; this draws the ground
+## (safety-tinted directly on its surface — see `_build_ground`) plus a
+## town-centre marker. Roads are real, buildable content now (mayor-issued
+## dirt paths, see `upsert_dirt_road`), and other structures arrive as build
+## orders complete.
 class_name World
 extends Node3D
 
 const _GROUND_Y := 0.0
-const _TILE_Y := 0.02   # district tiles sit just above the ground to avoid z-fighting
+const _TILE_Y := 0.02   # plot/home markers sit just above the ground to avoid z-fighting
 const _ROAD_Y := 0.05
 const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
 const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
 const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
-const _TILE_SEGMENT_STEP := 160.0  # world units per district-tile subdivision — see _add_district_tile
+## Base ground look and its safe/wilds-tinted variants (design intent
+## unchanged from the old translucent overlay: a subtle green/red tint over
+## the same base color, just painted directly into the ground mesh's vertex
+## colors now instead of a separate floating plane — see `_build_ground`).
+const _GROUND_BASE_COLOR := Color(0.10, 0.14, 0.10)
+const _GROUND_SAFE_COLOR := Color(0.11, 0.22, 0.14)
+const _GROUND_WILDS_COLOR := Color(0.20, 0.13, 0.11)
 
 var world_size := 6400.0
 
@@ -46,13 +53,16 @@ func _ready() -> void:
     add_child(_home_root)
     add_child(_plots_root)
 
-## Rebuild the district tiles from a `partition` message; lazily build the static
-## ground/roads once the world size and the terrain heightmap are both known.
+## Rebuild the district name labels from a `partition` message; lazily build
+## the static ground/roads once the world size and the terrain heightmap are
+## both known. `_zones` must be set *before* `_maybe_build_static()` so the
+## ground's first (and only) build already has real safety data to paint —
+## see `_build_ground`.
 func apply_partition(msg: Dictionary) -> void:
     world_size = float(msg.get("world", world_size))
     _partition_received = true
-    _maybe_build_static()
     _zones = msg.get("zones", [])
+    _maybe_build_static()
     _rebuild_tiles()
 
 ## The terrain heightmap (#54) arrived — build the ground/roads if the
@@ -76,7 +86,7 @@ func _rebuild_tiles() -> void:
 
     for entry_v in _zones:
         var z: Dictionary = entry_v
-        _add_district_tile(z)
+        _add_district_label(z)
 
 ## The district name containing world point `(wx, wy)`, or "" if it falls
 ## outside every known zone tile (shouldn't happen — the capital tiles the
@@ -100,11 +110,42 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
             return z
     return {}
 
+## The ground-paint color for world point `(wx, wy)`: the base ground color,
+## tinted toward green (safe) or red (wilds) per whichever zone contains it.
+## Safety is a static property of a district's identity (`Safety::Safe`/
+## `Wilds` in `world.rs`, never redrawn by later re-partitioning/zone-splits
+## — only the shard boundaries change, not which world positions are safe),
+## so painting this once at ground-build time never goes stale.
+func _ground_color_at(wx: float, wy: float) -> Color:
+    # Clamp to just inside the world bounds: a vertex sampled exactly at the
+    # world's far edge (`wx == world_size` or `wy == world_size`, which
+    # `_build_ground`'s last row/column of vertices always does) would
+    # otherwise satisfy no zone's exclusive `< x1`/`< y1` bound and fall
+    # through to the neutral fallback color -- a visible one-vertex-wide
+    # untinted seam around the whole map's perimeter.
+    var qx := minf(wx, world_size - 0.01)
+    var qy := minf(wy, world_size - 0.01)
+    for entry_v in _zones:
+        var z: Dictionary = entry_v
+        if qx >= float(z.get("x0", 0)) and qx < float(z.get("x1", 0)) \
+                and qy >= float(z.get("y0", 0)) and qy < float(z.get("y1", 0)):
+            return _GROUND_SAFE_COLOR if String(z.get("safety", "wilds")) == "safe" else _GROUND_WILDS_COLOR
+    return _GROUND_BASE_COLOR
+
 ## A grid mesh (not a flat `PlaneMesh`) so the ground actually shows
-## `Protocol.terrain_height`'s gentle rolling hills instead of looking dead
-## flat — every vertex is placed via the same `w2v` everything else already
-## goes through, so it's automatically consistent with where props/entities
-## sit on it.
+## `Protocol.terrain_height`'s relief instead of looking dead flat — every
+## vertex is placed via the same `w2v` everything else already goes through,
+## so it's automatically consistent with where props/entities sit on it.
+##
+## District safety used to be a separate translucent overlay plane
+## (`_add_district_tile`), sampled at just one height per district — fine
+## against the old gentle synthetic terrain, but real DEM terrain (#69)
+## carries enough relief across a whole district's footprint that a single
+## flat plane visibly floated above/through the real ground. Painted
+## directly into the ground mesh's own per-vertex colors instead: no second
+## mesh, no z-fighting margin, and it's mechanically impossible for the tint
+## to disagree with the surface it's tinting, since they're the same
+## vertices.
 func _build_ground() -> void:
     var st := SurfaceTool.new()
     st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -124,14 +165,25 @@ func _build_ground() -> void:
             var p10 := Protocol.w2v(wx1, wy0, _GROUND_Y)
             var p01 := Protocol.w2v(wx0, wy1, _GROUND_Y)
             var p11 := Protocol.w2v(wx1, wy1, _GROUND_Y)
+            var c00 := _ground_color_at(wx0, wy0)
+            var c10 := _ground_color_at(wx1, wy0)
+            var c01 := _ground_color_at(wx0, wy1)
+            var c11 := _ground_color_at(wx1, wy1)
             # Two triangles per grid cell, wound so generated normals point
             # up (verified by tests/smoke_terrain.gd — Godot's generate_normals
-            # gave downward-facing normals for the opposite order).
+            # gave downward-facing normals for the opposite order). Color is
+            # set immediately before each vertex it belongs to.
+            st.set_color(c00)
             st.add_vertex(p00)
+            st.set_color(c10)
             st.add_vertex(p10)
+            st.set_color(c11)
             st.add_vertex(p11)
+            st.set_color(c00)
             st.add_vertex(p00)
+            st.set_color(c11)
             st.add_vertex(p11)
+            st.set_color(c01)
             st.add_vertex(p01)
     st.index() # share vertices between adjacent triangles for smooth normals
     st.generate_normals()
@@ -139,7 +191,10 @@ func _build_ground() -> void:
     _ground = MeshInstance3D.new()
     _ground.mesh = st.commit()
     var mat := StandardMaterial3D.new()
-    mat.albedo_color = Color(0.10, 0.14, 0.10)
+    # White base + vertex_color_use_as_albedo so the final albedo *is* each
+    # vertex's painted color exactly (no multiply-darkening surprises).
+    mat.albedo_color = Color.WHITE
+    mat.vertex_color_use_as_albedo = true
     # The two triangles per cell (p00,p11,p10 / p00,p01,p11) already wind so
     # generated normals point up (verified by tests/smoke_terrain.gd) — no
     # need for BaseMaterial3D.CULL_DISABLED, which was a previous defensive
@@ -374,15 +429,10 @@ func _add_signpost(cx: float, cy: float, owner_name: String, tint: Color) -> voi
     label.position = Protocol.w2v(cx, cy, 2.15)
     _plots_root.add_child(label)
 
-## A district tile can span a large fraction of the whole world (districts
-## are quadrants/halves of `WORLD_SIZE`) -- with real DEM terrain (issue #69)
-## carrying far more relief than the old synthetic placeholder, a single flat
-## `PlaneMesh` sampled at just the tile's center visibly floats above/through
-## the real ground everywhere else in the tile. Subdivided into a
-## terrain-following grid instead, the same technique `_build_ground` and
-## `_build_road_ribbon` already use, so the tint overlay actually hugs the
-## surface underneath it.
-func _add_district_tile(z: Dictionary) -> void:
+## Just the floating district-name label now — safety is painted straight
+## into the ground mesh (`_build_ground`), so there's no separate tile mesh
+## to draw here any more.
+func _add_district_label(z: Dictionary) -> void:
     var x0 := float(z.get("x0", 0))
     var y0 := float(z.get("y0", 0))
     var x1 := float(z.get("x1", 0))
@@ -392,46 +442,14 @@ func _add_district_tile(z: Dictionary) -> void:
     if w <= 0.0 or h <= 0.0:
         return
 
-    var cols := maxi(1, ceili(w / _TILE_SEGMENT_STEP))
-    var rows := maxi(1, ceili(h / _TILE_SEGMENT_STEP))
-    var st := SurfaceTool.new()
-    st.begin(Mesh.PRIMITIVE_TRIANGLES)
-    for gy in range(rows):
-        for gx in range(cols):
-            var wx0 := x0 + w * (float(gx) / float(cols))
-            var wy0 := y0 + h * (float(gy) / float(rows))
-            var wx1 := x0 + w * (float(gx + 1) / float(cols))
-            var wy1 := y0 + h * (float(gy + 1) / float(rows))
-            var p00 := Protocol.w2v(wx0, wy0, _TILE_Y)
-            var p10 := Protocol.w2v(wx1, wy0, _TILE_Y)
-            var p01 := Protocol.w2v(wx0, wy1, _TILE_Y)
-            var p11 := Protocol.w2v(wx1, wy1, _TILE_Y)
-            st.add_vertex(p00)
-            st.add_vertex(p10)
-            st.add_vertex(p11)
-            st.add_vertex(p00)
-            st.add_vertex(p11)
-            st.add_vertex(p01)
-    st.index()
-    st.generate_normals()
-
-    var tile := MeshInstance3D.new()
-    tile.mesh = st.commit()
-
-    var safe := String(z.get("safety", "wilds")) == "safe"
-    var mat := StandardMaterial3D.new()
-    mat.albedo_color = (Color(0.12, 0.30, 0.18, 0.5) if safe
-        else Color(0.30, 0.12, 0.12, 0.5))
-    mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-    tile.material_override = mat
-    _tiles_root.add_child(tile)
-
     var district_name: String = String(z.get("district", z.get("zone_id", "")))
-    if district_name != "":
-        var label := Label3D.new()
-        label.text = district_name
-        label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-        label.modulate = Color(0.7, 1.0, 0.8) if safe else Color(1.0, 0.7, 0.7)
-        label.pixel_size = 0.05
-        label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 6.0)
-        _tiles_root.add_child(label)
+    if district_name == "":
+        return
+    var safe := String(z.get("safety", "wilds")) == "safe"
+    var label := Label3D.new()
+    label.text = district_name
+    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.modulate = Color(0.7, 1.0, 0.8) if safe else Color(1.0, 0.7, 0.7)
+    label.pixel_size = 0.05
+    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 6.0)
+    _tiles_root.add_child(label)
