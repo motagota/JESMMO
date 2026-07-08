@@ -1,13 +1,15 @@
-## Headless smoke test: ground cells below the river-height threshold paint
-## river silt-brown, overriding whatever safety tint that point would
-## otherwise get (World._ground_color_at / _RIVER_HEIGHT_THRESHOLD_M).
+## Headless smoke test: ground at or below _RIVER_FULL_M paints fully river
+## silt-brown, overriding whatever safety tint that point would otherwise
+## get; ground at or above _RIVER_FADE_M paints no river tint at all
+## (World._ground_color_at / _safety_color_at).
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_ground_paint_river.gd
 extends SceneTree
 
 func _initialize() -> void:
-	# A simple west-high/east-low ramp: west half is well above the river
-	# threshold, east half dips below it -- so the river-colored strip should
-	# land on the east side regardless of the (uniformly "safe") zone tint.
+	# A simple west-high/east-low ramp: west half sits well above
+	# _RIVER_FADE_M, east half sits well below _RIVER_FULL_M -- so the
+	# river-colored strip should land fully on the east side regardless of
+	# the (uniformly "safe") zone tint.
 	var resolution := 8
 	var world_size := 6400.0
 	var stride := resolution + 1
@@ -15,7 +17,7 @@ func _initialize() -> void:
 	heights.resize(stride * stride)
 	for gy in range(stride):
 		for gx in range(stride):
-			heights[gy * stride + gx] = 50.0 if gx < stride / 2 else 0.0
+			heights[gy * stride + gx] = 50.0 if gx < stride / 2 else -10.0
 	Protocol.apply_terrain_data(resolution, world_size, heights)
 
 	var world = load("res://world/World.gd").new()
@@ -26,7 +28,7 @@ func _initialize() -> void:
 	world.on_terrain_data()
 
 	var high_color: Color = world._ground_color_at(500.0, 500.0)   # west, height 50m
-	var low_color: Color = world._ground_color_at(5500.0, 500.0)   # east, height 0m
+	var low_color: Color = world._ground_color_at(5500.0, 500.0)   # east, height -10m
 	print("high_color=%s low_color=%s river_const=%s" % [high_color, low_color, World._RIVER_COLOR])
 
 	if high_color.is_equal_approx(low_color):
@@ -38,5 +40,18 @@ func _initialize() -> void:
 		quit(1)
 		return
 
-	print("SMOKE_OK: low-lying ground paints the river color, distinct from high ground")
+	# A point in the fade band (between _RIVER_FULL_M and _RIVER_FADE_M) must
+	# be a genuine blend -- neither the pure safety color nor pure river
+	# brown -- so a single low wire-grid corner doesn't wash a whole coarse
+	# cell into flat brown; it should taper.
+	var mid_h := (World._RIVER_FULL_M + World._RIVER_FADE_M) * 0.5
+	Protocol.apply_terrain_data(1, world_size, PackedFloat32Array([mid_h, mid_h, mid_h, mid_h]))
+	var mid_color: Color = world._ground_color_at(100.0, 100.0)
+	print("mid_color=%s (at height %s)" % [mid_color, mid_h])
+	if mid_color.is_equal_approx(World._RIVER_COLOR) or mid_color.is_equal_approx(high_color):
+		print("SMOKE_FAIL: fade-band height didn't blend (got %s)" % mid_color)
+		quit(1)
+		return
+
+	print("SMOKE_OK: river color fully applies when deep, fades out by _RIVER_FADE_M, and blends in between")
 	quit(0)
