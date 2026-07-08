@@ -141,6 +141,26 @@ pub fn compress_mask_horizontal(mask: &WaterMask, scale: f32) -> WaterMask {
     out
 }
 
+/// The [`FootprintMask`] counterpart to [`compress_mask_horizontal`] — same
+/// nearest-neighbor resampling, needed by detail synthesis (#65) to bring
+/// the capital footprint into alignment with the upsampled detail grid.
+pub fn resample_footprint(footprint: &FootprintMask, scale: f32) -> FootprintMask {
+    if scale == 1.0 {
+        return footprint.clone();
+    }
+    let new_width = ((footprint.width as f32) * scale).round().max(1.0) as usize;
+    let new_height = ((footprint.height as f32) * scale).round().max(1.0) as usize;
+    let mut out = FootprintMask::none(new_width, new_height);
+    for gy in 0..new_height {
+        for gx in 0..new_width {
+            let src_x = ((gx as f32 / scale).round() as usize).min(footprint.width - 1);
+            let src_y = ((gy as f32 / scale).round() as usize).min(footprint.height - 1);
+            out.set(gx, gy, footprint.get(src_x, src_y));
+        }
+    }
+    out
+}
+
 fn bilinear_sample(grid: &Grid, x: f32, y: f32) -> f32 {
     let x0 = (x.floor() as usize).min(grid.width - 1);
     let y0 = (y.floor() as usize).min(grid.height - 1);

@@ -47,3 +47,17 @@ vertical_scale = 0.1
 # x:[4840,6240], y:[40,2400] with margin to spare.
 capital_flatten_mask = "masks/capital_flatten.png"
 capital_flatten_margin_m = 100.0
+
+[detail]
+# Small-scale texture on top of the broad rolling hills (#65) -- kept modest
+# (base_amp_m well under the ~33m whole-terrain range) since this is still
+# cosmetic-only relief, not meant to look rocky/dramatic. Skipped entirely
+# inside the water mask (empty here anyway) and the capital_flatten
+# footprint, so the buildable plot field stays exactly level.
+octaves = 3
+base_amp_m = 0.6
+slope_amp_curve = 1.5
+lacunarity = 2.0
+gain = 0.5
+base_wavelength_m = 60.0
+seed = 4242

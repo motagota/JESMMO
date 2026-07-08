@@ -119,7 +119,7 @@ pub fn write_artifact(artifact: &ExportedArtifact, out_dir: &Path) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExportConfig, SourceConfig, StylizeConfig, WaterConfig};
+    use crate::config::{DetailConfig, ExportConfig, SourceConfig, StylizeConfig, WaterConfig};
 
     fn test_config(tile_size: u32, out_dir: &str) -> Config {
         Config {
@@ -133,6 +133,7 @@ mod tests {
             export: ExportConfig { tile_size, out_dir: out_dir.to_string() },
             water: WaterConfig::default(),
             stylize: StylizeConfig::default(),
+            detail: DetailConfig::default(),
         }
     }
 

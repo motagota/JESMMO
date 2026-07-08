@@ -18,6 +18,8 @@ pub struct Config {
     pub water: WaterConfig,
     #[serde(default)]
     pub stylize: StylizeConfig,
+    #[serde(default)]
+    pub detail: DetailConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +109,42 @@ impl Default for StylizeConfig {
             vertical_scale: 1.0,
             capital_flatten_mask: None,
             capital_flatten_margin_m: 150.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetailConfig {
+    /// `0` (the default) is a no-op — no detail stage exists in a config
+    /// that doesn't ask for one.
+    pub octaves: u32,
+    /// Amplitude (meters) at `slope == 1.0` (45°); scaled down from there by
+    /// `slope_amp_curve` on gentler ground, so plains stay smooth and only
+    /// steep terrain gets rocky high-frequency detail (design doc §5.4).
+    pub base_amp_m: f32,
+    pub slope_amp_curve: f32,
+    pub lacunarity: f32,
+    pub gain: f32,
+    /// Wavelength (meters) of the lowest-frequency octave. Not in the design
+    /// doc's config sketch — needed to actually define what "octave 0" means
+    /// in world units; each further octave is `lacunarity` times higher
+    /// frequency.
+    pub base_wavelength_m: f32,
+    /// Independent of `source.seed` so retuning ingest doesn't silently
+    /// reshuffle the detail texture, or vice versa.
+    pub seed: u32,
+}
+
+impl Default for DetailConfig {
+    fn default() -> Self {
+        DetailConfig {
+            octaves: 0,
+            base_amp_m: 0.0,
+            slope_amp_curve: 1.5,
+            lacunarity: 2.0,
+            gain: 0.5,
+            base_wavelength_m: 100.0,
+            seed: 4242,
         }
     }
 }

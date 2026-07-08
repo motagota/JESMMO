@@ -1,8 +1,8 @@
 //! Offline terrain bake CLI (terrain pipeline epic, issue tracker #56).
 //!
-//! `--stage ingest`/`water`/`stylize`/`export` do something (#59, #60, #61,
-//! #62); `all` runs every stage that exists so far. `detail`/`erode`/
-//! `classify` are reserved for #65/#66/#67.
+//! `--stage ingest`/`water`/`stylize`/`detail`/`export` do something (#59,
+//! #60, #61, #65, #62); `all` runs every stage that exists so far.
+//! `erode`/`classify` are reserved for #66/#67.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use terrain_bake::{
     cache,
     config::Config,
-    dump, export,
+    detail, dump, export,
     grid::Grid,
     stylize::{self, FootprintMask},
     synth,
@@ -68,12 +68,20 @@ fn main() {
             let (grid, _mask) = run_water(&config, grid, debug_dump);
             run_stylize(&config, grid, debug_dump);
         }
+        Stage::Detail => {
+            let grid = run_ingest(&config, cli.force, debug_dump);
+            let (grid, mask) = run_water(&config, grid, debug_dump);
+            let (grid, footprint) = run_stylize(&config, grid, debug_dump);
+            let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
+            run_detail(&config, grid, stylized_mask, footprint, debug_dump);
+        }
         Stage::All | Stage::Export => {
             let grid = run_ingest(&config, cli.force, debug_dump);
             let (grid, mask) = run_water(&config, grid, debug_dump);
-            let stylized = run_stylize(&config, grid, debug_dump);
+            let (grid, footprint) = run_stylize(&config, grid, debug_dump);
             let stylized_mask = stylize::compress_mask_horizontal(&mask, config.stylize.horizontal_scale);
-            run_export(&config, stylized, stylized_mask);
+            let (detailed, detailed_mask) = run_detail(&config, grid, stylized_mask, footprint, debug_dump);
+            run_export(&config, detailed, detailed_mask);
         }
         other => {
             eprintln!("[terrain-bake] --stage {other:?} isn't implemented yet — see the terrain pipeline epic (#56)");
@@ -149,7 +157,7 @@ fn run_water(config: &Config, mut grid: Grid, debug_dump: Option<&std::path::Pat
     (grid, mask)
 }
 
-fn run_stylize(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>) -> Grid {
+fn run_stylize(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>) -> (Grid, FootprintMask) {
     let footprint = match &config.stylize.capital_flatten_mask {
         Some(path) => match FootprintMask::from_luma_png(std::path::Path::new(path)) {
             Ok(m) => m,
@@ -180,7 +188,44 @@ fn run_stylize(config: &Config, grid: Grid, debug_dump: Option<&std::path::Path>
             }
         }
     }
-    out
+    // The footprint mask is already at the stylized grid's resolution (built
+    // from a PNG hand-painted for that resolution) — no resampling needed,
+    // unlike the water mask (computed *before* stylization's compression).
+    (out, footprint)
+}
+
+fn run_detail(
+    config: &Config,
+    grid: Grid,
+    mask: WaterMask,
+    footprint: FootprintMask,
+    debug_dump: Option<&std::path::Path>,
+) -> (Grid, WaterMask) {
+    let out = detail::run_detail_stage(&grid, &mask, &footprint, &config.detail, config.source.target_res_m);
+    println!(
+        "[terrain-bake] detail: {}x{} cells at {}m ({} octaves, base_amp {}m)",
+        out.width, out.height, out.cell_size_m, config.detail.octaves, config.detail.base_amp_m,
+    );
+
+    if let Some(dir) = debug_dump {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[terrain-bake] failed to create {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        let path = dir.join("detail_hillshade.png");
+        match dump::write_hillshade_png(&out, &path) {
+            Ok(()) => println!("[terrain-bake] wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("[terrain-bake] failed to write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    // The mask must follow the grid to whatever resolution detail synthesis
+    // upsampled to, same reasoning as stylize's own mask resampling.
+    let scale = grid.cell_size_m / config.source.target_res_m;
+    let out_mask = stylize::compress_mask_horizontal(&mask, scale);
+    (out, out_mask)
 }
 
 fn run_export(config: &Config, grid: Grid, mask: WaterMask) {

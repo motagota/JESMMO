@@ -3,12 +3,13 @@
 //! thin CLI wrapper around these.
 //!
 //! Ingest (#59, against a synthetic placeholder rather than a real GeoTIFF
-//! DEM — that's #69), the water mask (#60), stylization (#61), and export
-//! (#62) exist so far. Every later stage (detail #65, erosion #66,
-//! classification #67) plugs in here the same way.
+//! DEM — that's #69), the water mask (#60), stylization (#61), export
+//! (#62), and detail synthesis (#65) exist so far. Erosion (#66) and
+//! classification (#67) plug in here the same way.
 
 pub mod cache;
 pub mod config;
+pub mod detail;
 pub mod dump;
 pub mod export;
 pub mod grid;

@@ -1,10 +1,10 @@
 format_version = 1
-bake_hash = "66f22a282dd83505741be96901e3b68f545818ea2e8303ad93ad73b5e08ec96a"
+bake_hash = "b29d5f5de3e91a44d958eefac9cc7be0a09a5543b0be37f2901efe4edae8351e"
 world_size_m = [6400.0, 6400.0]
 tile_size = 256
 cell_size_m = 25.0
 tiles = [1, 1]
 height_encoding = "u16"
-height_min_m = -0.5
-height_max_m = 33.30055236816406
+height_min_m = -0.5000081658363342
+height_max_m = 33.300758361816406
 sea_level_m = -50.0
