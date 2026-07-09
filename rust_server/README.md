@@ -44,7 +44,7 @@ Then open `../client/client.html` in a browser.
 ### Terrain artifact
 
 The proxy loads authoritative terrain heights from the baked artifact at
-`../artifacts/world_v1/` (relative to this crate) at boot — panics with a clear
+`../artifacts/world_v2/` (relative to this crate) at boot — panics with a clear
 message if it's missing. It's checked into the repo; regenerate it after
 changing `../terrain.toml` with:
 

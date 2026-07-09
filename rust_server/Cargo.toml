@@ -45,3 +45,6 @@ argon2 = "0.5"
 # Authoritative terrain heights, loaded from the artifact `terrain-bake` produces
 # (issue #63) — the same tile format/sampler the offline bake tool uses.
 terrain-common = { path = "../terrain-common" }
+# Wraps terrain tile bytes for terrain streaming (terrain.tile_data) so they
+# ride the existing all-JSON/text-frame wire protocol unchanged.
+base64 = "0.22"

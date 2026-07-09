@@ -15,40 +15,6 @@ const _ROAD_Y := 0.05
 const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
 const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
 const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
-## Base ground look and its safe/wilds-tinted variants (design intent
-## unchanged from the old translucent overlay: a subtle green/red tint over
-## the same base color, just painted directly into the ground mesh's vertex
-## colors now instead of a separate floating plane — see `_build_ground`).
-const _GROUND_BASE_COLOR := Color(0.10, 0.14, 0.10)
-const _GROUND_SAFE_COLOR := Color(0.11, 0.22, 0.14)
-const _GROUND_WILDS_COLOR := Color(0.20, 0.13, 0.11)
-## Purely a visual read of the real DEM's own elevation (issue #69's
-## production bake) — no server round-trip, no nav/biome data needed.
-## Deliberately just a color, not a nav-blocking water mask (terrain.toml's
-## [water].sea_level_m stays low) — the real Brisbane River is famously
-## muddy brown, not blue, so this is truer to the place than a generic
-## water-blue would have been anyway.
-##
-## The wire heightmap the client actually has is coarse (`Protocol
-## .terrain_resolution()` corners, ~133m apart on the production world, far
-## coarser than the real bake's own 25m fidelity) and Gouraud-shaded across
-## each cell — a single low *corner* smears its color across every triangle
-## touching it. A hard cutoff at a height that matches the real river's true
-## width (~2m) therefore visibly over-paints far more area than the real
-## channel covers. Blending across a band instead (full brown only at the
-## channel's genuinely deep points, fading out entirely by `_RIVER_FADE_M`)
-## keeps only the deepest points solid and lets the smeared fringe read as a
-## muddy bank tapering into normal ground, instead of a flat wash of brown.
-## Tuned against the production bake's own wire-resolution heightmap: at this
-## coarseness only a handful of sample points ever reach the river's true
-## deepest bed (~-7.5m at this resolution), so `_RIVER_FULL_M` is set loose
-## enough that the tint is always a soft partial blend in practice, never a
-## harsh solid-brown patch, while `_RIVER_FADE_M` keeps the *visible* tinted
-## footprint modest (~10-11% of the ground mesh's cells at this bake, not
-## the "majority of the map" an earlier, harder cutoff produced).
-const _RIVER_FULL_M := -4.0   # at or below this height: fully river-brown
-const _RIVER_FADE_M := 1.0    # at or above this height: no river tint at all
-const _RIVER_COLOR := Color(0.35, 0.27, 0.16)
 
 var world_size := 6400.0
 
@@ -137,41 +103,6 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
             return z
     return {}
 
-## The safety-only ground color for world point `(wx, wy)`: the base ground
-## color tinted toward green (safe) or red (wilds) per whichever zone
-## contains it. Safety is a static property of a district's identity
-## (`Safety::Safe`/`Wilds` in `world.rs`, never redrawn by later
-## re-partitioning/zone-splits — only the shard boundaries change, not which
-## world positions are safe), so painting this once at ground-build time
-## never goes stale.
-func _safety_color_at(wx: float, wy: float) -> Color:
-    # Clamp to just inside the world bounds: a vertex sampled exactly at the
-    # world's far edge (`wx == world_size` or `wy == world_size`, which
-    # `_build_ground`'s last row/column of vertices always does) would
-    # otherwise satisfy no zone's exclusive `< x1`/`< y1` bound and fall
-    # through to the neutral fallback color -- a visible one-vertex-wide
-    # untinted seam around the whole map's perimeter.
-    var qx := minf(wx, world_size - 0.01)
-    var qy := minf(wy, world_size - 0.01)
-    for entry_v in _zones:
-        var z: Dictionary = entry_v
-        if qx >= float(z.get("x0", 0)) and qx < float(z.get("x1", 0)) \
-                and qy >= float(z.get("y0", 0)) and qy < float(z.get("y1", 0)):
-            return _GROUND_SAFE_COLOR if String(z.get("safety", "wilds")) == "safe" else _GROUND_WILDS_COLOR
-    return _GROUND_BASE_COLOR
-
-## The full ground-paint color for `(wx, wy)`: the safety color, blended
-## toward river silt-brown as height drops from `_RIVER_FADE_M` down to
-## `_RIVER_FULL_M` (see that constant's doc comment for why this is a band,
-## not a hard cutoff).
-func _ground_color_at(wx: float, wy: float) -> Color:
-    var safety := _safety_color_at(wx, wy)
-    var h := Protocol.terrain_height(wx, wy)
-    if h >= _RIVER_FADE_M:
-        return safety
-    var t := 1.0 if h <= _RIVER_FULL_M else (_RIVER_FADE_M - h) / (_RIVER_FADE_M - _RIVER_FULL_M)
-    return safety.lerp(_RIVER_COLOR, smoothstep(0.0, 1.0, t))
-
 ## A grid mesh (not a flat `PlaneMesh`) so the ground actually shows
 ## `Protocol.terrain_height`'s relief instead of looking dead flat — every
 ## vertex is placed via the same `w2v` everything else already goes through,
@@ -205,10 +136,10 @@ func _build_ground() -> void:
             var p10 := Protocol.w2v(wx1, wy0, _GROUND_Y)
             var p01 := Protocol.w2v(wx0, wy1, _GROUND_Y)
             var p11 := Protocol.w2v(wx1, wy1, _GROUND_Y)
-            var c00 := _ground_color_at(wx0, wy0)
-            var c10 := _ground_color_at(wx1, wy0)
-            var c01 := _ground_color_at(wx0, wy1)
-            var c11 := _ground_color_at(wx1, wy1)
+            var c00 := GroundPaint.ground_color_at(_zones, world_size, wx0, wy0)
+            var c10 := GroundPaint.ground_color_at(_zones, world_size, wx1, wy0)
+            var c01 := GroundPaint.ground_color_at(_zones, world_size, wx0, wy1)
+            var c11 := GroundPaint.ground_color_at(_zones, world_size, wx1, wy1)
             # Two triangles per grid cell, wound so generated normals point
             # up (verified by tests/smoke_terrain.gd — Godot's generate_normals
             # gave downward-facing normals for the opposite order). Color is

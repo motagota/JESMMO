@@ -2183,6 +2183,7 @@ name = "zone_server"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
  "futures-util",
  "rand",
  "serde",

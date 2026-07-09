@@ -1,0 +1,10 @@
+format_version = 1
+bake_hash = "354bc5927c5f88f99c021cacdf2ccdaf7c59642e5e5e18b78fadc31cb918808b"
+world_size_m = [6400.0, 6400.0]
+tile_size = 128
+cell_size_m = 5.0
+tiles = [10, 10]
+height_encoding = "u16"
+height_min_m = -21.376811981201172
+height_max_m = 111.7098388671875
+sea_level_m = -25.0

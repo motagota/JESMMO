@@ -268,7 +268,12 @@ pub const TERRAIN_RESOLUTION: i32 = 48;
 /// current working directory (which varies: the README's own instructions
 /// run the server from inside `rust_server/`, but a workspace-wide `cargo
 /// run -p proxy` from the repo root works too).
-const DEFAULT_TERRAIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../artifacts/world_v1");
+///
+/// `world_v2`, not `world_v1`: this bake is native 5m resolution (100 tiles)
+/// rather than the original 25m single-tile bake — a materially different,
+/// non-backward-compatible artifact, hence the new directory name rather
+/// than overwriting `world_v1` in place.
+const DEFAULT_TERRAIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../artifacts/world_v2");
 
 static TERRAIN: std::sync::OnceLock<std::sync::Arc<terrain_common::Terrain>> = std::sync::OnceLock::new();
 
@@ -282,12 +287,15 @@ static TERRAIN: std::sync::OnceLock<std::sync::Arc<terrain_common::Terrain>> = s
 /// format sent to clients (`terrain.data`, see `proxy.rs::send_terrain`)
 /// stays a flat `(TERRAIN_RESOLUTION+1)^2` grid exactly like the old
 /// synthetic generator sent — deliberately decoupled from the artifact's own
-/// internal resolution, so a much more detailed future bake (finer
-/// `cell_size_m`, real DEM data, etc.) never has to grow the wire payload;
-/// it only changes what `sample_height` returns at the same fixed sampling
-/// grid. If a much larger world ever needs genuinely high-detail client-side
-/// terrain, *that's* when a tile-streaming protocol redesign earns its
-/// complexity — not before (see the terrain pipeline epic, #56, issue #64).
+/// internal resolution, so this flat backdrop grid never has to grow just
+/// because the bake gets more detailed; it only changes what `sample_height`
+/// returns at the same fixed sampling grid. This backdrop is the permanent,
+/// zero-latency fallback terrain now that real high-resolution terrain
+/// streaming exists (`terrain.tile_request`/`terrain.tile_data`,
+/// `proxy.rs::send_terrain_tile`) — the client renders this coarse grid
+/// everywhere, and layers genuinely native-resolution tiles on top near the
+/// player, streamed in/out as they move (see
+/// `client_godot/world/TerrainStreamer.gd`).
 pub fn loaded_terrain() -> std::sync::Arc<terrain_common::Terrain> {
     TERRAIN
         .get_or_init(|| {

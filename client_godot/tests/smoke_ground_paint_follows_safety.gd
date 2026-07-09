@@ -1,7 +1,7 @@
 ## Headless smoke test: district safety is painted directly into the ground
-## mesh's per-vertex colors (World._build_ground / _ground_color_at), not a
-## separate overlay plane -- confirms the ground mesh actually carries a
-## COLOR array, and that a safe-zone vertex and a wilds-zone vertex get
+## mesh's per-vertex colors (World._build_ground / GroundPaint.ground_color_at),
+## not a separate overlay plane -- confirms the ground mesh actually carries
+## a COLOR array, and that a safe-zone vertex and a wilds-zone vertex get
 ## visibly different colors.
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_ground_paint_follows_safety.gd
 extends SceneTree
@@ -13,7 +13,7 @@ func _initialize() -> void:
 	var heights := PackedFloat32Array()
 	heights.resize(stride * stride)
 	# Flat is fine -- only safety colors matter here -- but must sit above
-	# _RIVER_HEIGHT_THRESHOLD_M, or every vertex would paint river-brown
+	# GroundPaint._RIVER_FADE_M, or every vertex would paint river-brown
 	# instead (see smoke_ground_paint_river.gd for that behavior).
 	heights.fill(50.0)
 	Protocol.apply_terrain_data(resolution, world_size, heights)

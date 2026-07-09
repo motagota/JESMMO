@@ -70,9 +70,11 @@ const S_CRAFT_RECIPES := "craft.recipes"
 const C_CRAFT_MAKE := "craft.make"
 const S_CRAFT_MADE := "craft.made"
 
-# --- gameplay: cosmetic terrain heightmap (#54) --------------------------------
+# --- gameplay: cosmetic terrain heightmap (#54) + native-res tile streaming ----
 const C_TERRAIN_LIST := "terrain.list"
 const S_TERRAIN_DATA := "terrain.data"
+const C_TERRAIN_TILE_REQUEST := "terrain.tile_request"
+const S_TERRAIN_TILE_DATA := "terrain.tile_data"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
@@ -136,11 +138,88 @@ static var _terrain_resolution := 0
 static var _terrain_world_size := 0.0
 static var _terrain_heights: PackedFloat32Array = PackedFloat32Array()
 
+## Terrain streaming (native-resolution tiles near the player): the baked
+## artifact's own manifest shape, carried on the extended `terrain.data`
+## message, plus a registry of currently-loaded fine tiles. All zero/empty
+## until `terrain.data` arrives; the registry fills and drains as
+## `TerrainStreamer` requests tiles around the player and frees ones left
+## behind. `terrain_height` transparently prefers a loaded fine tile over
+## the coarse backdrop grid, so every existing caller gets native fidelity
+## near the player with zero call-site changes.
+static var _tile_size := 0          # cells per tile side
+static var _tile_cell_m := 0.0      # meters per fine cell
+static var _tiles_x := 0            # tile-grid columns
+static var _tiles_y := 0            # tile-grid rows
+static var _height_min_m := 0.0     # u16 sample decode range (manifest's)
+static var _height_max_m := 0.0
+static var _tiles: Dictionary = {}  # Vector2i(tx,ty) -> PackedFloat32Array (side*side meters)
+
 ## Store the heightmap the server sent in response to `terrain.list`.
 static func apply_terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array) -> void:
     _terrain_resolution = resolution
     _terrain_world_size = world_size
     _terrain_heights = heights
+
+## Store the streamable tile grid's shape (the extended `terrain.data`
+## fields). Clears any previously-loaded tiles: a new manifest means a new
+## bake, and stale fine tiles from the old one must not shadow it.
+static func apply_terrain_meta(tile_size: int, cell_size_m: float, tiles_x: int, tiles_y: int, height_min_m: float, height_max_m: float) -> void:
+    _tile_size = tile_size
+    _tile_cell_m = cell_size_m
+    _tiles_x = tiles_x
+    _tiles_y = tiles_y
+    _height_min_m = height_min_m
+    _height_max_m = height_max_m
+    _tiles.clear()
+
+## Register one decoded fine tile (heights already in meters, row-major
+## `side*side` where `side == tile_size + 1` — the edge-duplication corner
+## convention `terrain-common`'s HeightTile uses).
+static func apply_terrain_tile(tx: int, ty: int, heights: PackedFloat32Array) -> void:
+    _tiles[Vector2i(tx, ty)] = heights
+
+static func remove_terrain_tile(tx: int, ty: int) -> void:
+    _tiles.erase(Vector2i(tx, ty))
+
+static func has_terrain_tile(tx: int, ty: int) -> bool:
+    return _tiles.has(Vector2i(tx, ty))
+
+## One tile's world-space extent in meters (0.0 before `terrain.data`).
+static func terrain_tile_extent_m() -> float:
+    return _tile_size * _tile_cell_m
+
+## The tile-grid coordinate owning world point `(wx, wy)`, clamped to the
+## manifest's actual grid (mirrors `terrain_common::Terrain::locate`'s edge
+## convention: the world's far edge belongs to the last tile, not a
+## nonexistent one past it). `Vector2i(-1, -1)` before `terrain.data`.
+static func terrain_tile_at(wx: float, wy: float) -> Vector2i:
+    var extent := terrain_tile_extent_m()
+    if extent <= 0.0 or _tiles_x <= 0 or _tiles_y <= 0:
+        return Vector2i(-1, -1)
+    var tx: int = clampi(int(floor(wx / extent)), 0, _tiles_x - 1)
+    var ty: int = clampi(int(floor(wy / extent)), 0, _tiles_y - 1)
+    return Vector2i(tx, ty)
+
+## Decode a `terrain.tile_data` payload's raw bytes (terrain-common's
+## `HeightTile::encode` format: 16-byte header — magic "TRHT", u16 LE
+## format_version, u16 reserved, i32 LE tile_x, i32 LE tile_y — then
+## side*side u16 LE samples) into meters via the manifest's height range.
+## Returns `{tx, ty, heights}` or `{}` on any malformed input.
+static func decode_height_tile(bytes: PackedByteArray) -> Dictionary:
+    var side := _tile_size + 1
+    if _tile_size <= 0 or bytes.size() != 16 + side * side * 2:
+        return {}
+    if bytes.slice(0, 4).get_string_from_ascii() != "TRHT":
+        return {}
+    var tx := bytes.decode_s32(8)
+    var ty := bytes.decode_s32(12)
+    var heights := PackedFloat32Array()
+    heights.resize(side * side)
+    var range_m := _height_max_m - _height_min_m
+    for i in range(side * side):
+        var raw := bytes.decode_u16(16 + i * 2)
+        heights[i] = _height_min_m + (float(raw) / 65535.0) * range_m
+    return {"tx": tx, "ty": ty, "heights": heights}
 
 ## Grid cells per axis of the received heightmap (0 before `terrain.data`
 ## arrives) — `World._build_ground` must use this exact resolution so its
@@ -148,15 +227,31 @@ static func apply_terrain_data(resolution: int, world_size: float, heights: Pack
 static func terrain_resolution() -> int:
     return _terrain_resolution
 
-## Ground height at world point `(wx, wy)`, sourced from the server's
-## heightmap grid. Locates the enclosing grid cell and does **planar**
-## (not bilinear) interpolation using whichever of the cell's two triangles
-## `(wx, wy)` actually falls in — this must exactly match the triangle split
-## `World._build_ground` uses to build the mesh, so a queried height can
-## never disagree with the rendered surface (the "falling through" bug was
-## caused by exactly this kind of mismatch, back when this was raw noise
-## sampled independently of the piecewise-flat mesh).
+## Planar (triangle-split, NOT bilinear) interpolation within one grid cell,
+## given its 4 corner heights and the fractional position inside it. The
+## split must exactly match the triangle winding the meshes use
+## (`World._build_ground` and `TerrainStreamer`'s per-tile builder share it:
+## p00-p10-p11 / p00-p11-p01), so a queried height can never disagree with
+## the rendered surface (the "falling through" bug was caused by exactly
+## this kind of mismatch, back when heights were raw noise sampled
+## independently of the piecewise-flat mesh).
+static func _planar_height(h00: float, h10: float, h01: float, h11: float, fx: float, fy: float) -> float:
+    if fy <= fx:
+        # Triangle (p00, p11, p10).
+        return h00 + (fx - fy) * (h10 - h00) + fy * (h11 - h00)
+    else:
+        # Triangle (p00, p01, p11).
+        return h00 + (fy - fx) * (h01 - h00) + fx * (h11 - h00)
+
+## Ground height at world point `(wx, wy)`. Prefers a loaded
+## native-resolution streamed tile when one covers the point (terrain
+## streaming); otherwise falls back to the coarse whole-world backdrop grid
+## from `terrain.data` — the permanent fallback, so there is always *an*
+## answer everywhere from the moment the backdrop arrives.
 static func terrain_height(wx: float, wy: float) -> float:
+    var fine := _tile_height(wx, wy)
+    if not is_nan(fine):
+        return fine
     if _terrain_heights.is_empty():
         return 0.0
     var n := _terrain_resolution
@@ -165,19 +260,37 @@ static func terrain_height(wx: float, wy: float) -> float:
     var gyf: float = clampf(wy / step, 0.0, float(n))
     var gx: int = clampi(int(floor(gxf)), 0, n - 1)
     var gy: int = clampi(int(floor(gyf)), 0, n - 1)
-    var fx := gxf - gx
-    var fy := gyf - gy
     var stride := n + 1
-    var h00 := _terrain_heights[gy * stride + gx]
-    var h10 := _terrain_heights[gy * stride + gx + 1]
-    var h01 := _terrain_heights[(gy + 1) * stride + gx]
-    var h11 := _terrain_heights[(gy + 1) * stride + gx + 1]
-    if fy <= fx:
-        # Triangle (p00, p11, p10).
-        return h00 + (fx - fy) * (h10 - h00) + fy * (h11 - h00)
-    else:
-        # Triangle (p00, p01, p11).
-        return h00 + (fy - fx) * (h01 - h00) + fx * (h11 - h00)
+    return _planar_height(
+        _terrain_heights[gy * stride + gx],
+        _terrain_heights[gy * stride + gx + 1],
+        _terrain_heights[(gy + 1) * stride + gx],
+        _terrain_heights[(gy + 1) * stride + gx + 1],
+        gxf - gx, gyf - gy)
+
+## Fine-tile height at `(wx, wy)`, or NAN when no loaded tile covers it.
+## Same planar interpolation as the backdrop, just against the tile's own
+## `side*side` corner grid (side = tile_size + 1, edges deliberately
+## duplicated with neighbors so any interior point resolves from one tile).
+static func _tile_height(wx: float, wy: float) -> float:
+    if _tiles.is_empty():
+        return NAN
+    var coord := terrain_tile_at(wx, wy)
+    var heights: PackedFloat32Array = _tiles.get(coord, PackedFloat32Array())
+    if heights.is_empty():
+        return NAN
+    var extent := terrain_tile_extent_m()
+    var gxf: float = clampf((wx - coord.x * extent) / _tile_cell_m, 0.0, float(_tile_size))
+    var gyf: float = clampf((wy - coord.y * extent) / _tile_cell_m, 0.0, float(_tile_size))
+    var gx: int = clampi(int(floor(gxf)), 0, _tile_size - 1)
+    var gy: int = clampi(int(floor(gyf)), 0, _tile_size - 1)
+    var stride := _tile_size + 1
+    return _planar_height(
+        heights[gy * stride + gx],
+        heights[gy * stride + gx + 1],
+        heights[(gy + 1) * stride + gx],
+        heights[(gy + 1) * stride + gx + 1],
+        gxf - gx, gyf - gy)
 
 ## Map a server world position `(wx, wy)` to a ground-plane point in the 3D
 ## scene. The server's Y axis becomes the scene's Z axis; `y` is a height

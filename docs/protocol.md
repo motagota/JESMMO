@@ -256,32 +256,42 @@ rent reclaim), so it doesn't go stale until someone's next login/district-crossi
 | `craft.make` | C→S | `recipe_id` — must be standing near a `crafting`-kind structure (#13) that's on your own plot | **live** |
 | `craft.made` | S→C | `recipe_id`, `item_id`, `qty` — feedback once the craft succeeds (`inv.update` and a `crafting` `skill.update` follow separately) | **live** |
 
-### `terrain.*` — cosmetic ground heightmap (#54, #63)
+### `terrain.*` — cosmetic ground heightmap (#54, #63) + native-res tile streaming
 
 Purely visual: the server has no other concept of elevation, and every
 gameplay position stays 2D (`x`, `y`). Heights are loaded once at boot from
 the baked terrain artifact (`terrain-bake`/`terrain-common`, the terrain
 pipeline epic #56 — see the repo-root `terrain.toml`) rather than generated
-in-process, and are static for the whole session, so the grid is requested
-once (like `craft.list`) rather than pushed proactively or folded into
-`partition` (which is rebroadcast on every zone split/merge/capture — too
-frequent for a several-KB static payload). The wire grid's resolution
-(`mmo::world::TERRAIN_RESOLUTION`) is deliberately decoupled from the baked
-artifact's own internal tile/cell resolution — the server samples
+in-process, and are static for the whole session, so the coarse grid is
+requested once (like `craft.list`) rather than pushed proactively or folded
+into `partition` (which is rebroadcast on every zone split/merge/capture —
+too frequent for a several-KB static payload). The coarse wire grid's
+resolution (`mmo::world::TERRAIN_RESOLUTION`) is deliberately decoupled from
+the baked artifact's own internal tile/cell resolution — the server samples
 `terrain_common::Terrain::sample_height` at a fixed `(resolution+1)^2` grid
-regardless of how detailed the underlying bake is, so a future higher-fidelity
-bake never grows this payload (see `mmo::world::loaded_terrain`'s doc
-comment).
+regardless of how detailed the underlying bake is. That coarse grid is the
+permanent, always-present **backdrop**; genuinely native-resolution terrain
+streams in separately, per baked tile, on demand (terrain streaming): the
+client requests individual tiles around the player as they move
+(`client_godot/world/TerrainStreamer.gd`) and frees them once left behind.
+Tile requests are stateless and idempotent server-side — no per-connection
+bookkeeping, same posture as `terrain.list`; a request for a tile outside
+the manifest's grid is silently ignored.
 
 | type | dir | fields | status |
 |---|---|---|---|
 | `terrain.list` | C→S | — (request the authored heightmap grid) | **live** |
-| `terrain.data` | S→C | `resolution` (grid cells per axis), `world_size`, `heights` (`(resolution+1)^2` floats, row-major/y-major: `heights[gy*(resolution+1)+gx]`, in the same units as world x/y) | **live** |
+| `terrain.data` | S→C | `resolution` (grid cells per axis), `world_size`, `heights` (`(resolution+1)^2` floats, row-major/y-major: `heights[gy*(resolution+1)+gx]`, in the same units as world x/y) — plus the baked artifact's own manifest shape for tile streaming: `tile_size` (cells per tile side), `tiles` (`[cols, rows]`), `cell_size_m`, `height_min_m`, `height_max_m` (the u16 sample decode range) | **live** |
+| `terrain.tile_request` | C→S | `tx`, `ty` (tile-grid coordinate) | **live** |
+| `terrain.tile_data` | S→C | `tx`, `ty`, `side` (`tile_size + 1` corner samples per side), `encoding` (`"tile_v1"`), `data_b64` — exactly `terrain_common::HeightTile::encode(1)`'s bytes, base64-wrapped: a 16-byte header (magic `TRHT`, u16 LE format_version, u16 reserved, i32 LE tile_x, i32 LE tile_y) then `side²` u16 LE samples, decoded to meters via `height_min_m`/`height_max_m` | **live** |
 
 Clients reconstruct the ground surface by treating each grid cell as two
 triangles (split along the `(0,0)`–`(1,1)` diagonal) and must use the exact
 same triangle-planar interpolation for both the rendered mesh and any height
-lookup (e.g. placing entities on the ground), so the two can never disagree.
+lookup (e.g. placing entities on the ground), so the two can never disagree —
+this applies identically to the coarse backdrop and to streamed fine tiles
+(`Protocol.terrain_height` prefers a loaded fine tile over the backdrop for
+any point one covers).
 
 The starter recipes (`mmo::world::recipes()`): `plank` (2 wood → 2 plank) and
 `tool_kit` (1 wood + 1 stone → 1 tool_kit). Crafting is instant (no timer) and

@@ -1,7 +1,7 @@
-## Headless smoke test: ground at or below _RIVER_FULL_M paints fully river
-## silt-brown, overriding whatever safety tint that point would otherwise
-## get; ground at or above _RIVER_FADE_M paints no river tint at all
-## (World._ground_color_at / _safety_color_at).
+## Headless smoke test: ground at or below GroundPaint._RIVER_FULL_M paints
+## fully river silt-brown, overriding whatever safety tint that point would
+## otherwise get; ground at or above GroundPaint._RIVER_FADE_M paints no
+## river tint at all (GroundPaint.ground_color_at / safety_color_at).
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_ground_paint_river.gd
 extends SceneTree
 
@@ -27,15 +27,15 @@ func _initialize() -> void:
 	]})
 	world.on_terrain_data()
 
-	var high_color: Color = world._ground_color_at(500.0, 500.0)   # west, height 50m
-	var low_color: Color = world._ground_color_at(5500.0, 500.0)   # east, height -10m
-	print("high_color=%s low_color=%s river_const=%s" % [high_color, low_color, World._RIVER_COLOR])
+	var high_color: Color = GroundPaint.ground_color_at(world._zones, world_size, 500.0, 500.0)   # west, height 50m
+	var low_color: Color = GroundPaint.ground_color_at(world._zones, world_size, 5500.0, 500.0)   # east, height -10m
+	print("high_color=%s low_color=%s river_const=%s" % [high_color, low_color, GroundPaint._RIVER_COLOR])
 
 	if high_color.is_equal_approx(low_color):
 		print("SMOKE_FAIL: high ground and low (river) ground painted the same color")
 		quit(1)
 		return
-	if not low_color.is_equal_approx(World._RIVER_COLOR):
+	if not low_color.is_equal_approx(GroundPaint._RIVER_COLOR):
 		print("SMOKE_FAIL: low-lying ground didn't paint the river color (got %s)" % low_color)
 		quit(1)
 		return
@@ -44,11 +44,11 @@ func _initialize() -> void:
 	# be a genuine blend -- neither the pure safety color nor pure river
 	# brown -- so a single low wire-grid corner doesn't wash a whole coarse
 	# cell into flat brown; it should taper.
-	var mid_h := (World._RIVER_FULL_M + World._RIVER_FADE_M) * 0.5
+	var mid_h := (GroundPaint._RIVER_FULL_M + GroundPaint._RIVER_FADE_M) * 0.5
 	Protocol.apply_terrain_data(1, world_size, PackedFloat32Array([mid_h, mid_h, mid_h, mid_h]))
-	var mid_color: Color = world._ground_color_at(100.0, 100.0)
+	var mid_color: Color = GroundPaint.ground_color_at(world._zones, world_size, 100.0, 100.0)
 	print("mid_color=%s (at height %s)" % [mid_color, mid_h])
-	if mid_color.is_equal_approx(World._RIVER_COLOR) or mid_color.is_equal_approx(high_color):
+	if mid_color.is_equal_approx(GroundPaint._RIVER_COLOR) or mid_color.is_equal_approx(high_color):
 		print("SMOKE_FAIL: fade-band height didn't blend (got %s)" % mid_color)
 		quit(1)
 		return

@@ -11,6 +11,7 @@ const GATEWAY_URL := "ws://127.0.0.1:8766"
 
 var _net: NetworkClient
 var _world: World
+var _streamer: TerrainStreamer
 var _entities: EntityManager
 var _player: LocalPlayer
 var _login: Login
@@ -41,6 +42,9 @@ func _ready() -> void:
 
     _world = World.new()
     add_child(_world)
+
+    _streamer = TerrainStreamer.new()
+    _world.add_child(_streamer)
 
     _entities = EntityManager.new()
     add_child(_entities)
@@ -155,10 +159,13 @@ func _wire_signals() -> void:
     _net.welcome.connect(_on_welcome)
     _net.partition.connect(func(msg):
         _world.apply_partition(msg)
+        _streamer.set_context(_world._zones, _world.world_size)
         _player.set_world_size(float(msg.get("world", 6400))))
     _net.terrain_data.connect(func(resolution, world_size, heights):
         Protocol.apply_terrain_data(resolution, world_size, heights)
         _world.on_terrain_data())
+    _net.terrain_tile_data.connect(func(tx, ty, heights): _streamer.on_tile_data(tx, ty, heights))
+    _streamer.tile_requested.connect(func(tx, ty): _net.send_terrain_tile_request(tx, ty))
     _net.status_update.connect(_on_status_update)
     _net.plot_district.connect(func(plots):
         _world.apply_plot_roster(plots, _plot_id)
@@ -218,6 +225,7 @@ func _wire_signals() -> void:
     _player.position_changed.connect(func(wx, wy):
         _hud.set_pos(wx, wy)
         _minimap.set_player(wx, wy, _player.facing())
+        _streamer.on_player_position(wx, wy)
         _check_district_crossing(wx, wy))
 
 ## Fan a skill update out to the HUD glance line, the skills panel (progress bars),

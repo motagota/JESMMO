@@ -34,6 +34,7 @@ signal build_placed(structure: Dictionary)
 signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
 signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
+signal terrain_tile_data(tx: int, ty: int, heights: PackedFloat32Array)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -154,7 +155,27 @@ func _handle_text(text: String) -> void:
             packed.resize(raw_heights.size())
             for i in range(raw_heights.size()):
                 packed[i] = float(raw_heights[i])
+            # The streamable tile grid's shape rides the same message —
+            # applied here, at the decode layer, so it's guaranteed in place
+            # before any terrain.tile_data payload could need it.
+            var tiles: Array = msg.get("tiles", [0, 0])
+            Protocol.apply_terrain_meta(
+                int(msg.get("tile_size", 0)),
+                float(msg.get("cell_size_m", 0.0)),
+                int(tiles[0]) if tiles.size() > 0 else 0,
+                int(tiles[1]) if tiles.size() > 1 else 0,
+                float(msg.get("height_min_m", 0.0)),
+                float(msg.get("height_max_m", 0.0)))
             terrain_data.emit(int(msg.get("resolution", 0)), float(msg.get("world_size", 0.0)), packed)
+        Protocol.S_TERRAIN_TILE_DATA:
+            # data_b64 is terrain-common's HeightTile::encode bytes verbatim,
+            # base64-wrapped to ride the all-JSON transport. Decoded to meters
+            # here (Protocol.decode_height_tile mirrors HeightTile::decode +
+            # decode_height); a malformed payload is dropped silently.
+            var decoded := Protocol.decode_height_tile(
+                Marshalls.base64_to_raw(String(msg.get("data_b64", ""))))
+            if not decoded.is_empty():
+                terrain_tile_data.emit(int(decoded["tx"]), int(decoded["ty"]), decoded["heights"])
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -245,6 +266,12 @@ func send_craft_list() -> void:
 ## sent once, same pattern as `send_craft_list`.
 func send_terrain_list() -> void:
     _send({"type": Protocol.C_TERRAIN_LIST})
+
+## Request one native-resolution terrain tile (terrain streaming) — sent by
+## `TerrainStreamer` as the player nears a tile it doesn't have. Stateless
+## and idempotent server-side; an out-of-range coordinate is silently ignored.
+func send_terrain_tile_request(tx: int, ty: int) -> void:
+    _send({"type": Protocol.C_TERRAIN_TILE_REQUEST, "tx": tx, "ty": ty})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

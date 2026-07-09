@@ -59,6 +59,32 @@ impl Terrain {
         self.meta_tiles.insert((tile.tile_x, tile.tile_y), tile);
     }
 
+    /// Read-only access to a single loaded height tile by tile-grid
+    /// coordinate — the terrain-streaming wire-serving path (issue: terrain
+    /// streaming) needs this to answer a client's `terrain.tile_request` by
+    /// forwarding the tile's own `encode()` bytes directly, without decoding
+    /// and re-encoding. `None` if `(tx, ty)` is outside `manifest().tiles` or
+    /// otherwise unloaded.
+    pub fn height_tile(&self, tx: i32, ty: i32) -> Option<&HeightTile> {
+        self.height_tiles.get(&(tx, ty))
+    }
+
+    /// Same, for metadata tiles — symmetric with [`Terrain::height_tile`];
+    /// not yet consumed by any client (nav/biome data stays server-only for
+    /// now) but free to expose alongside it.
+    pub fn meta_tile(&self, tx: i32, ty: i32) -> Option<&MetaTile> {
+        self.meta_tiles.get(&(tx, ty))
+    }
+
+    /// Which tile owns world point `(x, y)` — the public half of
+    /// [`Terrain::locate`], for callers (like a tile-request handler) that
+    /// need to map a position to a tile coordinate without duplicating the
+    /// edge-clamping logic themselves.
+    pub fn tile_at(&self, x: f32, y: f32) -> (i32, i32) {
+        let (tx, ty, _, _) = self.locate(x, y);
+        (tx, ty)
+    }
+
     /// Load a full baked artifact directory (`manifest.toml` + `tiles/`) —
     /// the shape the export stage (#62) writes and the server (#63) reads.
     pub fn load_dir(dir: &Path) -> Result<Terrain, LoadError> {
@@ -241,6 +267,38 @@ mod tests {
                 "seam mismatch at row {gy}"
             );
         }
+    }
+
+    #[test]
+    fn height_tile_accessor_returns_the_loaded_tile_or_none() {
+        let terrain = golden_fixture();
+        assert!(terrain.height_tile(0, 0).is_some());
+        assert!(terrain.height_tile(1, 0).is_some());
+        assert!(terrain.height_tile(2, 0).is_none(), "out-of-range tile must be None, not panic");
+        assert!(terrain.height_tile(0, 1).is_none());
+    }
+
+    #[test]
+    fn meta_tile_accessor_mirrors_height_tile_accessor() {
+        let terrain = golden_fixture();
+        // The golden fixture never inserts meta tiles (classification is a
+        // separate stage) -- every coordinate, in-range or not, is None.
+        assert!(terrain.meta_tile(0, 0).is_none());
+        assert!(terrain.meta_tile(1, 0).is_none());
+        assert!(terrain.meta_tile(5, 5).is_none());
+    }
+
+    #[test]
+    fn tile_at_matches_locate_for_interior_and_edge_points() {
+        let terrain = golden_fixture();
+        assert_eq!(terrain.tile_at(5.0, 5.0), (0, 0), "interior of tile 0");
+        assert_eq!(terrain.tile_at(45.0, 15.0), (1, 0), "interior of tile 1");
+        assert_eq!(terrain.tile_at(40.0, 0.0), (1, 0), "exactly on the tile 0/1 seam belongs to tile 1");
+        assert_eq!(
+            terrain.tile_at(80.0, 40.0),
+            (1, 0),
+            "world's far edge clamps to the last valid tile, not a nonexistent one past it"
+        );
     }
 
     #[test]

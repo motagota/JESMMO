@@ -1,31 +1,42 @@
 # Production terrain config for the Phase 1 capital. Real DEM ingest (#69):
-# `dem_data/brisbane_capital_25m.grid` is a real Geoscience Australia 5m
+# `dem_data/brisbane_capital_5m.grid` is a real Geoscience Australia 5m
 # LiDAR DTM, reprojected to UTM zone 56S, cropped to the 6.4km x 6.4km
-# `bounds_utm` rectangle below, resampled to 25m, with `tools/convert_dem.py`
-# (see `terrain-bake/README.md`). This AOI was picked specifically to capture
-# a real, recognizable stretch of the Brisbane River's characteristic
-# S-bends (a 6.4km window landing on generic hill country doesn't read as
-# "Brisbane" at all -- verified by eyeballing a hillshade+water preview
-# before committing to this crop). The suburbs starter-plot field's
-# flatten-mask rectangle (see [stylize] below) was checked against the real
-# river and sits entirely clear of it.
+# `bounds_utm` rectangle below, kept at its NATIVE 5m resolution (no
+# resampling) with `tools/convert_dem.py` (see `terrain-bake/README.md`).
+# This AOI was picked specifically to capture a real, recognizable stretch
+# of the Brisbane River's characteristic S-bends (a 6.4km window landing on
+# generic hill country doesn't read as "Brisbane" at all -- verified by
+# eyeballing a hillshade+water preview before committing to this crop). The
+# suburbs starter-plot field's flatten-mask rectangle (see [stylize] below)
+# was checked against the real river and sits entirely clear of it.
+#
+# Baked at true native resolution (not the coarser 25m of the original
+# real-DEM bake) so terrain streaming (client-requested tiles near the
+# player, see `client_godot/world/TerrainStreamer.gd`) can deliver real
+# fidelity up close -- 128-cell tiles (640m each) over a 1280x1280 cell grid
+# = a 10x10 tile grid. The old coarse whole-world wire heightmap
+# (`rust_server::world::TERRAIN_RESOLUTION`) is unrelated and unchanged --
+# it's still built from this same artifact via `Terrain::sample_height`, just
+# at its own fixed low resolution as the permanent backdrop.
 #
 # Regenerate with (from the repo root):
 #   cargo run -p terrain-bake -- --config terrain.toml
 #
-# then commit the resulting `artifacts/world_v1/` directory alongside this
+# then commit the resulting `artifacts/world_v2/` directory alongside this
 # file — the server loads it at boot (see `rust_server::world::loaded_terrain`).
+# (v2, not v1: this is a materially different, non-backward-compatible bake --
+# different resolution, different tile count.)
 
 [source]
-dem_path      = "dem_data/brisbane_capital_25m.grid"
+dem_path      = "dem_data/brisbane_capital_5m.grid"
 bounds_utm    = [501600.0, 6955700.0, 508000.0, 6962100.0]
-working_res_m = 25.0
-target_res_m  = 25.0
+working_res_m = 5.0
+target_res_m  = 5.0
 seed          = 1337
 
 [export]
-tile_size = 256
-out_dir   = "artifacts/world_v1/"
+tile_size = 128
+out_dir   = "artifacts/world_v2/"
 
 [water]
 # Comfortably below this AOI's real minimum (~-18.8m, the actual river
@@ -58,11 +69,11 @@ capital_flatten_mask = "masks/capital_flatten.png"
 capital_flatten_margin_m = 100.0
 
 [detail]
-# Small-scale texture on top of the real relief (#65) -- kept modest so it
-# adds fine texture (this AOI was resampled from 5m down to 25m, smoothing
-# some real micro-relief out) without overwhelming the real shape underneath.
-# Skipped entirely inside the water mask (empty here anyway) and the
-# capital_flatten footprint, so the buildable plot field stays exactly level.
+# Small-scale texture on top of the real relief (#65) -- now redundant with
+# the DEM's own native 5m micro-relief (no resampling smoothing it out
+# anymore), but kept modest and harmless as a light finishing touch. Skipped
+# entirely inside the water mask (empty here anyway) and the capital_flatten
+# footprint, so the buildable plot field stays exactly level.
 octaves = 3
 base_amp_m = 0.6
 slope_amp_curve = 1.5
@@ -72,10 +83,11 @@ base_wavelength_m = 60.0
 seed = 4242
 
 [erosion]
-# Design doc defaults. A true no-op on this bake -- this AOI's steepest real
-# slope (~38.6deg, the river valley wall) never reaches the 55deg talus
-# threshold -- but the stage is real and exercised, ready for a future bake
-# with steeper real terrain.
+# Design doc defaults. At native 5m resolution the steepest real points
+# (right at the river bank edge, ~67deg max) now genuinely exceed the 55deg
+# talus threshold for the first time (was a true no-op at the coarser 25m
+# bake) -- a small, real, expected effect: erosion softens the sharpest
+# riverbank edges instead of leaving them at their raw sampled steepness.
 enabled = true
 max_natural_slope = 55.0
 thermal_iters = 40
@@ -83,9 +95,9 @@ hydraulic_iters = 0
 hydraulic_strength = 0.1
 
 [classify]
-# Real slope variation now exists (mean ~4.3deg, up to ~38.6deg) -- unlike
-# the old synthetic bake's near-uniform slope, a slope-based rule actually
-# means something here: the river valley wall and steeper knolls read as
-# forest, the rest as plains.
+# Real slope variation now exists (mean ~4.9deg, up to ~67deg pre-erosion at
+# the river bank) -- unlike the old synthetic bake's near-uniform slope, a
+# slope-based rule actually means something here: the river valley wall and
+# steeper knolls read as forest, the rest as plains.
 rules = [{ biome = "forest", min_slope = 8.0 }, { biome = "plains" }]
 walkable_max_slope = 60.0

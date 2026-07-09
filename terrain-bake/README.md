@@ -6,7 +6,7 @@ Offline terrain bake pipeline (terrain pipeline epic, [#56](https://github.com/m
 cargo run -p terrain-bake -- --config terrain.toml
 ```
 
-writes `artifacts/world_v1/` (the production capital bake, still deliberately synthetic/flat — see `terrain.toml`'s own comments). `--stage <ingest|water|stylize|detail|erode|classify|export>` runs a single stage; `--debug-dump <dir>` writes a hillshade/water-mask/biome-map PNG at every stage boundary; `--force` bypasses the per-stage cache.
+writes `artifacts/world_v2/` (the production capital bake: real Brisbane DEM at native 5m resolution, 100 tiles — see `terrain.toml`'s own comments). `--stage <ingest|water|stylize|detail|erode|classify|export>` runs a single stage; `--debug-dump <dir>` writes a hillshade/water-mask/biome-map PNG at every stage boundary; `--force` bypasses the per-stage cache.
 
 ## Real DEM ingest (issue #69)
 
