@@ -22,21 +22,20 @@ const _GROUND_WILDS_COLOR := Color(0.20, 0.13, 0.11)
 ## muddy brown, not blue, so this is truer to the place than a generic
 ## water-blue would have been anyway.
 ##
-## The wire heightmap the backdrop mesh uses is coarse (`Protocol
-## .terrain_resolution()` corners, ~133m apart on the production world, far
-## coarser than the real bake's own 5m fidelity) and Gouraud-shaded across
-## each cell — a single low *corner* smears its color across every triangle
-## touching it. A hard cutoff at a height that matches the real river's true
-## width therefore visibly over-paints far more area than the real channel
-## covers. Blending across a band instead (full brown only at the channel's
-## genuinely deep points, fading out entirely by `_RIVER_FADE_M`) keeps only
-## the deepest points solid and lets the smeared fringe read as a muddy bank
-## tapering into normal ground, instead of a flat wash of brown. Streamed
-## native-resolution tiles (see `TerrainStreamer`) don't have this smearing
-## problem (their own vertices are only ~5m apart), but use the same blend
-## band for a visually consistent look across both mesh tiers.
-const _RIVER_FULL_M := -4.0   # at or below this height: fully river-brown
-const _RIVER_FADE_M := 1.0    # at or above this height: no river tint at all
+## The band's anchor is the DEM's own water-surface convention: LiDAR can't
+## measure through water, so the bake fills the river's NoData footprint at
+## exactly 0.0m (`convert_dem.py --sea-level 0`) — the channel IS 0.0m in
+## the heightmap, not its dredged bed depth. Full brown therefore starts at
+## 0.0m (the actual water surface), fading out by `_RIVER_FADE_M` so
+## genuinely low-lying banks read as a muddy fringe tapering into normal
+## ground. The blend band (rather than a hard cutoff) also keeps the coarse
+## backdrop honest: its ~133m Gouraud-shaded cells smear a single low corner
+## across every triangle touching it, and a hard cutoff over-painted far
+## more area than the real channel covers. Streamed native-resolution tiles
+## (see `TerrainStreamer`) resolve the channel crisply and use the same band
+## for a consistent look across both mesh tiers.
+const _RIVER_FULL_M := 0.0    # at or below this height: fully river-brown (the water surface itself)
+const _RIVER_FADE_M := 1.5    # at or above this height: no river tint at all
 const _RIVER_COLOR := Color(0.35, 0.27, 0.16)
 
 ## The safety-only ground color for world point `(wx, wy)`: the base ground

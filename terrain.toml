@@ -3,12 +3,16 @@
 # LiDAR DTM, reprojected to UTM zone 56S, cropped to the 6.4km x 6.4km
 # `bounds_utm` rectangle below, kept at its NATIVE 5m resolution (no
 # resampling) with `tools/convert_dem.py` (see `terrain-bake/README.md`).
-# This AOI was picked specifically to capture a real, recognizable stretch
-# of the Brisbane River's characteristic S-bends (a 6.4km window landing on
-# generic hill country doesn't read as "Brisbane" at all -- verified by
-# eyeballing a hillshade+water preview before committing to this crop). The
-# suburbs starter-plot field's flatten-mask rectangle (see [stylize] below)
-# was checked against the real river and sits entirely clear of it.
+# This AOI frames the Brisbane River's characteristic CBD-reach S-bends
+# across the upper third of the map (the first river-adjacent crop tucked
+# them into the far NW corner, so from the town-centre spawn the world read
+# as anonymous hill suburbs, not Brisbane). Chosen by scanning candidate
+# origins for maximum river presence in the map's central region under a
+# hard constraint of ZERO river/low-lying cells inside the suburbs
+# starter-plot field's flatten rectangle (see [stylize] below) -- verified
+# against the converted grid, plus an eyeballed hillshade+water preview,
+# before committing to this crop. The town-centre spawn (3200,3200) sits
+# ~1.5km south of the river with a real creek gully nearby.
 #
 # Baked at true native resolution (not the coarser 25m of the original
 # real-DEM bake) so terrain streaming (client-requested tiles near the
@@ -29,7 +33,7 @@
 
 [source]
 dem_path      = "dem_data/brisbane_capital_5m.grid"
-bounds_utm    = [501600.0, 6955700.0, 508000.0, 6962100.0]
+bounds_utm    = [500948.0, 6956350.0, 507348.0, 6962750.0]
 working_res_m = 5.0
 target_res_m  = 5.0
 seed          = 1337

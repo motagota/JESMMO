@@ -11,9 +11,10 @@
 ##   Godot --path client_godot -s res://tests/smoke_terrain_streaming_visual.gd -- --out=C:/some/path/shot.png
 extends SceneTree
 
-## Stand near the river's S-bend (upper-left quadrant of the production AOI).
-const _STAND_X := 1400.0
-const _STAND_Y := 1200.0
+## Stand on the riverbank at the CBD reach of the S-bend (upper-middle of
+## the production AOI).
+const _STAND_X := 2500.0
+const _STAND_Y := 1400.0
 
 var _net
 var _world
