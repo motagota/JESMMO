@@ -90,6 +90,16 @@ pub const C_TERRAIN_TILE_REQUEST: &str = "terrain.tile_request"; // {tx, ty}
 // reused byte-for-byte as the network format. A request for a tile outside
 // the manifest's tile grid, or not currently loaded, is silently ignored.
 pub const S_TERRAIN_TILE_DATA: &str = "terrain.tile_data";
+// --- terrain editing (epic #72): hand-authored delta layer, per chunk ----------
+pub const C_TERRAIN_DELTA_REQUEST: &str = "terrain.delta_request"; // {tx, ty}
+// {tx, ty, has_delta, revision?, encoding?: "delta_v1", data_b64?} -- data_b64
+// is terrain_common::SparseHeightDelta::encode(1)'s bytes, base64-wrapped
+// (magic "TRHD" + block bitmap + touched 16x16 i16-cm blocks). Unlike
+// `terrain.tile_request`, an IN-RANGE chunk always answers -- `has_delta:
+// false` when unedited -- so the client never has to distinguish "not
+// answered yet" from "answered, nothing here". Out-of-range requests are
+// silently ignored, same as the tile path.
+pub const S_TERRAIN_DELTA_DATA: &str = "terrain.delta_data";
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}

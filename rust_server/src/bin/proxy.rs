@@ -2690,6 +2690,49 @@ impl Proxy {
         }));
     }
 
+    /// Answer `terrain.delta_request` with the chunk's hand-authored edit
+    /// layer (terrain-editing epic #72). Same client-pull, stateless posture
+    /// as `send_terrain_tile`, with one deliberate difference: an in-range
+    /// chunk **always** answers — `has_delta: false` when unedited — so the
+    /// client never has to distinguish "not answered yet" from "answered,
+    /// nothing here". Out-of-range requests stay silently ignored, exactly
+    /// like the tile path. A DB read failure (or db-less mode) answers
+    /// `has_delta: false` too: the client renders base terrain, which is
+    /// also what a corrupt-row chunk should degrade to.
+    async fn send_terrain_delta(&self, pid: &str, tx: i32, ty: i32) {
+        let manifest = self.capital.terrain.manifest();
+        if tx < 0 || ty < 0 || tx >= manifest.tiles.0 as i32 || ty >= manifest.tiles.1 as i32 {
+            return;
+        }
+        let side = manifest.tile_size as usize + 1;
+        let delta = match &self.db {
+            Some(db) => db.load_terrain_delta(tx, ty, side).await.ok().flatten(),
+            None => None,
+        };
+        match delta.and_then(|d| d.height_delta.map(|hd| (d.revision, hd))) {
+            Some((revision, height_delta)) => {
+                let bytes = height_delta.encode(1);
+                self.push_to_player(pid, json!({
+                    "type": "terrain.delta_data",
+                    "tx": tx,
+                    "ty": ty,
+                    "has_delta": true,
+                    "revision": revision,
+                    "encoding": "delta_v1",
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                }));
+            }
+            None => {
+                self.push_to_player(pid, json!({
+                    "type": "terrain.delta_data",
+                    "tx": tx,
+                    "ty": ty,
+                    "has_delta": false,
+                }));
+            }
+        }
+    }
+
     /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
     /// caller's own plot. Silent no-op otherwise (no error protocol surface).
     async fn apply_set_respawn(&self, pid: &str, bed_id: &str) {
@@ -3089,6 +3132,16 @@ impl Proxy {
                         let tx = data.get("tx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                         let ty = data.get("ty").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                         self.send_terrain_tile(&player_id, tx, ty);
+                        continue;
+                    }
+                    // `terrain.delta_request` (terrain editing #72): the chunk's
+                    // hand-authored edit layer — client-pull and stateless like
+                    // `terrain.tile_request`, but an in-range chunk always
+                    // answers (`has_delta: false` when unedited).
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.delta_request") {
+                        let tx = data.get("tx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        let ty = data.get("ty").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        self.send_terrain_delta(&player_id, tx, ty).await;
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -5749,6 +5802,132 @@ mod tests {
         ws.send(Message::Text(json!({"type": "terrain.tile_request", "tx": 0, "ty": 0}).to_string())).await.unwrap();
         let msg = recv_until(&mut ws, "terrain.tile_data").await;
         assert_eq!(msg["tx"].as_i64().unwrap(), 0);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 0);
+
+        drop(ws);
+    }
+
+    // --- terrain editing (#75): terrain.delta_request / terrain.delta_data ----
+
+    /// Like `proxy_with_db`, but also hands back the Db so a test can seed
+    /// terrain-delta rows before the client asks for them.
+    async fn proxy_with_shared_db() -> (Arc<Proxy>, Arc<Db>, TestDb, FakeZone) {
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
+        let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
+        let zone = spawn_fake_zone().await;
+        proxy
+            .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        (proxy, db, dbf, zone)
+    }
+
+    /// An in-range chunk that has never been edited answers explicitly with
+    /// `has_delta: false` — never silence. The client must not have to
+    /// distinguish "not answered yet" from "answered, nothing here".
+    #[tokio::test]
+    async fn terrain_delta_request_unedited_chunk_answers_has_delta_false() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("editor1_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor1"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 4, "ty": 4}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+        assert_eq!(msg["tx"].as_i64().unwrap(), 4);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 4);
+        assert_eq!(msg["has_delta"].as_bool().unwrap(), false);
+        assert!(msg.get("data_b64").is_none(), "no payload for an unedited chunk");
+
+        drop(ws);
+    }
+
+    /// A chunk with a saved delta answers with base64-wrapped
+    /// `SparseHeightDelta::encode` bytes that decode back to exactly the
+    /// offsets that were stored, plus the row's revision.
+    #[tokio::test]
+    async fn terrain_delta_request_answers_with_the_saved_deltas_bytes() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        // Seed a delta for chunk (1, 2) straight through the persistence
+        // layer — the write path (#77) doesn't exist yet.
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let side = manifest.tile_size as usize + 1;
+        let mut hd = terrain_common::SparseHeightDelta::new(side);
+        hd.set_offset_cm(10, 10, 300);
+        hd.set_offset_cm(100, 60, -150);
+        let saved_rev = db
+            .save_terrain_delta(&terrain_common::TerrainDelta {
+                chunk_tx: 1,
+                chunk_ty: 2,
+                bake_hash: manifest.bake_hash.clone(),
+                revision: 0,
+                height_delta: Some(hd.clone()),
+                provenance: terrain_common::Provenance {
+                    author: terrain_common::AuthorId::Editor("test-editor".to_string()),
+                    edited_at: 0,
+                },
+            })
+            .await
+            .unwrap();
+
+        let email = format!("editor2_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 1, "ty": 2}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+
+        assert_eq!(msg["tx"].as_i64().unwrap(), 1);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 2);
+        assert_eq!(msg["has_delta"].as_bool().unwrap(), true);
+        assert_eq!(msg["revision"].as_u64().unwrap(), saved_rev);
+        assert_eq!(msg["encoding"].as_str().unwrap(), "delta_v1");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(msg["data_b64"].as_str().unwrap())
+            .expect("data_b64 must be valid base64");
+        let decoded = terrain_common::SparseHeightDelta::decode(&bytes, side).expect("must decode as a SparseHeightDelta");
+        assert_eq!(decoded, hd, "streamed delta must match what was stored, block for block");
+
+        drop(ws);
+    }
+
+    /// An out-of-range delta request is silently ignored (same posture as
+    /// the tile path) — proven by racing it against an in-range request
+    /// that answers, so silence isn't mistaken for success.
+    #[tokio::test]
+    async fn terrain_delta_request_out_of_range_is_silently_ignored() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("editor3_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor3"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 9999, "ty": -3}).to_string()))
+            .await
+            .unwrap();
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 0, "ty": 0}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+        assert_eq!(msg["tx"].as_i64().unwrap(), 0, "only the in-range request answered");
         assert_eq!(msg["ty"].as_i64().unwrap(), 0);
 
         drop(ws);
