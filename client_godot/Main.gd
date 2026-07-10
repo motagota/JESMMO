@@ -163,7 +163,12 @@ func _wire_signals() -> void:
         _player.set_world_size(float(msg.get("world", 6400))))
     _net.terrain_data.connect(func(resolution, world_size, heights):
         Protocol.apply_terrain_data(resolution, world_size, heights)
-        _world.on_terrain_data())
+        _world.on_terrain_data()
+        # Kick-start tile streaming at the spawn position: `position_changed`
+        # fired at activate() before the tile-grid shape was known (a no-op),
+        # and it won't fire again until the player actually moves — without
+        # this, a player standing still at spawn never streams any tiles.
+        _streamer.on_player_position(_player.world_pos().x, _player.world_pos().y))
     _net.terrain_tile_data.connect(func(tx, ty, heights): _streamer.on_tile_data(tx, ty, heights))
     _streamer.tile_requested.connect(func(tx, ty): _net.send_terrain_tile_request(tx, ty))
     _net.status_update.connect(_on_status_update)
