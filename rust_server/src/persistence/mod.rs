@@ -1865,6 +1865,67 @@ impl Db {
         .await?;
         Ok(revision as u64)
     }
+
+    /// Append one accepted edit op to the undo log: the op row plus, per
+    /// touched `(chunk, block)`, the block's pre-edit raw content (`None` =
+    /// the block didn't exist — revert deletes it). One transaction, so a
+    /// logged op is always complete.
+    pub async fn log_terrain_edit_op(
+        &self,
+        op_id: &str,
+        author: &str,
+        brush: &str,
+        created_at: i64,
+        blocks: &[(i32, i32, i64, Option<Vec<u8>>)],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO terrain_edit_op (id, author, brush, created_at, reverted) VALUES (?, ?, ?, ?, 0)")
+            .bind(op_id)
+            .bind(author)
+            .bind(brush)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+        for (chunk_tx, chunk_ty, block_idx, prev) in blocks {
+            sqlx::query(
+                "INSERT INTO terrain_edit_op_block (op_id, chunk_tx, chunk_ty, block_idx, prev_block) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(op_id)
+            .bind(chunk_tx)
+            .bind(chunk_ty)
+            .bind(block_idx)
+            .bind(prev)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Claim an op for revert: atomically flips `reverted` 0 → 1 and returns
+    /// its pre-edit block rows, or `None` if the op doesn't exist or was
+    /// already reverted (the claim is the double-revert guard — two racing
+    /// reverts can't both win the UPDATE).
+    pub async fn take_revertable_edit_op(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<Vec<(i32, i32, i64, Option<Vec<u8>>)>>, DbError> {
+        let claimed = sqlx::query("UPDATE terrain_edit_op SET reverted = 1 WHERE id = ? AND reverted = 0")
+            .bind(op_id)
+            .execute(&self.pool)
+            .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let rows: Vec<(i32, i32, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT chunk_tx, chunk_ty, block_idx, prev_block FROM terrain_edit_op_block WHERE op_id = ?",
+        )
+        .bind(op_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Some(rows))
+    }
 }
 
 #[cfg(test)]

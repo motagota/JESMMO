@@ -37,6 +37,7 @@ var _transition: DistrictTransition
 var _editor_mode := false
 var _editor_cam: EditorCamera
 var _brush: BrushController
+var _history: HistoryPanel
 
 var _my_id := ""
 var _plot_id := ""
@@ -330,7 +331,12 @@ func _setup_editor() -> void:
     add_child(_brush)
     _brush.stroke_committed.connect(func(brush, cells): _net.send_terrain_edit_op(brush, cells))
     _brush.status_changed.connect(func(text): _hud.flash_announce(text))
-    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, RMB-drag look, WASD/QE fly")
+    _history = HistoryPanel.new()
+    add_child(_history)
+    _history.do_revert.connect(func(op_id): _net.send_terrain_revert_op(op_id))
+    _net.terrain_edit_ack.connect(func(op_id, brush): _history.record_op(op_id, brush))
+    _net.terrain_revert_ack.connect(func(op_id): _history.mark_reverted(op_id))
+    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any

@@ -115,6 +115,19 @@ pub const S_TERRAIN_EDIT_ERROR: &str = "terrain.edit_error";
 // terrain.delta_data), not just the changed blocks -- deltas are small, and
 // replace-not-merge keeps the client decode path single.
 pub const S_TERRAIN_DELTA_PATCH: &str = "terrain.delta_patch";
+// {op_id, brush} -- sent to the op's AUTHOR only, before the patches, so
+// its history/undo UI can record the id the server minted for the stroke.
+pub const S_TERRAIN_EDIT_ACK: &str = "terrain.edit_ack";
+// {op_id} -- undo one accepted op: restores every block it touched to its
+// pre-op content (whole-block snapshots from the op log), bumps revisions,
+// and broadcasts terrain.delta_patch per affected chunk like a normal edit.
+// Editor-role-gated like terrain.edit_op; an unknown or already-reverted op
+// is rejected with terrain.edit_error. Note: reverting out of stroke order
+// can clobber a later overlapping op (whole-block restore, by design) --
+// clients should offer undo-last.
+pub const C_TERRAIN_REVERT_OP: &str = "terrain.revert_op";
+// {op_id} -- the revert was applied (patches follow separately).
+pub const S_TERRAIN_REVERT_ACK: &str = "terrain.revert_ack";
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}

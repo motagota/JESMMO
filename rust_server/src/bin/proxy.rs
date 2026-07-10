@@ -2857,10 +2857,14 @@ impl Proxy {
 
         // Read-modify-write under the edit lock: build every chunk's updated
         // delta in memory first (so a cap violation rejects the whole op with
-        // nothing saved), then persist and broadcast.
+        // nothing saved), then persist and broadcast. Along the way, capture
+        // each touched block's PRE-edit content for the undo log (whole
+        // 512-byte blocks; `None` = the block didn't exist, revert deletes
+        // it — the design doc's inverse-blocks tradeoff).
         let _guard = self.terrain_edit_lock.lock().await;
         let side = manifest.tile_size as usize + 1;
         let mut updated: Vec<((i32, i32), terrain_common::SparseHeightDelta)> = Vec::new();
+        let mut prev_blocks: Vec<(i32, i32, i64, Option<Vec<u8>>)> = Vec::new();
         for (&(tx, ty), chunk_cells) in &per_chunk {
             let mut hd = match db.load_terrain_delta(tx, ty, side).await {
                 Ok(existing) => existing
@@ -2872,6 +2876,13 @@ impl Proxy {
                     return;
                 }
             };
+            let mut captured: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for &(gx, gy, _) in chunk_cells {
+                let idx = hd.block_index_for(gx, gy);
+                if captured.insert(idx) {
+                    prev_blocks.push((tx, ty, idx as i64, hd.block_bytes(idx)));
+                }
+            }
             for &(gx, gy, d) in chunk_cells {
                 let total = hd.offset_cm(gx, gy) as i32 + d;
                 if total.abs() > EDIT_MAX_OFFSET_CM {
@@ -2887,6 +2898,17 @@ impl Proxy {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        // Log the op + ack its id to the author BEFORE the patches, so the
+        // client's history UI knows the stroke's id when they arrive.
+        let op_id = Uuid::new_v4().to_string();
+        let brush = data.get("brush").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author = terrain_common::AuthorId::Editor(pid.to_string());
+        if let Err(e) = db.log_terrain_edit_op(&op_id, &author.to_string(), &brush, edited_at, &prev_blocks).await {
+            eprintln!("[Proxy] terrain.edit_op: logging op failed: {e}");
+            reject("storage error logging the op");
+            return;
+        }
+        self.push_to_player(pid, json!({"type": "terrain.edit_ack", "op_id": op_id, "brush": brush}));
         for ((tx, ty), hd) in updated {
             let blob = hd.encode(1);
             let delta = terrain_common::TerrainDelta {
@@ -2920,6 +2942,111 @@ impl Proxy {
                 }
             }
         }
+    }
+
+    /// Apply `terrain.revert_op` (terrain-editing undo): restore every block
+    /// the op touched to its logged pre-op content, wholesale. Editor-gated
+    /// like `terrain.edit_op`; an unknown or already-reverted op id rejects
+    /// with `terrain.edit_error` (the DB claim in `take_revertable_edit_op`
+    /// is the double-revert guard, atomic even across racing reverts).
+    /// Whole-block restore means an out-of-order revert can clobber a later
+    /// overlapping op — the documented tradeoff; clients offer undo-last.
+    async fn apply_terrain_revert_op(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "terrain.edit_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may edit terrain");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("terrain editing requires persistence (no database)");
+            return;
+        };
+        let Some(op_id) = data.get("op_id").and_then(|v| v.as_str()).map(str::to_string) else {
+            reject("malformed revert: missing op_id");
+            return;
+        };
+        let _guard = self.terrain_edit_lock.lock().await;
+        let rows = match db.take_revertable_edit_op(&op_id).await {
+            Ok(Some(rows)) => rows,
+            Ok(None) => {
+                reject("unknown or already-reverted op");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[Proxy] terrain.revert_op: claiming {op_id} failed: {e}");
+                reject("storage error claiming the op");
+                return;
+            }
+        };
+        // Group the snapshots per chunk and write each chunk's blocks back.
+        let mut per_chunk: BTreeMap<(i32, i32), Vec<(i64, Option<Vec<u8>>)>> = BTreeMap::new();
+        for (tx, ty, idx, prev) in rows {
+            per_chunk.entry((tx, ty)).or_default().push((idx, prev));
+        }
+        let manifest = self.capital.terrain.manifest();
+        let side = manifest.tile_size as usize + 1;
+        let edited_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for ((tx, ty), blocks) in per_chunk {
+            let mut hd = match db.load_terrain_delta(tx, ty, side).await {
+                Ok(existing) => existing
+                    .and_then(|d| d.height_delta)
+                    .unwrap_or_else(|| terrain_common::SparseHeightDelta::new(side)),
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.revert_op: loading delta ({tx},{ty}) failed: {e}");
+                    reject("storage error loading the chunk's delta");
+                    return;
+                }
+            };
+            for (idx, prev) in blocks {
+                match prev {
+                    Some(bytes) => {
+                        if hd.set_block_bytes(idx as usize, &bytes).is_err() {
+                            eprintln!("[Proxy] terrain.revert_op: corrupt snapshot for op {op_id} block {idx}");
+                            reject("corrupt pre-edit snapshot for this op");
+                            return;
+                        }
+                    }
+                    None => hd.remove_block(idx as usize),
+                }
+            }
+            hd.prune_zero_blocks();
+            let blob = hd.encode(1);
+            let delta = terrain_common::TerrainDelta {
+                chunk_tx: tx,
+                chunk_ty: ty,
+                bake_hash: manifest.bake_hash.clone(),
+                revision: 0, // assigned by the DB on save
+                height_delta: Some(hd),
+                provenance: terrain_common::Provenance {
+                    author: terrain_common::AuthorId::Editor(pid.to_string()),
+                    edited_at,
+                },
+            };
+            match db.save_terrain_delta(&delta).await {
+                Ok(revision) => {
+                    self.broadcast_to_all(json!({
+                        "type": "terrain.delta_patch",
+                        "tx": tx,
+                        "ty": ty,
+                        "revision": revision,
+                        "encoding": "delta_v1",
+                        "data_b64": base64::engine::general_purpose::STANDARD.encode(&blob),
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.revert_op: saving delta ({tx},{ty}) failed: {e}");
+                    reject("storage error saving the chunk's delta");
+                    return;
+                }
+            }
+        }
+        self.push_to_player(pid, json!({"type": "terrain.revert_ack", "op_id": op_id}));
     }
 
     /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
@@ -3338,6 +3465,12 @@ impl Proxy {
                     // direct-answer reasoning as `mayor.build_create`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("terrain.edit_op") {
                         self.apply_terrain_edit_op(&player_id, data).await;
+                        continue;
+                    }
+                    // `terrain.revert_op` (terrain-editing undo): same
+                    // role-gated, no-live-position reasoning as edit_op.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.revert_op") {
+                        self.apply_terrain_revert_op(&player_id, data).await;
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -6340,6 +6473,142 @@ mod tests {
         let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
         assert_eq!(stored.revision, 1, "the rejected op must not bump the revision");
         assert_eq!(stored.height_delta.unwrap().offset_cm(10, 10), 4000, "first op only");
+
+        drop(ws);
+    }
+
+    // --- terrain editing (#79): undo via terrain.revert_op ---------------------
+
+    /// Undo-last restores exactly the pre-edit state, layer by layer: after
+    /// op1 (+300) then op2 (+150 same corner), reverting op2 lands back on
+    /// 300 exactly, and reverting op1 deletes the block outright (it didn't
+    /// exist before op1). Each revert broadcasts a patch and acks.
+    #[tokio::test]
+    async fn terrain_revert_op_restores_pre_edit_blocks_exactly() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 300]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack1 = recv_until(&mut ws, "terrain.edit_ack").await;
+        let op1 = ack1["op_id"].as_str().unwrap().to_string();
+        assert_eq!(ack1["brush"].as_str().unwrap(), "raise");
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 150]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op2 = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        assert_ne!(op1, op2, "each op gets its own id");
+
+        // Revert op2: back to exactly 300, revision bumped (3), patch decodes.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op2}).to_string())).await.unwrap();
+        let patch = recv_until(&mut ws, "terrain.delta_patch").await;
+        assert_eq!(patch["revision"].as_u64().unwrap(), 3, "a revert bumps the revision like any edit");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(patch["data_b64"].as_str().unwrap()).unwrap();
+        let hd = terrain_common::SparseHeightDelta::decode(&bytes, side).unwrap();
+        assert_eq!(hd.offset_cm(10, 10), 300, "revert of op2 restores op1's exact state");
+        let ack = recv_until(&mut ws, "terrain.revert_ack").await;
+        assert_eq!(ack["op_id"].as_str().unwrap(), op2);
+
+        // Revert op1: the block didn't exist before it — deleted outright.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op1}).to_string())).await.unwrap();
+        let patch2 = recv_until(&mut ws, "terrain.delta_patch").await;
+        let bytes2 = base64::engine::general_purpose::STANDARD.decode(patch2["data_b64"].as_str().unwrap()).unwrap();
+        let hd2 = terrain_common::SparseHeightDelta::decode(&bytes2, side).unwrap();
+        assert!(hd2.is_empty(), "revert of the creating op deletes the block");
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        assert!(stored.height_delta.unwrap().is_empty(), "durably back to procedural");
+
+        drop(ws);
+    }
+
+    /// Double reverts, unknown ids, and non-editor reverts are all rejected
+    /// cleanly with terrain.edit_error — never a panic, never a second apply.
+    #[tokio::test]
+    async fn terrain_revert_op_rejects_double_unknown_and_non_editor() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[20, 20, 500]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        // Second revert of the same op: rejected, and the state is untouched.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "terrain.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("already-reverted") || err["message"].as_str().unwrap().contains("unknown"));
+
+        // Unknown id: same rejection.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": "nope"}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.edit_error").await;
+
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        assert!(stored.height_delta.unwrap().is_empty(), "rejected reverts change nothing");
+
+        // Non-editor revert: role-gated like edit_op.
+        let email = format!("scrub2_{}@t.test", Uuid::new_v4().simple());
+        let mut player_ws = dial(&proxy).await;
+        player_ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Scrub2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut player_ws, "welcome").await;
+        player_ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        let err2 = recv_until(&mut player_ws, "terrain.edit_error").await;
+        assert!(err2["message"].as_str().unwrap().contains("editor"));
+
+        drop(ws);
+        drop(player_ws);
+    }
+
+    /// A seam-crossing op reverts on BOTH chunks (its snapshots span them).
+    #[tokio::test]
+    async fn terrain_revert_op_spans_chunks_like_the_op_did() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let ts = manifest.tile_size as i64;
+        let side = manifest.tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[ts, 7, 250]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        let a = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        let b = db.load_terrain_delta(1, 0, side).await.unwrap().unwrap();
+        assert!(a.height_delta.unwrap().is_empty(), "chunk (0,0) back to procedural");
+        assert!(b.height_delta.unwrap().is_empty(), "chunk (1,0) back to procedural");
 
         drop(ws);
     }

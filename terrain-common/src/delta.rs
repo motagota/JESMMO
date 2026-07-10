@@ -58,6 +58,29 @@ impl HeightBlock {
     pub fn is_all_zero(&self) -> bool {
         self.offsets_cm.iter().all(|&v| v == 0)
     }
+
+    /// The block's raw content: 512 bytes of LE i16 — the exact shape the
+    /// undo op-log stores as a pre-edit snapshot (issue: terrain-editing
+    /// undo). No header/magic: the row it lives in carries the context.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(BLOCK_SIZE * BLOCK_SIZE * 2);
+        for v in &self.offsets_cm {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Inverse of [`HeightBlock::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<HeightBlock, TileError> {
+        if bytes.len() != BLOCK_SIZE * BLOCK_SIZE * 2 {
+            return Err(TileError::WrongBodySize { expected: BLOCK_SIZE * BLOCK_SIZE * 2, actual: bytes.len() });
+        }
+        let mut block = HeightBlock::zeroed();
+        for (i, c) in bytes.chunks_exact(2).enumerate() {
+            block.offsets_cm[i] = i16::from_le_bytes([c[0], c[1]]);
+        }
+        Ok(block)
+    }
 }
 
 impl Default for HeightBlock {
@@ -105,10 +128,36 @@ impl SparseHeightDelta {
         self.blocks.len()
     }
 
-    fn block_index(&self, gx: usize, gy: usize) -> usize {
+    /// Which block stores corner `(gx, gy)` — public because the undo
+    /// op-log is keyed by block index (the write path captures each touched
+    /// block's pre-edit content before applying an op).
+    pub fn block_index_for(&self, gx: usize, gy: usize) -> usize {
         debug_assert!(gx < self.side && gy < self.side, "corner ({gx},{gy}) outside side {}", self.side);
         let bps = blocks_per_side(self.side);
         (gy / BLOCK_SIZE) * bps + (gx / BLOCK_SIZE)
+    }
+
+    fn block_index(&self, gx: usize, gy: usize) -> usize {
+        self.block_index_for(gx, gy)
+    }
+
+    /// A present block's raw 512-byte content, or `None` if untouched —
+    /// what the undo log snapshots (NULL row = "block didn't exist; revert
+    /// by deleting it").
+    pub fn block_bytes(&self, idx: usize) -> Option<Vec<u8>> {
+        self.blocks.get(&idx).map(|b| b.to_bytes())
+    }
+
+    /// Overwrite one block wholesale from its raw bytes — the revert path.
+    pub fn set_block_bytes(&mut self, idx: usize, bytes: &[u8]) -> Result<(), TileError> {
+        let block = HeightBlock::from_bytes(bytes)?;
+        self.blocks.insert(idx, block);
+        Ok(())
+    }
+
+    /// Remove one block entirely — reverting an op that created it.
+    pub fn remove_block(&mut self, idx: usize) {
+        self.blocks.remove(&idx);
     }
 
     fn cell_index(gx: usize, gy: usize) -> usize {
@@ -387,6 +436,31 @@ mod tests {
         b.set_offset_cm(2, 2, 9);
         b.set_offset_cm(100, 100, 5);
         assert_eq!(a.encode(1), b.encode(1));
+    }
+
+    #[test]
+    fn block_bytes_round_trip_and_revert_restores_exact_state() {
+        let mut d = SparseHeightDelta::new(SIDE);
+        d.set_offset_cm(3, 3, 700);
+        d.set_offset_cm(4, 4, -20);
+        let idx = d.block_index_for(3, 3);
+        // Snapshot pre-edit content, then "edit" the block further.
+        let snapshot = d.block_bytes(idx).expect("block exists");
+        assert_eq!(snapshot.len(), BLOCK_SIZE * BLOCK_SIZE * 2);
+        d.set_offset_cm(3, 3, 9999);
+        d.set_offset_cm(5, 5, 1);
+        // Revert: the whole block goes back byte-for-byte.
+        d.set_block_bytes(idx, &snapshot).unwrap();
+        assert_eq!(d.offset_cm(3, 3), 700);
+        assert_eq!(d.offset_cm(4, 4), -20);
+        assert_eq!(d.offset_cm(5, 5), 0);
+        assert_eq!(d.block_bytes(idx).unwrap(), snapshot);
+        // A block absent pre-edit reverts by removal.
+        d.remove_block(idx);
+        assert_eq!(d.offset_cm(3, 3), 0);
+        assert!(d.is_empty());
+        // Malformed bytes are rejected, not panicked on.
+        assert!(d.set_block_bytes(idx, &[1, 2, 3]).is_err());
     }
 
     #[test]

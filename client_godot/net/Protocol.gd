@@ -86,6 +86,13 @@ const S_TERRAIN_DELTA_DATA := "terrain.delta_data"
 const C_TERRAIN_EDIT_OP := "terrain.edit_op"
 const S_TERRAIN_EDIT_ERROR := "terrain.edit_error"
 const S_TERRAIN_DELTA_PATCH := "terrain.delta_patch"
+## Undo (#79): the server acks each accepted op with its minted id (author
+## only); `terrain.revert_op {op_id}` restores that op's pre-edit blocks and
+## patches everyone. Reverts should be issued newest-first (whole-block
+## restore — out-of-order can clobber a later overlapping stroke).
+const S_TERRAIN_EDIT_ACK := "terrain.edit_ack"
+const C_TERRAIN_REVERT_OP := "terrain.revert_op"
+const S_TERRAIN_REVERT_ACK := "terrain.revert_ack"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"

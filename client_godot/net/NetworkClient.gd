@@ -44,6 +44,10 @@ signal terrain_delta_data(tx: int, ty: int, has_delta: bool, offsets: PackedFloa
 signal terrain_delta_patch(tx: int, ty: int, revision: int, offsets: PackedFloat32Array)
 ## This client's own edit op was rejected (not an editor / bounds / caps).
 signal terrain_edit_error(message: String)
+## This client's own accepted op, with the server-minted id (undo handle).
+signal terrain_edit_ack(op_id: String, brush: String)
+## This client's own revert was applied (patches arrive separately).
+signal terrain_revert_ack(op_id: String)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -211,6 +215,10 @@ func _handle_text(text: String) -> void:
                     int(msg.get("revision", 0)), patch_offsets)
         Protocol.S_TERRAIN_EDIT_ERROR:
             terrain_edit_error.emit(String(msg.get("message", "edit rejected")))
+        Protocol.S_TERRAIN_EDIT_ACK:
+            terrain_edit_ack.emit(String(msg.get("op_id", "")), String(msg.get("brush", "")))
+        Protocol.S_TERRAIN_REVERT_ACK:
+            terrain_revert_ack.emit(String(msg.get("op_id", "")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -321,6 +329,10 @@ func send_terrain_delta_request(tx: int, ty: int) -> void:
 ## touched chunk on success, `terrain.edit_error` on rejection.
 func send_terrain_edit_op(brush: String, cells: Array) -> void:
     _send({"type": Protocol.C_TERRAIN_EDIT_OP, "brush": brush, "cells": cells})
+
+## Undo one accepted edit op by its acked id (terrain editing #79).
+func send_terrain_revert_op(op_id: String) -> void:
+    _send({"type": Protocol.C_TERRAIN_REVERT_OP, "op_id": op_id})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:
