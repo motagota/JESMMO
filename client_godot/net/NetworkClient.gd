@@ -38,6 +38,12 @@ signal terrain_tile_data(tx: int, ty: int, heights: PackedFloat32Array)
 ## `offsets` is a dense side*side meter-offset grid (zeros where unedited);
 ## empty when `has_delta` is false.
 signal terrain_delta_data(tx: int, ty: int, has_delta: bool, offsets: PackedFloat32Array)
+## An accepted edit op's authoritative result for one chunk (terrain editing
+## #72) — pushed by the server to every client, whoever painted. Same dense
+## meter-offset decode as `terrain_delta_data`; replace-not-merge.
+signal terrain_delta_patch(tx: int, ty: int, revision: int, offsets: PackedFloat32Array)
+## This client's own edit op was rejected (not an editor / bounds / caps).
+signal terrain_edit_error(message: String)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -192,6 +198,19 @@ func _handle_text(text: String) -> void:
                     Marshalls.base64_to_raw(String(msg.get("data_b64", ""))))
                 has_delta = not offsets.is_empty()
             terrain_delta_data.emit(int(msg.get("tx", 0)), int(msg.get("ty", 0)), has_delta, offsets)
+        Protocol.S_TERRAIN_DELTA_PATCH:
+            # An accepted edit's per-chunk authoritative state (terrain
+            # editing #72). A malformed payload is dropped silently — the
+            # chunk simply keeps its current (possibly preview) heights until
+            # the next stream-in re-requests the delta.
+            var patch_offsets := Protocol.decode_height_delta(
+                Marshalls.base64_to_raw(String(msg.get("data_b64", ""))))
+            if not patch_offsets.is_empty():
+                terrain_delta_patch.emit(
+                    int(msg.get("tx", 0)), int(msg.get("ty", 0)),
+                    int(msg.get("revision", 0)), patch_offsets)
+        Protocol.S_TERRAIN_EDIT_ERROR:
+            terrain_edit_error.emit(String(msg.get("message", "edit rejected")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -295,6 +314,13 @@ func send_terrain_tile_request(tx: int, ty: int) -> void:
 ## ignored, same as the tile path.
 func send_terrain_delta_request(tx: int, ty: int) -> void:
     _send({"type": Protocol.C_TERRAIN_DELTA_REQUEST, "tx": tx, "ty": ty})
+
+## Send one editor brush stroke (terrain editing #72): `cells` is
+## `[[cx, cy, d_cm], ...]` in world corner coordinates. Server-validated
+## (editor role, bounds, caps); answered with `terrain.delta_patch` per
+## touched chunk on success, `terrain.edit_error` on rejection.
+func send_terrain_edit_op(brush: String, cells: Array) -> void:
+    _send({"type": Protocol.C_TERRAIN_EDIT_OP, "brush": brush, "cells": cells})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

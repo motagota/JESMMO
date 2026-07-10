@@ -9,6 +9,13 @@ extends Node3D
 const SESSION_PATH := "user://session.cfg"
 const GATEWAY_URL := "ws://127.0.0.1:8766"
 
+## Editor mode (terrain editing #78): launch with `--editor-mode` (after the
+## `--` separator, e.g. `Godot --path client_godot -- --editor-mode`) to get
+## the free-fly camera + terrain brush instead of the player, logged in as
+## the server-seeded editor account (dev credentials, mirroring proxy.rs).
+const EDITOR_EMAIL := "editor@capital.town"
+const EDITOR_PASSWORD := "editor12345"
+
 var _net: NetworkClient
 var _world: World
 var _streamer: TerrainStreamer
@@ -27,6 +34,10 @@ var _mayor_road: MayorRoad
 var _rent: RentPanel
 var _transition: DistrictTransition
 
+var _editor_mode := false
+var _editor_cam: EditorCamera
+var _brush: BrushController
+
 var _my_id := ""
 var _plot_id := ""
 var _plot_bounds: Dictionary = {}
@@ -38,6 +49,8 @@ var _sleep_down := false
 var _rent_panel_down := false
 
 func _ready() -> void:
+    _editor_mode = OS.get_cmdline_user_args().has("--editor-mode") \
+        or OS.get_cmdline_args().has("--editor-mode")
     _build_environment()
 
     _world = World.new()
@@ -106,6 +119,13 @@ func _process(_delta: float) -> void:
     # can be dragged straight into it.
     if _my_id == "":
         return
+    if _editor_mode:
+        # The free-fly camera drives tile streaming instead of the player;
+        # none of the proximity gameplay below applies to an editor.
+        if _editor_cam != null:
+            var cam_pos := _editor_cam.world_pos()
+            _streamer.on_player_position(cam_pos.x, cam_pos.y)
+        return
     var near_store := _entities.nearest_storage(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _storage.show_panel(near_store)
     _inventory.set_forced_open(near_store)
@@ -168,13 +188,21 @@ func _wire_signals() -> void:
         # fired at activate() before the tile-grid shape was known (a no-op),
         # and it won't fire again until the player actually moves — without
         # this, a player standing still at spawn never streams any tiles.
-        _streamer.on_player_position(_player.world_pos().x, _player.world_pos().y))
+        # (In editor mode the free-fly camera is the streaming anchor.)
+        var anchor := _editor_cam.world_pos() if _editor_mode and _editor_cam != null else _player.world_pos()
+        _streamer.on_player_position(anchor.x, anchor.y))
     _net.terrain_tile_data.connect(func(tx, ty, heights): _streamer.on_tile_data(tx, ty, heights))
     _streamer.tile_requested.connect(func(tx, ty): _net.send_terrain_tile_request(tx, ty))
     # Hand-authored edit layer (terrain editing #72): requested alongside
     # each tile, composited onto the tile's heights before/at mesh build.
     _net.terrain_delta_data.connect(func(tx, ty, has_delta, offsets): _streamer.on_delta_data(tx, ty, has_delta, offsets))
     _streamer.delta_requested.connect(func(tx, ty): _net.send_terrain_delta_request(tx, ty))
+    # Accepted edits (anyone's) arrive as authoritative per-chunk patches;
+    # a rejected own-edit rolls its preview back to the last known state.
+    _net.terrain_delta_patch.connect(func(tx, ty, _rev, offsets): _streamer.on_delta_patch(tx, ty, offsets))
+    _net.terrain_edit_error.connect(func(message):
+        _hud.flash_announce("Editor: %s" % message)
+        _streamer.discard_edit_preview())
     _net.status_update.connect(_on_status_update)
     _net.plot_district.connect(func(plots):
         _world.apply_plot_roster(plots, _plot_id)
@@ -248,6 +276,12 @@ func _on_skill_update(skill_id: String, xp: int, level: int) -> void:
 # --- handshake ----------------------------------------------------------------
 
 func _on_auth_required(version: int) -> void:
+    if _editor_mode:
+        # Editor mode skips the login UI (and any saved session token —
+        # a stale player token must not shadow the editor identity).
+        _login.show_overlay(false)
+        _net.login(EDITOR_EMAIL, EDITOR_PASSWORD)
+        return
     _login.set_version(version)
     _login.prefill_email(_load_email())
     var token := _load_token()
@@ -272,12 +306,31 @@ func _on_welcome(data: Dictionary) -> void:
     _entities.set_local_id(_my_id)
     _hud.set_zone(String(data.get("zone", "—")))
     _login.show_overlay(false)
-    _player.activate()
+    if _editor_mode:
+        _setup_editor()
+    else:
+        _player.activate()
     _net.send_craft_list() # the recipe registry is static; pull it once per session
     _net.send_terrain_list() # the heightmap is static; pull it once per session
     _mayor_road.is_mayor = String(data.get("role", "player")) == "mayor"
     if _mayor_road.is_mayor:
         _hud.flash_announce("You are the mayor — press M to commission a dirt path")
+
+## Build the editor rig (terrain editing #78): free-fly camera over the town
+## centre + the height brush, replacing the player entirely (the character
+## the editor account owns just idles at spawn, server-side).
+func _setup_editor() -> void:
+    _editor_cam = EditorCamera.new()
+    add_child(_editor_cam)
+    _editor_cam.place_over(3200.0, 3200.0)
+    _editor_cam.make_current()
+    _brush = BrushController.new()
+    _brush.camera = _editor_cam
+    _brush.streamer = _streamer
+    add_child(_brush)
+    _brush.stroke_committed.connect(func(brush, cells): _net.send_terrain_edit_op(brush, cells))
+    _brush.status_changed.connect(func(text): _hud.flash_announce(text))
+    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, RMB-drag look, WASD/QE fly")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any
@@ -337,6 +390,8 @@ func _on_gather_pressed() -> void:
 
 func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
     if id == _my_id:
+        if _editor_mode:
+            return # the editor's idle character isn't controlled or rendered
         if not _seeded_position:
             # First authoritative snapshot: place us exactly where the server spawned us.
             _seeded_position = true

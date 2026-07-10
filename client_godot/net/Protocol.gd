@@ -79,6 +79,13 @@ const S_TERRAIN_TILE_DATA := "terrain.tile_data"
 ## in-range request ALWAYS answers (`has_delta: false` when unedited).
 const C_TERRAIN_DELTA_REQUEST := "terrain.delta_request"
 const S_TERRAIN_DELTA_DATA := "terrain.delta_data"
+## One editor brush stroke: `{brush, cells: [[cx, cy, d_cm], ...]}` in WORLD
+## corner coordinates. Requires `role == "editor"` server-side; rejected with
+## `terrain.edit_error`. Accepted ops come back as `terrain.delta_patch`
+## (the touched chunks' full current deltas) pushed to every client.
+const C_TERRAIN_EDIT_OP := "terrain.edit_op"
+const S_TERRAIN_EDIT_ERROR := "terrain.edit_error"
+const S_TERRAIN_DELTA_PATCH := "terrain.delta_patch"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
