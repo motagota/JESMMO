@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::{json, Value};
@@ -2627,18 +2628,65 @@ impl Proxy {
         self.push_to_player(pid, json!({"type": "craft.recipes", "recipes": recipes}));
     }
 
-    /// Answer `terrain.list` with the authored heightmap grid (#54). Stateless
-    /// and static (same every boot) — sent once per session rather than
-    /// folded into `partition` (which gets rebroadcast on every zone
+    /// Answer `terrain.list` with the heightmap grid (#54), now sampled from
+    /// the baked terrain artifact (#63) rather than an in-process generator.
+    /// Stateless and static (same every boot) — sent once per session rather
+    /// than folded into `partition` (which gets rebroadcast on every zone
     /// split/merge/capture; the terrain payload is too large to wastefully
     /// resend on every one of those).
+    ///
+    /// The coarse-grid wire shape is unchanged from the old synthetic
+    /// generator — a flat `(TERRAIN_RESOLUTION+1)^2` grid — deliberately
+    /// decoupled from the artifact's own internal tile/cell resolution (see
+    /// `mmo::world::loaded_terrain`'s doc comment for why): it's the
+    /// permanent, always-present backdrop. Also includes the artifact's own
+    /// manifest shape (tile_size/tiles/cell_size_m/height_min_m/
+    /// height_max_m) so the client knows what it can additionally stream in
+    /// at native resolution via `terrain.tile_request`/`send_terrain_tile`.
     fn send_terrain(&self, pid: &str) {
         let terrain = &self.capital.terrain;
+        let resolution = mmo::world::TERRAIN_RESOLUTION;
+        let fine_n = (resolution + 1) as usize;
+        let step = WORLD_SIZE as f32 / resolution as f32;
+        let mut heights = Vec::with_capacity(fine_n * fine_n);
+        for gy in 0..fine_n {
+            for gx in 0..fine_n {
+                heights.push(terrain.sample_height(gx as f32 * step, gy as f32 * step));
+            }
+        }
+        let manifest = terrain.manifest();
         self.push_to_player(pid, json!({
             "type": "terrain.data",
-            "resolution": terrain.resolution,
+            "resolution": resolution,
             "world_size": WORLD_SIZE,
-            "heights": terrain.heights,
+            "heights": heights,
+            "tile_size": manifest.tile_size,
+            "tiles": [manifest.tiles.0, manifest.tiles.1],
+            "cell_size_m": manifest.cell_size_m,
+            "height_min_m": manifest.height_min_m,
+            "height_max_m": manifest.height_max_m,
+        }));
+    }
+
+    /// Answer `terrain.tile_request` with the requested tile's raw bytes —
+    /// terrain streaming's on-demand native-resolution path. Reuses
+    /// `terrain_common::HeightTile::encode`'s exact on-disk wire format,
+    /// base64-wrapped so it still rides the existing all-JSON/text-frame
+    /// transport (see `docs/protocol.md`'s `terrain.*` section). Stateless
+    /// and silent on a miss: an out-of-range or not-yet-loaded `(tx, ty)`
+    /// just gets nothing back, the same posture as every other
+    /// directly-answered message in this dispatch loop when asked for
+    /// something that doesn't exist.
+    fn send_terrain_tile(&self, pid: &str, tx: i32, ty: i32) {
+        let Some(tile) = self.capital.terrain.height_tile(tx, ty) else { return };
+        let bytes = tile.encode(1);
+        self.push_to_player(pid, json!({
+            "type": "terrain.tile_data",
+            "tx": tx,
+            "ty": ty,
+            "side": tile.side,
+            "encoding": "tile_v1",
+            "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
         }));
     }
 
@@ -3031,6 +3079,16 @@ impl Proxy {
                     // grid (#54) — same reasoning as `craft.list`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("terrain.list") {
                         self.send_terrain(&player_id);
+                        continue;
+                    }
+                    // `terrain.tile_request` (terrain streaming): a client-pull
+                    // request for one native-resolution tile, keyed only on the
+                    // requested (tx, ty) — stateless/idempotent, same reasoning
+                    // as `terrain.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.tile_request") {
+                        let tx = data.get("tx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        let ty = data.get("ty").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        self.send_terrain_tile(&player_id, tx, ty);
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -5579,12 +5637,119 @@ mod tests {
         let msg = recv_until(&mut ws, "terrain.data").await;
 
         let expected = mmo::world::capital().terrain;
-        assert_eq!(msg["resolution"].as_i64().unwrap(), expected.resolution as i64);
+        let resolution = mmo::world::TERRAIN_RESOLUTION;
+        assert_eq!(msg["resolution"].as_i64().unwrap(), resolution as i64);
         let heights: Vec<f64> = msg["heights"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
-        assert_eq!(heights.len(), expected.heights.len());
-        for (got, want) in heights.iter().zip(expected.heights.iter()) {
-            assert!((*got - *want as f64).abs() < 0.0001, "heightmap sent over the wire must match capital()'s exactly");
+        let fine_n = (resolution + 1) as usize;
+        assert_eq!(heights.len(), fine_n * fine_n);
+
+        // Every sent corner must match an independent `sample_height` call
+        // against the same loaded artifact — the wire message and
+        // `capital()` must never disagree (that mismatch is exactly the bug
+        // class #54 fixed).
+        let step = WORLD_SIZE as f32 / resolution as f32;
+        for gy in 0..fine_n {
+            for gx in 0..fine_n {
+                let want = expected.sample_height(gx as f32 * step, gy as f32 * step);
+                let got = heights[gy * fine_n + gx];
+                assert!(
+                    (got - want as f64).abs() < 0.0001,
+                    "heightmap sent over the wire must match capital()'s exactly at ({gx},{gy})"
+                );
+            }
         }
+
+        // Terrain streaming: the same message must also carry the baked
+        // artifact's own manifest shape, so the client knows what it can
+        // additionally request at native resolution.
+        let manifest = expected.manifest();
+        assert_eq!(msg["tile_size"].as_u64().unwrap(), manifest.tile_size as u64);
+        assert_eq!(msg["tiles"][0].as_u64().unwrap(), manifest.tiles.0 as u64);
+        assert_eq!(msg["tiles"][1].as_u64().unwrap(), manifest.tiles.1 as u64);
+        assert!((msg["cell_size_m"].as_f64().unwrap() - manifest.cell_size_m as f64).abs() < 0.0001);
+        assert!((msg["height_min_m"].as_f64().unwrap() - manifest.height_min_m as f64).abs() < 0.0001);
+        assert!((msg["height_max_m"].as_f64().unwrap() - manifest.height_max_m as f64).abs() < 0.0001);
+
+        drop(ws);
+    }
+
+    /// Terrain streaming: `terrain.tile_request` answers with the requested
+    /// tile's bytes, base64-wrapped, in exactly `HeightTile::encode`'s
+    /// on-disk format — decoding it back must reproduce the same tile the
+    /// baked artifact itself holds, so the streamed tile can never disagree
+    /// with the coarse backdrop or the bake tool's own validation.
+    #[tokio::test]
+    async fn terrain_tile_request_answers_with_the_requested_tiles_bytes() {
+        use base64::Engine;
+
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
+
+        let email = format!("surveyor2_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Surveyor2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        let expected_terrain = mmo::world::capital().terrain;
+        let expected_tile = expected_terrain.height_tile(0, 0).expect("tile (0,0) must exist in the production bake");
+
+        ws.send(Message::Text(json!({"type": "terrain.tile_request", "tx": 0, "ty": 0}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.tile_data").await;
+
+        assert_eq!(msg["tx"].as_i64().unwrap(), 0);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 0);
+        assert_eq!(msg["side"].as_u64().unwrap(), expected_tile.side as u64);
+        assert_eq!(msg["encoding"].as_str().unwrap(), "tile_v1");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(msg["data_b64"].as_str().unwrap())
+            .expect("data_b64 must be valid base64");
+        let decoded = terrain_common::HeightTile::decode(&bytes, expected_tile.side).expect("must decode as a valid HeightTile");
+        for gy in 0..decoded.side {
+            for gx in 0..decoded.side {
+                assert_eq!(
+                    decoded.get(gx, gy),
+                    expected_tile.get(gx, gy),
+                    "streamed tile sample ({gx},{gy}) must match the loaded artifact's own tile exactly"
+                );
+            }
+        }
+
+        drop(ws);
+    }
+
+    /// An out-of-range tile request (outside the manifest's tile grid) is
+    /// silently ignored — same posture as every other directly-answered
+    /// message in this dispatch loop when asked for something that doesn't
+    /// exist. Confirmed by racing it against a real request that *does*
+    /// answer, so a silent hang isn't mistaken for "the bad request also
+    /// worked."
+    #[tokio::test]
+    async fn terrain_tile_request_out_of_range_is_silently_ignored() {
+        let (proxy, _dbf, _zone) = proxy_with_db().await;
+
+        let email = format!("surveyor3_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Surveyor3"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.tile_request", "tx": 9999, "ty": 9999}).to_string()))
+            .await
+            .unwrap();
+        // No terrain.tile_data for the bad request — but a subsequent good
+        // request must still answer normally, proving the bad one didn't
+        // wedge anything.
+        ws.send(Message::Text(json!({"type": "terrain.tile_request", "tx": 0, "ty": 0}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.tile_data").await;
+        assert_eq!(msg["tx"].as_i64().unwrap(), 0);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 0);
 
         drop(ws);
     }

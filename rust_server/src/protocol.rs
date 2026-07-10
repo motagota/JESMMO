@@ -75,9 +75,21 @@ pub const S_CRAFT_RECIPES: &str = "craft.recipes"; // {recipes: [{id, name, inpu
 pub const C_CRAFT_MAKE: &str = "craft.make"; // {recipe_id}
 pub const S_CRAFT_MADE: &str = "craft.made"; // {recipe_id, item_id, qty} -- feedback once craft.make succeeds
 
-// --- terrain.* — cosmetic heightmap (#54) ---------------------------------------
+// --- terrain.* — cosmetic heightmap (#54) + native-resolution tile streaming ----
 pub const C_TERRAIN_LIST: &str = "terrain.list"; // -> the authored heightmap grid
-pub const S_TERRAIN_DATA: &str = "terrain.data"; // {resolution, world_size, heights: [f32; (resolution+1)^2]}
+// {resolution, world_size, heights: [f32; (resolution+1)^2]} -- the coarse,
+// whole-world backdrop grid (unchanged since #54), plus manifest-derived
+// fields (added for terrain streaming) so the client knows the streamable
+// tile grid's shape: tile_size (cells/side), tiles: [cols, rows],
+// cell_size_m, height_min_m, height_max_m.
+pub const S_TERRAIN_DATA: &str = "terrain.data";
+pub const C_TERRAIN_TILE_REQUEST: &str = "terrain.tile_request"; // {tx, ty}
+// {tx, ty, side, encoding: "tile_v1", data_b64} -- data_b64 is exactly
+// terrain_common::HeightTile::encode(1)'s bytes, base64-wrapped (16-byte
+// header + little-endian u16 corner samples) -- the on-disk wire format
+// reused byte-for-byte as the network format. A request for a tile outside
+// the manifest's tile grid, or not currently loaded, is silently ignored.
+pub const S_TERRAIN_TILE_DATA: &str = "terrain.tile_data";
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}

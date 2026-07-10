@@ -1,0 +1,49 @@
+# Real-DEM ingest demo/proof (issue #69) — NOT the production capital config
+# (that's the repo-root `terrain.toml`, still deliberately synthetic/flat per
+# #55/#63). This exists purely to prove the acceptance criteria: a real DEM
+# produces a recognizable hillshade, and every downstream stage runs
+# unmodified against real-ingested data.
+#
+# `brisbane_hills_demo.grid` (committed) is a 320x320 cell / 25m-resolution
+# slice of the D'Aguilar Range foothills west of Brisbane (UTM zone 56S
+# bounds below), produced once from a real Geoscience Australia 5m LiDAR DTM
+# via:
+#
+#   python tools/convert_dem.py \
+#       --input 5m_DEM.tif --output testdata/brisbane_hills_demo.grid \
+#       --dst-crs EPSG:32756 --res 25 \
+#       --bounds 484000 6960000 492000 6968000 --sea-level 0
+#
+# Regenerate this bake with (from the repo root):
+#   cargo run -p terrain-bake -- --config terrain-bake/testdata/brisbane_demo.toml --debug-dump <dir>
+
+[source]
+dem_path      = "terrain-bake/testdata/brisbane_hills_demo.grid"
+bounds_utm    = [484000.0, 6960000.0, 492000.0, 6968000.0]
+working_res_m = 25.0
+target_res_m  = 25.0
+seed          = 1
+
+[export]
+tile_size = 64
+out_dir   = "terrain-bake/testdata/brisbane_demo_out/"
+
+[water]
+# This AOI's real height range is ~29m..411m (real hill country, no water
+# body inside it) -- sea_level_m stays comfortably below that so the water
+# stage runs (proving it doesn't choke on real data) without manufacturing
+# fake water where there isn't any.
+sea_level_m = -10.0
+open_close_radius = 1
+min_river_width_m = 20.0
+clamp_epsilon_m = 0.2
+
+[stylize]
+horizontal_scale = 1.0
+vertical_curve_exp = 1.0
+vertical_scale = 1.0
+capital_flatten_margin_m = 100.0
+
+[classify]
+rules = [{ biome = "forest", min_slope = 8.0 }, { biome = "plains" }]
+walkable_max_slope = 45.0

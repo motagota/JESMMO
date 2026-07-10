@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["rust_server", "terrain-common", "terrain-bake"]
+
+# Building from the repo root now covers every crate:
+#   cargo build --workspace
+#   cargo test --workspace
+# `rust_server` keeps working exactly as before (cd rust_server && cargo run --bin proxy),
+# since a workspace member still builds against the shared root target dir/lockfile.

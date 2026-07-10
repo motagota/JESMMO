@@ -21,6 +21,11 @@ the proxy listens on the same ports as the Python version.
 cargo build --release
 ```
 
+This crate is now a member of the repo-root Cargo workspace (alongside `terrain-common`
+and `terrain-bake` — see the terrain pipeline epic, issue #56). Building/testing from
+here works unchanged; `cargo build --workspace` / `cargo test --workspace` from the repo
+root builds everything at once.
+
 ## Run
 
 In separate terminals:
@@ -35,6 +40,20 @@ cargo run --release --bin zone_server zone_b 9002 ws://127.0.0.1:8764
 ```
 
 Then open `../client/client.html` in a browser.
+
+### Terrain artifact
+
+The proxy loads authoritative terrain heights from the baked artifact at
+`../artifacts/world_v2/` (relative to this crate) at boot — panics with a clear
+message if it's missing. It's checked into the repo; regenerate it after
+changing `../terrain.toml` with:
+
+```sh
+cargo run -p terrain-bake -- --config ../terrain.toml
+```
+
+(from this directory) or `cargo run -p terrain-bake -- --config terrain.toml`
+from the repo root. Override the artifact location with `TERRAIN_DATA_DIR`.
 
 ## Accounts & persistence (M0)
 
