@@ -232,6 +232,25 @@ impl Db {
         hp: i64,
         now: i64,
     ) -> Result<(), DbError> {
+        self.seed_account_with_role(email, pw_hash, name, x, y, hp, now, "mayor").await
+    }
+
+    /// Idempotently seed one account+character with an elevated `role` —
+    /// shared by the mayor (city build orders) and editor (terrain editing,
+    /// epic #72) boot seeding. A no-op if the email is already registered
+    /// (never overwrites an existing account).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_account_with_role(
+        &self,
+        email: &str,
+        pw_hash: &str,
+        name: &str,
+        x: i64,
+        y: i64,
+        hp: i64,
+        now: i64,
+        role: &str,
+    ) -> Result<(), DbError> {
         if self.find_account_by_email(email).await?.is_some() {
             return Ok(());
         }
@@ -240,11 +259,12 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO account (id, email, pw_hash, role, created_at, last_login) \
-             VALUES (?, ?, ?, 'mayor', ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&account_id)
         .bind(email)
         .bind(pw_hash)
+        .bind(role)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)

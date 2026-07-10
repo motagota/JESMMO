@@ -100,6 +100,21 @@ pub const C_TERRAIN_DELTA_REQUEST: &str = "terrain.delta_request"; // {tx, ty}
 // answered yet" from "answered, nothing here". Out-of-range requests are
 // silently ignored, same as the tile path.
 pub const S_TERRAIN_DELTA_DATA: &str = "terrain.delta_data";
+// {brush, cells: [[cx, cy, d_cm], ...]} -- one editor brush stroke. Cells are
+// WORLD corner coordinates (cx in [0, tile_size*tiles_x], same for cy) with
+// centimeter height increments; the server maps each corner to every chunk
+// that shares it (the duplicated-edge convention), so a stroke crossing a
+// chunk seam can never open a gap. Restricted to role == "editor".
+pub const C_TERRAIN_EDIT_OP: &str = "terrain.edit_op";
+// {message} -- the op was rejected (not an editor / out of bounds / over the
+// per-corner offset cap / malformed).
+pub const S_TERRAIN_EDIT_ERROR: &str = "terrain.edit_error";
+// {tx, ty, revision, encoding: "delta_v1", data_b64} -- pushed to EVERY
+// connected client after an accepted edit op, once per chunk the op touched.
+// data_b64 is the chunk's full current delta (same encoding as
+// terrain.delta_data), not just the changed blocks -- deltas are small, and
+// replace-not-merge keeps the client decode path single.
+pub const S_TERRAIN_DELTA_PATCH: &str = "terrain.delta_patch";
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}
