@@ -2759,6 +2759,47 @@ impl Proxy {
         }
     }
 
+    /// The authoritative *effective* ground height at `(x, y)`: baked base
+    /// plus any hand-authored height delta (terrain editing #72/#80) — the
+    /// one blessed door for any future server-side gameplay consumer of
+    /// elevation (fall damage, water simulation, 3D-aware movement
+    /// validation, Phase 2 terraforming rules...).
+    ///
+    /// The #80 audit found there is **no such consumer today**: movement
+    /// validation is pure 2D clamping (`zone_server::clamp_world`/
+    /// `clamp_region`), there is no server-side ground-snap (the client
+    /// snaps visually via `Protocol.w2v`), and `is_walkable`/`nav_flags`
+    /// have no production call sites. The only production `sample_height`
+    /// caller is `send_terrain`'s coarse backdrop, which deliberately stays
+    /// **base**: it's sent once per session as a static payload, so baking
+    /// deltas in would leave it stale after the first live edit — and the
+    /// client only renders deltas on streamed chunks anyway (the backdrop
+    /// is only visible outside the streamed ring, where an edit is beneath
+    /// LOD relevance).
+    ///
+    /// Composition happens live (a per-call delta load), so there is no
+    /// cache and therefore nothing to invalidate or debounce — the question
+    /// #80 told us to check before building machinery. If a per-tick
+    /// consumer ever appears, add an in-memory delta cache maintained by
+    /// `apply_terrain_edit_op`/`apply_terrain_revert_op` (both already
+    /// serialize under `terrain_edit_lock`) and invalidate there.
+    #[allow(dead_code)] // no gameplay consumer yet — exercised by tests; see the doc above
+    async fn composited_ground_height(&self, x: f32, y: f32) -> f32 {
+        let terrain = &self.capital.terrain;
+        let Some(db) = &self.db else {
+            return terrain.sample_height(x, y); // db-less mode: base only
+        };
+        let (tx, ty) = terrain.tile_at(x, y);
+        let side = terrain.manifest().tile_size as usize + 1;
+        let delta = db
+            .load_terrain_delta(tx, ty, side)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.height_delta);
+        terrain.sample_height_with_delta(x, y, delta.as_ref())
+    }
+
     /// Push one message to every connected client — the fanout for
     /// `terrain.delta_patch`, which any client with the chunk streamed in
     /// cares about regardless of zone/district (terrain is world-scoped;
@@ -6611,5 +6652,74 @@ mod tests {
         assert!(b.height_delta.unwrap().is_empty(), "chunk (1,0) back to procedural");
 
         drop(ws);
+    }
+
+    // --- terrain editing (#80): the server's composited height answer ----------
+
+    /// The #80 invariant, end-to-end through the real write path: after an
+    /// edit op lands over the wire, `composited_ground_height` answers base
+    /// + delta exactly; after the op is reverted, it answers base again,
+    /// bit-exactly. An untouched point never moves, and the coarse backdrop
+    /// (`terrain.data`) deliberately keeps answering base throughout.
+    #[tokio::test]
+    async fn composited_ground_height_follows_edits_and_reverts() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let cell = manifest.cell_size_m;
+        // World corner (40, 40) — interior of chunk (0,0); sample exactly on
+        // the corner so the expected lift is the full 250cm, no interpolation.
+        let (wx, wy) = (40.0 * cell, 40.0 * cell);
+        let (ux, uy) = (100.0 * cell, 100.0 * cell); // untouched control point
+
+        let base = proxy.capital.terrain.sample_height(wx, wy);
+        assert_eq!(
+            proxy.composited_ground_height(wx, wy).await,
+            base,
+            "no delta row -> composited answer IS the base, bit-exactly"
+        );
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[40, 40, 250]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        let edited = proxy.composited_ground_height(wx, wy).await;
+        assert!(
+            (edited - (base + 2.5)).abs() < 0.001,
+            "composited height must be base + 2.5m (base={base}, got={edited})"
+        );
+        let control_base = proxy.capital.terrain.sample_height(ux, uy);
+        assert_eq!(
+            proxy.composited_ground_height(ux, uy).await,
+            control_base,
+            "an untouched point in the same chunk must not move"
+        );
+        // The coarse backdrop wire message stays base — it's a static,
+        // once-per-session payload (see composited_ground_height's doc).
+        assert_eq!(proxy.capital.terrain.sample_height(wx, wy), base);
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.revert_ack").await;
+        assert_eq!(
+            proxy.composited_ground_height(wx, wy).await,
+            base,
+            "after revert the composited answer is the base again, bit-exactly"
+        );
+
+        drop(ws);
+    }
+
+    /// db-less mode (the proxy can boot without persistence): the composited
+    /// answer degrades to base rather than erroring.
+    #[tokio::test]
+    async fn composited_ground_height_without_a_db_answers_base() {
+        let proxy = test_proxy(); // Proxy::new(..., None)
+        let base = proxy.capital.terrain.sample_height(500.0, 500.0);
+        assert_eq!(proxy.composited_ground_height(500.0, 500.0).await, base);
     }
 }

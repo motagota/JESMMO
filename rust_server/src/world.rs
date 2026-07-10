@@ -296,6 +296,15 @@ static TERRAIN: std::sync::OnceLock<std::sync::Arc<terrain_common::Terrain>> = s
 /// everywhere, and layers genuinely native-resolution tiles on top near the
 /// player, streamed in/out as they move (see
 /// `client_godot/world/TerrainStreamer.gd`).
+///
+/// **Terrain-editing caveat (#72/#80)**: this is the immutable *base*.
+/// Hand-authored edits live as deltas in the `terrain_delta` table and are
+/// composited separately (`Terrain::sample_height_with_delta`; the client
+/// composites onto streamed chunks). If you add a server-side gameplay
+/// consumer of ground height, do **not** call `sample_height` directly --
+/// go through `proxy.rs::composited_ground_height` (or replicate its
+/// base-plus-delta composition), or edited terrain will be invisible to
+/// your feature. The #80 audit confirmed no such consumer exists today.
 pub fn loaded_terrain() -> std::sync::Arc<terrain_common::Terrain> {
     TERRAIN
         .get_or_init(|| {

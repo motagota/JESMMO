@@ -293,6 +293,8 @@ the manifest's grid is silently ignored.
 | `terrain.revert_op` | C→S | `op_id` — undo one accepted op: every block it touched is restored to its logged **pre-op content** (whole 512-byte block snapshots from the append-only op log), revisions bump, and `terrain.delta_patch` broadcasts per affected chunk like a normal edit. Editor-role-gated; unknown or already-reverted ids are rejected with `terrain.edit_error` (the revert claim is atomic — racing double-reverts can't both apply). Whole-block restore means an out-of-order revert can clobber a later overlapping stroke: clients should undo newest-first | **live** |
 | `terrain.revert_ack` | S→C | `op_id` — the revert was applied (its patches arrive separately) | **live** |
 
+**Which surfaces carry hand-authored edits (#80):** `terrain.data` (the coarse backdrop) and `terrain.tile_data` (streamed chunk bytes) are always the immutable *base* bake — the backdrop is a static once-per-session payload (compositing edits in would leave it stale after the first live edit), and the client composites deltas onto streamed chunks itself from `terrain.delta_data`/`terrain.delta_patch`. Server-side, the effective (base + delta) height is answered by `proxy.rs::composited_ground_height`; the #80 audit confirmed no gameplay system consumes elevation today (movement validation is 2D clamping, ground-snap is client-visual only), so that helper is the door any future consumer must use.
+
 Clients reconstruct the ground surface by treating each grid cell as two
 triangles (split along the `(0,0)`–`(1,1)` diagonal) and must use the exact
 same triangle-planar interpolation for both the rendered mesh and any height
