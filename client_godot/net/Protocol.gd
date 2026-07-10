@@ -75,6 +75,10 @@ const C_TERRAIN_LIST := "terrain.list"
 const S_TERRAIN_DATA := "terrain.data"
 const C_TERRAIN_TILE_REQUEST := "terrain.tile_request"
 const S_TERRAIN_TILE_DATA := "terrain.tile_data"
+## Terrain editing (epic #72): a chunk's hand-authored edit layer. An
+## in-range request ALWAYS answers (`has_delta: false` when unedited).
+const C_TERRAIN_DELTA_REQUEST := "terrain.delta_request"
+const S_TERRAIN_DELTA_DATA := "terrain.delta_data"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
@@ -220,6 +224,53 @@ static func decode_height_tile(bytes: PackedByteArray) -> Dictionary:
         var raw := bytes.decode_u16(16 + i * 2)
         heights[i] = _height_min_m + (float(raw) / 65535.0) * range_m
     return {"tx": tx, "ty": ty, "heights": heights}
+
+## Decode a `terrain.delta_data` payload's raw bytes (terrain-common's
+## `SparseHeightDelta::encode` format: 8-byte header — magic "TRHD", u16 LE
+## format_version, u16 reserved — then a block-presence bitmap of
+## `ceil(ceil(side/16)^2 / 64)` u64 LE words, then each present 16x16
+## block's 256 i16 LE centimeter offsets in ascending block-index order)
+## into a dense `side*side` array of METER offsets, zero everywhere no
+## block covers. Dense-on-decode keeps compositing a plain element-wise
+## add against a streamed tile's heights. Returns an empty array on any
+## malformed input (mirrors `decode_height_tile`'s silent-drop posture).
+static func decode_height_delta(bytes: PackedByteArray) -> PackedFloat32Array:
+    var side := _tile_size + 1
+    if _tile_size <= 0 or bytes.size() < 8:
+        return PackedFloat32Array()
+    if bytes.slice(0, 4).get_string_from_ascii() != "TRHD":
+        return PackedFloat32Array()
+    var bps := int(ceil(side / 16.0))
+    var words := int(ceil(bps * bps / 64.0))
+    if bytes.size() < 8 + words * 8:
+        return PackedFloat32Array()
+    var indices: Array[int] = []
+    for w in range(words):
+        var word := bytes.decode_u64(8 + w * 8)
+        for bit in range(64):
+            if word & (1 << bit):
+                indices.append(w * 64 + bit)
+    if bytes.size() != 8 + words * 8 + indices.size() * 256 * 2:
+        return PackedFloat32Array()
+    var offsets := PackedFloat32Array()
+    offsets.resize(side * side) # zero-filled: untouched corners offset by 0
+    var pos := 8 + words * 8
+    for idx in indices:
+        if idx >= bps * bps:
+            return PackedFloat32Array() # bitmap bit outside the block grid
+        var block_row := int(floor(idx / float(bps)))
+        var block_col := idx % bps
+        for cy in range(16):
+            var gy := block_row * 16 + cy
+            for cx in range(16):
+                var gx := block_col * 16 + cx
+                var cm := bytes.decode_s16(pos)
+                pos += 2
+                # Edge blocks are partial: cells past `side` are stored
+                # (as zeros) but out of the corner grid — skip them.
+                if gx < side and gy < side:
+                    offsets[gy * side + gx] = cm * 0.01
+    return offsets
 
 ## Grid cells per axis of the received heightmap (0 before `terrain.data`
 ## arrives) — `World._build_ground` must use this exact resolution so its

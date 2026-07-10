@@ -171,6 +171,10 @@ func _wire_signals() -> void:
         _streamer.on_player_position(_player.world_pos().x, _player.world_pos().y))
     _net.terrain_tile_data.connect(func(tx, ty, heights): _streamer.on_tile_data(tx, ty, heights))
     _streamer.tile_requested.connect(func(tx, ty): _net.send_terrain_tile_request(tx, ty))
+    # Hand-authored edit layer (terrain editing #72): requested alongside
+    # each tile, composited onto the tile's heights before/at mesh build.
+    _net.terrain_delta_data.connect(func(tx, ty, has_delta, offsets): _streamer.on_delta_data(tx, ty, has_delta, offsets))
+    _streamer.delta_requested.connect(func(tx, ty): _net.send_terrain_delta_request(tx, ty))
     _net.status_update.connect(_on_status_update)
     _net.plot_district.connect(func(plots):
         _world.apply_plot_roster(plots, _plot_id)

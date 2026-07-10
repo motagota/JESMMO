@@ -35,6 +35,9 @@ signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
 signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
 signal terrain_tile_data(tx: int, ty: int, heights: PackedFloat32Array)
+## `offsets` is a dense side*side meter-offset grid (zeros where unedited);
+## empty when `has_delta` is false.
+signal terrain_delta_data(tx: int, ty: int, has_delta: bool, offsets: PackedFloat32Array)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -176,6 +179,19 @@ func _handle_text(text: String) -> void:
                 Marshalls.base64_to_raw(String(msg.get("data_b64", ""))))
             if not decoded.is_empty():
                 terrain_tile_data.emit(int(decoded["tx"]), int(decoded["ty"]), decoded["heights"])
+        Protocol.S_TERRAIN_DELTA_DATA:
+            # Hand-authored edit layer (terrain editing #72). `has_delta:
+            # false` still emits — the streamer counts the answer so a chunk
+            # isn't left waiting — just with empty offsets. A malformed
+            # payload decodes to empty and is treated as no delta, degrading
+            # to base terrain (same posture as a malformed tile).
+            var has_delta: bool = bool(msg.get("has_delta", false))
+            var offsets := PackedFloat32Array()
+            if has_delta:
+                offsets = Protocol.decode_height_delta(
+                    Marshalls.base64_to_raw(String(msg.get("data_b64", ""))))
+                has_delta = not offsets.is_empty()
+            terrain_delta_data.emit(int(msg.get("tx", 0)), int(msg.get("ty", 0)), has_delta, offsets)
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -272,6 +288,13 @@ func send_terrain_list() -> void:
 ## and idempotent server-side; an out-of-range coordinate is silently ignored.
 func send_terrain_tile_request(tx: int, ty: int) -> void:
     _send({"type": Protocol.C_TERRAIN_TILE_REQUEST, "tx": tx, "ty": ty})
+
+## Request a chunk's hand-authored edit layer (terrain editing #72) — sent by
+## `TerrainStreamer` alongside each tile request. An in-range chunk always
+## answers (`has_delta: false` when unedited); out-of-range is silently
+## ignored, same as the tile path.
+func send_terrain_delta_request(tx: int, ty: int) -> void:
+    _send({"type": Protocol.C_TERRAIN_DELTA_REQUEST, "tx": tx, "ty": ty})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:
