@@ -12,10 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
+
+use crate::util::now_secs;
 
 /// All persistence errors surface as `sqlx::Error`; callers that need friendlier
 /// semantics (e.g. "email already taken") check before writing.
@@ -60,13 +61,6 @@ pub struct Character {
 
 pub struct Db {
     pool: SqlitePool,
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 // --- In-transaction item helpers ---------------------------------------------

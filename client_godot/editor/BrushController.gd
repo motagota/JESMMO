@@ -164,23 +164,8 @@ func _key_edge(key: Key) -> bool:
 	_key_down[key] = down
 	return down and not was
 
-## Camera-ray → ground world point, the same two-pass plane-then-terrain
-## refinement `MayorRoad._raycast_ground` uses.
+## Ground point under the mouse in world units, remembering the last good hit
+## as the fallback for frames with no sane intersection (`Protocol.pick_ground`).
 func _raycast_ground() -> Vector2:
-	var mouse := get_viewport().get_mouse_position()
-	var origin := camera.project_ray_origin(mouse)
-	var dir := camera.project_ray_normal(mouse)
-	if absf(dir.y) < 0.0001:
-		return _last_ground
-	var t := -origin.y / dir.y
-	if t <= 0.0:
-		return _last_ground
-	var hit := origin + dir * t
-	var approx := Vector2(hit.x / Protocol.WORLD_SCALE, hit.z / Protocol.WORLD_SCALE)
-	var ground_y := Protocol.terrain_height(approx.x, approx.y)
-	var t2 := (ground_y - origin.y) / dir.y
-	if t2 <= 0.0:
-		return _last_ground
-	var hit2 := origin + dir * t2
-	_last_ground = Vector2(hit2.x / Protocol.WORLD_SCALE, hit2.z / Protocol.WORLD_SCALE)
+	_last_ground = Protocol.pick_ground(camera, get_viewport().get_mouse_position(), _last_ground)
 	return _last_ground

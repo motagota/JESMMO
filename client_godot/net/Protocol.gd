@@ -365,6 +365,32 @@ static func _tile_height(wx: float, wy: float) -> float:
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
     return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy), wy * WORLD_SCALE)
 
+## Camera-ray → ground world point, shared by every mouse-on-terrain picker
+## (build placement, mayor roads, the editor brush). Two passes: intersect the
+## flat y=0 plane to get an approximate point, then re-intersect at that
+## point's actual terrain height — good enough because nearby terrain height
+## varies slowly relative to the camera distance. Returns `fallback` (the
+## caller's last good pick) when the camera is missing or the ray never
+## crosses the ground.
+static func pick_ground(camera: Camera3D, mouse: Vector2, fallback: Vector2) -> Vector2:
+    if camera == null:
+        return fallback
+    var origin := camera.project_ray_origin(mouse)
+    var dir := camera.project_ray_normal(mouse)
+    if absf(dir.y) < 0.0001:
+        return fallback
+    var t := -origin.y / dir.y
+    if t <= 0.0:
+        return fallback
+    var hit := origin + dir * t
+    var approx := Vector2(hit.x / WORLD_SCALE, hit.z / WORLD_SCALE)
+    var ground_y := terrain_height(approx.x, approx.y)
+    var t2 := (ground_y - origin.y) / dir.y
+    if t2 <= 0.0:
+        return fallback
+    var hit2 := origin + dir * t2
+    return Vector2(hit2.x / WORLD_SCALE, hit2.z / WORLD_SCALE)
+
 ## Mirror of the server's XP → level curve (`persistence::level_for_xp`): level n at
 ## 100·n² xp. Kept here so the skills panel can render progress-to-next-level and the
 ## build board can grey orders the player can't yet contribute to.

@@ -75,30 +75,10 @@ func _process(_delta: float) -> void:
 		_ghost.visible = false
 		mode_changed.emit(active, _has_start)
 
-## Raycast from the camera through the mouse position onto the ground, refined
-## against the actual terrain height — same two-pass approach as
-## `BuildPlace._raycast_ground` (see its comment for why one plane pass alone
-## isn't accurate enough on sloped ground).
+## Ground point under the mouse in world units, remembering the last good hit
+## as the fallback for frames with no sane intersection (`Protocol.pick_ground`).
 func _raycast_ground() -> Vector2:
-	if camera == null:
-		return _last_ground
-	var mouse := get_viewport().get_mouse_position()
-	var origin := camera.project_ray_origin(mouse)
-	var dir := camera.project_ray_normal(mouse)
-	if absf(dir.y) < 0.0001:
-		return _last_ground
-	var t := -origin.y / dir.y
-	if t <= 0.0:
-		return _last_ground
-	var hit := origin + dir * t
-	var approx := Vector2(hit.x / Protocol.WORLD_SCALE, hit.z / Protocol.WORLD_SCALE)
-
-	var ground_y := Protocol.terrain_height(approx.x, approx.y)
-	var t2 := (ground_y - origin.y) / dir.y
-	if t2 <= 0.0:
-		return _last_ground
-	var hit2 := origin + dir * t2
-	_last_ground = Vector2(hit2.x / Protocol.WORLD_SCALE, hit2.z / Protocol.WORLD_SCALE)
+	_last_ground = Protocol.pick_ground(camera, get_viewport().get_mouse_position(), _last_ground)
 	return _last_ground
 
 func _update_ghost(a: Vector2, b: Vector2) -> void:
