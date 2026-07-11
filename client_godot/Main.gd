@@ -36,6 +36,12 @@ var _transition: DistrictTransition
 
 var _editor_mode := false
 var _editor_cam: EditorCamera
+## The camera is first placed at `_setup_editor` (on `welcome`), but the real
+## world size only arrives with the `partition` message moments later — the
+## first partition recentres it once over the true town centre, then leaves
+## the camera alone (later partitions are zone splits/merges, and yanking the
+## camera mid-flight would be hostile).
+var _editor_cam_centred := false
 var _brush: BrushController
 var _history: HistoryPanel
 
@@ -181,7 +187,11 @@ func _wire_signals() -> void:
     _net.partition.connect(func(msg):
         _world.apply_partition(msg)
         _streamer.set_context(_world._zones, _world.world_size)
-        _player.set_world_size(float(msg.get("world", 6400))))
+        _player.set_world_size(float(msg.get("world", 6400)))
+        if _editor_mode and _editor_cam != null and not _editor_cam_centred:
+            _editor_cam_centred = true
+            var mid := _world.world_size * 0.5
+            _editor_cam.place_over(mid, mid))
     _net.terrain_data.connect(func(resolution, world_size, heights):
         Protocol.apply_terrain_data(resolution, world_size, heights)
         _world.on_terrain_data()
@@ -194,6 +204,11 @@ func _wire_signals() -> void:
         _streamer.on_player_position(anchor.x, anchor.y))
     _net.terrain_tile_data.connect(func(tx, ty, heights): _streamer.on_tile_data(tx, ty, heights))
     _streamer.tile_requested.connect(func(tx, ty): _net.send_terrain_tile_request(tx, ty))
+    # Plot markers / roads are static meshes sampled against the terrain at
+    # draw time — redraw them whenever the displayed surface changes so they
+    # sit on the ground instead of staying buried under streamed-in or
+    # brush-raised terrain.
+    _streamer.terrain_changed.connect(_world.refresh_plot_markers)
     # Hand-authored edit layer (terrain editing #72): requested alongside
     # each tile, composited onto the tile's heights before/at mesh build.
     _net.terrain_delta_data.connect(func(tx, ty, has_delta, offsets): _streamer.on_delta_data(tx, ty, has_delta, offsets))
@@ -323,7 +338,10 @@ func _on_welcome(data: Dictionary) -> void:
 func _setup_editor() -> void:
     _editor_cam = EditorCamera.new()
     add_child(_editor_cam)
-    _editor_cam.place_over(3200.0, 3200.0)
+    # Provisional until the first `partition` supplies the real world size
+    # (see `_editor_cam_centred`) — `welcome` arrives just before it.
+    var mid := _world.world_size * 0.5
+    _editor_cam.place_over(mid, mid)
     _editor_cam.make_current()
     _brush = BrushController.new()
     _brush.camera = _editor_cam

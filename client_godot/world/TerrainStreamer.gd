@@ -29,6 +29,11 @@ signal tile_requested(tx: int, ty: int)
 ## Emitted alongside `tile_requested` for the same chunk — `Main.gd` wires
 ## this to `NetworkClient.send_terrain_delta_request` (terrain editing #72).
 signal delta_requested(tx: int, ty: int)
+## Emitted whenever the DISPLAYED heights change anywhere (a fine tile
+## streamed in or out, an edit patch/preview rebuilt a mesh) — `Main.gd`
+## wires this to `World.refresh_plot_markers`, whose static marker meshes
+## sample terrain height at draw time and need a redraw to follow it.
+signal terrain_changed
 
 var _loaded: Dictionary = {}   # Vector2i(tx,ty) -> MeshInstance3D
 var _pending: Dictionary = {}  # Vector2i(tx,ty) -> true (requested, not yet arrived)
@@ -104,6 +109,7 @@ func on_tile_data(tx: int, ty: int, heights: PackedFloat32Array) -> void:
     var offsets: PackedFloat32Array = _delta_offsets.get(coord, PackedFloat32Array())
     Protocol.apply_terrain_tile(tx, ty, _composited(heights, offsets))
     _loaded[coord] = _build_tile_mesh(coord)
+    terrain_changed.emit()
 
 ## A chunk's delta answer arrived (`NetworkClient.terrain_delta_data`).
 ## Every in-range request answers exactly once (has_delta false when the
@@ -221,6 +227,7 @@ func _process(delta: float) -> void:
             _loaded[coord].queue_free()
             _loaded[coord] = _build_tile_mesh(coord)
     _dirty.clear()
+    terrain_changed.emit()
 
 func _refresh_ring() -> void:
     var wanted := wanted_tiles_for(_current_tile, _LOAD_RADIUS_TILES, Protocol._tiles_x, Protocol._tiles_y)
@@ -239,6 +246,7 @@ func _refresh_ring() -> void:
     for coord in _pending_deltas.keys().duplicate():
         if not wanted.has(coord):
             _pending_deltas.erase(coord)
+    var unloaded := false
     for coord in _loaded.keys().duplicate():
         if not wanted.has(coord):
             _loaded[coord].queue_free()
@@ -252,6 +260,9 @@ func _refresh_ring() -> void:
             _delta_offsets.erase(coord)
             _base_heights.erase(coord)
             _dirty.erase(coord)
+            unloaded = true
+    if unloaded:
+        terrain_changed.emit()
 
 ## Build one tile's ground mesh: the same per-vertex height (`Protocol.w2v`)
 ## + paint (`GroundPaint`) + triangle winding as `World._build_ground`, just

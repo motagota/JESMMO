@@ -1,6 +1,8 @@
 ## Headless smoke test: World.apply_plot_roster's per-plot marker shape --
 ## a free plot gets just the tile+border (no signpost at all), a taken one
-## also gets a small signpost (post + name-plank + label) naming the owner.
+## also gets a small signpost (post + name-plank + label) naming the owner --
+## and the fill conforms to the terrain surface (per-vertex heights, not a
+## flat plane buried in the first slope).
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_world_plots.gd
 extends SceneTree
 
@@ -8,6 +10,16 @@ func _initialize() -> void:
 	var world = load("res://world/World.gd").new()
 	root.add_child(world)
 	world.apply_partition({"world": 6400, "zones": []})
+
+	# A sloped backdrop under the plots (heights rise with x), so a flat
+	# marker would provably disagree with the surface.
+	var resolution := 64
+	var heights := PackedFloat32Array()
+	heights.resize((resolution + 1) * (resolution + 1))
+	for gy in range(resolution + 1):
+		for gx in range(resolution + 1):
+			heights[gy * (resolution + 1) + gx] = gx * 2.0
+	Protocol.apply_terrain_data(resolution, 6400.0, heights)
 
 	var plots := [
 		{"plot_id": "free1", "bounds": {"x": 4800, "y": 0, "w": 80, "h": 80}, "owner_name": null},
@@ -38,5 +50,28 @@ func _initialize() -> void:
 		quit(1)
 		return
 
-	print("SMOKE_OK: free plots get no signpost, taken plots get exactly one naming the owner")
+	# The free plot's fill (its first child) must drape over the slope: every
+	# vertex sits a small fixed lift above the terrain height at its own
+	# (x, z), so the whole tile follows the ground instead of one flat plane
+	# at the centre's height.
+	var fill: MeshInstance3D = world._plots_root.get_child(0)
+	var worst := 0.0
+	var y_min := INF
+	var y_max := -INF
+	for v in fill.mesh.get_faces():
+		var ground: float = Protocol.terrain_height(v.x / Protocol.WORLD_SCALE, v.z / Protocol.WORLD_SCALE)
+		worst = maxf(worst, absf(v.y - ground - (world._TILE_Y + 0.005)))
+		y_min = minf(y_min, v.y)
+		y_max = maxf(y_max, v.y)
+	print("fill-vs-terrain worst error:", worst, " fill y span:", y_max - y_min)
+	if worst > 0.01:
+		print("SMOKE_FAIL: fill vertex strays %f from the terrain surface" % worst)
+		quit(1)
+		return
+	if y_max - y_min < 0.5:
+		print("SMOKE_FAIL: fill is flat (y span %f) over sloped terrain" % (y_max - y_min))
+		quit(1)
+		return
+
+	print("SMOKE_OK: free plots get no signpost, taken plots get exactly one naming the owner, fills follow the terrain")
 	quit(0)
