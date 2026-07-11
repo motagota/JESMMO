@@ -39,6 +39,7 @@ use uuid::Uuid;
 use mmo::auth;
 use mmo::persistence::Db;
 use mmo::protocol::{self, PROTOCOL_VERSION};
+use mmo::util::{dist2, now_secs, random_heading};
 
 /// Spawn point for a brand-new character: the capital's town centre (the spawn
 /// anchor authored in `mmo::world`). Kept in sync via `spawn_matches_town_centre`.
@@ -73,12 +74,6 @@ const EDIT_MAX_CELLS_PER_OP: usize = 16_384;
 /// contribute to it.
 const BOARD_RANGE: i32 = 60;
 
-fn dist2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
-    let dx = (ax - bx) as i64;
-    let dy = (ay - by) as i64;
-    dx * dx + dy * dy
-}
-
 /// Squared distance from `(px,py)` to the segment `(x0,y0)-(x1,y1)` (clamped
 /// projection), for gating proximity to a segment-shaped structure like a road.
 fn point_segment_dist2(px: i32, py: i32, x0: i32, y0: i32, x1: i32, y1: i32) -> i64 {
@@ -106,14 +101,6 @@ const RENT_GRACE_SECS: i64 = 2 * 24 * 3600;
 const RENT_WARNING_LEAD_SECS: i64 = 24 * 3600;
 /// How often the rent ticker checks every owned plot.
 const RENT_TICK_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Current unix time in seconds. Used by the rent ticker (#14).
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Outbound queue for a trusted internal peer (zone / admin). Unbounded is fine:
 /// single consumer, head-of-line stalls are not an attack surface.
@@ -147,8 +134,7 @@ const SPLIT_COOLDOWN: Duration = Duration::from_secs(8);
 const AUTOSCALE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Edge length of the (square) world. Zones own rectangular sub-regions of it.
-/// Mirrors `mmo::world::WORLD_SIZE` / `zone_server.rs`'s copy — keep in sync.
-const WORLD_SIZE: i32 = 6400;
+use mmo::world::WORLD_SIZE;
 
 /// A half-open rectangular region of the world: [x0, x1) x [y0, y1).
 #[derive(Clone, Copy)]
@@ -3807,15 +3793,6 @@ fn persistent_identity(ch: mmo::persistence::Character, role: String) -> Identit
     }
 }
 
-/// A random 8-direction heading (never standing still), for the internal bots.
-fn random_heading() -> (i32, i32) {
-    let dirs = [
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (1, 1), (1, -1), (-1, 1), (-1, -1),
-    ];
-    dirs[rand::thread_rng().gen_range(0..dirs.len())]
-}
-
 /// One gateway-spawned load-test bot: connect to the client port and wander,
 /// re-rolling its heading occasionally. Aborting the task disconnects it.
 async fn run_internal_bot(uri: String) {
@@ -4925,9 +4902,9 @@ mod tests {
     async fn partition_labels_districts() {
         let proxy = test_proxy();
         // Three shards, one per authored district band.
-        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 1600, y1: 6400 });
-        add_zone_region(&proxy, "z_civic", Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 });
-        add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
+        add_zone_region(&proxy, "z_suburbs", Region { x0: 0, y0: 0, x1: 6400, y1: 25600 });
+        add_zone_region(&proxy, "z_civic", Region { x0: 6400, y0: 6400, x1: 19200, y1: 19200 });
+        add_zone_region(&proxy, "z_market", Region { x0: 19200, y0: 0, x1: 25600, y1: 25600 });
 
         let snap = proxy.partition_snapshot();
         let by_zone = |zid: &str| -> String {
@@ -5270,7 +5247,7 @@ mod tests {
         ws.send(Message::Text(json!({
             "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
             "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
-            "x": 3200, "y": 3200, "x1": 3300, "y1": 3200,
+            "x": 12800, "y": 12800, "x1": 13200, "y1": 12800,
         }).to_string()))
         .await
         .unwrap();
@@ -5290,7 +5267,7 @@ mod tests {
         let db = Db::connect(dbf.url()).await.unwrap();
         db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
         let mayor_hash = auth::hash_password("h").unwrap();
-        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 12800, 12800, 100, 0)
             .await
             .unwrap();
 
@@ -5334,7 +5311,7 @@ mod tests {
         let (proxy, dbf, zone) = proxy_with_db().await;
         let db = Db::connect(dbf.url()).await.unwrap();
         let mayor_hash = auth::hash_password("h").unwrap();
-        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 12800, 12800, 100, 0)
             .await
             .unwrap();
 
@@ -5348,7 +5325,7 @@ mod tests {
 
         // Well clear of the civic build board (town_centre - 30, +10) and of any
         // plot grid (only the suburbs has one) — plainly city land.
-        let (x0, y0, x1, y1) = (3200, 1000, 3300, 1000);
+        let (x0, y0, x1, y1) = (12800, 4000, 13200, 4000);
         mayor_ws.send(Message::Text(json!({
             "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
             "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
@@ -5891,7 +5868,7 @@ mod tests {
         // *centre* resolves to Civic (no plot grid there). Add a second zone
         // that actually covers the Suburbs, so a client tracked there sees
         // the real roster.
-        let _suburbs_zone = add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
+        let _suburbs_zone = add_zone_region(&proxy, "z_suburbs", Region { x0: 0, y0: 0, x1: 6400, y1: 25600 });
 
         let email1 = format!("landowner1_{}@t.test", Uuid::new_v4().simple());
         let mut ws1 = dial(&proxy).await;
@@ -6032,7 +6009,7 @@ mod tests {
         // crossed into the Suburbs.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 3200, y: 3200, hp: 100, gather: None },
+            EntityCache { x: 12800, y: 12800, hp: 100, gather: None },
         );
 
         ws.send(Message::Text(
@@ -6315,7 +6292,7 @@ mod tests {
     /// Seed + log in the editor account; returns its socket.
     async fn dial_editor(proxy: &Arc<Proxy>, db: &Db) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         let hash = auth::hash_password("h").unwrap();
-        db.seed_account_with_role(EDITOR_EMAIL, &hash, "The Editor", 3200, 3200, 100, 0, "editor")
+        db.seed_account_with_role(EDITOR_EMAIL, &hash, "The Editor", 12800, 12800, 100, 0, "editor")
             .await
             .unwrap();
         let mut ws = dial(proxy).await;
