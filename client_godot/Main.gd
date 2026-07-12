@@ -12,7 +12,9 @@ const GATEWAY_URL := "ws://127.0.0.1:8766"
 ## Editor mode (terrain editing #78): launch with `--editor-mode` (after the
 ## `--` separator, e.g. `Godot --path client_godot -- --editor-mode`) to get
 ## the free-fly camera + terrain brush instead of the player, logged in as
-## the server-seeded editor account (dev credentials, mirroring proxy.rs).
+## the server-seeded editor account (dev credentials, mirroring proxy.rs)
+## unless overridden with `--editor-email=<email> --editor-pass=<password>`
+## — any editor-role account works, and edits are then attributed to it.
 const EDITOR_EMAIL := "editor@capital.town"
 const EDITOR_PASSWORD := "editor12345"
 
@@ -312,8 +314,18 @@ func _on_auth_required(version: int) -> void:
     if _editor_mode:
         # Editor mode skips the login UI (and any saved session token —
         # a stale player token must not shadow the editor identity).
+        # `--editor-email=` / `--editor-pass=` pick a different editor-role
+        # account (edit provenance is attributed to whoever logs in here);
+        # default is the server-seeded dev editor.
+        var email := EDITOR_EMAIL
+        var password := EDITOR_PASSWORD
+        for arg in OS.get_cmdline_user_args():
+            if arg.begins_with("--editor-email="):
+                email = arg.substr(len("--editor-email="))
+            elif arg.begins_with("--editor-pass="):
+                password = arg.substr(len("--editor-pass="))
         _login.show_overlay(false)
-        _net.login(EDITOR_EMAIL, EDITOR_PASSWORD)
+        _net.login(email, password)
         return
     _login.set_version(version)
     _login.prefill_email(_load_email())

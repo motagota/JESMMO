@@ -1,3 +1,10 @@
 # Baked terrain tiles are binary — never subject to CRLF normalization,
 # regardless of git's own content-sniffing heuristic (issue #63).
 artifacts/**/*.bin binary
+
+# sqlx checksums migration files by their exact bytes at apply time — if
+# git's autocrlf materializes them as CRLF on one checkout and LF on another,
+# every already-migrated database refuses to open ("migration N was
+# previously applied but has been modified") and the server silently runs
+# WITHOUT persistence. Pin them to LF everywhere.
+rust_server/migrations/*.sql text eol=lf

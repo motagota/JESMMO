@@ -17,6 +17,7 @@ var _t := 0.0
 var _painted_ticks := 0
 var _committed := false
 var _shot_taken := false
+var _ack_wired := false
 var _op_id := "" # our stroke's acked id — reverted after the shot (clean dev DB)
 var _out_path := "user://editor_visual.png"
 
@@ -26,13 +27,17 @@ func _initialize() -> void:
 			_out_path = arg.substr(len("--out="))
 	_main = load("res://Main.tscn").instantiate()
 	root.add_child(_main)
-	_main._net.terrain_edit_ack.connect(func(op_id, _brush): _op_id = op_id)
-	_main._net.terrain_revert_ack.connect(func(_op):
-		print("SMOKE: test stroke reverted — dev DB left clean")
-		quit(0))
 
 func _process(delta: float) -> bool:
 	_t += delta
+	# Main builds `_net` in its `_ready`, which hasn't run yet during
+	# `_initialize` — wire the ack/revert hooks on the first live frame.
+	if not _ack_wired and _main._net != null:
+		_ack_wired = true
+		_main._net.terrain_edit_ack.connect(func(op_id, _brush): _op_id = op_id)
+		_main._net.terrain_revert_ack.connect(func(_op):
+			print("SMOKE: test stroke reverted — dev DB left clean")
+			quit(0))
 	# By ~5s: editor login, terrain.data, and the camera-anchored tile ring
 	# should be resident. Paint for ~2s (40 ticks of 50ms) — the same
 	# _paint_tick a mouse drag drives, at a fixed ground point.
