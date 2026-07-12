@@ -6,9 +6,9 @@ class_name EditorCamera
 extends Camera3D
 
 const _MOUSE_SENSITIVITY := 0.005
-const _SPEED_DEFAULT := 30.0     # scene units/s (world is 640m across at 0.1 scale)
+const _SPEED_DEFAULT := 150.0    # m/s (the metric world is 25.6km across)
 const _SPEED_MIN := 2.0
-const _SPEED_MAX := 300.0
+const _SPEED_MAX := 2000.0
 const _SPEED_WHEEL_FACTOR := 1.25
 
 var _speed := _SPEED_DEFAULT
@@ -17,12 +17,17 @@ var _pitch := -0.9   # start looking down at the terrain
 var _looking := false
 
 func _ready() -> void:
+	# Same far-plane bump as the player camera: the metric world's horizon
+	# is far beyond Godot's 4km default.
+	far = 40000.0
 	rotation = Vector3(_pitch, _yaw, 0.0)
 
 ## Place the camera above a world (server-unit) position, looking down.
-func place_over(wx: float, wy: float, height_m: float = 60.0) -> void:
-	var ground := Protocol.terrain_height(wx, wy)
-	global_position = Vector3(wx * Protocol.WORLD_SCALE, ground + height_m, wy * Protocol.WORLD_SCALE)
+## `lift` is a scene-space height above the ground there — high enough by
+## default for a working overview of the surrounding chunks at metric scale.
+func place_over(wx: float, wy: float, lift: float = 300.0) -> void:
+	var ground := Protocol.terrain_height(wx, wy) * Protocol.HEIGHT_SCALE
+	global_position = Vector3(wx * Protocol.WORLD_SCALE, ground + lift, wy * Protocol.WORLD_SCALE)
 	rotation = Vector3(_pitch, _yaw, 0.0)
 
 ## The camera's position in world (server) units — feeds `TerrainStreamer`

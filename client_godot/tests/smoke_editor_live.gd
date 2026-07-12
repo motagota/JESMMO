@@ -24,6 +24,7 @@ var _h_preview := 0.0
 var _stroke: Array = []
 var _tile_in := false
 var _delta_in := false
+var _op_id := "" # our accepted stroke's server-minted id, for the cleanup revert
 
 func _fail(message: String) -> void:
 	print("SMOKE_FAIL: %s" % message)
@@ -62,6 +63,11 @@ func _initialize() -> void:
 				return
 			_delta_in = true
 			_maybe_paint())
+	_net.terrain_edit_ack.connect(func(op_id, _brush): _op_id = op_id)
+	_net.terrain_revert_ack.connect(func(_op):
+		if _phase == "cleanup":
+			print("SMOKE_OK: live editor round-trip (login, stream, preview, edit_op, patch reconcile, fresh-session persistence, guest rejection) works — and the test stroke was reverted, leaving the dev DB clean")
+			quit(0))
 	_net.terrain_delta_patch.connect(func(tx, ty, revision, offsets):
 		_streamer.on_delta_patch(tx, ty, offsets)
 		if Vector2i(tx, ty) == Vector2i(5, 5) and _phase == "awaiting_patch":
@@ -132,8 +138,12 @@ func _on_patch(revision: int) -> void:
 		if absf(got - 0.8) > 0.001:
 			_fail("fresh session decoded %.3fm at the center corner, want 0.8" % got)
 			return
-		print("SMOKE_OK: live editor round-trip (login, stream, preview, edit_op, patch reconcile, fresh-session persistence, guest rejection) works")
-		quit(0))
+		# All checks passed — revert our own stroke so the test leaves the
+		# dev DB the way it found it (and stays rerunnable: the (5,5)
+		# starts-unedited precondition above would fail a second run
+		# otherwise). SMOKE_OK prints on the revert ack.
+		_phase = "cleanup"
+		_net.send_terrain_revert_op(_op_id))
 	_net2.connect_to("ws://127.0.0.1:8766")
 
 func _process(delta: float) -> bool:

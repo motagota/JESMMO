@@ -62,6 +62,12 @@ var _was_open := false
 
 func connect_to(u: String) -> void:
     url = u
+    # Godot's default inbound buffer is 64KiB per frame — the one-time
+    # `terrain.data` backdrop (a (TERRAIN_RESOLUTION+1)^2 JSON heights array,
+    # ~700KB at resolution 192 on the 25.6km world) silently exceeds it and
+    # the client just never sees the message. Size generously; it's a cap,
+    # not an allocation.
+    _ws.inbound_buffer_size = 8 * 1024 * 1024
     var err := _ws.connect_to_url(url)
     if err != OK:
         push_error("[net] connect_to_url(%s) failed: %s" % [url, err])

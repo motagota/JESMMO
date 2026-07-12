@@ -103,14 +103,15 @@ func _initialize() -> void:
 			quit(1)
 			return
 
-	# Every mesh vertex's height must agree with terrain_height at that same
-	# world point -- the actual guarantee against "falling through": mesh
-	# and height-lookup can never disagree because they share one grid.
+	# Every mesh vertex's height must agree with terrain_height (scaled to
+	# scene Y) at that same world point -- the actual guarantee against
+	# "falling through": mesh and height-lookup can never disagree because
+	# they share one grid.
 	var mismatch := false
 	for v in verts:
 		var wx := v.x / Protocol.WORLD_SCALE
 		var wy := v.z / Protocol.WORLD_SCALE
-		var expected_y := Protocol.terrain_height(wx, wy)
+		var expected_y := Protocol.terrain_height(wx, wy) * Protocol.HEIGHT_SCALE
 		if absf(v.y - expected_y) > 0.01:
 			print("SMOKE_FAIL: mesh vertex at world (%f, %f) has y=%f but terrain_height says %f" % [wx, wy, v.y, expected_y])
 			mismatch = true

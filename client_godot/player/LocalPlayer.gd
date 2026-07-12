@@ -78,6 +78,9 @@ func _ready() -> void:
 
 	_camera = Camera3D.new()
 	_camera.position = Vector3(0, 0, _CAM_DISTANCE)
+	# The metric world is 25.6km across — Godot's default 4km far plane
+	# would clip the backdrop's distant hills to skybox.
+	_camera.far = 40000.0
 	_camera.current = true
 	_cam_pitch_node.add_child(_camera)
 

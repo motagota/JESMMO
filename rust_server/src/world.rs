@@ -260,7 +260,15 @@ pub struct BuildBoard {
 /// artifact's own internal tile/cell resolution (see [`loaded_terrain`]'s
 /// doc comment for why that decoupling is the whole point). Mirrored by the
 /// client's ground mesh — see `docs/protocol.md`'s `terrain.*` section.
-pub const TERRAIN_RESOLUTION: i32 = 48;
+///
+/// 384 keeps the backdrop at ~66m per cell on the 25600 world — twice the
+/// per-cell fidelity the original 6400 world had at 48 — so distant terrain
+/// (everything beyond the streamed fine-tile ring) reads as real hills
+/// with ridgelines, and together with the client's distance fog the
+/// fine-to-coarse transition stops reading as "leftover placeholder
+/// terrain". The one-time `terrain.data` message grows to (384+1)² ≈ 148k
+/// height samples (~1.5MB of JSON), still a single push at session start.
+pub const TERRAIN_RESOLUTION: i32 = 384;
 
 /// Where the baked terrain artifact (issue #56's terrain pipeline; produced
 /// by `terrain-bake`, see the repo-root `terrain.toml`) lives, unless

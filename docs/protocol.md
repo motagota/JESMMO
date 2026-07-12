@@ -95,21 +95,21 @@ Any client-supplied `player_id` is ignored — the gateway stamps the real one.
 
 ## The Capital (world content)
 
-The world is the authored **Capital** (`mmo::world::capital()`): a 6400×6400 space
-(~41 km², matching the design's ~40 km² target — see `MMO.md` §7) tiled into five
+The world is the authored **Capital** (`mmo::world::capital()`): a 25600×25600
+space (~655 km², the near-full-extent Brisbane DEM — world v3) tiled into five
 named districts in a plus/cross layout, all **safe** (zero-PvP) for Phase 1. The
 capital starts **empty** — authored ground, roads, and a plot grid, but no
 buildings; structures appear only as players complete build orders / build homes.
 
 | district | id | region `[x0,x1) × [y0,y1)` | notes |
 |---|---|---|---|
-| Market District | `market` | `[0,1600) × [0,6400)` | west band |
-| Starter Suburbs | `suburbs` | `[4800,6400) × [0,6400)` | east band; starter plot grid (12×20 = 240 plots) |
-| Civic Centre | `civic` | `[1600,4800) × [1600,4800)` | centre; town centre + first build-order board |
-| Craftworks Quarter | `craftworks` | `[1600,4800) × [0,1600)` | north band |
-| Old Quarter | `old_quarter` | `[1600,4800) × [4800,6400)` | south band |
+| Starter Suburbs | `suburbs` | `[0,6400) × [0,25600)` | west band; starter plot grid (12×20 = 240 plots) |
+| Market District | `market` | `[19200,25600) × [0,25600)` | east band (reaches the river mouth / bay) |
+| Civic Centre | `civic` | `[6400,19200) × [6400,19200)` | centre; town centre + first build-order board |
+| Craftworks Quarter | `craftworks` | `[6400,19200) × [0,6400)` | north band |
+| Old Quarter | `old_quarter` | `[6400,19200) × [19200,25600)` | south band |
 
-- **Town centre / spawn:** world centre `(3200, 3200)`, inside the Civic Centre.
+- **Town centre / spawn:** world centre `(12800, 12800)`, inside the Civic Centre.
 - **District identity is keyed to world geometry**, not to sim processes. The
   gateway labels each shard's `district` and `safety` in `partition` by its region
   centre, so the capital stays correctly named however the world is split/merged.

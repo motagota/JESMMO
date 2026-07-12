@@ -164,10 +164,21 @@ func _process(_delta: float) -> void:
 func _build_environment() -> void:
     var env := Environment.new()
     env.background_mode = Environment.BG_COLOR
-    env.background_color = Color(0.04, 0.05, 0.07)
+    # A hazy daylight sky the distance fog can fade into — with the old
+    # near-black background, fogged terrain read as a wrong-looking dark
+    # band instead of receding into the sky.
+    env.background_color = Color(0.55, 0.63, 0.72)
     env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
     env.ambient_light_color = Color(0.5, 0.5, 0.55)
     env.ambient_light_energy = 0.6
+    # Distance haze over the metric 25.6km world: barely-there inside the
+    # streamed fine-tile ring (~18% at 2km), heavy by the far districts
+    # (~70% at 12km), so the coarse backdrop beyond the ring reads as
+    # terrain-in-the-haze rather than a smooth low-poly leftover.
+    env.fog_enabled = true
+    env.fog_light_color = Color(0.55, 0.63, 0.72) # match the sky: fade into it
+    env.fog_density = 0.0001
+    env.fog_sun_scatter = 0.05
     var we := WorldEnvironment.new()
     we.environment = env
     add_child(we)
@@ -209,6 +220,12 @@ func _wire_signals() -> void:
     # sit on the ground instead of staying buried under streamed-in or
     # brush-raised terrain.
     _streamer.terrain_changed.connect(_world.refresh_plot_markers)
+    # Hide the coarse backdrop under every resident fine tile: its ~66m
+    # interpolation runs metres above the true 5m ground in places, and
+    # without the mask it renders as a phantom surface swallowing the
+    # player wherever it wins the depth test.
+    _streamer.terrain_changed.connect(func():
+        _world.update_backdrop_mask(_streamer.resident_tiles()))
     # Hand-authored edit layer (terrain editing #72): requested alongside
     # each tile, composited onto the tile's heights before/at mesh build.
     _net.terrain_delta_data.connect(func(tx, ty, has_delta, offsets): _streamer.on_delta_data(tx, ty, has_delta, offsets))

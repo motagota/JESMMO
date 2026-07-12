@@ -2943,7 +2943,11 @@ impl Proxy {
                 chunk_ty: ty,
                 bake_hash: manifest.bake_hash.clone(),
                 revision: 0, // assigned by the DB on save
-                height_delta: Some(hd),
+                // A pruned-to-empty delta (an op that nets to zero) persists
+                // as "no height layer" (NULL blob), per SparseHeightDelta::
+                // is_empty's contract — otherwise the chunk answers
+                // `has_delta: true` forever with all-zero offsets.
+                height_delta: if hd.is_empty() { None } else { Some(hd) },
                 provenance: terrain_common::Provenance {
                     // The durable character id — the identity the rest of the
                     // codebase uses for "who did this".
@@ -3049,7 +3053,10 @@ impl Proxy {
                 chunk_ty: ty,
                 bake_hash: manifest.bake_hash.clone(),
                 revision: 0, // assigned by the DB on save
-                height_delta: Some(hd),
+                // A fully-reverted chunk persists as "no height layer" (NULL
+                // blob) so it round-trips as unedited (`has_delta: false`) —
+                // same rule as the edit path above.
+                height_delta: if hd.is_empty() { None } else { Some(hd) },
                 provenance: terrain_common::Provenance {
                     author: terrain_common::AuthorId::Editor(pid.to_string()),
                     edited_at,
@@ -6547,7 +6554,10 @@ mod tests {
         recv_until(&mut ws, "terrain.revert_ack").await;
 
         let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
-        assert!(stored.height_delta.unwrap().is_empty(), "durably back to procedural");
+        assert!(
+            stored.height_delta.is_none(),
+            "durably back to procedural: a fully-reverted chunk stores NO height layer, so it round-trips as has_delta: false"
+        );
 
         drop(ws);
     }
@@ -6581,7 +6591,7 @@ mod tests {
         recv_until(&mut ws, "terrain.edit_error").await;
 
         let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
-        assert!(stored.height_delta.unwrap().is_empty(), "rejected reverts change nothing");
+        assert!(stored.height_delta.is_none(), "rejected reverts change nothing (still no height layer)");
 
         // Non-editor revert: role-gated like edit_op.
         let email = format!("scrub2_{}@t.test", Uuid::new_v4().simple());
@@ -6625,8 +6635,8 @@ mod tests {
 
         let a = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
         let b = db.load_terrain_delta(1, 0, side).await.unwrap().unwrap();
-        assert!(a.height_delta.unwrap().is_empty(), "chunk (0,0) back to procedural");
-        assert!(b.height_delta.unwrap().is_empty(), "chunk (1,0) back to procedural");
+        assert!(a.height_delta.is_none(), "chunk (0,0) back to procedural (no height layer)");
+        assert!(b.height_delta.is_none(), "chunk (1,0) back to procedural (no height layer)");
 
         drop(ws);
     }

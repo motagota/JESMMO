@@ -136,15 +136,31 @@ const STORAGE_RANGE := 60.0
 const BOARD_RANGE := 60.0
 
 # --- movement / render tuning (mirrors client.html and the server) ------------
-## World units sent per move tick, per axis. The server applies the delta directly.
-const MOVE_STEP := 10
-## Seconds between move sends (~16/s) — a steady cadence, not OS key-repeat.
-const MOVE_TICK := 0.06
-## Accept the server's position as a correction only past this drift (units), so
+## World units sent per move tick, per axis. The server applies the delta
+## directly. 1 unit/tick at 8 ticks/s = 8 m/s — a human run, now that world
+## units are real metres (the old 10-per-60ms was ~167 m/s: authored for the
+## abstract pre-DEM world, and it read fine only because the avatar was a
+## 22m giant at the old scene scale).
+const MOVE_STEP := 1
+## Seconds between move sends (8/s) — a steady cadence, not OS key-repeat.
+const MOVE_TICK := 0.125
+## Accept the server's position as a correction only past this drift (metres), so
 ## local prediction stays smooth between authoritative snapshots.
-const RECONCILE_DRIFT := 30.0
-## World units -> metres in the 3D scene (6400-unit world -> 640 m).
-const WORLD_SCALE := 0.1
+const RECONCILE_DRIFT := 5.0
+## World units -> scene units. The v3 world is a real-metres DEM, and the
+## avatar, props, and camera rig are all authored in metres too — so the
+## scene is simply metric (1 unit = 1 m). The old 0.1 compressed the world
+## 10x horizontally, which made every metre-authored prop a 10x giant
+## relative to the terrain.
+const WORLD_SCALE := 1.0
+## Stylistic vertical exaggeration for terrain relief. 1.0 = true-to-scale
+## (real-world relief tends to read flat through a game camera); mild
+## exaggeration keeps hills legible. NOTE: before world v3 the scene Y was
+## raw unscaled metres — an implicit 10x that read fine on the old ±10m
+## synthetic terrain but turned the real 430m Brisbane relief into needles.
+const HEIGHT_EXAGGERATION := 1.5
+## Terrain metres -> scene Y units (the vertical counterpart of WORLD_SCALE).
+const HEIGHT_SCALE := WORLD_SCALE * HEIGHT_EXAGGERATION
 
 ## Server-authored heightmap (`terrain.data`, #54) — purely cosmetic, the
 ## server has no other concept of height/elevation, and every gameplay
@@ -363,7 +379,7 @@ static func _tile_height(wx: float, wy: float) -> float:
 ## passing "how high above the ground" keeps working unchanged, automatically
 ## following the terrain everywhere it's placed.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
-    return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy), wy * WORLD_SCALE)
+    return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy) * HEIGHT_SCALE, wy * WORLD_SCALE)
 
 ## Camera-ray → ground world point, shared by every mouse-on-terrain picker
 ## (build placement, mayor roads, the editor brush). Two passes: intersect the
@@ -384,7 +400,7 @@ static func pick_ground(camera: Camera3D, mouse: Vector2, fallback: Vector2) -> 
         return fallback
     var hit := origin + dir * t
     var approx := Vector2(hit.x / WORLD_SCALE, hit.z / WORLD_SCALE)
-    var ground_y := terrain_height(approx.x, approx.y)
+    var ground_y := terrain_height(approx.x, approx.y) * HEIGHT_SCALE
     var t2 := (ground_y - origin.y) / dir.y
     if t2 <= 0.0:
         return fallback

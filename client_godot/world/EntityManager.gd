@@ -215,7 +215,10 @@ func _solid(c: Color) -> StandardMaterial3D:
 	return m
 
 ## Attach a billboarded text label floating `height` metres above an entity mesh,
-## drawn on top (no depth test) so it's readable from across the district.
+## drawn on top (no depth test) so a nearby rise or wall never hides it — but
+## distance-culled with a fade: fixed_size + no_depth_test at metric world
+## scale otherwise means every label renders full-size through kilometres of
+## terrain from anywhere on the map.
 func _add_label(parent: Node3D, text: String, height: float, color: Color) -> void:
 	var label := Label3D.new()
 	label.text = text
@@ -226,4 +229,7 @@ func _add_label(parent: Node3D, text: String, height: float, color: Color) -> vo
 	label.modulate = color
 	label.outline_size = 8
 	label.position = Vector3(0, height, 0)
+	label.visibility_range_end = 350.0
+	label.visibility_range_end_margin = 50.0
+	label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
 	parent.add_child(label)

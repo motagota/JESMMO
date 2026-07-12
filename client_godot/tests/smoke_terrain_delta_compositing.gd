@@ -84,9 +84,11 @@ func _initialize() -> void:
 	streamer.tile_requested.connect(func(tx, ty): tile_reqs.append(Vector2i(tx, ty)))
 	streamer.delta_requested.connect(func(tx, ty): delta_reqs.append(Vector2i(tx, ty)))
 
-	streamer.on_player_position(3520.0, 3520.0) # tile (5,5) -> full 3x3 ring
-	if tile_reqs.size() != 9 or delta_reqs.size() != 9:
-		_fail("expected 9 tile + 9 delta requests, got %d + %d" % [tile_reqs.size(), delta_reqs.size()])
+	streamer.on_player_position(3520.0, 3520.0) # tile (5,5) -> full unclamped ring
+	var ring_side: int = 2 * streamer._LOAD_RADIUS_TILES + 1
+	var want_reqs := ring_side * ring_side
+	if tile_reqs.size() != want_reqs or delta_reqs.size() != want_reqs:
+		_fail("expected %d tile + %d delta requests, got %d + %d" % [want_reqs, want_reqs, tile_reqs.size(), delta_reqs.size()])
 		return
 	if not delta_reqs.has(Vector2i(5, 5)):
 		_fail("delta request ring missing the center chunk")

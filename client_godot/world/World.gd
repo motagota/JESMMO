@@ -10,8 +10,8 @@ class_name World
 extends Node3D
 
 const _GROUND_Y := 0.0
-const _TILE_Y := 0.02   # plot/home markers sit just above the ground to avoid z-fighting
-const _ROAD_Y := 0.05
+const _TILE_Y := 0.2    # plot/home markers sit just above the ground to avoid z-fighting
+const _ROAD_Y := 0.5
 const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
 const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
 const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
@@ -21,6 +21,35 @@ const _PLOT_EDGE_STEP := 10.0     # plot edges are short; sample tighter than ro
 var world_size := 6400.0
 
 var _ground: MeshInstance3D
+## Backdrop residency mask (one texel per terrain tile): white = a fine
+## streamed tile is resident there, and the backdrop shader discards its
+## fragments so the coarse mesh can never poke up through the real 5m
+## ground (its ~66m interpolation runs metres above/below the true surface
+## in places — enough to bury the player). Updated from
+## `update_backdrop_mask` every time the streamer's resident set changes.
+var _mask_image: Image
+var _mask_texture: ImageTexture
+
+## The backdrop's material: standard vertex-color look (white base, painted
+## per-vertex albedo, roughness 1) plus the residency-mask discard above.
+## Environment fog still applies — spatial shaders get it unless disabled.
+const _GROUND_SHADER := "
+shader_type spatial;
+uniform sampler2D tile_mask : filter_nearest;
+uniform vec2 world_extent = vec2(1.0, 1.0);
+varying vec3 wpos;
+void vertex() {
+    wpos = VERTEX; // the mesh sits at the origin, so object space == world space
+}
+void fragment() {
+    if (texture(tile_mask, wpos.xz / world_extent).r > 0.5) {
+        discard;
+    }
+    ALBEDO = COLOR.rgb;
+    ROUGHNESS = 1.0;
+}
+"
+
 var _tiles_root := Node3D.new()
 var _roads_root := Node3D.new()
 var _home_root := Node3D.new()
@@ -103,6 +132,20 @@ func _maybe_build_static() -> void:
     _build_ground()
     _build_town_centre_marker()
     _built_static = true
+
+## Repaint the backdrop's residency mask from the streamer's current
+## resident-tile set (`TerrainStreamer.resident_tiles()`), wired to
+## `terrain_changed` in Main — cheap enough (a tiles_x*tiles_y byte image)
+## to just redo wholesale on every change.
+func update_backdrop_mask(resident: Dictionary) -> void:
+    if _mask_image == null:
+        return
+    _mask_image.fill(Color.BLACK)
+    for coord in resident:
+        if coord.x >= 0 and coord.x < _mask_image.get_width() \
+                and coord.y >= 0 and coord.y < _mask_image.get_height():
+            _mask_image.set_pixel(coord.x, coord.y, Color.WHITE)
+    _mask_texture.update(_mask_image)
 
 func _rebuild_tiles() -> void:
     for child in _tiles_root.get_children():
@@ -192,16 +235,24 @@ func _build_ground() -> void:
 
     _ground = MeshInstance3D.new()
     _ground.mesh = st.commit()
-    var mat := StandardMaterial3D.new()
-    # White base + vertex_color_use_as_albedo so the final albedo *is* each
-    # vertex's painted color exactly (no multiply-darkening surprises).
-    mat.albedo_color = Color.WHITE
-    mat.vertex_color_use_as_albedo = true
-    # The two triangles per cell (p00,p11,p10 / p00,p01,p11) already wind so
-    # generated normals point up (verified by tests/smoke_terrain.gd) — no
-    # need for BaseMaterial3D.CULL_DISABLED, which was a previous defensive
-    # guess and, by letting backfaces render, is the likely cause of the
-    # washed-out/"translucent" look reported against the noise-based terrain.
+    # Shader material: same vertex-color-as-albedo look the old
+    # StandardMaterial gave (the two triangles per cell already wind so
+    # generated normals point up — verified by tests/smoke_terrain.gd), plus
+    # the residency-mask discard so the backdrop never renders underneath a
+    # resident fine tile (see `_mask_image`'s comment). Offline harnesses
+    # that never learned the tile-grid shape get a 1x1 never-discard mask.
+    var shader := Shader.new()
+    shader.code = _GROUND_SHADER
+    var mat := ShaderMaterial.new()
+    mat.shader = shader
+    var mask_w := maxi(Protocol._tiles_x, 1)
+    var mask_h := maxi(Protocol._tiles_y, 1)
+    _mask_image = Image.create(mask_w, mask_h, false, Image.FORMAT_L8)
+    _mask_image.fill(Color.BLACK)
+    _mask_texture = ImageTexture.create_from_image(_mask_image)
+    mat.set_shader_parameter("tile_mask", _mask_texture)
+    mat.set_shader_parameter("world_extent",
+        Vector2(world_size, world_size) * Protocol.WORLD_SCALE)
     _ground.material_override = mat
     add_child(_ground)
 
@@ -368,6 +419,13 @@ func show_home_plot(bounds: Dictionary) -> void:
     label.modulate = gold
     label.outline_size = 8
     label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 15.0)
+    # Homing aid, so it carries further than fixture labels — but still
+    # distance-culled: fixed_size + no_depth_test would otherwise render it
+    # full-size through 20km of terrain (the HUD's home arrow covers the
+    # cross-map case).
+    label.visibility_range_end = 2000.0
+    label.visibility_range_end_margin = 200.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
     _home_root.add_child(label)
 
 ## Rebuild every *other* plot from a `plot.district` roster (#18) — the
@@ -443,6 +501,12 @@ func _add_signpost(cx: float, cy: float, owner_name: String, tint: Color) -> voi
     label.modulate = Color(1, 1, 1)
     label.outline_size = 4
     label.position = Protocol.w2v(cx, cy, 2.15)
+    # A signpost name only matters standing near the plot — cull it early
+    # (fixed_size + no_depth_test would otherwise show every owner's name
+    # across the whole district, through terrain).
+    label.visibility_range_end = 150.0
+    label.visibility_range_end_margin = 30.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
     _plots_root.add_child(label)
 
 ## Just the floating district-name label now — safety is painted straight
@@ -466,6 +530,8 @@ func _add_district_label(z: Dictionary) -> void:
     label.text = district_name
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
     label.modulate = Color(0.7, 1.0, 0.8) if safe else Color(1.0, 0.7, 0.7)
-    label.pixel_size = 0.05
-    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 6.0)
+    # World-sized on purpose (not fixed_size) so it reads as far-off signage;
+    # sized for the metric scene, where a district band is kilometres across.
+    label.pixel_size = 0.5
+    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 60.0)
     _tiles_root.add_child(label)

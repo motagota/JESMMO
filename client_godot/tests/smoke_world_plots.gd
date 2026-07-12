@@ -59,7 +59,7 @@ func _initialize() -> void:
 	var y_min := INF
 	var y_max := -INF
 	for v in fill.mesh.get_faces():
-		var ground: float = Protocol.terrain_height(v.x / Protocol.WORLD_SCALE, v.z / Protocol.WORLD_SCALE)
+		var ground: float = Protocol.terrain_height(v.x / Protocol.WORLD_SCALE, v.z / Protocol.WORLD_SCALE) * Protocol.HEIGHT_SCALE
 		worst = maxf(worst, absf(v.y - ground - (world._TILE_Y + 0.005)))
 		y_min = minf(y_min, v.y)
 		y_max = maxf(y_max, v.y)
@@ -68,8 +68,11 @@ func _initialize() -> void:
 		print("SMOKE_FAIL: fill vertex strays %f from the terrain surface" % worst)
 		quit(1)
 		return
-	if y_max - y_min < 0.5:
-		print("SMOKE_FAIL: fill is flat (y span %f) over sloped terrain" % (y_max - y_min))
+	# The authored slope rises 1.6m across the 80-unit plot; the fill must
+	# span most of that (in world metres, so the check is independent of
+	# Protocol.HEIGHT_SCALE's stylistic exaggeration).
+	if (y_max - y_min) / Protocol.HEIGHT_SCALE < 1.2:
+		print("SMOKE_FAIL: fill is flat (y span %fm world) over sloped terrain" % ((y_max - y_min) / Protocol.HEIGHT_SCALE))
 		quit(1)
 		return
 

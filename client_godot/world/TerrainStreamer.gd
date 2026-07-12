@@ -12,16 +12,19 @@ class_name TerrainStreamer
 extends Node3D
 
 ## Tiles kept resident in each direction around the player's current tile —
-## 1 = a 3x3 ring (1920m across at the production bake's 640m tiles), ample
-## for the tight third-person camera while keeping at most 9 tile meshes
-## (~98k triangles each) alive.
-const _LOAD_RADIUS_TILES := 1
+## 3 = a 7x7 ring (4480m across at the production bake's 640m tiles). The
+## original 3x3 ring read fine on the 6.4km world but felt like a postage
+## stamp on the 25.6km v3 world (everything past ~1km dropped to the coarse
+## backdrop); 49 resident tile meshes (~33k triangles each) is fine on any
+## GPU that can run the game at all, and together with the distance fog it
+## pushes the fine-to-backdrop transition out to where the haze hides it.
+const _LOAD_RADIUS_TILES := 3
 ## Scene-space lift applied to streamed tile meshes only (not to gameplay
 ## heights — `Protocol.terrain_height` stays bias-free): the fine mesh and
 ## the coarse backdrop disagree slightly wherever the backdrop's ~133m grid
 ## cuts corners the 5m data resolves, and without a bias the two surfaces
 ## z-fight wherever they nearly coincide. Same trick as `World._TILE_Y`.
-const _STREAM_Y_BIAS := 0.03
+const _STREAM_Y_BIAS := 0.3
 
 ## Emitted when the ring wants a tile that isn't loaded or in flight —
 ## `Main.gd` wires this to `NetworkClient.send_terrain_tile_request`.
@@ -67,6 +70,12 @@ func set_context(zones: Array, world_size: float) -> void:
     _zones = zones
     _world_size = world_size
 
+## The currently-resident tile set (Vector2i -> MeshInstance3D) — read-only
+## use by `World.update_backdrop_mask`, which hides the coarse backdrop
+## under every chunk that has real fine geometry.
+func resident_tiles() -> Dictionary:
+    return _loaded
+
 ## The set of tile coords a player at tile `center` should have resident: a
 ## `(2*radius+1)^2` window clamped to the tile grid. Pure/static so the
 ## streaming policy is testable without a scene tree or network. Returned as
@@ -109,6 +118,7 @@ func on_tile_data(tx: int, ty: int, heights: PackedFloat32Array) -> void:
     var offsets: PackedFloat32Array = _delta_offsets.get(coord, PackedFloat32Array())
     Protocol.apply_terrain_tile(tx, ty, _composited(heights, offsets))
     _loaded[coord] = _build_tile_mesh(coord)
+    _mark_edge_neighbors_dirty(coord)
     terrain_changed.emit()
 
 ## A chunk's delta answer arrived (`NetworkClient.terrain_delta_data`).
@@ -203,6 +213,22 @@ func _recomposite(coord: Vector2i) -> void:
     var offsets: PackedFloat32Array = _delta_offsets.get(coord, PackedFloat32Array())
     Protocol.apply_terrain_tile(coord.x, coord.y, _composited(base, offsets))
     _dirty[coord] = true
+    _mark_edge_neighbors_dirty(coord)
+
+## Queue the loaded -x/-y/diagonal neighbors of `coord` for a mesh rebuild.
+## A tile mesh's far (+x/+y) edge vertices resolve through `terrain_height`
+## into the NEXT tile's footprint, so a neighbor built before `coord`'s
+## heights were registered baked the coarse backdrop into that edge — a
+## visible seam wall wherever the backdrop's ~133m grid disagrees with the
+## 5m data. Rebuilding them once `coord`'s heights are in place closes the
+## seam; tiles on the ring's rim (no loaded far neighbor) keep their
+## backdrop-stitched edge until the ring grows past them, which is the
+## LOD transition working as intended.
+func _mark_edge_neighbors_dirty(coord: Vector2i) -> void:
+    for n in [Vector2i(coord.x - 1, coord.y), Vector2i(coord.x, coord.y - 1),
+            Vector2i(coord.x - 1, coord.y - 1)]:
+        if _loaded.has(n):
+            _dirty[n] = true
 
 ## Element-wise `heights + offsets` into a NEW array — always a duplicate,
 ## even with empty offsets, because the result becomes the chunk's private
