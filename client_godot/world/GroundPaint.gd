@@ -69,8 +69,13 @@ static func safety_color_at(zones: Array, world_size: float, wx: float, wy: floa
 ## and falls back to the coarse backdrop grid otherwise -- this function
 ## doesn't need to know or care which.
 static func ground_color_at(zones: Array, world_size: float, wx: float, wy: float) -> Color:
+    return ground_color_at_height(zones, world_size, wx, wy, Protocol.terrain_height(wx, wy))
+
+## Same, with the corner's height supplied by the caller — the mesh builders
+## already hold every corner's height, and skipping 16k+ redundant
+## `terrain_height` lookups per tile matters for stream-in stutter.
+static func ground_color_at_height(zones: Array, world_size: float, wx: float, wy: float, h: float) -> Color:
     var safety := safety_color_at(zones, world_size, wx, wy)
-    var h := Protocol.terrain_height(wx, wy)
     if h >= _RIVER_FADE_M:
         return safety
     var t := 1.0 if h <= _RIVER_FULL_M else (_RIVER_FADE_M - h) / (_RIVER_FADE_M - _RIVER_FULL_M)

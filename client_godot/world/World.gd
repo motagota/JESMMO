@@ -93,10 +93,19 @@ func _ready() -> void:
 func refresh_plot_markers() -> void:
     _plots_dirty = true
 
-func _process(_delta: float) -> void:
-    if not _plots_dirty:
+## Marker/road redraw cadence: during tile stream-in bursts terrain_changed
+## fires nearly every frame, and redrawing the whole 240-plot roster each
+## time is real stutter — 4Hz tracks the ground closely enough for static
+## overlay meshes.
+const _PLOT_REFRESH_INTERVAL := 0.25
+var _plot_refresh_cooldown := 0.0
+
+func _process(delta: float) -> void:
+    _plot_refresh_cooldown = maxf(_plot_refresh_cooldown - delta, 0.0)
+    if not _plots_dirty or _plot_refresh_cooldown > 0.0:
         return
     _plots_dirty = false
+    _plot_refresh_cooldown = _PLOT_REFRESH_INTERVAL
     if not _home_bounds.is_empty():
         show_home_plot(_home_bounds)
     if not _roster_plots.is_empty():
@@ -192,49 +201,78 @@ func district_rect_at(wx: float, wy: float) -> Dictionary:
 ## to disagree with the surface it's tinting, since they're the same
 ## vertices.
 func _build_ground() -> void:
-    var st := SurfaceTool.new()
-    st.begin(Mesh.PRIMITIVE_TRIANGLES)
     # Must match the server's grid exactly (#54) — the client's height
     # lookups (`Protocol.terrain_height`) interpolate the *same* received
     # grid, so a mismatched local resolution here would make the rendered
     # surface disagree with where entities are placed on it.
+    #
+    # Built as an indexed ArrayMesh with per-corner (not per-emitted-vertex)
+    # positions/colors and analytic heightfield normals — the SurfaceTool
+    # version of this was a ~1.1s freeze at session start. Triangles are
+    # (p00,p10,p11)/(p00,p11,p01), the same split `Protocol._planar_height`
+    # interpolates and the same upward winding tests/smoke_terrain.gd checks.
     var resolution := Protocol.terrain_resolution()
     var step := world_size / float(resolution)
+    var side := resolution + 1
+    var n := side * side
+    var positions := PackedVector3Array()
+    var colors := PackedColorArray()
+    var normals := PackedVector3Array()
+    var scene_y := PackedFloat32Array()
+    positions.resize(n)
+    colors.resize(n)
+    normals.resize(n)
+    scene_y.resize(n)
+    var ws := Protocol.WORLD_SCALE
+    var hs := Protocol.HEIGHT_SCALE
+    for gy in range(side):
+        var wy := gy * step
+        var row := gy * side
+        for gx in range(side):
+            var i := row + gx
+            var wx := gx * step
+            var h := Protocol.terrain_height(wx, wy)
+            scene_y[i] = h * hs
+            positions[i] = Vector3(wx * ws, scene_y[i] + _GROUND_Y, wy * ws)
+            colors[i] = GroundPaint.ground_color_at_height(_zones, world_size, wx, wy, h)
+    var span := step * ws
+    for gy in range(side):
+        var row := gy * side
+        for gx in range(side):
+            var i := row + gx
+            var xl: float = scene_y[i - 1] if gx > 0 else scene_y[i]
+            var xr: float = scene_y[i + 1] if gx < resolution else scene_y[i]
+            var zu: float = scene_y[i - side] if gy > 0 else scene_y[i]
+            var zd: float = scene_y[i + side] if gy < resolution else scene_y[i]
+            var span_x := span * 2.0 if gx > 0 and gx < resolution else span
+            var span_z := span * 2.0 if gy > 0 and gy < resolution else span
+            normals[i] = Vector3(-(xr - xl) / span_x, 1.0, -(zd - zu) / span_z).normalized()
+    var indices := PackedInt32Array()
+    indices.resize(resolution * resolution * 6)
+    var k := 0
     for gy in range(resolution):
         for gx in range(resolution):
-            var wx0 := gx * step
-            var wy0 := gy * step
-            var wx1 := wx0 + step
-            var wy1 := wy0 + step
-            var p00 := Protocol.w2v(wx0, wy0, _GROUND_Y)
-            var p10 := Protocol.w2v(wx1, wy0, _GROUND_Y)
-            var p01 := Protocol.w2v(wx0, wy1, _GROUND_Y)
-            var p11 := Protocol.w2v(wx1, wy1, _GROUND_Y)
-            var c00 := GroundPaint.ground_color_at(_zones, world_size, wx0, wy0)
-            var c10 := GroundPaint.ground_color_at(_zones, world_size, wx1, wy0)
-            var c01 := GroundPaint.ground_color_at(_zones, world_size, wx0, wy1)
-            var c11 := GroundPaint.ground_color_at(_zones, world_size, wx1, wy1)
-            # Two triangles per grid cell, wound so generated normals point
-            # up (verified by tests/smoke_terrain.gd — Godot's generate_normals
-            # gave downward-facing normals for the opposite order). Color is
-            # set immediately before each vertex it belongs to.
-            st.set_color(c00)
-            st.add_vertex(p00)
-            st.set_color(c10)
-            st.add_vertex(p10)
-            st.set_color(c11)
-            st.add_vertex(p11)
-            st.set_color(c00)
-            st.add_vertex(p00)
-            st.set_color(c11)
-            st.add_vertex(p11)
-            st.set_color(c01)
-            st.add_vertex(p01)
-    st.index() # share vertices between adjacent triangles for smooth normals
-    st.generate_normals()
+            var i00 := gy * side + gx
+            var i11 := i00 + side + 1
+            indices[k] = i00
+            indices[k + 1] = i00 + 1      # i10
+            indices[k + 2] = i11
+            indices[k + 3] = i00
+            indices[k + 4] = i11
+            indices[k + 5] = i00 + side   # i01
+            k += 6
+
+    var arrays := []
+    arrays.resize(Mesh.ARRAY_MAX)
+    arrays[Mesh.ARRAY_VERTEX] = positions
+    arrays[Mesh.ARRAY_NORMAL] = normals
+    arrays[Mesh.ARRAY_COLOR] = colors
+    arrays[Mesh.ARRAY_INDEX] = indices
+    var ground_mesh := ArrayMesh.new()
+    ground_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 
     _ground = MeshInstance3D.new()
-    _ground.mesh = st.commit()
+    _ground.mesh = ground_mesh
     # Shader material: same vertex-color-as-albedo look the old
     # StandardMaterial gave (the two triangles per cell already wind so
     # generated normals point up — verified by tests/smoke_terrain.gd), plus

@@ -242,18 +242,45 @@ static func _composited(heights: PackedFloat32Array, offsets: PackedFloat32Array
         out[i] += offsets[i]
     return out
 
+## Cap on mesh rebuilds per flush: keeps a worst-case flush to ~20ms (a
+## rebuild measures ~10ms) instead of letting a big dirty set (brush drag
+## across many chunks, stream-in burst) stall one frame.
+const _REBUILDS_PER_FLUSH := 2
+
+## True when a +x/+y/diagonal neighbor is still in flight — rebuilding now
+## would just get re-dirtied (and rebuilt again) the moment it arrives, so
+## the flush below defers this tile. It stays in `_dirty`, and the arrival's
+## `_mark_edge_neighbors_dirty` keeps it there; when the last neighbor lands
+## the deferral clears and one final rebuild does the job. This collapsed a
+## measured 48-rebuild storm during initial ring stream-in.
+func _far_neighbor_pending(coord: Vector2i) -> bool:
+    return _pending.has(Vector2i(coord.x + 1, coord.y)) \
+        or _pending.has(Vector2i(coord.x, coord.y + 1)) \
+        or _pending.has(Vector2i(coord.x + 1, coord.y + 1))
+
 ## Batched dirty-mesh rebuilds (see `_dirty`'s comment).
 func _process(delta: float) -> void:
     _rebuild_cooldown = maxf(_rebuild_cooldown - delta, 0.0)
     if _dirty.is_empty() or _rebuild_cooldown > 0.0:
         return
     _rebuild_cooldown = _REBUILD_INTERVAL
-    for coord in _dirty:
-        if _loaded.has(coord):
-            _loaded[coord].queue_free()
-            _loaded[coord] = _build_tile_mesh(coord)
-    _dirty.clear()
-    terrain_changed.emit()
+    var budget := _REBUILDS_PER_FLUSH
+    var rebuilt := false
+    for coord in _dirty.keys():
+        if budget == 0:
+            break
+        if not _loaded.has(coord):
+            _dirty.erase(coord)
+            continue
+        if _far_neighbor_pending(coord):
+            continue # deferred — see _far_neighbor_pending
+        _dirty.erase(coord)
+        _loaded[coord].queue_free()
+        _loaded[coord] = _build_tile_mesh(coord)
+        rebuilt = true
+        budget -= 1
+    if rebuilt:
+        terrain_changed.emit()
 
 func _refresh_ring() -> void:
     var wanted := wanted_tiles_for(_current_tile, _LOAD_RADIUS_TILES, Protocol._tiles_x, Protocol._tiles_y)
@@ -290,56 +317,96 @@ func _refresh_ring() -> void:
     if unloaded:
         terrain_changed.emit()
 
-## Build one tile's ground mesh: the same per-vertex height (`Protocol.w2v`)
-## + paint (`GroundPaint`) + triangle winding as `World._build_ground`, just
-## over one tile's footprint at native cell size instead of the whole world
-## at backdrop resolution. Corner positions/colors are precomputed per
-## corner (side^2) rather than per emitted vertex (6 per cell) since
-## GroundPaint lookups dominate the build cost.
+## The tile-grid index buffer — identical for every tile (same side, same
+## triangle split), so it's built once and shared. Triangles are
+## (p00,p10,p11)/(p00,p11,p01), matching `Protocol._planar_height`'s split
+## and `World._build_ground`'s upward winding.
+var _tile_index_cache := PackedInt32Array()
+
+func _tile_indices(tile_size: int, side: int) -> PackedInt32Array:
+    if _tile_index_cache.size() == tile_size * tile_size * 6:
+        return _tile_index_cache
+    var indices := PackedInt32Array()
+    indices.resize(tile_size * tile_size * 6)
+    var k := 0
+    for gy in range(tile_size):
+        for gx in range(tile_size):
+            var i00 := gy * side + gx
+            var i11 := i00 + side + 1
+            indices[k] = i00
+            indices[k + 1] = i00 + 1      # i10
+            indices[k + 2] = i11
+            indices[k + 3] = i00
+            indices[k + 4] = i11
+            indices[k + 5] = i00 + side   # i01
+            k += 6
+    _tile_index_cache = indices
+    return indices
+
+## Build one tile's ground mesh. Perf-critical (a ~72ms SurfaceTool version
+## of this was the client's stutter): indexed ArrayMesh with a shared index
+## buffer, corner heights read straight from the tile's own composited
+## registry entry (identical to `terrain_height` there, minus 16k dictionary
+## lookups) — except the far +x/+y edges, which go through `terrain_height`
+## so they resolve from the neighbor's data, or stitch to the backdrop at
+## the ring's rim (see `_mark_edge_neighbors_dirty`). Normals are analytic
+## heightfield normals (central differences), which are both cheaper and
+## smoother than face-accumulated ones.
 func _build_tile_mesh(coord: Vector2i) -> MeshInstance3D:
     var tile_size := Protocol._tile_size
     var cell_m := Protocol._tile_cell_m
     var extent := Protocol.terrain_tile_extent_m()
     var side := tile_size + 1
+    var heights: PackedFloat32Array = Protocol._tiles.get(coord, PackedFloat32Array())
+    var n := side * side
     var positions := PackedVector3Array()
     var colors := PackedColorArray()
-    positions.resize(side * side)
-    colors.resize(side * side)
+    var normals := PackedVector3Array()
+    var scene_y := PackedFloat32Array()
+    positions.resize(n)
+    colors.resize(n)
+    normals.resize(n)
+    scene_y.resize(n)
+    var ws := Protocol.WORLD_SCALE
+    var hs := Protocol.HEIGHT_SCALE
     for gy in range(side):
+        var wy := coord.y * extent + gy * cell_m
+        var row := gy * side
         for gx in range(side):
+            var i := row + gx
             var wx := coord.x * extent + gx * cell_m
-            var wy := coord.y * extent + gy * cell_m
-            positions[gy * side + gx] = Protocol.w2v(wx, wy, _STREAM_Y_BIAS)
-            colors[gy * side + gx] = GroundPaint.ground_color_at(_zones, _world_size, wx, wy)
+            var h: float
+            if gx == tile_size or gy == tile_size or heights.is_empty():
+                h = Protocol.terrain_height(wx, wy)
+            else:
+                h = heights[i]
+            scene_y[i] = h * hs
+            positions[i] = Vector3(wx * ws, scene_y[i] + _STREAM_Y_BIAS, wy * ws)
+            colors[i] = GroundPaint.ground_color_at_height(_zones, _world_size, wx, wy, h)
+    var step := cell_m * ws
+    for gy in range(side):
+        var row := gy * side
+        for gx in range(side):
+            var i := row + gx
+            var xl: float = scene_y[i - 1] if gx > 0 else scene_y[i]
+            var xr: float = scene_y[i + 1] if gx < tile_size else scene_y[i]
+            var zu: float = scene_y[i - side] if gy > 0 else scene_y[i]
+            var zd: float = scene_y[i + side] if gy < tile_size else scene_y[i]
+            var span_x := step * 2.0 if gx > 0 and gx < tile_size else step
+            var span_z := step * 2.0 if gy > 0 and gy < tile_size else step
+            normals[i] = Vector3(-(xr - xl) / span_x, 1.0, -(zd - zu) / span_z).normalized()
 
-    var st := SurfaceTool.new()
-    st.begin(Mesh.PRIMITIVE_TRIANGLES)
-    for gy in range(tile_size):
-        for gx in range(tile_size):
-            var i00 := gy * side + gx
-            var i10 := gy * side + gx + 1
-            var i01 := (gy + 1) * side + gx
-            var i11 := (gy + 1) * side + gx + 1
-            # Same winding as World._build_ground (p00,p10,p11 / p00,p11,p01)
-            # so generated normals point up and Protocol._planar_height's
-            # triangle split matches the rendered surface exactly.
-            st.set_color(colors[i00])
-            st.add_vertex(positions[i00])
-            st.set_color(colors[i10])
-            st.add_vertex(positions[i10])
-            st.set_color(colors[i11])
-            st.add_vertex(positions[i11])
-            st.set_color(colors[i00])
-            st.add_vertex(positions[i00])
-            st.set_color(colors[i11])
-            st.add_vertex(positions[i11])
-            st.set_color(colors[i01])
-            st.add_vertex(positions[i01])
-    st.index()
-    st.generate_normals()
+    var arrays := []
+    arrays.resize(Mesh.ARRAY_MAX)
+    arrays[Mesh.ARRAY_VERTEX] = positions
+    arrays[Mesh.ARRAY_NORMAL] = normals
+    arrays[Mesh.ARRAY_COLOR] = colors
+    arrays[Mesh.ARRAY_INDEX] = _tile_indices(tile_size, side)
+    var mesh := ArrayMesh.new()
+    mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 
     var mi := MeshInstance3D.new()
-    mi.mesh = st.commit()
+    mi.mesh = mesh
     var mat := StandardMaterial3D.new()
     mat.albedo_color = Color.WHITE
     mat.vertex_color_use_as_albedo = true
