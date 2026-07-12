@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::delta::SparseHeightDelta;
 use crate::manifest::{Manifest, ManifestError};
 use crate::tile::{decode_height, nav, HeightTile, MetaTile, TileError};
 
@@ -134,6 +135,20 @@ impl Terrain {
     /// `terrain_height`) — a caller that needs to distinguish "no data" from
     /// "genuinely at sea level" should check tile presence itself.
     pub fn sample_height(&self, x: f32, y: f32) -> f32 {
+        self.sample_height_with_delta(x, y, None)
+    }
+
+    /// [`Terrain::sample_height`] with a hand-authored edit layer composited
+    /// in (terrain-editing epic #72): each of the 4 corner samples gets its
+    /// [`SparseHeightDelta`] offset added *before* bilinear interpolation, so
+    /// an edited slope interpolates exactly like a baked one.
+    ///
+    /// `delta` must be the delta **for the tile that owns `(x, y)`** — the
+    /// caller resolves ownership via [`Terrain::tile_at`] and looks up its
+    /// own per-chunk delta store. `None` (or an empty delta) composes to
+    /// bit-exactly the base height: absent blocks contribute a literal
+    /// `+ 0.0` to each corner.
+    pub fn sample_height_with_delta(&self, x: f32, y: f32, delta: Option<&SparseHeightDelta>) -> f32 {
         let (tx, ty, gxf, gyf) = self.locate(x, y);
         let Some(tile) = self.height_tiles.get(&(tx, ty)) else { return 0.0 };
         // Corner index one-past-the-last-cell is the shared/duplicated edge
@@ -145,10 +160,17 @@ impl Terrain {
         let fy = gyf - gy0 as f32;
 
         let (min, max) = (self.manifest.height_min_m, self.manifest.height_max_m);
-        let h00 = decode_height(tile.get(gx0, gy0), min, max);
-        let h10 = decode_height(tile.get(gx0 + 1, gy0), min, max);
-        let h01 = decode_height(tile.get(gx0, gy0 + 1), min, max);
-        let h11 = decode_height(tile.get(gx0 + 1, gy0 + 1), min, max);
+        let corner = |gx: usize, gy: usize| -> f32 {
+            let base = decode_height(tile.get(gx, gy), min, max);
+            match delta {
+                Some(d) => base + d.offset_m(gx, gy),
+                None => base,
+            }
+        };
+        let h00 = corner(gx0, gy0);
+        let h10 = corner(gx0 + 1, gy0);
+        let h01 = corner(gx0, gy0 + 1);
+        let h11 = corner(gx0 + 1, gy0 + 1);
         let h0 = h00 + (h10 - h00) * fx;
         let h1 = h01 + (h11 - h01) * fx;
         h0 + (h1 - h0) * fy
@@ -299,6 +321,52 @@ mod tests {
             (1, 0),
             "world's far edge clamps to the last valid tile, not a nonexistent one past it"
         );
+    }
+
+    #[test]
+    fn empty_or_absent_delta_composes_to_exactly_the_base_height() {
+        let terrain = golden_fixture();
+        let empty = SparseHeightDelta::new(5);
+        for &(x, y) in &[(0.0f32, 0.0f32), (5.0, 5.0), (35.0, 20.0), (40.0, 40.0), (80.0, 40.0)] {
+            let base = terrain.sample_height(x, y);
+            // Bit-exact, not epsilon-close: unedited terrain must not drift.
+            assert_eq!(terrain.sample_height_with_delta(x, y, None), base);
+            assert_eq!(terrain.sample_height_with_delta(x, y, Some(&empty)), base);
+        }
+    }
+
+    #[test]
+    fn delta_offsets_composite_through_bilinear_interpolation() {
+        let terrain = golden_fixture();
+        // Raise all 4 corners of tile 0's first cell (world x,y in [0,10])
+        // by exactly 1m (100cm): every interior point of that cell must read
+        // exactly 1m above base, and points outside it must be untouched.
+        let mut d = SparseHeightDelta::new(5);
+        for (gx, gy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            d.set_offset_cm(gx, gy, 100);
+        }
+        let raised = terrain.sample_height_with_delta(5.0, 5.0, Some(&d));
+        assert!((raised - (5.0 + 1.0)).abs() < 0.01, "cell interior should be base+1m, got {raised}");
+        let corner = terrain.sample_height_with_delta(0.0, 0.0, Some(&d));
+        assert!((corner - 1.0).abs() < 0.01, "corner should be 0+1m, got {corner}");
+        // (15, 5) is in the next cell over: corners (1,0)/(1,1) are raised
+        // but (2,0)/(2,1) aren't, so at its midpoint the lift is half.
+        let half = terrain.sample_height_with_delta(15.0, 5.0, Some(&d));
+        assert!((half - (15.0 + 0.5)).abs() < 0.01, "edited-slope midpoint should be base+0.5m, got {half}");
+        // Well clear of the edit: no effect at all.
+        let far = terrain.sample_height_with_delta(35.0, 20.0, Some(&d));
+        assert_eq!(far, terrain.sample_height(35.0, 20.0));
+    }
+
+    #[test]
+    fn negative_delta_lowers_terrain() {
+        let terrain = golden_fixture();
+        let mut d = SparseHeightDelta::new(5);
+        for (gx, gy) in [(2, 2), (3, 2), (2, 3), (3, 3)] {
+            d.set_offset_cm(gx, gy, -250); // dig 2.5m
+        }
+        let dug = terrain.sample_height_with_delta(25.0, 25.0, Some(&d));
+        assert!((dug - (25.0 - 2.5)).abs() < 0.01, "expected base-2.5m, got {dug}");
     }
 
     #[test]

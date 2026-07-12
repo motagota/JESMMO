@@ -17,7 +17,7 @@
 //   * Zone and admin connections stay unbounded: they are trusted internal peers
 //     with a single consumer each, where head-of-line stalling is not a DoS vector.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,7 @@ use uuid::Uuid;
 use mmo::auth;
 use mmo::persistence::Db;
 use mmo::protocol::{self, PROTOCOL_VERSION};
+use mmo::util::{dist2, now_secs, random_heading};
 
 /// Spawn point for a brand-new character: the capital's town centre (the spawn
 /// anchor authored in `mmo::world`). Kept in sync via `spawn_matches_town_centre`.
@@ -51,15 +52,27 @@ const SPAWN_HP: i32 = 100;
 const MAYOR_EMAIL: &str = "mayor@capital.town";
 const MAYOR_PASSWORD: &str = "mayor12345";
 
+/// The one seeded editor login (terrain editing, epic #72) — same pattern as
+/// the mayor: a normal account with `role = 'editor'`, gating `terrain.edit_op`.
+const EDITOR_EMAIL: &str = "editor@capital.town";
+const EDITOR_PASSWORD: &str = "editor12345";
+
+/// Hard cap on a corner's TOTAL accumulated height offset (base ± 50m) — the
+/// server-side safety envelope for `terrain.edit_op`, checked against the
+/// stored delta plus the op's increment. A per-op increment beyond this is
+/// rejected outright too. Lives here as a const rather than a runtime TOML
+/// because the server loads no runtime TOML today (brush *feel* params are
+/// client-side, `config/editor/brushes.toml`); promote to config if Phase 2
+/// player terraforming ever needs per-scope caps.
+const EDIT_MAX_OFFSET_CM: i32 = 5_000;
+/// Cells per op cap: a 64m-radius brush at 5m cells touches ~660 corners, and
+/// even a stroke dragged across a whole 129-corner chunk is ~16k — anything
+/// bigger is malformed or abusive, not a real stroke.
+const EDIT_MAX_CELLS_PER_OP: usize = 16_384;
+
 /// Must be within this of a build board — or a build order's own placement — to
 /// contribute to it.
 const BOARD_RANGE: i32 = 60;
-
-fn dist2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
-    let dx = (ax - bx) as i64;
-    let dy = (ay - by) as i64;
-    dx * dx + dy * dy
-}
 
 /// Squared distance from `(px,py)` to the segment `(x0,y0)-(x1,y1)` (clamped
 /// projection), for gating proximity to a segment-shaped structure like a road.
@@ -88,14 +101,6 @@ const RENT_GRACE_SECS: i64 = 2 * 24 * 3600;
 const RENT_WARNING_LEAD_SECS: i64 = 24 * 3600;
 /// How often the rent ticker checks every owned plot.
 const RENT_TICK_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Current unix time in seconds. Used by the rent ticker (#14).
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Outbound queue for a trusted internal peer (zone / admin). Unbounded is fine:
 /// single consumer, head-of-line stalls are not an attack surface.
@@ -129,8 +134,7 @@ const SPLIT_COOLDOWN: Duration = Duration::from_secs(8);
 const AUTOSCALE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Edge length of the (square) world. Zones own rectangular sub-regions of it.
-/// Mirrors `mmo::world::WORLD_SIZE` / `zone_server.rs`'s copy — keep in sync.
-const WORLD_SIZE: i32 = 6400;
+use mmo::world::WORLD_SIZE;
 
 /// A half-open rectangular region of the world: [x0, x1) x [y0, y1).
 #[derive(Clone, Copy)]
@@ -226,8 +230,9 @@ struct ClientInfo {
     /// True when `player_id` is a durable character backed by the database, so its
     /// position is written back on flush/disconnect. Guests are ephemeral.
     persistent: bool,
-    /// Cached from the account at login (`"player"` or `"mayor"`) so gating
-    /// `mayor.build_create` doesn't need a DB round trip per message.
+    /// Cached from the account at login (`"player"`, `"mayor"`, or
+    /// `"editor"`) so gating `mayor.build_create` / `terrain.edit_op`
+    /// doesn't need a DB round trip per message.
     role: String,
 }
 
@@ -252,7 +257,8 @@ struct Identity {
     y: i32,
     hp: i32,
     persistent: bool,
-    /// `"player"` (default) or `"mayor"` — gates `mayor.build_create`.
+    /// `"player"` (default), `"mayor"` (gates `mayor.build_create`), or
+    /// `"editor"` (gates `terrain.edit_op`).
     role: String,
     /// A legacy/bot client may send a gameplay frame instead of authenticating;
     /// we treat it as a guest and carry that first frame so it isn't dropped.
@@ -311,6 +317,11 @@ struct Proxy {
     /// sampled from the already-periodic `persistence_flush`/rent-ticker writes
     /// rather than instrumenting every call site.
     db_write_latencies_ms: Mutex<VecDeque<u64>>,
+    /// Serializes `terrain.edit_op` application (terrain editing #72): each op
+    /// is a read-modify-write of its chunks' delta rows, and two concurrent
+    /// editors interleaving load/save would silently drop one's cells. Edits
+    /// are human-rate, so one async lock across the whole apply is plenty.
+    terrain_edit_lock: tokio::sync::Mutex<()>,
 }
 
 /// Cap on the rolling DB-latency sample window (#16) — recent-enough to be a
@@ -433,6 +444,7 @@ impl Proxy {
             capital: mmo::world::capital(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
+            terrain_edit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -2690,6 +2702,387 @@ impl Proxy {
         }));
     }
 
+    /// Answer `terrain.delta_request` with the chunk's hand-authored edit
+    /// layer (terrain-editing epic #72). Same client-pull, stateless posture
+    /// as `send_terrain_tile`, with one deliberate difference: an in-range
+    /// chunk **always** answers — `has_delta: false` when unedited — so the
+    /// client never has to distinguish "not answered yet" from "answered,
+    /// nothing here". Out-of-range requests stay silently ignored, exactly
+    /// like the tile path. A DB read failure (or db-less mode) answers
+    /// `has_delta: false` too: the client renders base terrain, which is
+    /// also what a corrupt-row chunk should degrade to.
+    async fn send_terrain_delta(&self, pid: &str, tx: i32, ty: i32) {
+        let manifest = self.capital.terrain.manifest();
+        if tx < 0 || ty < 0 || tx >= manifest.tiles.0 as i32 || ty >= manifest.tiles.1 as i32 {
+            return;
+        }
+        let side = manifest.tile_size as usize + 1;
+        let delta = match &self.db {
+            Some(db) => db.load_terrain_delta(tx, ty, side).await.ok().flatten(),
+            None => None,
+        };
+        match delta.and_then(|d| d.height_delta.map(|hd| (d.revision, hd))) {
+            Some((revision, height_delta)) => {
+                let bytes = height_delta.encode(1);
+                self.push_to_player(pid, json!({
+                    "type": "terrain.delta_data",
+                    "tx": tx,
+                    "ty": ty,
+                    "has_delta": true,
+                    "revision": revision,
+                    "encoding": "delta_v1",
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                }));
+            }
+            None => {
+                self.push_to_player(pid, json!({
+                    "type": "terrain.delta_data",
+                    "tx": tx,
+                    "ty": ty,
+                    "has_delta": false,
+                }));
+            }
+        }
+    }
+
+    /// The authoritative *effective* ground height at `(x, y)`: baked base
+    /// plus any hand-authored height delta (terrain editing #72/#80) — the
+    /// one blessed door for any future server-side gameplay consumer of
+    /// elevation (fall damage, water simulation, 3D-aware movement
+    /// validation, Phase 2 terraforming rules...).
+    ///
+    /// The #80 audit found there is **no such consumer today**: movement
+    /// validation is pure 2D clamping (`zone_server::clamp_world`/
+    /// `clamp_region`), there is no server-side ground-snap (the client
+    /// snaps visually via `Protocol.w2v`), and `is_walkable`/`nav_flags`
+    /// have no production call sites. The only production `sample_height`
+    /// caller is `send_terrain`'s coarse backdrop, which deliberately stays
+    /// **base**: it's sent once per session as a static payload, so baking
+    /// deltas in would leave it stale after the first live edit — and the
+    /// client only renders deltas on streamed chunks anyway (the backdrop
+    /// is only visible outside the streamed ring, where an edit is beneath
+    /// LOD relevance).
+    ///
+    /// Composition happens live (a per-call delta load), so there is no
+    /// cache and therefore nothing to invalidate or debounce — the question
+    /// #80 told us to check before building machinery. If a per-tick
+    /// consumer ever appears, add an in-memory delta cache maintained by
+    /// `apply_terrain_edit_op`/`apply_terrain_revert_op` (both already
+    /// serialize under `terrain_edit_lock`) and invalidate there.
+    #[allow(dead_code)] // no gameplay consumer yet — exercised by tests; see the doc above
+    async fn composited_ground_height(&self, x: f32, y: f32) -> f32 {
+        let terrain = &self.capital.terrain;
+        let Some(db) = &self.db else {
+            return terrain.sample_height(x, y); // db-less mode: base only
+        };
+        let (tx, ty) = terrain.tile_at(x, y);
+        let side = terrain.manifest().tile_size as usize + 1;
+        let delta = db
+            .load_terrain_delta(tx, ty, side)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.height_delta);
+        terrain.sample_height_with_delta(x, y, delta.as_ref())
+    }
+
+    /// Push one message to every connected client — the fanout for
+    /// `terrain.delta_patch`, which any client with the chunk streamed in
+    /// cares about regardless of zone/district (terrain is world-scoped;
+    /// clients that don't hold the chunk ignore the patch).
+    fn broadcast_to_all(&self, msg: Value) {
+        let text = msg.to_string();
+        let clients = self.clients.lock().unwrap();
+        for info in clients.values() {
+            self.push_to_client(info, Message::Text(text.clone()));
+        }
+    }
+
+    /// Apply `terrain.edit_op` (terrain editing #72): one editor brush
+    /// stroke's worth of corner-height increments, validated and written to
+    /// the authoritative delta store, then patched out to every client.
+    ///
+    /// Cells arrive in **world corner coordinates** (`[[cx, cy, d_cm], ..]`)
+    /// rather than per-chunk ones: a chunk's last corner row/column is the
+    /// same world data as its neighbor's first (the tile edge-duplication
+    /// convention), and making the *server* own that fanout means a stroke
+    /// across a seam can never leave the two chunks disagreeing — the exact
+    /// hazard `terrain-common`'s module doc flags for the write path. One op
+    /// therefore touches 1–4 chunks (4 only at a chunk corner).
+    ///
+    /// Validation is all-or-nothing: any out-of-bounds corner, over-cap
+    /// increment, or over-cap accumulated offset rejects the whole op with
+    /// `terrain.edit_error` before anything is saved (mirrors
+    /// `apply_mayor_build_create`'s explicit-error posture — an editor needs
+    /// to see *why*, unlike the silent gameplay no-ops).
+    async fn apply_terrain_edit_op(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "terrain.edit_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may edit terrain");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("terrain editing requires persistence (no database)");
+            return;
+        };
+        let Some(cells_json) = data.get("cells").and_then(|v| v.as_array()) else {
+            reject("malformed op: missing cells");
+            return;
+        };
+        if cells_json.is_empty() || cells_json.len() > EDIT_MAX_CELLS_PER_OP {
+            reject("malformed op: empty or oversized cells array");
+            return;
+        }
+        let manifest = self.capital.terrain.manifest();
+        let ts = manifest.tile_size as i64;
+        let (max_cx, max_cy) = (ts * manifest.tiles.0 as i64, ts * manifest.tiles.1 as i64);
+        let mut cells: Vec<(i64, i64, i32)> = Vec::with_capacity(cells_json.len());
+        for c in cells_json {
+            let (Some(cx), Some(cy), Some(d_cm)) = (
+                c.get(0).and_then(|v| v.as_i64()),
+                c.get(1).and_then(|v| v.as_i64()),
+                c.get(2).and_then(|v| v.as_i64()),
+            ) else {
+                reject("malformed op: each cell must be [cx, cy, d_cm]");
+                return;
+            };
+            if cx < 0 || cx > max_cx || cy < 0 || cy > max_cy {
+                reject("corner out of world bounds");
+                return;
+            }
+            if d_cm.abs() > EDIT_MAX_OFFSET_CM as i64 {
+                reject("increment exceeds the per-corner offset cap");
+                return;
+            }
+            cells.push((cx, cy, d_cm as i32));
+        }
+
+        // Group per chunk, duplicating shared-edge corners into every chunk
+        // that stores them: `cx/ts` owns the corner, and a corner exactly on
+        // an interior seam (`cx % ts == 0`) is also its left/top neighbor's
+        // last column/row.
+        let mut per_chunk: BTreeMap<(i32, i32), Vec<(usize, usize, i32)>> = BTreeMap::new();
+        for &(cx, cy, d) in &cells {
+            let mut txs = vec![(cx / ts).min(manifest.tiles.0 as i64 - 1)];
+            if cx % ts == 0 && cx > 0 && cx / ts <= manifest.tiles.0 as i64 - 1 {
+                txs.push(cx / ts - 1);
+            }
+            let mut tys = vec![(cy / ts).min(manifest.tiles.1 as i64 - 1)];
+            if cy % ts == 0 && cy > 0 && cy / ts <= manifest.tiles.1 as i64 - 1 {
+                tys.push(cy / ts - 1);
+            }
+            for &tx in &txs {
+                for &ty in &tys {
+                    let (gx, gy) = ((cx - tx * ts) as usize, (cy - ty * ts) as usize);
+                    per_chunk.entry((tx as i32, ty as i32)).or_default().push((gx, gy, d));
+                }
+            }
+        }
+
+        // Read-modify-write under the edit lock: build every chunk's updated
+        // delta in memory first (so a cap violation rejects the whole op with
+        // nothing saved), then persist and broadcast. Along the way, capture
+        // each touched block's PRE-edit content for the undo log (whole
+        // 512-byte blocks; `None` = the block didn't exist, revert deletes
+        // it — the design doc's inverse-blocks tradeoff).
+        let _guard = self.terrain_edit_lock.lock().await;
+        let side = manifest.tile_size as usize + 1;
+        let mut updated: Vec<((i32, i32), terrain_common::SparseHeightDelta)> = Vec::new();
+        let mut prev_blocks: Vec<(i32, i32, i64, Option<Vec<u8>>)> = Vec::new();
+        for (&(tx, ty), chunk_cells) in &per_chunk {
+            let mut hd = match db.load_terrain_delta(tx, ty, side).await {
+                Ok(existing) => existing
+                    .and_then(|d| d.height_delta)
+                    .unwrap_or_else(|| terrain_common::SparseHeightDelta::new(side)),
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.edit_op: loading delta ({tx},{ty}) failed: {e}");
+                    reject("storage error loading the chunk's delta");
+                    return;
+                }
+            };
+            let mut captured: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for &(gx, gy, _) in chunk_cells {
+                let idx = hd.block_index_for(gx, gy);
+                if captured.insert(idx) {
+                    prev_blocks.push((tx, ty, idx as i64, hd.block_bytes(idx)));
+                }
+            }
+            for &(gx, gy, d) in chunk_cells {
+                let total = hd.offset_cm(gx, gy) as i32 + d;
+                if total.abs() > EDIT_MAX_OFFSET_CM {
+                    reject("accumulated offset would exceed the per-corner cap");
+                    return;
+                }
+                hd.set_offset_cm(gx, gy, total as i16);
+            }
+            hd.prune_zero_blocks();
+            updated.push(((tx, ty), hd));
+        }
+        let edited_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Log the op + ack its id to the author BEFORE the patches, so the
+        // client's history UI knows the stroke's id when they arrive.
+        let op_id = Uuid::new_v4().to_string();
+        let brush = data.get("brush").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author = terrain_common::AuthorId::Editor(pid.to_string());
+        if let Err(e) = db.log_terrain_edit_op(&op_id, &author.to_string(), &brush, edited_at, &prev_blocks).await {
+            eprintln!("[Proxy] terrain.edit_op: logging op failed: {e}");
+            reject("storage error logging the op");
+            return;
+        }
+        self.push_to_player(pid, json!({"type": "terrain.edit_ack", "op_id": op_id, "brush": brush}));
+        for ((tx, ty), hd) in updated {
+            let blob = hd.encode(1);
+            let delta = terrain_common::TerrainDelta {
+                chunk_tx: tx,
+                chunk_ty: ty,
+                bake_hash: manifest.bake_hash.clone(),
+                revision: 0, // assigned by the DB on save
+                // A pruned-to-empty delta (an op that nets to zero) persists
+                // as "no height layer" (NULL blob), per SparseHeightDelta::
+                // is_empty's contract — otherwise the chunk answers
+                // `has_delta: true` forever with all-zero offsets.
+                height_delta: if hd.is_empty() { None } else { Some(hd) },
+                provenance: terrain_common::Provenance {
+                    // The durable character id — the identity the rest of the
+                    // codebase uses for "who did this".
+                    author: terrain_common::AuthorId::Editor(pid.to_string()),
+                    edited_at,
+                },
+            };
+            match db.save_terrain_delta(&delta).await {
+                Ok(revision) => {
+                    self.broadcast_to_all(json!({
+                        "type": "terrain.delta_patch",
+                        "tx": tx,
+                        "ty": ty,
+                        "revision": revision,
+                        "encoding": "delta_v1",
+                        "data_b64": base64::engine::general_purpose::STANDARD.encode(&blob),
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.edit_op: saving delta ({tx},{ty}) failed: {e}");
+                    reject("storage error saving the chunk's delta");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Apply `terrain.revert_op` (terrain-editing undo): restore every block
+    /// the op touched to its logged pre-op content, wholesale. Editor-gated
+    /// like `terrain.edit_op`; an unknown or already-reverted op id rejects
+    /// with `terrain.edit_error` (the DB claim in `take_revertable_edit_op`
+    /// is the double-revert guard, atomic even across racing reverts).
+    /// Whole-block restore means an out-of-order revert can clobber a later
+    /// overlapping op — the documented tradeoff; clients offer undo-last.
+    async fn apply_terrain_revert_op(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "terrain.edit_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may edit terrain");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("terrain editing requires persistence (no database)");
+            return;
+        };
+        let Some(op_id) = data.get("op_id").and_then(|v| v.as_str()).map(str::to_string) else {
+            reject("malformed revert: missing op_id");
+            return;
+        };
+        let _guard = self.terrain_edit_lock.lock().await;
+        let rows = match db.take_revertable_edit_op(&op_id).await {
+            Ok(Some(rows)) => rows,
+            Ok(None) => {
+                reject("unknown or already-reverted op");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[Proxy] terrain.revert_op: claiming {op_id} failed: {e}");
+                reject("storage error claiming the op");
+                return;
+            }
+        };
+        // Group the snapshots per chunk and write each chunk's blocks back.
+        let mut per_chunk: BTreeMap<(i32, i32), Vec<(i64, Option<Vec<u8>>)>> = BTreeMap::new();
+        for (tx, ty, idx, prev) in rows {
+            per_chunk.entry((tx, ty)).or_default().push((idx, prev));
+        }
+        let manifest = self.capital.terrain.manifest();
+        let side = manifest.tile_size as usize + 1;
+        let edited_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for ((tx, ty), blocks) in per_chunk {
+            let mut hd = match db.load_terrain_delta(tx, ty, side).await {
+                Ok(existing) => existing
+                    .and_then(|d| d.height_delta)
+                    .unwrap_or_else(|| terrain_common::SparseHeightDelta::new(side)),
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.revert_op: loading delta ({tx},{ty}) failed: {e}");
+                    reject("storage error loading the chunk's delta");
+                    return;
+                }
+            };
+            for (idx, prev) in blocks {
+                match prev {
+                    Some(bytes) => {
+                        if hd.set_block_bytes(idx as usize, &bytes).is_err() {
+                            eprintln!("[Proxy] terrain.revert_op: corrupt snapshot for op {op_id} block {idx}");
+                            reject("corrupt pre-edit snapshot for this op");
+                            return;
+                        }
+                    }
+                    None => hd.remove_block(idx as usize),
+                }
+            }
+            hd.prune_zero_blocks();
+            let blob = hd.encode(1);
+            let delta = terrain_common::TerrainDelta {
+                chunk_tx: tx,
+                chunk_ty: ty,
+                bake_hash: manifest.bake_hash.clone(),
+                revision: 0, // assigned by the DB on save
+                // A fully-reverted chunk persists as "no height layer" (NULL
+                // blob) so it round-trips as unedited (`has_delta: false`) —
+                // same rule as the edit path above.
+                height_delta: if hd.is_empty() { None } else { Some(hd) },
+                provenance: terrain_common::Provenance {
+                    author: terrain_common::AuthorId::Editor(pid.to_string()),
+                    edited_at,
+                },
+            };
+            match db.save_terrain_delta(&delta).await {
+                Ok(revision) => {
+                    self.broadcast_to_all(json!({
+                        "type": "terrain.delta_patch",
+                        "tx": tx,
+                        "ty": ty,
+                        "revision": revision,
+                        "encoding": "delta_v1",
+                        "data_b64": base64::engine::general_purpose::STANDARD.encode(&blob),
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[Proxy] terrain.revert_op: saving delta ({tx},{ty}) failed: {e}");
+                    reject("storage error saving the chunk's delta");
+                    return;
+                }
+            }
+        }
+        self.push_to_player(pid, json!({"type": "terrain.revert_ack", "op_id": op_id}));
+    }
+
     /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
     /// caller's own plot. Silent no-op otherwise (no error protocol surface).
     async fn apply_set_respawn(&self, pid: &str, bed_id: &str) {
@@ -3091,6 +3484,29 @@ impl Proxy {
                         self.send_terrain_tile(&player_id, tx, ty);
                         continue;
                     }
+                    // `terrain.delta_request` (terrain editing #72): the chunk's
+                    // hand-authored edit layer — client-pull and stateless like
+                    // `terrain.tile_request`, but an in-range chunk always
+                    // answers (`has_delta: false` when unedited).
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.delta_request") {
+                        let tx = data.get("tx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        let ty = data.get("ty").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                        self.send_terrain_delta(&player_id, tx, ty).await;
+                        continue;
+                    }
+                    // `terrain.edit_op` (terrain editing #72) is role- and
+                    // bounds-checked with no live-position dependency — same
+                    // direct-answer reasoning as `mayor.build_create`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.edit_op") {
+                        self.apply_terrain_edit_op(&player_id, data).await;
+                        continue;
+                    }
+                    // `terrain.revert_op` (terrain-editing undo): same
+                    // role-gated, no-live-position reasoning as edit_op.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("terrain.revert_op") {
+                        self.apply_terrain_revert_op(&player_id, data).await;
+                        continue;
+                    }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
                     // mine?), not live position, so it's answered directly too.
                     if data.get("type").and_then(|v| v.as_str()) == Some("home.set_respawn") {
@@ -3384,15 +3800,6 @@ fn persistent_identity(ch: mmo::persistence::Character, role: String) -> Identit
     }
 }
 
-/// A random 8-direction heading (never standing still), for the internal bots.
-fn random_heading() -> (i32, i32) {
-    let dirs = [
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (1, 1), (1, -1), (-1, 1), (-1, -1),
-    ];
-    dirs[rand::thread_rng().gen_range(0..dirs.len())]
-}
-
 /// One gateway-spawned load-test bot: connect to the client port and wander,
 /// re-rolling its heading occasionally. Aborting the task disconnects it.
 async fn run_internal_bot(uri: String) {
@@ -3462,6 +3869,12 @@ async fn main() {
                 Ok(()) => println!("[Proxy] Mayor account ready ({MAYOR_EMAIL})"),
                 Err(e) => println!("[Proxy] WARNING: mayor seeding failed: {e}"),
             }
+            // Seed the one editor login (terrain editing #72) the same way.
+            let editor_hash = auth::hash_password(EDITOR_PASSWORD).unwrap_or_default();
+            match db.seed_account_with_role(EDITOR_EMAIL, &editor_hash, "The Editor", tcx as i64, tcy as i64, SPAWN_HP as i64, now, "editor").await {
+                Ok(()) => println!("[Proxy] Editor account ready ({EDITOR_EMAIL})"),
+                Err(e) => println!("[Proxy] WARNING: editor seeding failed: {e}"),
+            }
             Some(Arc::new(db))
         }
         Err(e) => {
@@ -3515,6 +3928,7 @@ mod tests {
             capital: mmo::world::capital(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
+            terrain_edit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -4495,9 +4909,9 @@ mod tests {
     async fn partition_labels_districts() {
         let proxy = test_proxy();
         // Three shards, one per authored district band.
-        add_zone_region(&proxy, "z_market", Region { x0: 0, y0: 0, x1: 1600, y1: 6400 });
-        add_zone_region(&proxy, "z_civic", Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 });
-        add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
+        add_zone_region(&proxy, "z_suburbs", Region { x0: 0, y0: 0, x1: 6400, y1: 25600 });
+        add_zone_region(&proxy, "z_civic", Region { x0: 6400, y0: 6400, x1: 19200, y1: 19200 });
+        add_zone_region(&proxy, "z_market", Region { x0: 19200, y0: 0, x1: 25600, y1: 25600 });
 
         let snap = proxy.partition_snapshot();
         let by_zone = |zid: &str| -> String {
@@ -4840,7 +5254,7 @@ mod tests {
         ws.send(Message::Text(json!({
             "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
             "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
-            "x": 3200, "y": 3200, "x1": 3300, "y1": 3200,
+            "x": 12800, "y": 12800, "x1": 13200, "y1": 12800,
         }).to_string()))
         .await
         .unwrap();
@@ -4860,7 +5274,7 @@ mod tests {
         let db = Db::connect(dbf.url()).await.unwrap();
         db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
         let mayor_hash = auth::hash_password("h").unwrap();
-        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 12800, 12800, 100, 0)
             .await
             .unwrap();
 
@@ -4904,7 +5318,7 @@ mod tests {
         let (proxy, dbf, zone) = proxy_with_db().await;
         let db = Db::connect(dbf.url()).await.unwrap();
         let mayor_hash = auth::hash_password("h").unwrap();
-        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 3200, 3200, 100, 0)
+        db.seed_mayor_account(MAYOR_EMAIL, &mayor_hash, "The Mayor", 12800, 12800, 100, 0)
             .await
             .unwrap();
 
@@ -4918,7 +5332,7 @@ mod tests {
 
         // Well clear of the civic build board (town_centre - 30, +10) and of any
         // plot grid (only the suburbs has one) — plainly city land.
-        let (x0, y0, x1, y1) = (3200, 1000, 3300, 1000);
+        let (x0, y0, x1, y1) = (12800, 4000, 13200, 4000);
         mayor_ws.send(Message::Text(json!({
             "type": "mayor.build_create", "district": "civic", "kind": "dirt_path",
             "structure_kind": "dirt_road", "required_json": "{\"stone\":5}",
@@ -5461,7 +5875,7 @@ mod tests {
         // *centre* resolves to Civic (no plot grid there). Add a second zone
         // that actually covers the Suburbs, so a client tracked there sees
         // the real roster.
-        let _suburbs_zone = add_zone_region(&proxy, "z_suburbs", Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 });
+        let _suburbs_zone = add_zone_region(&proxy, "z_suburbs", Region { x0: 0, y0: 0, x1: 6400, y1: 25600 });
 
         let email1 = format!("landowner1_{}@t.test", Uuid::new_v4().simple());
         let mut ws1 = dial(&proxy).await;
@@ -5602,7 +6016,7 @@ mod tests {
         // crossed into the Suburbs.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 3200, y: 3200, hp: 100, gather: None },
+            EntityCache { x: 12800, y: 12800, hp: 100, gather: None },
         );
 
         ws.send(Message::Text(
@@ -5752,5 +6166,547 @@ mod tests {
         assert_eq!(msg["ty"].as_i64().unwrap(), 0);
 
         drop(ws);
+    }
+
+    // --- terrain editing (#75): terrain.delta_request / terrain.delta_data ----
+
+    /// Like `proxy_with_db`, but also hands back the Db so a test can seed
+    /// terrain-delta rows before the client asks for them.
+    async fn proxy_with_shared_db() -> (Arc<Proxy>, Arc<Db>, TestDb, FakeZone) {
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
+        let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
+        let zone = spawn_fake_zone().await;
+        proxy
+            .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        (proxy, db, dbf, zone)
+    }
+
+    /// An in-range chunk that has never been edited answers explicitly with
+    /// `has_delta: false` — never silence. The client must not have to
+    /// distinguish "not answered yet" from "answered, nothing here".
+    #[tokio::test]
+    async fn terrain_delta_request_unedited_chunk_answers_has_delta_false() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("editor1_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor1"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 4, "ty": 4}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+        assert_eq!(msg["tx"].as_i64().unwrap(), 4);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 4);
+        assert_eq!(msg["has_delta"].as_bool().unwrap(), false);
+        assert!(msg.get("data_b64").is_none(), "no payload for an unedited chunk");
+
+        drop(ws);
+    }
+
+    /// A chunk with a saved delta answers with base64-wrapped
+    /// `SparseHeightDelta::encode` bytes that decode back to exactly the
+    /// offsets that were stored, plus the row's revision.
+    #[tokio::test]
+    async fn terrain_delta_request_answers_with_the_saved_deltas_bytes() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        // Seed a delta for chunk (1, 2) straight through the persistence
+        // layer — the write path (#77) doesn't exist yet.
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let side = manifest.tile_size as usize + 1;
+        let mut hd = terrain_common::SparseHeightDelta::new(side);
+        hd.set_offset_cm(10, 10, 300);
+        hd.set_offset_cm(100, 60, -150);
+        let saved_rev = db
+            .save_terrain_delta(&terrain_common::TerrainDelta {
+                chunk_tx: 1,
+                chunk_ty: 2,
+                bake_hash: manifest.bake_hash.clone(),
+                revision: 0,
+                height_delta: Some(hd.clone()),
+                provenance: terrain_common::Provenance {
+                    author: terrain_common::AuthorId::Editor("test-editor".to_string()),
+                    edited_at: 0,
+                },
+            })
+            .await
+            .unwrap();
+
+        let email = format!("editor2_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 1, "ty": 2}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+
+        assert_eq!(msg["tx"].as_i64().unwrap(), 1);
+        assert_eq!(msg["ty"].as_i64().unwrap(), 2);
+        assert_eq!(msg["has_delta"].as_bool().unwrap(), true);
+        assert_eq!(msg["revision"].as_u64().unwrap(), saved_rev);
+        assert_eq!(msg["encoding"].as_str().unwrap(), "delta_v1");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(msg["data_b64"].as_str().unwrap())
+            .expect("data_b64 must be valid base64");
+        let decoded = terrain_common::SparseHeightDelta::decode(&bytes, side).expect("must decode as a SparseHeightDelta");
+        assert_eq!(decoded, hd, "streamed delta must match what was stored, block for block");
+
+        drop(ws);
+    }
+
+    /// An out-of-range delta request is silently ignored (same posture as
+    /// the tile path) — proven by racing it against an in-range request
+    /// that answers, so silence isn't mistaken for success.
+    #[tokio::test]
+    async fn terrain_delta_request_out_of_range_is_silently_ignored() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("editor3_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Editor3"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 9999, "ty": -3}).to_string()))
+            .await
+            .unwrap();
+        ws.send(Message::Text(json!({"type": "terrain.delta_request", "tx": 0, "ty": 0}).to_string())).await.unwrap();
+        let msg = recv_until(&mut ws, "terrain.delta_data").await;
+        assert_eq!(msg["tx"].as_i64().unwrap(), 0, "only the in-range request answered");
+        assert_eq!(msg["ty"].as_i64().unwrap(), 0);
+
+        drop(ws);
+    }
+
+    // --- terrain editing (#77): terrain.edit_op write path ---------------------
+
+    /// Seed + log in the editor account; returns its socket.
+    async fn dial_editor(proxy: &Arc<Proxy>, db: &Db) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        let hash = auth::hash_password("h").unwrap();
+        db.seed_account_with_role(EDITOR_EMAIL, &hash, "The Editor", 12800, 12800, 100, 0, "editor")
+            .await
+            .unwrap();
+        let mut ws = dial(proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "login", "email": EDITOR_EMAIL, "password": "h"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        assert_eq!(welcome["role"].as_str().unwrap(), "editor");
+        ws
+    }
+
+    /// A non-editor's `terrain.edit_op` is rejected with an explicit error
+    /// and persists nothing.
+    #[tokio::test]
+    async fn terrain_edit_op_is_rejected_for_non_editors() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("scrub_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Scrub"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 100]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "terrain.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("editor"));
+
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+        assert!(
+            db.load_terrain_delta(0, 0, side).await.unwrap().is_none(),
+            "a rejected op must persist nothing"
+        );
+
+        drop(ws);
+    }
+
+    /// A valid editor op persists (revision 1, then 2 on a second op), is
+    /// broadcast as `terrain.delta_patch` to every connected client, and the
+    /// patch bytes decode to the accumulated offsets.
+    #[tokio::test]
+    async fn terrain_edit_op_persists_bumps_revision_and_broadcasts() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // A second, regular client that should also receive the patch.
+        let email = format!("watcher_{}@t.test", Uuid::new_v4().simple());
+        let mut watcher_ws = dial(&proxy).await;
+        watcher_ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Watcher"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut watcher_ws, "welcome").await;
+
+        // World corner (10,10) is interior to chunk (0,0): exactly one patch.
+        editor_ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 250]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let patch = recv_until(&mut editor_ws, "terrain.delta_patch").await;
+        assert_eq!(patch["tx"].as_i64().unwrap(), 0);
+        assert_eq!(patch["ty"].as_i64().unwrap(), 0);
+        assert_eq!(patch["revision"].as_u64().unwrap(), 1);
+        let watcher_patch = recv_until(&mut watcher_ws, "terrain.delta_patch").await;
+        assert_eq!(watcher_patch["revision"].as_u64().unwrap(), 1, "the patch reaches every client");
+
+        // Second op on the same corner: accumulates and bumps the revision.
+        editor_ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 150]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let patch2 = recv_until(&mut editor_ws, "terrain.delta_patch").await;
+        assert_eq!(patch2["revision"].as_u64().unwrap(), 2);
+
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(patch2["data_b64"].as_str().unwrap())
+            .unwrap();
+        let hd = terrain_common::SparseHeightDelta::decode(&bytes, side).unwrap();
+        assert_eq!(hd.offset_cm(10, 10), 400, "250 + 150 accumulated");
+
+        // And it's durable: the persistence layer holds the same state.
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().expect("row exists");
+        assert_eq!(stored.revision, 2);
+        assert_eq!(stored.height_delta.unwrap().offset_cm(10, 10), 400);
+        assert!(
+            matches!(stored.provenance.author, terrain_common::AuthorId::Editor(_)),
+            "provenance records the editor"
+        );
+
+        drop(editor_ws);
+        drop(watcher_ws);
+    }
+
+    /// A corner exactly on a chunk seam (cx == tile_size) must be written
+    /// into BOTH chunks' deltas — the duplicated-edge convention — or the
+    /// two meshes would disagree along the seam.
+    #[tokio::test]
+    async fn terrain_edit_op_on_a_seam_updates_both_chunks() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let ts = manifest.tile_size as i64;
+        let side = manifest.tile_size as usize + 1;
+        // World corner (ts, 5) = chunk (0,0)'s last column = chunk (1,0)'s first.
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[ts, 5, 300]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Two patches, one per chunk, in either order.
+        let mut patched: Vec<(i64, i64)> = Vec::new();
+        for _ in 0..2 {
+            let patch = recv_until(&mut ws, "terrain.delta_patch").await;
+            let (tx, ty) = (patch["tx"].as_i64().unwrap(), patch["ty"].as_i64().unwrap());
+            patched.push((tx, ty));
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(patch["data_b64"].as_str().unwrap())
+                .unwrap();
+            let hd = terrain_common::SparseHeightDelta::decode(&bytes, side).unwrap();
+            // Chunk (0,0) stores the seam corner as its last column (gx =
+            // side-1); chunk (1,0) as its first (gx = 0). Same world data.
+            let gx = if tx == 0 { side - 1 } else { 0 };
+            assert_eq!(hd.offset_cm(gx, 5), 300, "chunk ({tx},{ty}) must store the seam offset");
+        }
+        patched.sort();
+        assert_eq!(patched, vec![(0, 0), (1, 0)], "one seam corner, two patched chunks");
+
+        // Durable on both sides too.
+        let a = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        let b = db.load_terrain_delta(1, 0, side).await.unwrap().unwrap();
+        assert_eq!(a.height_delta.unwrap().offset_cm(side - 1, 5), 300);
+        assert_eq!(b.height_delta.unwrap().offset_cm(0, 5), 300);
+
+        drop(ws);
+    }
+
+    /// Bounds and caps: out-of-world corners, over-cap increments, and an
+    /// accumulation that would breach the total cap are all rejected whole,
+    /// persisting nothing beyond what was already there.
+    #[tokio::test]
+    async fn terrain_edit_op_rejects_out_of_bounds_and_over_cap() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+
+        // Out of world bounds.
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[99999, 5, 100]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "terrain.edit_error").await;
+
+        // Single increment over the cap.
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 5001]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "terrain.edit_error").await;
+
+        // Two legal increments whose accumulation breaches the cap: the
+        // first lands, the second is rejected and changes nothing.
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 4000]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 4000]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "terrain.edit_error").await;
+
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        assert_eq!(stored.revision, 1, "the rejected op must not bump the revision");
+        assert_eq!(stored.height_delta.unwrap().offset_cm(10, 10), 4000, "first op only");
+
+        drop(ws);
+    }
+
+    // --- terrain editing (#79): undo via terrain.revert_op ---------------------
+
+    /// Undo-last restores exactly the pre-edit state, layer by layer: after
+    /// op1 (+300) then op2 (+150 same corner), reverting op2 lands back on
+    /// 300 exactly, and reverting op1 deletes the block outright (it didn't
+    /// exist before op1). Each revert broadcasts a patch and acks.
+    #[tokio::test]
+    async fn terrain_revert_op_restores_pre_edit_blocks_exactly() {
+        use base64::Engine;
+
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 300]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack1 = recv_until(&mut ws, "terrain.edit_ack").await;
+        let op1 = ack1["op_id"].as_str().unwrap().to_string();
+        assert_eq!(ack1["brush"].as_str().unwrap(), "raise");
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[10, 10, 150]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op2 = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        assert_ne!(op1, op2, "each op gets its own id");
+
+        // Revert op2: back to exactly 300, revision bumped (3), patch decodes.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op2}).to_string())).await.unwrap();
+        let patch = recv_until(&mut ws, "terrain.delta_patch").await;
+        assert_eq!(patch["revision"].as_u64().unwrap(), 3, "a revert bumps the revision like any edit");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(patch["data_b64"].as_str().unwrap()).unwrap();
+        let hd = terrain_common::SparseHeightDelta::decode(&bytes, side).unwrap();
+        assert_eq!(hd.offset_cm(10, 10), 300, "revert of op2 restores op1's exact state");
+        let ack = recv_until(&mut ws, "terrain.revert_ack").await;
+        assert_eq!(ack["op_id"].as_str().unwrap(), op2);
+
+        // Revert op1: the block didn't exist before it — deleted outright.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op1}).to_string())).await.unwrap();
+        let patch2 = recv_until(&mut ws, "terrain.delta_patch").await;
+        let bytes2 = base64::engine::general_purpose::STANDARD.decode(patch2["data_b64"].as_str().unwrap()).unwrap();
+        let hd2 = terrain_common::SparseHeightDelta::decode(&bytes2, side).unwrap();
+        assert!(hd2.is_empty(), "revert of the creating op deletes the block");
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        assert!(
+            stored.height_delta.is_none(),
+            "durably back to procedural: a fully-reverted chunk stores NO height layer, so it round-trips as has_delta: false"
+        );
+
+        drop(ws);
+    }
+
+    /// Double reverts, unknown ids, and non-editor reverts are all rejected
+    /// cleanly with terrain.edit_error — never a panic, never a second apply.
+    #[tokio::test]
+    async fn terrain_revert_op_rejects_double_unknown_and_non_editor() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let side = mmo::world::capital().terrain.manifest().tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[20, 20, 500]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        // Second revert of the same op: rejected, and the state is untouched.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "terrain.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("already-reverted") || err["message"].as_str().unwrap().contains("unknown"));
+
+        // Unknown id: same rejection.
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": "nope"}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.edit_error").await;
+
+        let stored = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        assert!(stored.height_delta.is_none(), "rejected reverts change nothing (still no height layer)");
+
+        // Non-editor revert: role-gated like edit_op.
+        let email = format!("scrub2_{}@t.test", Uuid::new_v4().simple());
+        let mut player_ws = dial(&proxy).await;
+        player_ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Scrub2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut player_ws, "welcome").await;
+        player_ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        let err2 = recv_until(&mut player_ws, "terrain.edit_error").await;
+        assert!(err2["message"].as_str().unwrap().contains("editor"));
+
+        drop(ws);
+        drop(player_ws);
+    }
+
+    /// A seam-crossing op reverts on BOTH chunks (its snapshots span them).
+    #[tokio::test]
+    async fn terrain_revert_op_spans_chunks_like_the_op_did() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let ts = manifest.tile_size as i64;
+        let side = manifest.tile_size as usize + 1;
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[ts, 7, 250]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.delta_patch").await;
+        recv_until(&mut ws, "terrain.revert_ack").await;
+
+        let a = db.load_terrain_delta(0, 0, side).await.unwrap().unwrap();
+        let b = db.load_terrain_delta(1, 0, side).await.unwrap().unwrap();
+        assert!(a.height_delta.is_none(), "chunk (0,0) back to procedural (no height layer)");
+        assert!(b.height_delta.is_none(), "chunk (1,0) back to procedural (no height layer)");
+
+        drop(ws);
+    }
+
+    // --- terrain editing (#80): the server's composited height answer ----------
+
+    /// The #80 invariant, end-to-end through the real write path: after an
+    /// edit op lands over the wire, `composited_ground_height` answers base
+    /// + delta exactly; after the op is reverted, it answers base again,
+    /// bit-exactly. An untouched point never moves, and the coarse backdrop
+    /// (`terrain.data`) deliberately keeps answering base throughout.
+    #[tokio::test]
+    async fn composited_ground_height_follows_edits_and_reverts() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        let manifest = mmo::world::capital().terrain.manifest().clone();
+        let cell = manifest.cell_size_m;
+        // World corner (40, 40) — interior of chunk (0,0); sample exactly on
+        // the corner so the expected lift is the full 250cm, no interpolation.
+        let (wx, wy) = (40.0 * cell, 40.0 * cell);
+        let (ux, uy) = (100.0 * cell, 100.0 * cell); // untouched control point
+
+        let base = proxy.capital.terrain.sample_height(wx, wy);
+        assert_eq!(
+            proxy.composited_ground_height(wx, wy).await,
+            base,
+            "no delta row -> composited answer IS the base, bit-exactly"
+        );
+
+        ws.send(Message::Text(
+            json!({"type": "terrain.edit_op", "brush": "raise", "cells": [[40, 40, 250]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let op = recv_until(&mut ws, "terrain.edit_ack").await["op_id"].as_str().unwrap().to_string();
+        recv_until(&mut ws, "terrain.delta_patch").await;
+
+        let edited = proxy.composited_ground_height(wx, wy).await;
+        assert!(
+            (edited - (base + 2.5)).abs() < 0.001,
+            "composited height must be base + 2.5m (base={base}, got={edited})"
+        );
+        let control_base = proxy.capital.terrain.sample_height(ux, uy);
+        assert_eq!(
+            proxy.composited_ground_height(ux, uy).await,
+            control_base,
+            "an untouched point in the same chunk must not move"
+        );
+        // The coarse backdrop wire message stays base — it's a static,
+        // once-per-session payload (see composited_ground_height's doc).
+        assert_eq!(proxy.capital.terrain.sample_height(wx, wy), base);
+
+        ws.send(Message::Text(json!({"type": "terrain.revert_op", "op_id": op}).to_string())).await.unwrap();
+        recv_until(&mut ws, "terrain.revert_ack").await;
+        assert_eq!(
+            proxy.composited_ground_height(wx, wy).await,
+            base,
+            "after revert the composited answer is the base again, bit-exactly"
+        );
+
+        drop(ws);
+    }
+
+    /// db-less mode (the proxy can boot without persistence): the composited
+    /// answer degrades to base rather than erroring.
+    #[tokio::test]
+    async fn composited_ground_height_without_a_db_answers_base() {
+        let proxy = test_proxy(); // Proxy::new(..., None)
+        let base = proxy.capital.terrain.sample_height(500.0, 500.0);
+        assert_eq!(proxy.composited_ground_height(500.0, 500.0).await, base);
     }
 }

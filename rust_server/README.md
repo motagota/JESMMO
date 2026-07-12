@@ -1,13 +1,12 @@
 # Rust server
 
-Rust port of the Python server (`../server/proxy.py` and `../server/zoneServer.py`).
 Two binaries:
 
 - **proxy** — routes client websockets to zones, supports 3-phase migration via stdin commands.
 - **zone_server** — holds player/bot state, self-registers with the proxy, random-walk bots.
 
-The browser client (`../client/client.html`) and `../client/test_client.py` work unchanged;
-the proxy listens on the same ports as the Python version.
+(Originally a port of a Python prototype, removed once the port was complete —
+see git history if you ever need it.)
 
 ## Ports
 
@@ -44,7 +43,7 @@ Then open `../client/client.html` in a browser.
 ### Terrain artifact
 
 The proxy loads authoritative terrain heights from the baked artifact at
-`../artifacts/world_v2/` (relative to this crate) at boot — panics with a clear
+`../artifacts/world_v3/` (relative to this crate) at boot — panics with a clear
 message if it's missing. It's checked into the repo; regenerate it after
 changing `../terrain.toml` with:
 

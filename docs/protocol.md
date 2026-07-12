@@ -95,21 +95,21 @@ Any client-supplied `player_id` is ignored — the gateway stamps the real one.
 
 ## The Capital (world content)
 
-The world is the authored **Capital** (`mmo::world::capital()`): a 6400×6400 space
-(~41 km², matching the design's ~40 km² target — see `MMO.md` §7) tiled into five
+The world is the authored **Capital** (`mmo::world::capital()`): a 25600×25600
+space (~655 km², the near-full-extent Brisbane DEM — world v3) tiled into five
 named districts in a plus/cross layout, all **safe** (zero-PvP) for Phase 1. The
 capital starts **empty** — authored ground, roads, and a plot grid, but no
 buildings; structures appear only as players complete build orders / build homes.
 
 | district | id | region `[x0,x1) × [y0,y1)` | notes |
 |---|---|---|---|
-| Market District | `market` | `[0,1600) × [0,6400)` | west band |
-| Starter Suburbs | `suburbs` | `[4800,6400) × [0,6400)` | east band; starter plot grid (12×20 = 240 plots) |
-| Civic Centre | `civic` | `[1600,4800) × [1600,4800)` | centre; town centre + first build-order board |
-| Craftworks Quarter | `craftworks` | `[1600,4800) × [0,1600)` | north band |
-| Old Quarter | `old_quarter` | `[1600,4800) × [4800,6400)` | south band |
+| Starter Suburbs | `suburbs` | `[0,6400) × [0,25600)` | west band; starter plot grid (12×20 = 240 plots) |
+| Market District | `market` | `[19200,25600) × [0,25600)` | east band (reaches the river mouth / bay) |
+| Civic Centre | `civic` | `[6400,19200) × [6400,19200)` | centre; town centre + first build-order board |
+| Craftworks Quarter | `craftworks` | `[6400,19200) × [0,6400)` | north band |
+| Old Quarter | `old_quarter` | `[6400,19200) × [19200,25600)` | south band |
 
-- **Town centre / spawn:** world centre `(3200, 3200)`, inside the Civic Centre.
+- **Town centre / spawn:** world centre `(12800, 12800)`, inside the Civic Centre.
 - **District identity is keyed to world geometry**, not to sim processes. The
   gateway labels each shard's `district` and `safety` in `partition` by its region
   centre, so the capital stays correctly named however the world is split/merged.
@@ -284,6 +284,16 @@ the manifest's grid is silently ignored.
 | `terrain.data` | S→C | `resolution` (grid cells per axis), `world_size`, `heights` (`(resolution+1)^2` floats, row-major/y-major: `heights[gy*(resolution+1)+gx]`, in the same units as world x/y) — plus the baked artifact's own manifest shape for tile streaming: `tile_size` (cells per tile side), `tiles` (`[cols, rows]`), `cell_size_m`, `height_min_m`, `height_max_m` (the u16 sample decode range) | **live** |
 | `terrain.tile_request` | C→S | `tx`, `ty` (tile-grid coordinate) | **live** |
 | `terrain.tile_data` | S→C | `tx`, `ty`, `side` (`tile_size + 1` corner samples per side), `encoding` (`"tile_v1"`), `data_b64` — exactly `terrain_common::HeightTile::encode(1)`'s bytes, base64-wrapped: a 16-byte header (magic `TRHT`, u16 LE format_version, u16 reserved, i32 LE tile_x, i32 LE tile_y) then `side²` u16 LE samples, decoded to meters via `height_min_m`/`height_max_m` | **live** |
+| `terrain.delta_request` | C→S | `tx`, `ty` (chunk = the same tile-grid coordinate) — request the chunk's hand-authored edit layer (terrain-editing epic #72) | **live** |
+| `terrain.delta_data` | S→C | `tx`, `ty`, `has_delta`; when `has_delta` is true also `revision` (monotonic per chunk), `encoding` (`"delta_v1"`), `data_b64` — `terrain_common::SparseHeightDelta::encode(1)`'s bytes, base64-wrapped: an 8-byte header (magic `TRHD`, u16 LE format_version, u16 reserved), a block-presence bitmap (`ceil(ceil(side/16)²/64)` u64 LE words), then each present 16×16 block's 256 i16 LE **centimeter offsets** in ascending block-index order. Composited client-side onto the corresponding streamed tile's corner heights *before* mesh build. Unlike `terrain.tile_request`, an in-range chunk **always** answers (`has_delta: false` when unedited) so the client never confuses "no answer yet" with "nothing here"; out-of-range stays silently ignored | **live** |
+| `terrain.edit_op` | C→S | `brush` (freeform label, recorded), `cells` (`[[cx, cy, d_cm], …]`) — one editor brush stroke of height increments in **world corner coordinates** (`cx ∈ [0, tile_size·cols]`), centimeters. Requires `role == "editor"`. The server maps each corner to *every* chunk that stores it (duplicated-edge convention), so a stroke across a chunk seam updates both sides atomically; validation is all-or-nothing (bounds, ±50 m accumulated per-corner cap, ≤16 384 cells/op) | **live** |
+| `terrain.edit_error` | S→C | `message` — the op was rejected (not an editor / out of bounds / over cap / malformed); nothing was saved | **live** |
+| `terrain.delta_patch` | S→C | `tx`, `ty`, `revision`, `encoding` (`"delta_v1"`), `data_b64` — pushed to **every** connected client after an accepted edit op *or revert*, once per chunk the op touched. Carries the chunk's *full current* delta (same payload format as `terrain.delta_data`), replace-not-merge, so clients holding the chunk apply it with the same decode path and clients without it ignore it | **live** |
+| `terrain.edit_ack` | S→C | `op_id`, `brush` — sent to the accepted op's **author only**, before its patches: the server-minted id is the undo handle the history UI records | **live** |
+| `terrain.revert_op` | C→S | `op_id` — undo one accepted op: every block it touched is restored to its logged **pre-op content** (whole 512-byte block snapshots from the append-only op log), revisions bump, and `terrain.delta_patch` broadcasts per affected chunk like a normal edit. Editor-role-gated; unknown or already-reverted ids are rejected with `terrain.edit_error` (the revert claim is atomic — racing double-reverts can't both apply). Whole-block restore means an out-of-order revert can clobber a later overlapping stroke: clients should undo newest-first | **live** |
+| `terrain.revert_ack` | S→C | `op_id` — the revert was applied (its patches arrive separately) | **live** |
+
+**Which surfaces carry hand-authored edits (#80):** `terrain.data` (the coarse backdrop) and `terrain.tile_data` (streamed chunk bytes) are always the immutable *base* bake — the backdrop is a static once-per-session payload (compositing edits in would leave it stale after the first live edit), and the client composites deltas onto streamed chunks itself from `terrain.delta_data`/`terrain.delta_patch`. Server-side, the effective (base + delta) height is answered by `proxy.rs::composited_ground_height`; the #80 audit confirmed no gameplay system consumes elevation today (movement validation is 2D clamping, ground-snap is client-visual only), so that helper is the door any future consumer must use.
 
 Clients reconstruct the ground surface by treating each grid cell as two
 triangles (split along the `(0,0)`–`(1,1)` diagonal) and must use the exact

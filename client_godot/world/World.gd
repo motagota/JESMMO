@@ -10,15 +10,46 @@ class_name World
 extends Node3D
 
 const _GROUND_Y := 0.0
-const _TILE_Y := 0.02   # plot/home markers sit just above the ground to avoid z-fighting
-const _ROAD_Y := 0.05
+const _TILE_Y := 0.2    # plot/home markers sit just above the ground to avoid z-fighting
+const _ROAD_Y := 0.5
 const _ROAD_WIDTH := 6.0        # a dirt path is a footpath, not the old avenue
 const _ROAD_SEGMENT_STEP := 40.0  # world units per subdivision — short enough to hug hills
 const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
+const _PLOT_FILL_STEPS := 8       # fill-grid subdivisions per plot axis
+const _PLOT_EDGE_STEP := 10.0     # plot edges are short; sample tighter than roads
 
 var world_size := 6400.0
 
 var _ground: MeshInstance3D
+## Backdrop residency mask (one texel per terrain tile): white = a fine
+## streamed tile is resident there, and the backdrop shader discards its
+## fragments so the coarse mesh can never poke up through the real 5m
+## ground (its ~66m interpolation runs metres above/below the true surface
+## in places — enough to bury the player). Updated from
+## `update_backdrop_mask` every time the streamer's resident set changes.
+var _mask_image: Image
+var _mask_texture: ImageTexture
+
+## The backdrop's material: standard vertex-color look (white base, painted
+## per-vertex albedo, roughness 1) plus the residency-mask discard above.
+## Environment fog still applies — spatial shaders get it unless disabled.
+const _GROUND_SHADER := "
+shader_type spatial;
+uniform sampler2D tile_mask : filter_nearest;
+uniform vec2 world_extent = vec2(1.0, 1.0);
+varying vec3 wpos;
+void vertex() {
+    wpos = VERTEX; // the mesh sits at the origin, so object space == world space
+}
+void fragment() {
+    if (texture(tile_mask, wpos.xz / world_extent).r > 0.5) {
+        discard;
+    }
+    ALBEDO = COLOR.rgb;
+    ROUGHNESS = 1.0;
+}
+"
+
 var _tiles_root := Node3D.new()
 var _roads_root := Node3D.new()
 var _home_root := Node3D.new()
@@ -38,13 +69,42 @@ var _zones: Array = []
 ## Rendered dirt-road segments, keyed by their `status_update` id
 ## (`structure_<build order kind>`) — a road is static once built, so a repeat
 ## update (e.g. a re-broadcast on district re-entry) is a no-op, not a rebuild.
+## Each entry keeps its endpoints (`{a, b, node}`) so `refresh_plot_markers`
+## can re-drape the ribbon when the terrain under it changes.
 var _dirt_roads: Dictionary = {}
+## What the plot markers were last drawn from, so they can be redrawn against
+## fresh terrain heights (see `refresh_plot_markers`).
+var _home_bounds: Dictionary = {}
+var _roster_plots: Array = []
+var _my_plot_id := ""
+var _plots_dirty := false
 
 func _ready() -> void:
     add_child(_tiles_root)
     add_child(_roads_root)
     add_child(_home_root)
     add_child(_plots_root)
+
+## The displayed terrain changed under us (a fine tile streamed in/out, or an
+## edit patch landed — `TerrainStreamer.terrain_changed`): the plot markers
+## and roads are static meshes sampled at draw time, so without a redraw they
+## stay buried under (or float over) the new surface. Deferred to `_process`
+## so a burst of tile arrivals costs one rebuild, not one per tile.
+func refresh_plot_markers() -> void:
+    _plots_dirty = true
+
+func _process(_delta: float) -> void:
+    if not _plots_dirty:
+        return
+    _plots_dirty = false
+    if not _home_bounds.is_empty():
+        show_home_plot(_home_bounds)
+    if not _roster_plots.is_empty():
+        apply_plot_roster(_roster_plots, _my_plot_id)
+    for id in _dirt_roads:
+        var rec: Dictionary = _dirt_roads[id]
+        rec["node"].queue_free()
+        rec["node"] = _build_road_ribbon(rec["a"], rec["b"])
 
 ## Rebuild the district name labels from a `partition` message; lazily build
 ## the static ground/roads once the world size and the terrain heightmap are
@@ -72,6 +132,20 @@ func _maybe_build_static() -> void:
     _build_ground()
     _build_town_centre_marker()
     _built_static = true
+
+## Repaint the backdrop's residency mask from the streamer's current
+## resident-tile set (`TerrainStreamer.resident_tiles()`), wired to
+## `terrain_changed` in Main — cheap enough (a tiles_x*tiles_y byte image)
+## to just redo wholesale on every change.
+func update_backdrop_mask(resident: Dictionary) -> void:
+    if _mask_image == null:
+        return
+    _mask_image.fill(Color.BLACK)
+    for coord in resident:
+        if coord.x >= 0 and coord.x < _mask_image.get_width() \
+                and coord.y >= 0 and coord.y < _mask_image.get_height():
+            _mask_image.set_pixel(coord.x, coord.y, Color.WHITE)
+    _mask_texture.update(_mask_image)
 
 func _rebuild_tiles() -> void:
     for child in _tiles_root.get_children():
@@ -161,16 +235,24 @@ func _build_ground() -> void:
 
     _ground = MeshInstance3D.new()
     _ground.mesh = st.commit()
-    var mat := StandardMaterial3D.new()
-    # White base + vertex_color_use_as_albedo so the final albedo *is* each
-    # vertex's painted color exactly (no multiply-darkening surprises).
-    mat.albedo_color = Color.WHITE
-    mat.vertex_color_use_as_albedo = true
-    # The two triangles per cell (p00,p11,p10 / p00,p01,p11) already wind so
-    # generated normals point up (verified by tests/smoke_terrain.gd) — no
-    # need for BaseMaterial3D.CULL_DISABLED, which was a previous defensive
-    # guess and, by letting backfaces render, is the likely cause of the
-    # washed-out/"translucent" look reported against the noise-based terrain.
+    # Shader material: same vertex-color-as-albedo look the old
+    # StandardMaterial gave (the two triangles per cell already wind so
+    # generated normals point up — verified by tests/smoke_terrain.gd), plus
+    # the residency-mask discard so the backdrop never renders underneath a
+    # resident fine tile (see `_mask_image`'s comment). Offline harnesses
+    # that never learned the tile-grid shape get a 1x1 never-discard mask.
+    var shader := Shader.new()
+    shader.code = _GROUND_SHADER
+    var mat := ShaderMaterial.new()
+    mat.shader = shader
+    var mask_w := maxi(Protocol._tiles_x, 1)
+    var mask_h := maxi(Protocol._tiles_y, 1)
+    _mask_image = Image.create(mask_w, mask_h, false, Image.FORMAT_L8)
+    _mask_image.fill(Color.BLACK)
+    _mask_texture = ImageTexture.create_from_image(_mask_image)
+    mat.set_shader_parameter("tile_mask", _mask_texture)
+    mat.set_shader_parameter("world_extent",
+        Vector2(world_size, world_size) * Protocol.WORLD_SCALE)
     _ground.material_override = mat
     add_child(_ground)
 
@@ -200,13 +282,21 @@ func upsert_dirt_road(id: String, state: Dictionary) -> void:
         return
     var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
     var b := Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))
-    _dirt_roads[id] = _build_road_ribbon(a, b)
+    _dirt_roads[id] = {"a": a, "b": b, "node": _build_road_ribbon(a, b)}
 
 func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
+    return _build_ribbon(_roads_root, a, b, _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y, _ROAD_SEGMENT_STEP)
+
+## A terrain-following strip of `width` from `a` to `b`: every cross-section
+## is placed with its own `Protocol.w2v` sample, so it drapes over hills and
+## edited ground instead of floating/clipping between two flat endpoints.
+## Shared by the dirt roads and the plot borders.
+func _build_ribbon(parent: Node3D, a: Vector2, b: Vector2, width: float, color: Color,
+        y: float, step: float) -> MeshInstance3D:
     var length := a.distance_to(b)
-    var segments := maxi(1, ceili(length / _ROAD_SEGMENT_STEP))
+    var segments := maxi(1, ceili(length / step))
     var dir := (b - a).normalized() if length > 0.001 else Vector2.RIGHT
-    var perp := Vector2(-dir.y, dir.x) * (_ROAD_WIDTH * 0.5)
+    var perp := Vector2(-dir.y, dir.x) * (width * 0.5)
 
     var st := SurfaceTool.new()
     st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -215,8 +305,8 @@ func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     for i in range(segments + 1):
         var t := float(i) / float(segments)
         var p := a.lerp(b, t)
-        var left := Protocol.w2v(p.x + perp.x, p.y + perp.y, _ROAD_Y)
-        var right := Protocol.w2v(p.x - perp.x, p.y - perp.y, _ROAD_Y)
+        var left := Protocol.w2v(p.x + perp.x, p.y + perp.y, y)
+        var right := Protocol.w2v(p.x - perp.x, p.y - perp.y, y)
         if i > 0:
             # Mirrors `_build_ground`'s winding (p00,p10,p11 / p00,p11,p01) so
             # generated normals point up here too.
@@ -234,32 +324,62 @@ func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     var strip := MeshInstance3D.new()
     strip.mesh = st.commit()
     var mat := StandardMaterial3D.new()
-    mat.albedo_color = _ROAD_COLOR
-    strip.material_override = mat
-    _roads_root.add_child(strip)
-    return strip
-
-func _add_strip(parent: Node3D, a: Vector2, b: Vector2, width: float, color: Color) -> void:
-    var strip := MeshInstance3D.new()
-    var box := BoxMesh.new()
-    var length := a.distance_to(b)
-    # Horizontal strip if a.y == b.y, else vertical — both axis-aligned here.
-    if absf(a.y - b.y) < 0.5:
-        box.size = Vector3(length, 0.04, width) * Protocol.WORLD_SCALE
-    else:
-        box.size = Vector3(width, 0.04, length) * Protocol.WORLD_SCALE
-    strip.mesh = box
-    var mid := (a + b) * 0.5
-    strip.position = Protocol.w2v(mid.x, mid.y, _ROAD_Y)
-    var mat := StandardMaterial3D.new()
     mat.albedo_color = color
     strip.material_override = mat
     parent.add_child(strip)
+    return strip
+
+## A terrain-conforming translucent fill over rect `(x0,y0,w,h)`: a small
+## per-vertex grid (the same w2v-every-vertex approach as `_build_ground`),
+## so the tile hugs the surface instead of burying its corners on sloped or
+## brush-edited ground the way the old single flat plane did.
+func _add_plot_fill(parent: Node3D, x0: float, y0: float, w: float, h: float,
+        color: Color, y: float) -> void:
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    var sx := w / float(_PLOT_FILL_STEPS)
+    var sy := h / float(_PLOT_FILL_STEPS)
+    for gy in range(_PLOT_FILL_STEPS):
+        for gx in range(_PLOT_FILL_STEPS):
+            var wx0 := x0 + gx * sx
+            var wy0 := y0 + gy * sy
+            var p00 := Protocol.w2v(wx0, wy0, y)
+            var p10 := Protocol.w2v(wx0 + sx, wy0, y)
+            var p01 := Protocol.w2v(wx0, wy0 + sy, y)
+            var p11 := Protocol.w2v(wx0 + sx, wy0 + sy, y)
+            st.add_vertex(p00)
+            st.add_vertex(p10)
+            st.add_vertex(p11)
+            st.add_vertex(p00)
+            st.add_vertex(p11)
+            st.add_vertex(p01)
+    st.index()
+    st.generate_normals()
+
+    var fill := MeshInstance3D.new()
+    fill.mesh = st.commit()
+    var mat := StandardMaterial3D.new()
+    mat.albedo_color = color
+    mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+    fill.material_override = mat
+    parent.add_child(fill)
+
+## The four edge ribbons of rect `(x0,y0,w,h)`. The horizontal edges are
+## extended by half the border width past each corner so the corners meet
+## without notches (the old axis-aligned boxes got this for free).
+func _add_plot_border(parent: Node3D, x0: float, y0: float, w: float, h: float,
+        bw: float, color: Color) -> void:
+    var hw := bw * 0.5
+    _build_ribbon(parent, Vector2(x0 - hw, y0), Vector2(x0 + w + hw, y0), bw, color, _ROAD_Y, _PLOT_EDGE_STEP)
+    _build_ribbon(parent, Vector2(x0 - hw, y0 + h), Vector2(x0 + w + hw, y0 + h), bw, color, _ROAD_Y, _PLOT_EDGE_STEP)
+    _build_ribbon(parent, Vector2(x0, y0), Vector2(x0, y0 + h), bw, color, _ROAD_Y, _PLOT_EDGE_STEP)
+    _build_ribbon(parent, Vector2(x0 + w, y0), Vector2(x0 + w, y0 + h), bw, color, _ROAD_Y, _PLOT_EDGE_STEP)
 
 ## Draw (or redraw) the player's home plot from a `plot.assigned` `bounds`
 ## rect: a bright filled outline on the ground plus a tall beacon, so it reads
 ## as a distinct, findable landmark from across the district (#11).
 func show_home_plot(bounds: Dictionary) -> void:
+    _home_bounds = bounds
     for child in _home_root.get_children():
         child.queue_free()
 
@@ -271,22 +391,9 @@ func show_home_plot(bounds: Dictionary) -> void:
         return
     var gold := Color(1.0, 0.82, 0.15)
 
-    var fill := MeshInstance3D.new()
-    var plane := PlaneMesh.new()
-    plane.size = Vector2(w, h) * Protocol.WORLD_SCALE
-    fill.mesh = plane
-    fill.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, _TILE_Y + 0.01)
-    var fill_mat := StandardMaterial3D.new()
-    fill_mat.albedo_color = Color(gold.r, gold.g, gold.b, 0.35)
-    fill_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-    fill.material_override = fill_mat
-    _home_root.add_child(fill)
-
-    var bw := 1.5
-    _add_strip(_home_root, Vector2(x0, y0), Vector2(x0 + w, y0), bw, gold)
-    _add_strip(_home_root, Vector2(x0, y0 + h), Vector2(x0 + w, y0 + h), bw, gold)
-    _add_strip(_home_root, Vector2(x0, y0), Vector2(x0, y0 + h), bw, gold)
-    _add_strip(_home_root, Vector2(x0 + w, y0), Vector2(x0 + w, y0 + h), bw, gold)
+    _add_plot_fill(_home_root, x0, y0, w, h,
+        Color(gold.r, gold.g, gold.b, 0.35), _TILE_Y + 0.01)
+    _add_plot_border(_home_root, x0, y0, w, h, 1.5, gold)
 
     var beacon := MeshInstance3D.new()
     var cyl := CylinderMesh.new()
@@ -312,6 +419,13 @@ func show_home_plot(bounds: Dictionary) -> void:
     label.modulate = gold
     label.outline_size = 8
     label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 15.0)
+    # Homing aid, so it carries further than fixture labels — but still
+    # distance-culled: fixed_size + no_depth_test would otherwise render it
+    # full-size through 20km of terrain (the HUD's home arrow covers the
+    # cross-map case).
+    label.visibility_range_end = 2000.0
+    label.visibility_range_end_margin = 200.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
     _home_root.add_child(label)
 
 ## Rebuild every *other* plot from a `plot.district` roster (#18) — the
@@ -322,6 +436,8 @@ func show_home_plot(bounds: Dictionary) -> void:
 ## to say if it's free, red with a small signpost naming the owner if it's
 ## taken.
 func apply_plot_roster(plots: Array, my_plot_id: String) -> void:
+    _roster_plots = plots
+    _my_plot_id = my_plot_id
     for child in _plots_root.get_children():
         child.queue_free()
 
@@ -341,22 +457,9 @@ func _add_plot_marker(bounds: Dictionary, owner_name) -> void:
     var taken := owner_name != null and String(owner_name) != ""
     var tint := Color(0.85, 0.30, 0.25) if taken else Color(0.25, 0.85, 0.35)
 
-    var fill := MeshInstance3D.new()
-    var plane := PlaneMesh.new()
-    plane.size = Vector2(w, h) * Protocol.WORLD_SCALE
-    fill.mesh = plane
-    fill.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, _TILE_Y + 0.005)
-    var fill_mat := StandardMaterial3D.new()
-    fill_mat.albedo_color = Color(tint.r, tint.g, tint.b, 0.28)
-    fill_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-    fill.material_override = fill_mat
-    _plots_root.add_child(fill)
-
-    var bw := 1.0
-    _add_strip(_plots_root, Vector2(x0, y0), Vector2(x0 + w, y0), bw, tint)
-    _add_strip(_plots_root, Vector2(x0, y0 + h), Vector2(x0 + w, y0 + h), bw, tint)
-    _add_strip(_plots_root, Vector2(x0, y0), Vector2(x0, y0 + h), bw, tint)
-    _add_strip(_plots_root, Vector2(x0 + w, y0), Vector2(x0 + w, y0 + h), bw, tint)
+    _add_plot_fill(_plots_root, x0, y0, w, h,
+        Color(tint.r, tint.g, tint.b, 0.28), _TILE_Y + 0.005)
+    _add_plot_border(_plots_root, x0, y0, w, h, 1.0, tint)
 
     # A free plot just reads as green — nothing more to say about it. Only a
     # taken one gets a signpost naming the owner.
@@ -398,6 +501,12 @@ func _add_signpost(cx: float, cy: float, owner_name: String, tint: Color) -> voi
     label.modulate = Color(1, 1, 1)
     label.outline_size = 4
     label.position = Protocol.w2v(cx, cy, 2.15)
+    # A signpost name only matters standing near the plot — cull it early
+    # (fixed_size + no_depth_test would otherwise show every owner's name
+    # across the whole district, through terrain).
+    label.visibility_range_end = 150.0
+    label.visibility_range_end_margin = 30.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
     _plots_root.add_child(label)
 
 ## Just the floating district-name label now — safety is painted straight
@@ -421,6 +530,8 @@ func _add_district_label(z: Dictionary) -> void:
     label.text = district_name
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
     label.modulate = Color(0.7, 1.0, 0.8) if safe else Color(1.0, 0.7, 0.7)
-    label.pixel_size = 0.05
-    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 6.0)
+    # World-sized on purpose (not fixed_size) so it reads as far-off signage;
+    # sized for the metric scene, where a district band is kilometres across.
+    label.pixel_size = 0.5
+    label.position = Protocol.w2v(x0 + w * 0.5, y0 + h * 0.5, 60.0)
     _tiles_root.add_child(label)

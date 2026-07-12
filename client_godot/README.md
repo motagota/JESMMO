@@ -57,7 +57,7 @@ is cached in `user://session.cfg` for silent reconnects.
   saved token, or `login`/`register`/`guest` → `auth_ok` (token stored) →
   `welcome` (spawn) → `partition` (draw districts) → `status_update` stream. The
   client sends its `protocol_version`, so a mismatched build is refused cleanly.
-- **Prediction + reconciliation** (`LocalPlayer`): every `MOVE_TICK` (60 ms) the
+- **Prediction + reconciliation** (`LocalPlayer`): every `MOVE_TICK` (125 ms) the
   client sends a `move {dx,dy}` delta **and** applies it locally so input feels
   instant. An authoritative self-`status_update` only snaps the position when it
   has drifted past `RECONCILE_DRIFT` (after a migration, respawn, or world-edge

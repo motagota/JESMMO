@@ -75,6 +75,24 @@ const C_TERRAIN_LIST := "terrain.list"
 const S_TERRAIN_DATA := "terrain.data"
 const C_TERRAIN_TILE_REQUEST := "terrain.tile_request"
 const S_TERRAIN_TILE_DATA := "terrain.tile_data"
+## Terrain editing (epic #72): a chunk's hand-authored edit layer. An
+## in-range request ALWAYS answers (`has_delta: false` when unedited).
+const C_TERRAIN_DELTA_REQUEST := "terrain.delta_request"
+const S_TERRAIN_DELTA_DATA := "terrain.delta_data"
+## One editor brush stroke: `{brush, cells: [[cx, cy, d_cm], ...]}` in WORLD
+## corner coordinates. Requires `role == "editor"` server-side; rejected with
+## `terrain.edit_error`. Accepted ops come back as `terrain.delta_patch`
+## (the touched chunks' full current deltas) pushed to every client.
+const C_TERRAIN_EDIT_OP := "terrain.edit_op"
+const S_TERRAIN_EDIT_ERROR := "terrain.edit_error"
+const S_TERRAIN_DELTA_PATCH := "terrain.delta_patch"
+## Undo (#79): the server acks each accepted op with its minted id (author
+## only); `terrain.revert_op {op_id}` restores that op's pre-edit blocks and
+## patches everyone. Reverts should be issued newest-first (whole-block
+## restore — out-of-order can clobber a later overlapping stroke).
+const S_TERRAIN_EDIT_ACK := "terrain.edit_ack"
+const C_TERRAIN_REVERT_OP := "terrain.revert_op"
+const S_TERRAIN_REVERT_ACK := "terrain.revert_ack"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
@@ -118,15 +136,31 @@ const STORAGE_RANGE := 60.0
 const BOARD_RANGE := 60.0
 
 # --- movement / render tuning (mirrors client.html and the server) ------------
-## World units sent per move tick, per axis. The server applies the delta directly.
-const MOVE_STEP := 10
-## Seconds between move sends (~16/s) — a steady cadence, not OS key-repeat.
-const MOVE_TICK := 0.06
-## Accept the server's position as a correction only past this drift (units), so
+## World units sent per move tick, per axis. The server applies the delta
+## directly. 1 unit/tick at 8 ticks/s = 8 m/s — a human run, now that world
+## units are real metres (the old 10-per-60ms was ~167 m/s: authored for the
+## abstract pre-DEM world, and it read fine only because the avatar was a
+## 22m giant at the old scene scale).
+const MOVE_STEP := 1
+## Seconds between move sends (8/s) — a steady cadence, not OS key-repeat.
+const MOVE_TICK := 0.125
+## Accept the server's position as a correction only past this drift (metres), so
 ## local prediction stays smooth between authoritative snapshots.
-const RECONCILE_DRIFT := 30.0
-## World units -> metres in the 3D scene (6400-unit world -> 640 m).
-const WORLD_SCALE := 0.1
+const RECONCILE_DRIFT := 5.0
+## World units -> scene units. The v3 world is a real-metres DEM, and the
+## avatar, props, and camera rig are all authored in metres too — so the
+## scene is simply metric (1 unit = 1 m). The old 0.1 compressed the world
+## 10x horizontally, which made every metre-authored prop a 10x giant
+## relative to the terrain.
+const WORLD_SCALE := 1.0
+## Stylistic vertical exaggeration for terrain relief. 1.0 = true-to-scale
+## (real-world relief tends to read flat through a game camera); mild
+## exaggeration keeps hills legible. NOTE: before world v3 the scene Y was
+## raw unscaled metres — an implicit 10x that read fine on the old ±10m
+## synthetic terrain but turned the real 430m Brisbane relief into needles.
+const HEIGHT_EXAGGERATION := 1.5
+## Terrain metres -> scene Y units (the vertical counterpart of WORLD_SCALE).
+const HEIGHT_SCALE := WORLD_SCALE * HEIGHT_EXAGGERATION
 
 ## Server-authored heightmap (`terrain.data`, #54) — purely cosmetic, the
 ## server has no other concept of height/elevation, and every gameplay
@@ -221,6 +255,53 @@ static func decode_height_tile(bytes: PackedByteArray) -> Dictionary:
         heights[i] = _height_min_m + (float(raw) / 65535.0) * range_m
     return {"tx": tx, "ty": ty, "heights": heights}
 
+## Decode a `terrain.delta_data` payload's raw bytes (terrain-common's
+## `SparseHeightDelta::encode` format: 8-byte header — magic "TRHD", u16 LE
+## format_version, u16 reserved — then a block-presence bitmap of
+## `ceil(ceil(side/16)^2 / 64)` u64 LE words, then each present 16x16
+## block's 256 i16 LE centimeter offsets in ascending block-index order)
+## into a dense `side*side` array of METER offsets, zero everywhere no
+## block covers. Dense-on-decode keeps compositing a plain element-wise
+## add against a streamed tile's heights. Returns an empty array on any
+## malformed input (mirrors `decode_height_tile`'s silent-drop posture).
+static func decode_height_delta(bytes: PackedByteArray) -> PackedFloat32Array:
+    var side := _tile_size + 1
+    if _tile_size <= 0 or bytes.size() < 8:
+        return PackedFloat32Array()
+    if bytes.slice(0, 4).get_string_from_ascii() != "TRHD":
+        return PackedFloat32Array()
+    var bps := int(ceil(side / 16.0))
+    var words := int(ceil(bps * bps / 64.0))
+    if bytes.size() < 8 + words * 8:
+        return PackedFloat32Array()
+    var indices: Array[int] = []
+    for w in range(words):
+        var word := bytes.decode_u64(8 + w * 8)
+        for bit in range(64):
+            if word & (1 << bit):
+                indices.append(w * 64 + bit)
+    if bytes.size() != 8 + words * 8 + indices.size() * 256 * 2:
+        return PackedFloat32Array()
+    var offsets := PackedFloat32Array()
+    offsets.resize(side * side) # zero-filled: untouched corners offset by 0
+    var pos := 8 + words * 8
+    for idx in indices:
+        if idx >= bps * bps:
+            return PackedFloat32Array() # bitmap bit outside the block grid
+        var block_row := int(floor(idx / float(bps)))
+        var block_col := idx % bps
+        for cy in range(16):
+            var gy := block_row * 16 + cy
+            for cx in range(16):
+                var gx := block_col * 16 + cx
+                var cm := bytes.decode_s16(pos)
+                pos += 2
+                # Edge blocks are partial: cells past `side` are stored
+                # (as zeros) but out of the corner grid — skip them.
+                if gx < side and gy < side:
+                    offsets[gy * side + gx] = cm * 0.01
+    return offsets
+
 ## Grid cells per axis of the received heightmap (0 before `terrain.data`
 ## arrives) — `World._build_ground` must use this exact resolution so its
 ## mesh and `terrain_height`'s lookups share an identical grid.
@@ -298,7 +379,33 @@ static func _tile_height(wx: float, wy: float) -> float:
 ## passing "how high above the ground" keeps working unchanged, automatically
 ## following the terrain everywhere it's placed.
 static func w2v(wx: float, wy: float, y: float = 0.0) -> Vector3:
-    return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy), wy * WORLD_SCALE)
+    return Vector3(wx * WORLD_SCALE, y + terrain_height(wx, wy) * HEIGHT_SCALE, wy * WORLD_SCALE)
+
+## Camera-ray → ground world point, shared by every mouse-on-terrain picker
+## (build placement, mayor roads, the editor brush). Two passes: intersect the
+## flat y=0 plane to get an approximate point, then re-intersect at that
+## point's actual terrain height — good enough because nearby terrain height
+## varies slowly relative to the camera distance. Returns `fallback` (the
+## caller's last good pick) when the camera is missing or the ray never
+## crosses the ground.
+static func pick_ground(camera: Camera3D, mouse: Vector2, fallback: Vector2) -> Vector2:
+    if camera == null:
+        return fallback
+    var origin := camera.project_ray_origin(mouse)
+    var dir := camera.project_ray_normal(mouse)
+    if absf(dir.y) < 0.0001:
+        return fallback
+    var t := -origin.y / dir.y
+    if t <= 0.0:
+        return fallback
+    var hit := origin + dir * t
+    var approx := Vector2(hit.x / WORLD_SCALE, hit.z / WORLD_SCALE)
+    var ground_y := terrain_height(approx.x, approx.y) * HEIGHT_SCALE
+    var t2 := (ground_y - origin.y) / dir.y
+    if t2 <= 0.0:
+        return fallback
+    var hit2 := origin + dir * t2
+    return Vector2(hit2.x / WORLD_SCALE, hit2.z / WORLD_SCALE)
 
 ## Mirror of the server's XP → level curve (`persistence::level_for_xp`): level n at
 ## 100·n² xp. Kept here so the skills panel can render progress-to-next-level and the

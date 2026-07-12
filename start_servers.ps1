@@ -31,7 +31,9 @@ if (-not $NoBuild) {
     }
 }
 
-$bin = Join-Path $server "target\$profile"
+# Binaries land in the repo-root workspace target dir (see the root Cargo.toml),
+# not rust_server\target — pointing there would launch stale pre-workspace builds.
+$bin = Join-Path $root "target\$profile"
 $proxyExe = Join-Path $bin 'proxy.exe'
 $zoneExe = Join-Path $bin 'zone_server.exe'
 $botsExe = Join-Path $bin 'bots.exe'

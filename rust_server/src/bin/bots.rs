@@ -27,6 +27,8 @@ use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use mmo::util::{dist2, random_heading};
+
 /// How many units of one item a bot gathers before heading off to contribute
 /// it, so it doesn't camp a single node forever.
 const CARRY_GOAL: i64 = 3;
@@ -72,21 +74,6 @@ fn parse_config() -> Config {
         }
     }
     cfg
-}
-
-/// Pick a random 8-direction heading (never standing still).
-fn random_heading() -> (i32, i32) {
-    let dirs = [
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (1, 1), (1, -1), (-1, 1), (-1, -1),
-    ];
-    dirs[rand::thread_rng().gen_range(0..dirs.len())]
-}
-
-fn dist2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
-    let dx = (ax - bx) as i64;
-    let dy = (ay - by) as i64;
-    dx * dx + dy * dy
 }
 
 /// A step (each axis clamped to `step`) from `(fx,fy)` toward `(tx,ty)` — no

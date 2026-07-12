@@ -8,4 +8,5 @@
 pub mod auth;
 pub mod persistence;
 pub mod protocol;
+pub mod util;
 pub mod world;

@@ -8,9 +8,7 @@ edition = "2021"
 name = "mmo"
 path = "src/lib.rs"
 
-# Two binaries that mirror the Python server:
-#   proxy        <- proxy.py
-#   zone_server  <- zoneServer.py
+# The two server binaries: the client-facing gateway and the simulation zone.
 [[bin]]
 name = "proxy"
 path = "src/bin/proxy.rs"

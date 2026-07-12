@@ -12,10 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
+
+use crate::util::now_secs;
 
 /// All persistence errors surface as `sqlx::Error`; callers that need friendlier
 /// semantics (e.g. "email already taken") check before writing.
@@ -60,13 +61,6 @@ pub struct Character {
 
 pub struct Db {
     pool: SqlitePool,
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 // --- In-transaction item helpers ---------------------------------------------
@@ -232,6 +226,25 @@ impl Db {
         hp: i64,
         now: i64,
     ) -> Result<(), DbError> {
+        self.seed_account_with_role(email, pw_hash, name, x, y, hp, now, "mayor").await
+    }
+
+    /// Idempotently seed one account+character with an elevated `role` —
+    /// shared by the mayor (city build orders) and editor (terrain editing,
+    /// epic #72) boot seeding. A no-op if the email is already registered
+    /// (never overwrites an existing account).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_account_with_role(
+        &self,
+        email: &str,
+        pw_hash: &str,
+        name: &str,
+        x: i64,
+        y: i64,
+        hp: i64,
+        now: i64,
+        role: &str,
+    ) -> Result<(), DbError> {
         if self.find_account_by_email(email).await?.is_some() {
             return Ok(());
         }
@@ -240,11 +253,12 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO account (id, email, pw_hash, role, created_at, last_login) \
-             VALUES (?, ?, ?, 'mayor', ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&account_id)
         .bind(email)
         .bind(pw_hash)
+        .bind(role)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -1765,6 +1779,147 @@ impl Db {
         }
         Ok(())
     }
+
+    // --- Terrain deltas (terrain-editing epic #72) ----------------------------
+    // Hand-authored edits composited over the baked artifact. One row per
+    // edited chunk; an unedited chunk has no row (load returns `None`, and the
+    // sampler treats that as "compose nothing" — zero cost for the whole world
+    // until someone paints).
+
+    /// The chunk's delta record, or `None` if it has never been edited.
+    /// `side` is the artifact's corner-samples-per-chunk (`tile_size + 1`,
+    /// from the loaded manifest) — the blob format doesn't self-describe it,
+    /// same convention as `HeightTile::decode`.
+    pub async fn load_terrain_delta(
+        &self,
+        chunk_tx: i32,
+        chunk_ty: i32,
+        side: usize,
+    ) -> Result<Option<terrain_common::TerrainDelta>, DbError> {
+        let row: Option<(i64, String, Option<Vec<u8>>, String, i64)> = sqlx::query_as(
+            "SELECT revision, bake_hash, height_delta_blob, author, edited_at
+             FROM terrain_delta WHERE chunk_tx = ? AND chunk_ty = ?",
+        )
+        .bind(chunk_tx)
+        .bind(chunk_ty)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((revision, bake_hash, blob, author, edited_at)) = row else {
+            return Ok(None);
+        };
+        let height_delta = match blob {
+            Some(bytes) => Some(
+                terrain_common::SparseHeightDelta::decode(&bytes, side)
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            ),
+            None => None,
+        };
+        let author = author
+            .parse::<terrain_common::AuthorId>()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
+        Ok(Some(terrain_common::TerrainDelta {
+            chunk_tx,
+            chunk_ty,
+            bake_hash,
+            revision: revision as u64,
+            height_delta,
+            provenance: terrain_common::Provenance { author, edited_at },
+        }))
+    }
+
+    /// Upsert a chunk's delta and return the new revision: `1` for a chunk's
+    /// first-ever edit, `previous + 1` after that. The revision is computed
+    /// in the database (single statement, `RETURNING`), not taken from the
+    /// input — callers never coordinate revision numbers themselves, which
+    /// is what keeps concurrent editors from silently overwriting each
+    /// other's bump. `delta.revision` is ignored on save.
+    pub async fn save_terrain_delta(
+        &self,
+        delta: &terrain_common::TerrainDelta,
+    ) -> Result<u64, DbError> {
+        let blob = delta.height_delta.as_ref().map(|d| d.encode(1));
+        let revision: i64 = sqlx::query_scalar(
+            "INSERT INTO terrain_delta (chunk_tx, chunk_ty, revision, bake_hash, height_delta_blob, author, edited_at)
+             VALUES (?, ?, 1, ?, ?, ?, ?)
+             ON CONFLICT(chunk_tx, chunk_ty) DO UPDATE SET
+                 revision = terrain_delta.revision + 1,
+                 bake_hash = excluded.bake_hash,
+                 height_delta_blob = excluded.height_delta_blob,
+                 author = excluded.author,
+                 edited_at = excluded.edited_at
+             RETURNING revision",
+        )
+        .bind(delta.chunk_tx)
+        .bind(delta.chunk_ty)
+        .bind(&delta.bake_hash)
+        .bind(blob)
+        .bind(delta.provenance.author.to_string())
+        .bind(delta.provenance.edited_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(revision as u64)
+    }
+
+    /// Append one accepted edit op to the undo log: the op row plus, per
+    /// touched `(chunk, block)`, the block's pre-edit raw content (`None` =
+    /// the block didn't exist — revert deletes it). One transaction, so a
+    /// logged op is always complete.
+    pub async fn log_terrain_edit_op(
+        &self,
+        op_id: &str,
+        author: &str,
+        brush: &str,
+        created_at: i64,
+        blocks: &[(i32, i32, i64, Option<Vec<u8>>)],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO terrain_edit_op (id, author, brush, created_at, reverted) VALUES (?, ?, ?, ?, 0)")
+            .bind(op_id)
+            .bind(author)
+            .bind(brush)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+        for (chunk_tx, chunk_ty, block_idx, prev) in blocks {
+            sqlx::query(
+                "INSERT INTO terrain_edit_op_block (op_id, chunk_tx, chunk_ty, block_idx, prev_block) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(op_id)
+            .bind(chunk_tx)
+            .bind(chunk_ty)
+            .bind(block_idx)
+            .bind(prev)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Claim an op for revert: atomically flips `reverted` 0 → 1 and returns
+    /// its pre-edit block rows, or `None` if the op doesn't exist or was
+    /// already reverted (the claim is the double-revert guard — two racing
+    /// reverts can't both win the UPDATE).
+    pub async fn take_revertable_edit_op(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<Vec<(i32, i32, i64, Option<Vec<u8>>)>>, DbError> {
+        let claimed = sqlx::query("UPDATE terrain_edit_op SET reverted = 1 WHERE id = ? AND reverted = 0")
+            .bind(op_id)
+            .execute(&self.pool)
+            .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let rows: Vec<(i32, i32, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT chunk_tx, chunk_ty, block_idx, prev_block FROM terrain_edit_op_block WHERE op_id = ?",
+        )
+        .bind(op_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Some(rows))
+    }
 }
 
 #[cfg(test)]
@@ -2309,5 +2464,74 @@ mod tests {
         let r = db.contribute(&cid, &order.id, "wood", 30).await.unwrap();
         assert_eq!(r.moved, 30, "the threshold un-greys the order");
         assert!(r.completed);
+    }
+
+    // --- Terrain deltas (#74) --------------------------------------------------
+
+    /// Production-shaped corner-grid side (tile_size 128 + 1).
+    const DELTA_SIDE: usize = 129;
+
+    fn a_delta(tx: i32, ty: i32) -> terrain_common::TerrainDelta {
+        let mut d = terrain_common::SparseHeightDelta::new(DELTA_SIDE);
+        d.set_offset_cm(3, 3, 250);
+        d.set_offset_cm(40, 90, -775); // second block, negative offset
+        d.set_offset_cm(128, 128, 42); // partial edge block
+        terrain_common::TerrainDelta {
+            chunk_tx: tx,
+            chunk_ty: ty,
+            bake_hash: "test-bake-hash".to_string(),
+            revision: 0, // ignored on save — the DB assigns
+            height_delta: Some(d),
+            provenance: terrain_common::Provenance {
+                author: terrain_common::AuthorId::Editor("acct-e1".to_string()),
+                edited_at: 1_700_000_000,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn terrain_delta_saves_and_loads_round_trip() {
+        let (db, _t) = TempDb::open().await;
+        let delta = a_delta(2, 7);
+        let rev = db.save_terrain_delta(&delta).await.unwrap();
+        assert_eq!(rev, 1, "first-ever save of a chunk is revision 1");
+
+        let loaded = db.load_terrain_delta(2, 7, DELTA_SIDE).await.unwrap().expect("row exists");
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.bake_hash, "test-bake-hash");
+        assert_eq!(loaded.provenance, delta.provenance);
+        let hd = loaded.height_delta.expect("height layer present");
+        assert_eq!(hd.offset_cm(3, 3), 250);
+        assert_eq!(hd.offset_cm(40, 90), -775);
+        assert_eq!(hd.offset_cm(128, 128), 42);
+        assert_eq!(hd.offset_cm(0, 0), 0, "untouched corner stays zero");
+        assert_eq!(hd.touched_block_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn terrain_delta_upsert_bumps_revision_per_chunk_independently() {
+        let (db, _t) = TempDb::open().await;
+        db.save_terrain_delta(&a_delta(0, 0)).await.unwrap();
+        let rev2 = db.save_terrain_delta(&a_delta(0, 0)).await.unwrap();
+        assert_eq!(rev2, 2, "second save of the same chunk bumps its revision");
+        let other = db.save_terrain_delta(&a_delta(5, 5)).await.unwrap();
+        assert_eq!(other, 1, "a different chunk starts its own revision sequence");
+        assert_eq!(db.load_terrain_delta(0, 0, DELTA_SIDE).await.unwrap().unwrap().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn terrain_delta_never_edited_chunk_loads_none() {
+        let (db, _t) = TempDb::open().await;
+        assert!(db.load_terrain_delta(9, 9, DELTA_SIDE).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn terrain_delta_null_blob_round_trips_as_no_height_layer() {
+        let (db, _t) = TempDb::open().await;
+        let mut delta = a_delta(1, 1);
+        delta.height_delta = None;
+        db.save_terrain_delta(&delta).await.unwrap();
+        let loaded = db.load_terrain_delta(1, 1, DELTA_SIDE).await.unwrap().unwrap();
+        assert!(loaded.height_delta.is_none(), "NULL blob must load as None, not an empty delta");
     }
 }

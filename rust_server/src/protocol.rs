@@ -90,6 +90,44 @@ pub const C_TERRAIN_TILE_REQUEST: &str = "terrain.tile_request"; // {tx, ty}
 // reused byte-for-byte as the network format. A request for a tile outside
 // the manifest's tile grid, or not currently loaded, is silently ignored.
 pub const S_TERRAIN_TILE_DATA: &str = "terrain.tile_data";
+// --- terrain editing (epic #72): hand-authored delta layer, per chunk ----------
+pub const C_TERRAIN_DELTA_REQUEST: &str = "terrain.delta_request"; // {tx, ty}
+// {tx, ty, has_delta, revision?, encoding?: "delta_v1", data_b64?} -- data_b64
+// is terrain_common::SparseHeightDelta::encode(1)'s bytes, base64-wrapped
+// (magic "TRHD" + block bitmap + touched 16x16 i16-cm blocks). Unlike
+// `terrain.tile_request`, an IN-RANGE chunk always answers -- `has_delta:
+// false` when unedited -- so the client never has to distinguish "not
+// answered yet" from "answered, nothing here". Out-of-range requests are
+// silently ignored, same as the tile path.
+pub const S_TERRAIN_DELTA_DATA: &str = "terrain.delta_data";
+// {brush, cells: [[cx, cy, d_cm], ...]} -- one editor brush stroke. Cells are
+// WORLD corner coordinates (cx in [0, tile_size*tiles_x], same for cy) with
+// centimeter height increments; the server maps each corner to every chunk
+// that shares it (the duplicated-edge convention), so a stroke crossing a
+// chunk seam can never open a gap. Restricted to role == "editor".
+pub const C_TERRAIN_EDIT_OP: &str = "terrain.edit_op";
+// {message} -- the op was rejected (not an editor / out of bounds / over the
+// per-corner offset cap / malformed).
+pub const S_TERRAIN_EDIT_ERROR: &str = "terrain.edit_error";
+// {tx, ty, revision, encoding: "delta_v1", data_b64} -- pushed to EVERY
+// connected client after an accepted edit op, once per chunk the op touched.
+// data_b64 is the chunk's full current delta (same encoding as
+// terrain.delta_data), not just the changed blocks -- deltas are small, and
+// replace-not-merge keeps the client decode path single.
+pub const S_TERRAIN_DELTA_PATCH: &str = "terrain.delta_patch";
+// {op_id, brush} -- sent to the op's AUTHOR only, before the patches, so
+// its history/undo UI can record the id the server minted for the stroke.
+pub const S_TERRAIN_EDIT_ACK: &str = "terrain.edit_ack";
+// {op_id} -- undo one accepted op: restores every block it touched to its
+// pre-op content (whole-block snapshots from the op log), bumps revisions,
+// and broadcasts terrain.delta_patch per affected chunk like a normal edit.
+// Editor-role-gated like terrain.edit_op; an unknown or already-reverted op
+// is rejected with terrain.edit_error. Note: reverting out of stroke order
+// can clobber a later overlapping op (whole-block restore, by design) --
+// clients should offer undo-last.
+pub const C_TERRAIN_REVERT_OP: &str = "terrain.revert_op";
+// {op_id} -- the revert was applied (patches follow separately).
+pub const S_TERRAIN_REVERT_ACK: &str = "terrain.revert_ack";
 
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}

@@ -111,36 +111,12 @@ func _process(_delta: float) -> void:
 		active = false
 		mode_changed.emit(active, current_kind(), _rot)
 
-## Raycast from the camera through `screen_pos` (the current mouse position by
-## default — overridable for tests) onto the ground, returning the hit in
-## world units. Falls back to the last good hit if the camera looks dead
-## level or the ground is behind it (no sane intersection that frame).
-##
-## The ground isn't flat (`Protocol.terrain_height`), so a single plane
-## intersection would land slightly off on sloped ground — refined with one
-## extra pass against the actual terrain height at the first-pass estimate,
-## which is accurate enough for gentle, smoothly-varying hills without
-## iteratively ray-marching the surface.
+## Ground point under `screen_pos` (the current mouse position by default —
+## overridable for tests) in world units, remembering the last good hit as the
+## fallback for frames with no sane intersection (`Protocol.pick_ground`).
 func _raycast_ground(screen_pos: Variant = null) -> Vector2:
-	if camera == null:
-		return _last_ground
 	var mouse: Vector2 = screen_pos if screen_pos != null else get_viewport().get_mouse_position()
-	var origin := camera.project_ray_origin(mouse)
-	var dir := camera.project_ray_normal(mouse)
-	if absf(dir.y) < 0.0001:
-		return _last_ground
-	var t := -origin.y / dir.y
-	if t <= 0.0:
-		return _last_ground
-	var hit := origin + dir * t
-	var approx := Vector2(hit.x / Protocol.WORLD_SCALE, hit.z / Protocol.WORLD_SCALE)
-
-	var ground_y := Protocol.terrain_height(approx.x, approx.y)
-	var t2 := (ground_y - origin.y) / dir.y
-	if t2 <= 0.0:
-		return _last_ground
-	var hit2 := origin + dir * t2
-	_last_ground = Vector2(hit2.x / Protocol.WORLD_SCALE, hit2.z / Protocol.WORLD_SCALE)
+	_last_ground = Protocol.pick_ground(camera, mouse, _last_ground)
 	return _last_ground
 
 func _snapped_pos() -> Vector2:

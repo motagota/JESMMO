@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-/// Mirrors `mmo::world::WORLD_SIZE` / `proxy.rs`'s copy — keep in sync.
-const WORLD_SIZE: i32 = 6400;
+use mmo::util::dist2;
+use mmo::world::WORLD_SIZE;
 
 // --- Simulation / combat tuning ------------------------------------------------
 const TICK_MS: u64 = 50; // 20 Hz authoritative simulation
@@ -220,12 +220,6 @@ fn clamp_region(r: &Region, x: i32, y: i32) -> (i32, i32) {
         x.clamp(r.x0, (r.x1 - 1).max(r.x0)),
         y.clamp(r.y0, (r.y1 - 1).max(r.y0)),
     )
-}
-
-fn dist2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
-    let dx = (ax - bx) as i64;
-    let dy = (ay - by) as i64;
-    dx * dx + dy * dy
 }
 
 /// A unit-ish step of `speed` world units from (fx,fy) toward (tx,ty).
@@ -1367,15 +1361,15 @@ mod tests {
     #[test]
     fn safe_in_capital_wilds_outside() {
         // Each authored district band is safe.
-        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 1600, y1: 6400 }).is_safe()); // market
-        assert!(zone_for_region(Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 }).is_safe()); // civic
-        assert!(zone_for_region(Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 }).is_safe()); // suburbs
-        assert!(zone_for_region(Region { x0: 1600, y0: 0, x1: 4800, y1: 1600 }).is_safe()); // craftworks
-        assert!(zone_for_region(Region { x0: 1600, y0: 4800, x1: 4800, y1: 6400 }).is_safe()); // old_quarter
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 6400, y1: 25600 }).is_safe()); // suburbs
+        assert!(zone_for_region(Region { x0: 6400, y0: 6400, x1: 19200, y1: 19200 }).is_safe()); // civic
+        assert!(zone_for_region(Region { x0: 19200, y0: 0, x1: 25600, y1: 25600 }).is_safe()); // market
+        assert!(zone_for_region(Region { x0: 6400, y0: 0, x1: 19200, y1: 6400 }).is_safe()); // craftworks
+        assert!(zone_for_region(Region { x0: 6400, y0: 19200, x1: 19200, y1: 25600 }).is_safe()); // old_quarter
         // The default whole-world zone is safe (centre is the Civic Centre).
-        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 6400, y1: 6400 }).is_safe());
+        assert!(zone_for_region(Region { x0: 0, y0: 0, x1: 25600, y1: 25600 }).is_safe());
         // A region whose centre falls outside the authored capital is wilds.
-        assert!(!zone_for_region(Region { x0: 6600, y0: 6600, x1: 8000, y1: 8000 }).is_safe());
+        assert!(!zone_for_region(Region { x0: 26600, y0: 26600, x1: 32000, y1: 32000 }).is_safe());
     }
 
     /// Acceptance (#5): in the safe capital, a mob sitting on top of a player deals
@@ -1383,8 +1377,8 @@ mod tests {
     #[tokio::test]
     async fn safe_zone_deals_no_player_damage() {
         // Civic Centre band, centred on the town centre — safe.
-        let region = Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 };
-        let hp = run_with_player_and_adjacent_mob(region, "p1", (3200, 3200), 8).await;
+        let region = Region { x0: 6400, y0: 6400, x1: 19200, y1: 19200 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (12800, 12800), 8).await;
         assert_eq!(hp, PLAYER_MAX_HP, "a player took damage inside the safe capital");
     }
 
@@ -1394,8 +1388,8 @@ mod tests {
     async fn wilds_zone_damages_player() {
         // A region whose centre is outside the capital -> wilds. It still contains
         // the player's spot so the mob can reach them.
-        let region = Region { x0: 6600, y0: 6600, x1: 8000, y1: 8000 };
-        let hp = run_with_player_and_adjacent_mob(region, "p1", (6650, 6650), 8).await;
+        let region = Region { x0: 26600, y0: 26600, x1: 32000, y1: 32000 };
+        let hp = run_with_player_and_adjacent_mob(region, "p1", (26650, 26650), 8).await;
         assert!(hp < PLAYER_MAX_HP, "a wilds mob should have damaged the player (hp={hp})");
     }
 
@@ -1410,7 +1404,7 @@ mod tests {
         let zone = zone_for_region(CIVIC);
         zone.entities.lock().unwrap().insert(
             "p1".to_string(),
-            Entity { hp: 0, ..Entity::player(3200, 3200, PLAYER_MAX_HP) },
+            Entity { hp: 0, ..Entity::player(12800, 12800, PLAYER_MAX_HP) },
         );
         let packets = drive(zone.clone(), 1).await;
 
@@ -1426,8 +1420,8 @@ mod tests {
 
     // --- #7: resource gathering -----------------------------------------------
 
-    const CIVIC: Region = Region { x0: 1600, y0: 1600, x1: 4800, y1: 4800 };
-    const TREE: &str = "node_civic_tree_0"; // authored at (3140, 3140), wood, qty 5
+    const CIVIC: Region = Region { x0: 6400, y0: 6400, x1: 19200, y1: 19200 };
+    const TREE: &str = "node_civic_tree_0"; // authored at (12740, 12740), wood, qty 5
 
     /// Civic zone with its authored nodes spawned and a player standing on the tree.
     fn civic_zone_on_tree() -> Arc<ZoneServer> {
@@ -1435,7 +1429,7 @@ mod tests {
         zone.spawn_nodes();
         zone.entities.lock().unwrap().insert(
             "p1".to_string(),
-            Entity::player(3140, 3140, PLAYER_MAX_HP),
+            Entity::player(12740, 12740, PLAYER_MAX_HP),
         );
         zone
     }
@@ -1503,7 +1497,7 @@ mod tests {
     async fn gather_out_of_range_is_cancelled() {
         let zone = civic_zone_on_tree();
         // Move the player far from the tree (still in-region, but out of gather range).
-        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 3400;
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 13000;
         zone.gathering.lock().unwrap().insert(
             "p1".to_string(),
             GatherJob { node_id: TREE.to_string(), progress: 0 },
@@ -1529,7 +1523,7 @@ mod tests {
     #[tokio::test]
     async fn plots_spawn_in_suburbs_and_gate_geometrically() {
         // Suburbs band — the only district with an authored plot grid.
-        let region = Region { x0: 4800, y0: 0, x1: 6400, y1: 6400 };
+        let region = Region { x0: 0, y0: 0, x1: 6400, y1: 25600 };
         let zone = zone_for_region(region);
         zone.spawn_plots();
         let plots = zone.plots.lock().unwrap().clone();
@@ -1543,7 +1537,7 @@ mod tests {
         let civic_zone = zone_for_region(CIVIC);
         civic_zone.spawn_plots();
         assert!(civic_zone.plots.lock().unwrap().is_empty());
-        assert!(!civic_zone.on_a_plot(3200, 3200), "no plot grid in the civic centre");
+        assert!(!civic_zone.on_a_plot(12800, 12800), "no plot grid in the civic centre");
     }
 
     /// #13: deposit/withdraw and crafting are gated on proximity to a *specific*

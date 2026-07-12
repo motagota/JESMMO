@@ -1,6 +1,5 @@
 # Rust
 /target/
-/rust_server/target/
 **/*.rs.bk
 
 # terrain-bake's per-stage cache (regenerable; the checked-in artifact itself,
@@ -16,14 +15,14 @@ venv/
 env/
 
 # Server logs / runtime output
-server/*_out.txt
-server/*_err.txt
 *.log
 
-# SQLite dev/test databases (created at runtime; never committed)
+# SQLite dev/test databases (created at runtime; never committed) — including
+# set-aside backups of incompatible-world dev DBs (e.g. mmo_dev.v2world.db.bak)
 *.db
 *.db-wal
 *.db-shm
+*.db.bak
 
 # OS / editor
 .DS_Store
@@ -35,6 +34,10 @@ Thumbs.db
 # these *is* committed (see terrain-bake/testdata/).
 *.tif
 *.tiff
+# The v3 full-map converted grid is ~105MB -- over GitHub's per-file limit,
+# so unlike the small v2 grid it is NOT committed; regenerate it from
+# 5m_DEM.tif with the convert_dem.py invocation in terrain.toml's header.
+dem_data/brisbane_full_5m.grid
 
 # Regenerable bake output from the real-DEM demo config (issue #69) -- the
 # committed .grid input + .toml config regenerate it; not the output itself.

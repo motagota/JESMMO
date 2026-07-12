@@ -13,12 +13,13 @@
 //! by the mayor, see `mayor.build_create`) and build homes (M2/M3). See
 //! phase1.md §3.1-3.2.
 //!
-//! `WORLD_SIZE` mirrors the gateway/zone constant; keep them in sync.
+//! `WORLD_SIZE` lives here; the gateway/zone binaries import it.
 
-/// Edge length of the (square) world, in world units (1 unit = 1 meter). Mirrors
-/// the same constant in `proxy.rs` / `zone_server.rs`. 6400x6400 = ~41 km²,
-/// matching the design's ~40 km² capital footprint (`MMO.md` §7).
-pub const WORLD_SIZE: i32 = 6400;
+/// Edge length of the (square) world, in world units (1 unit = 1 meter).
+/// 25600x25600 = ~655 km²: the near-full extent of the real Brisbane DEM
+/// (the v3 bake, see the repo-root `terrain.toml`) — exactly 4x the linear
+/// size of the original 6400 world, so all authored coordinates scaled by 4.
+pub const WORLD_SIZE: i32 = 25600;
 
 /// A half-open rectangle of the world: `[x0, x1) x [y0, y1)`. (Mirror of the
 /// gateway's private `Region`, exposed here as authored geometry.)
@@ -259,7 +260,15 @@ pub struct BuildBoard {
 /// artifact's own internal tile/cell resolution (see [`loaded_terrain`]'s
 /// doc comment for why that decoupling is the whole point). Mirrored by the
 /// client's ground mesh — see `docs/protocol.md`'s `terrain.*` section.
-pub const TERRAIN_RESOLUTION: i32 = 48;
+///
+/// 384 keeps the backdrop at ~66m per cell on the 25600 world — twice the
+/// per-cell fidelity the original 6400 world had at 48 — so distant terrain
+/// (everything beyond the streamed fine-tile ring) reads as real hills
+/// with ridgelines, and together with the client's distance fog the
+/// fine-to-coarse transition stops reading as "leftover placeholder
+/// terrain". The one-time `terrain.data` message grows to (384+1)² ≈ 148k
+/// height samples (~1.5MB of JSON), still a single push at session start.
+pub const TERRAIN_RESOLUTION: i32 = 384;
 
 /// Where the baked terrain artifact (issue #56's terrain pipeline; produced
 /// by `terrain-bake`, see the repo-root `terrain.toml`) lives, unless
@@ -269,11 +278,11 @@ pub const TERRAIN_RESOLUTION: i32 = 48;
 /// run the server from inside `rust_server/`, but a workspace-wide `cargo
 /// run -p proxy` from the repo root works too).
 ///
-/// `world_v2`, not `world_v1`: this bake is native 5m resolution (100 tiles)
-/// rather than the original 25m single-tile bake — a materially different,
-/// non-backward-compatible artifact, hence the new directory name rather
-/// than overwriting `world_v1` in place.
-const DEFAULT_TERRAIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../artifacts/world_v2");
+/// `world_v3`: the near-full-extent 25.6km Brisbane bake (1600 tiles) —
+/// materially different from `world_v2`'s 6.4km crop (16x the area, plot
+/// field moved to the west band), hence the new directory name rather than
+/// overwriting `world_v2` in place.
+const DEFAULT_TERRAIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../artifacts/world_v3");
 
 static TERRAIN: std::sync::OnceLock<std::sync::Arc<terrain_common::Terrain>> = std::sync::OnceLock::new();
 
@@ -296,6 +305,15 @@ static TERRAIN: std::sync::OnceLock<std::sync::Arc<terrain_common::Terrain>> = s
 /// everywhere, and layers genuinely native-resolution tiles on top near the
 /// player, streamed in/out as they move (see
 /// `client_godot/world/TerrainStreamer.gd`).
+///
+/// **Terrain-editing caveat (#72/#80)**: this is the immutable *base*.
+/// Hand-authored edits live as deltas in the `terrain_delta` table and are
+/// composited separately (`Terrain::sample_height_with_delta`; the client
+/// composites onto streamed chunks). If you add a server-side gameplay
+/// consumer of ground height, do **not** call `sample_height` directly --
+/// go through `proxy.rs::composited_ground_height` (or replicate its
+/// base-plus-delta composition), or edited terrain will be invisible to
+/// your feature. The #80 audit confirmed no such consumer exists today.
 pub fn loaded_terrain() -> std::sync::Arc<terrain_common::Terrain> {
     TERRAIN
         .get_or_init(|| {
@@ -387,36 +405,42 @@ impl Capital {
     }
 }
 
-/// The Phase 1 capital: five named districts tiling the 6400x6400 (~41 km²) world
-/// in a plus/cross layout — a central Civic Centre with Market/Suburbs bands to its
-/// west/east and Craftworks/Old Quarter bands to its north/south — a starter plot
-/// grid in the suburbs, a town-centre spawn at the world centre, and a civic build
-/// board. No roads and no build orders are authored; both start empty and are
-/// built at runtime (roads via mayor-issued build orders).
+/// The Phase 1 capital: five named districts tiling the 25600x25600 (~655 km²)
+/// world in a plus/cross layout — a central Civic Centre with Suburbs/Market
+/// bands to its west/east and Craftworks/Old Quarter bands to its north/south —
+/// a starter plot grid in the suburbs, a town-centre spawn at the world centre,
+/// and a civic build board. No roads and no build orders are authored; both
+/// start empty and are built at runtime (roads via mayor-issued build orders).
+///
+/// The suburbs (and their starter-plot field) sit in the WEST band: in the v3
+/// full-extent Brisbane bake the east band reaches the river mouth and Moreton
+/// Bay (flat sea-filled ground), while the west band is real inland hillside —
+/// the bake's `capital_flatten_mask` placement (see `terrain.toml`) matches.
 pub fn capital() -> Capital {
     // A plus/cross tiling: west/east bands span the full height; the middle column
     // (between them) splits into north/centre/south. Exact tiling, verified in
     // `districts_tile_the_world_without_gaps_or_overlap`.
-    let side = WORLD_SIZE / 4; // 1600 — west/east band width, north/south band height
-    let mid0 = side; // 1600
-    let mid1 = WORLD_SIZE - side; // 4800
+    let side = WORLD_SIZE / 4; // 6400 — west/east band width, north/south band height
+    let mid0 = side; // 6400
+    let mid1 = WORLD_SIZE - side; // 19200
 
     let market = District {
         id: "market",
         name: "Market District",
-        region: Rect::new(0, 0, side, WORLD_SIZE),
+        region: Rect::new(mid1, 0, WORLD_SIZE, WORLD_SIZE),
         safety: Safety::Safe,
         plot_grid: None,
     };
     let suburbs = District {
         id: "suburbs",
         name: "Starter Suburbs",
-        region: Rect::new(mid1, 0, WORLD_SIZE, WORLD_SIZE),
+        region: Rect::new(0, 0, side, WORLD_SIZE),
         safety: Safety::Safe,
-        // A generous starter grid: 12 columns x 20 rows = 240 plots (10x Phase 1's
-        // original 24, for a ~28x bigger world — plots stay scarce/premium, not an
-        // attempt at the design doc's long-term ~100k-plot figure). plot 80 + gap 40
-        // -> 120 per cell; 12 cols span 1400 < 1600, 20 rows span 2360 < 6400.
+        // A generous starter grid: 12 columns x 20 rows = 240 plots — plots stay
+        // scarce/premium, not an attempt at the design doc's long-term ~100k-plot
+        // figure. plot 80 + gap 40 -> 120 per cell; 12 cols span 1400 < 6400,
+        // 20 rows span 2360 < 25600. Anchored at the band's top-left (NW corner
+        // of the world) — the terrain there is real, bake-flattened hillside.
         plot_grid: Some(PlotGrid {
             cols: 12,
             rows: 20,
@@ -476,24 +500,24 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_civic_tree_2", district: "civic", item_id: "wood", x: tcx - 60, y: tcy + 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_tree_3", district: "civic", item_id: "wood", x: tcx + 60, y: tcy + 60, qty: 5 },
         ResourceNodeSpawn { id: "node_civic_rock_0", district: "civic", item_id: "stone", x: tcx, y: tcy - 110, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_tree_0", district: "market", item_id: "wood", x: 400, y: 800, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 1000, y: 2400, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 600, y: 4000, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_tree_2", district: "market", item_id: "wood", x: 1200, y: 5200, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_rock_1", district: "market", item_id: "stone", x: 300, y: 6000, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 5200, y: 700, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 5900, y: 2200, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 5400, y: 3600, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_tree_2", district: "suburbs", item_id: "wood", x: 6000, y: 5000, qty: 5 },
-        ResourceNodeSpawn { id: "node_suburbs_rock_1", district: "suburbs", item_id: "stone", x: 5100, y: 6100, qty: 5 },
-        ResourceNodeSpawn { id: "node_craftworks_tree_0", district: "craftworks", item_id: "wood", x: 2000, y: 400, qty: 5 },
-        ResourceNodeSpawn { id: "node_craftworks_rock_0", district: "craftworks", item_id: "stone", x: 3200, y: 900, qty: 5 },
-        ResourceNodeSpawn { id: "node_craftworks_tree_1", district: "craftworks", item_id: "wood", x: 4400, y: 500, qty: 5 },
-        ResourceNodeSpawn { id: "node_craftworks_rock_1", district: "craftworks", item_id: "stone", x: 2800, y: 1300, qty: 5 },
-        ResourceNodeSpawn { id: "node_old_quarter_tree_0", district: "old_quarter", item_id: "wood", x: 2000, y: 5200, qty: 5 },
-        ResourceNodeSpawn { id: "node_old_quarter_rock_0", district: "old_quarter", item_id: "stone", x: 3200, y: 5900, qty: 5 },
-        ResourceNodeSpawn { id: "node_old_quarter_tree_1", district: "old_quarter", item_id: "wood", x: 4400, y: 5400, qty: 5 },
-        ResourceNodeSpawn { id: "node_old_quarter_rock_1", district: "old_quarter", item_id: "stone", x: 2800, y: 6100, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_0", district: "market", item_id: "wood", x: 20800, y: 2800, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 23600, y: 8800, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 21600, y: 14400, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_tree_2", district: "market", item_id: "wood", x: 24000, y: 20000, qty: 5 },
+        ResourceNodeSpawn { id: "node_market_rock_1", district: "market", item_id: "stone", x: 20400, y: 24400, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 1600, y: 3200, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 4000, y: 9600, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 2400, y: 16000, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_tree_2", district: "suburbs", item_id: "wood", x: 4800, y: 20800, qty: 5 },
+        ResourceNodeSpawn { id: "node_suburbs_rock_1", district: "suburbs", item_id: "stone", x: 1200, y: 24000, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_tree_0", district: "craftworks", item_id: "wood", x: 8000, y: 1600, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_rock_0", district: "craftworks", item_id: "stone", x: 12800, y: 3600, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_tree_1", district: "craftworks", item_id: "wood", x: 17600, y: 2000, qty: 5 },
+        ResourceNodeSpawn { id: "node_craftworks_rock_1", district: "craftworks", item_id: "stone", x: 11200, y: 5200, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_tree_0", district: "old_quarter", item_id: "wood", x: 8000, y: 20800, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_rock_0", district: "old_quarter", item_id: "stone", x: 12800, y: 23600, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_tree_1", district: "old_quarter", item_id: "wood", x: 17600, y: 21600, qty: 5 },
+        ResourceNodeSpawn { id: "node_old_quarter_rock_1", district: "old_quarter", item_id: "stone", x: 11200, y: 24400, qty: 5 },
     ];
 
     // A public town storehouse beside the town centre (the M2 stash). Per-plot
@@ -559,14 +583,14 @@ mod tests {
     #[test]
     fn district_lookup_by_point_and_region() {
         let c = capital();
-        assert_eq!(c.district_at(10, 10).unwrap().id, "market");
-        assert_eq!(c.district_at(3200, 3200).unwrap().id, "civic");
-        assert_eq!(c.district_at(5500, 3200).unwrap().id, "suburbs");
-        assert_eq!(c.district_at(3200, 800).unwrap().id, "craftworks");
-        assert_eq!(c.district_at(3200, 5600).unwrap().id, "old_quarter");
+        assert_eq!(c.district_at(10, 10).unwrap().id, "suburbs");
+        assert_eq!(c.district_at(12800, 12800).unwrap().id, "civic");
+        assert_eq!(c.district_at(22000, 12800).unwrap().id, "market");
+        assert_eq!(c.district_at(12800, 3200).unwrap().id, "craftworks");
+        assert_eq!(c.district_at(12800, 22400).unwrap().id, "old_quarter");
         assert!(c.district_at(WORLD_SIZE, 0).is_none()); // outside (half-open)
         // Region centre routing survives shard geometry.
-        let r = Rect::new(5000, 0, 5400, 600);
+        let r = Rect::new(200, 0, 1600, 2400);
         assert_eq!(c.district_for_region(r).unwrap().id, "suburbs");
     }
 
