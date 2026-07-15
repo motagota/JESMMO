@@ -17,8 +17,8 @@
 # against the converted grid -- the same process that picked the v2 AOI.
 # The east edge reaches the Brisbane River mouth and Moreton Bay: those
 # water areas are NoData in the LiDAR and are filled flat at 0m (~10% of
-# cells), reading as level coastal plains until client-side water rendering
-# exists. The CBD river S-bends sit mid-map near the town-centre spawn.
+# cells), captured by the [water] mask and rendered by the client's water
+# plane. The CBD river S-bends sit mid-map near the town-centre spawn.
 #
 # 128-cell tiles (640m each) over a 5120x5120 cell grid = a 40x40 tile
 # grid. The coarse whole-world wire heightmap
@@ -46,12 +46,15 @@ tile_size = 128
 out_dir   = "artifacts/world_v3/"
 
 [water]
-# Comfortably below this crop's real minimum (~-21.4m, the actual river
-# channel bed) so the water mask stays empty -- the Godot client doesn't
-# render biome/water data yet (only the height mesh), so nav-blocking the
-# river/bay here would produce an invisible, confusing wall with no visual
-# cue. Revisit once client-side water rendering exists.
-sea_level_m = -25.0
+# Real sea level (#84, player-attributes epic #83). The empty-mask -25.0
+# placeholder existed only because the client had no water rendering and a
+# nav-blocked river would have been an invisible wall; the client water
+# plane shipped 2026-07-14, and the drowning mechanic needs the river/bay
+# to be a real water mask with real depth (the channel bed reaches ~-21.4m).
+# Water cells clamp flat to 0m and [detail] noise is skipped inside the
+# mask, so the NoData fill stops carrying ±0.6m bed bumps. Nav is still
+# NOT blocked -- deep water kills via the breath mechanic instead (#87).
+sea_level_m = 0.0
 open_close_radius = 1
 min_river_width_m = 20.0
 clamp_epsilon_m = 0.2
@@ -78,8 +81,9 @@ capital_flatten_margin_m = 100.0
 # Small-scale texture on top of the real relief (#65) -- now redundant with
 # the DEM's own native 5m micro-relief (no resampling smoothing it out
 # anymore), but kept modest and harmless as a light finishing touch. Skipped
-# entirely inside the water mask (empty here anyway) and the capital_flatten
-# footprint, so the buildable plot field stays exactly level.
+# entirely inside the water mask (the river/bay -- keeps the waterline bed
+# flat) and the capital_flatten footprint, so the buildable plot field
+# stays exactly level.
 octaves = 3
 base_amp_m = 0.6
 slope_amp_curve = 1.5
