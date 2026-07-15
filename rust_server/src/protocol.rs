@@ -129,6 +129,31 @@ pub const C_TERRAIN_REVERT_OP: &str = "terrain.revert_op";
 // {op_id} -- the revert was applied (patches follow separately).
 pub const S_TERRAIN_REVERT_ACK: &str = "terrain.revert_ack";
 
+// --- object.* — placed world props (player-attributes epic #83, issue #85) -----
+// Editor-authored props with gameplay meaning (first kind: "poison_tree").
+// World-scoped like terrain: every client sees every object regardless of
+// zone/district. Coordinates are world units (metres), the same space as
+// structures and resource nodes.
+// (no payload) -> {objects: [{id, kind, x, y}, ...]} -- the full current
+// object roster, answered from the gateway's in-memory cache. Stateless
+// read like terrain.list; clients request it once the world is up and then
+// stay current via the placed/removed broadcasts.
+pub const C_OBJECT_LIST: &str = "object.list";
+pub const S_OBJECT_LIST: &str = "object.list";
+// {kind, x, y} -- place one object. Restricted to role == "editor"; kind
+// must be a registered object kind, (x, y) inside the world.
+pub const C_OBJECT_PLACE: &str = "object.place";
+// {object_id} -- delete one placed object. Restricted to role == "editor".
+pub const C_OBJECT_DELETE: &str = "object.delete";
+// {id, kind, x, y} / {id} -- pushed to EVERY connected client after an
+// accepted place/delete (the author included -- clients render acks, same
+// reconcile shape as terrain.delta_patch).
+pub const S_OBJECT_PLACED: &str = "object.placed";
+pub const S_OBJECT_REMOVED: &str = "object.removed";
+// {message} -- the place/delete was rejected (not an editor / unknown kind /
+// out of bounds / no such object / no database).
+pub const S_OBJECT_EDIT_ERROR: &str = "object.edit_error";
+
 // --- rent.*  (M4 §4.7) ----------------------------------------------------------
 pub const S_RENT_STATUS: &str = "rent.status"; // {plot_id, due_at, paid_through, state, auto_pay, gold}
 pub const C_RENT_PAY: &str = "rent.pay"; // {plot_id}

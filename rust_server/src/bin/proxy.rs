@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
 
 use mmo::auth;
-use mmo::persistence::Db;
+use mmo::persistence::{self, Db};
 use mmo::protocol::{self, PROTOCOL_VERSION};
 use mmo::util::{dist2, now_secs, random_heading};
 
@@ -69,6 +69,11 @@ const EDIT_MAX_OFFSET_CM: i32 = 5_000;
 /// even a stroke dragged across a whole 129-corner chunk is ~16k — anything
 /// bigger is malformed or abusive, not a real stroke.
 const EDIT_MAX_CELLS_PER_OP: usize = 16_384;
+
+/// Object kinds an editor may place (#85). The gateway validates placement
+/// against this registry; gameplay semantics attach elsewhere (the poison
+/// tick, #88, reads `poison_tree` positions from the object cache).
+const OBJECT_KINDS: &[&str] = &["poison_tree"];
 
 /// Must be within this of a build board — or a build order's own placement — to
 /// contribute to it.
@@ -317,6 +322,12 @@ struct Proxy {
     /// sampled from the already-periodic `persistence_flush`/rent-ticker writes
     /// rather than instrumenting every call site.
     db_write_latencies_ms: Mutex<VecDeque<u64>>,
+    /// Live placed world props (#85), keyed by object id — the source every
+    /// `object.list` answer and (#88) poison-proximity check reads, so neither
+    /// touches the DB. Lazily hydrated from `world_object` on first use (tests
+    /// drive handlers without `start()`, so boot-time-only loading would miss
+    /// them) and write-through on every accepted place/delete.
+    world_objects: tokio::sync::OnceCell<Mutex<HashMap<String, persistence::WorldObject>>>,
     /// Serializes `terrain.edit_op` application (terrain editing #72): each op
     /// is a read-modify-write of its chunks' delta rows, and two concurrent
     /// editors interleaving load/save would silently drop one's cells. Edits
@@ -445,6 +456,7 @@ impl Proxy {
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
+            world_objects: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -3083,6 +3095,130 @@ impl Proxy {
         self.push_to_player(pid, json!({"type": "terrain.revert_ack", "op_id": op_id}));
     }
 
+    // --- Placed world props (player-attributes epic #83, issue #85) ----------
+
+    /// The live world-object cache (see the field doc): lazily hydrated from
+    /// the `world_object` table on first touch, then kept write-through by
+    /// `apply_object_place`/`apply_object_delete`. With no DB it stays an
+    /// empty map — `object.list` still answers (an empty roster), only the
+    /// write path needs persistence.
+    async fn world_object_cache(&self) -> &Mutex<HashMap<String, persistence::WorldObject>> {
+        self.world_objects
+            .get_or_init(|| async {
+                let mut map = HashMap::new();
+                if let Some(db) = &self.db {
+                    match db.list_world_objects().await {
+                        Ok(objects) => {
+                            for o in objects {
+                                map.insert(o.id.clone(), o);
+                            }
+                        }
+                        Err(e) => println!("[Proxy] WARNING: world_object cache load failed: {e}"),
+                    }
+                }
+                Mutex::new(map)
+            })
+            .await
+    }
+
+    /// Answer `object.list`: the full current object roster from the cache.
+    /// Explicit even when empty — the client must not have to distinguish
+    /// "not answered yet" from "answered, nothing placed" (the
+    /// `terrain.delta_data` lesson).
+    async fn send_object_list(&self, pid: &str) {
+        let objects: Vec<Value> = {
+            let cache = self.world_object_cache().await.lock().unwrap();
+            cache
+                .values()
+                .map(|o| json!({"id": o.id, "kind": o.kind, "x": o.x, "y": o.y}))
+                .collect()
+        };
+        self.push_to_player(pid, json!({"type": "object.list", "objects": objects}));
+    }
+
+    /// Apply an editor's `object.place`. Validation is explicit-error
+    /// (`object.edit_error`), mirroring `apply_terrain_edit_op`'s posture — an
+    /// editor needs to see *why*, unlike the silent gameplay no-ops. On
+    /// success the stored object is broadcast to every client as
+    /// `object.placed` (the author included — clients render acks).
+    async fn apply_object_place(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "object.edit_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may place objects");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("placing objects requires persistence (no database)");
+            return;
+        };
+        let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if !OBJECT_KINDS.contains(&kind) {
+            reject("unknown object kind");
+            return;
+        }
+        let (Some(x), Some(y)) = (
+            data.get("x").and_then(|v| v.as_i64()),
+            data.get("y").and_then(|v| v.as_i64()),
+        ) else {
+            reject("malformed object.place (x/y required)");
+            return;
+        };
+        let world = mmo::world::WORLD_SIZE as i64;
+        if !(0..world).contains(&x) || !(0..world).contains(&y) {
+            reject("object position is outside the world");
+            return;
+        }
+        let author = terrain_common::AuthorId::Editor(pid.to_string()).to_string();
+        match db.insert_world_object(kind, x as i32, y as i32, &author, now_secs()).await {
+            Ok(obj) => {
+                let placed = json!({"type": "object.placed", "id": obj.id, "kind": obj.kind, "x": obj.x, "y": obj.y});
+                self.world_object_cache().await.lock().unwrap().insert(obj.id.clone(), obj);
+                self.broadcast_to_all(placed);
+            }
+            Err(e) => {
+                println!("[Proxy] object.place persist failed: {e}");
+                reject("storage error saving the object");
+            }
+        }
+    }
+
+    /// Apply an editor's `object.delete`. The DB row is the claim (a losing
+    /// racer's delete affects zero rows and errors instead of broadcasting a
+    /// second removal); the cache entry follows the row.
+    async fn apply_object_delete(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "object.edit_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may delete objects");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("deleting objects requires persistence (no database)");
+            return;
+        };
+        let object_id = data.get("object_id").and_then(|v| v.as_str()).unwrap_or("");
+        if object_id.is_empty() {
+            reject("malformed object.delete (object_id required)");
+            return;
+        }
+        match db.delete_world_object(object_id).await {
+            Ok(true) => {
+                self.world_object_cache().await.lock().unwrap().remove(object_id);
+                self.broadcast_to_all(json!({"type": "object.removed", "id": object_id}));
+            }
+            Ok(false) => reject("no such object"),
+            Err(e) => {
+                println!("[Proxy] object.delete persist failed: {e}");
+                reject("storage error deleting the object");
+            }
+        }
+    }
+
     /// Apply `home.set_respawn`: `bed_id` must name a `bed`-kind structure on the
     /// caller's own plot. Silent no-op otherwise (no error protocol surface).
     async fn apply_set_respawn(&self, pid: &str, bed_id: &str) {
@@ -3507,6 +3643,23 @@ impl Proxy {
                         self.apply_terrain_revert_op(&player_id, data).await;
                         continue;
                     }
+                    // `object.list` (world props #85) is a stateless read of the
+                    // gateway's object cache — same reasoning as `terrain.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("object.list") {
+                        self.send_object_list(&player_id).await;
+                        continue;
+                    }
+                    // `object.place`/`object.delete` (#85) are role- and
+                    // bounds-checked with no live-position dependency — same
+                    // direct-answer reasoning as `terrain.edit_op`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("object.place") {
+                        self.apply_object_place(&player_id, data).await;
+                        continue;
+                    }
+                    if data.get("type").and_then(|v| v.as_str()) == Some("object.delete") {
+                        self.apply_object_delete(&player_id, data).await;
+                        continue;
+                    }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
                     // mine?), not live position, so it's answered directly too.
                     if data.get("type").and_then(|v| v.as_str()) == Some("home.set_respawn") {
@@ -3929,6 +4082,7 @@ mod tests {
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
+            world_objects: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -6708,5 +6862,189 @@ mod tests {
         let proxy = test_proxy(); // Proxy::new(..., None)
         let base = proxy.capital.terrain.sample_height(500.0, 500.0);
         assert_eq!(proxy.composited_ground_height(500.0, 500.0).await, base);
+    }
+
+    // --- placed world props (#85): object.list / object.place / object.delete --
+
+    /// A non-editor's place and delete are both rejected with an explicit
+    /// error, and nothing persists.
+    #[tokio::test]
+    async fn object_place_and_delete_are_rejected_for_non_editors() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("scrub_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Scrub"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "object.place", "kind": "poison_tree", "x": 100, "y": 200}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("editor"));
+
+        ws.send(Message::Text(
+            json!({"type": "object.delete", "object_id": "whatever"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("editor"));
+
+        assert!(db.list_world_objects().await.unwrap().is_empty(), "a rejected op must persist nothing");
+        drop(ws);
+    }
+
+    /// The full editor round-trip: place broadcasts `object.placed` to every
+    /// client (a bystander included), `object.list` answers the roster, delete
+    /// broadcasts `object.removed`, and the roster empties again.
+    #[tokio::test]
+    async fn object_place_list_delete_round_trip_with_broadcasts() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // A plain-player bystander, connected before the placement.
+        let email = format!("watcher_{}@t.test", Uuid::new_v4().simple());
+        let mut watcher_ws = dial(&proxy).await;
+        watcher_ws
+            .send(Message::Text(
+                json!({"type": "register", "email": email, "password": "pw12", "name": "Watcher"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        recv_until(&mut watcher_ws, "welcome").await;
+
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "object.place", "kind": "poison_tree", "x": 12700, "y": 12750}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let placed = recv_until(&mut editor_ws, "object.placed").await;
+        let id = placed["id"].as_str().unwrap().to_string();
+        assert_eq!(placed["kind"].as_str().unwrap(), "poison_tree");
+        assert_eq!(placed["x"].as_i64().unwrap(), 12700);
+        assert_eq!(placed["y"].as_i64().unwrap(), 12750);
+        let seen = recv_until(&mut watcher_ws, "object.placed").await;
+        assert_eq!(seen["id"].as_str().unwrap(), id, "the bystander sees the same placement");
+
+        // The roster answers from the cache, and the row is durable.
+        watcher_ws
+            .send(Message::Text(json!({"type": "object.list"}).to_string()))
+            .await
+            .unwrap();
+        let roster = recv_until(&mut watcher_ws, "object.list").await;
+        let objects = roster["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["id"].as_str().unwrap(), id);
+        assert_eq!(db.list_world_objects().await.unwrap().len(), 1);
+
+        editor_ws
+            .send(Message::Text(json!({"type": "object.delete", "object_id": id}).to_string()))
+            .await
+            .unwrap();
+        let removed = recv_until(&mut watcher_ws, "object.removed").await;
+        assert_eq!(removed["id"].as_str().unwrap(), id, "the bystander sees the removal too");
+        recv_until(&mut editor_ws, "object.removed").await;
+
+        watcher_ws
+            .send(Message::Text(json!({"type": "object.list"}).to_string()))
+            .await
+            .unwrap();
+        let roster = recv_until(&mut watcher_ws, "object.list").await;
+        assert!(roster["objects"].as_array().unwrap().is_empty(), "the roster empties after delete");
+        assert!(db.list_world_objects().await.unwrap().is_empty());
+
+        drop(editor_ws);
+        drop(watcher_ws);
+    }
+
+    /// Kind and bounds are validated with explicit errors; a delete of an
+    /// unknown id errors instead of broadcasting.
+    #[tokio::test]
+    async fn object_place_validates_kind_bounds_and_delete_validates_existence() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        ws.send(Message::Text(
+            json!({"type": "object.place", "kind": "chocolate_teapot", "x": 100, "y": 100}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("kind"));
+
+        ws.send(Message::Text(
+            json!({"type": "object.place", "kind": "poison_tree", "x": -1, "y": 100}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("outside"));
+
+        ws.send(Message::Text(
+            json!({"type": "object.place", "kind": "poison_tree", "y": 100}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("malformed"));
+
+        ws.send(Message::Text(
+            json!({"type": "object.delete", "object_id": "no-such-id"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "object.edit_error").await;
+        assert!(err["message"].as_str().unwrap().contains("no such object"));
+
+        assert!(db.list_world_objects().await.unwrap().is_empty(), "nothing persisted by any rejected op");
+        drop(ws);
+    }
+
+    /// Placed objects survive a gateway restart: a second proxy over the same
+    /// DB hydrates its cache from the table and serves the same roster.
+    #[tokio::test]
+    async fn object_roster_survives_a_gateway_restart() {
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
+
+        let proxy1 = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
+        let zone1 = spawn_fake_zone().await;
+        proxy1
+            .register_zone("zone_a".to_string(), zone1.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        let mut editor_ws = dial_editor(&proxy1, &db).await;
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "object.place", "kind": "poison_tree", "x": 5000, "y": 6000}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let placed = recv_until(&mut editor_ws, "object.placed").await;
+        let id = placed["id"].as_str().unwrap().to_string();
+        drop(editor_ws);
+
+        // "Restart": a brand-new proxy instance over the same database.
+        let proxy2 = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
+        let zone2 = spawn_fake_zone().await;
+        proxy2
+            .register_zone("zone_a".to_string(), zone2.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        let mut ws = dial_editor(&proxy2, &db).await;
+        ws.send(Message::Text(json!({"type": "object.list"}).to_string())).await.unwrap();
+        let roster = recv_until(&mut ws, "object.list").await;
+        let objects = roster["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1, "the restarted gateway must hydrate its cache from the table");
+        assert_eq!(objects[0]["id"].as_str().unwrap(), id);
+        assert_eq!(objects[0]["x"].as_i64().unwrap(), 5000);
+
+        drop(ws);
     }
 }

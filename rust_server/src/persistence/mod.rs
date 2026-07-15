@@ -509,6 +509,20 @@ pub struct Structure {
     pub data: String,
 }
 
+/// A placed world prop (player-attributes epic #83, issue #85): editor-authored,
+/// world-scoped, with gameplay meaning (first kind: `poison_tree`). Unlike
+/// [`Structure`] it belongs to no plot and no owner — `author` is provenance
+/// (terrain_delta's AuthorId string form), not ownership.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WorldObject {
+    pub id: String,
+    pub kind: String,
+    pub x: i32,
+    pub y: i32,
+    pub author: String,
+    pub created_at: i64,
+}
+
 /// A décor item. Flair is owned by the *character*, not the plot — `plot_id` is
 /// `NULL` while unattached (e.g. after a rent reclaim rehomes it, #14) so it's
 /// never destroyed, only detached from land the character no longer holds.
@@ -1920,6 +1934,62 @@ impl Db {
         .await?;
         Ok(Some(rows))
     }
+
+    // --- placed world props (player-attributes epic #83, issue #85) ---------
+
+    /// Persist a newly placed world object (editor `object.place`). The id is
+    /// minted here so the caller broadcasts exactly what was stored.
+    pub async fn insert_world_object(
+        &self,
+        kind: &str,
+        x: i32,
+        y: i32,
+        author: &str,
+        created_at: i64,
+    ) -> Result<WorldObject, DbError> {
+        let obj = WorldObject {
+            id: Uuid::new_v4().to_string(),
+            kind: kind.to_string(),
+            x,
+            y,
+            author: author.to_string(),
+            created_at,
+        };
+        sqlx::query("INSERT INTO world_object (id, kind, x, y, author, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&obj.id)
+            .bind(&obj.kind)
+            .bind(obj.x)
+            .bind(obj.y)
+            .bind(&obj.author)
+            .bind(obj.created_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(obj)
+    }
+
+    /// Delete a placed world object (editor `object.delete`). Returns whether
+    /// a row was actually removed — `false` means the id didn't exist (e.g.
+    /// two editors racing to delete the same tree; only one wins and
+    /// broadcasts).
+    pub async fn delete_world_object(&self, id: &str) -> Result<bool, DbError> {
+        let res = sqlx::query("DELETE FROM world_object WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Every placed world object — the gateway's boot-time cache load.
+    pub async fn list_world_objects(&self) -> Result<Vec<WorldObject>, DbError> {
+        let rows: Vec<(String, String, i32, i32, String, i64)> =
+            sqlx::query_as("SELECT id, kind, x, y, author, created_at FROM world_object ORDER BY created_at, id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, x, y, author, created_at)| WorldObject { id, kind, x, y, author, created_at })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -2533,5 +2603,35 @@ mod tests {
         db.save_terrain_delta(&delta).await.unwrap();
         let loaded = db.load_terrain_delta(1, 1, DELTA_SIDE).await.unwrap().unwrap();
         assert!(loaded.height_delta.is_none(), "NULL blob must load as None, not an empty delta");
+    }
+
+    // --- placed world props (#85) -------------------------------------------
+
+    #[tokio::test]
+    async fn world_objects_insert_list_delete_round_trip() {
+        let (db, _t) = TempDb::open().await;
+        assert!(db.list_world_objects().await.unwrap().is_empty(), "starts empty");
+
+        let a = db.insert_world_object("poison_tree", 100, 200, "editor:e1", 1000).await.unwrap();
+        let b = db.insert_world_object("poison_tree", 110, 200, "editor:e1", 1001).await.unwrap();
+        assert_ne!(a.id, b.id, "each placement mints its own id");
+
+        let all = db.list_world_objects().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], a, "list returns exactly what insert stored, in placement order");
+        assert_eq!(all[1], b);
+
+        assert!(db.delete_world_object(&a.id).await.unwrap(), "deleting an existing object reports true");
+        let remaining = db.list_world_objects().await.unwrap();
+        assert_eq!(remaining, vec![b], "only the deleted object is gone");
+    }
+
+    #[tokio::test]
+    async fn world_object_delete_of_missing_id_reports_false() {
+        let (db, _t) = TempDb::open().await;
+        assert!(
+            !db.delete_world_object("no-such-id").await.unwrap(),
+            "a losing racer's delete must report false (it must not broadcast)"
+        );
     }
 }

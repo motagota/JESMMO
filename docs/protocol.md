@@ -325,6 +325,26 @@ while the respawn point belongs to another, the zone doesn't respawn the player
 itself — it reports the death (`player_died`, see below) and the gateway resolves
 the destination and hands off exactly like a `migrate_request`.
 
+### `object.*` — placed world props (player-attributes epic #83, #85)
+
+Editor-authored props with gameplay meaning; first kind: `poison_tree` (the
+poison hazard, #88, reads placed trees' positions). World-scoped like
+`terrain.*`: every connected client sees every object regardless of
+zone/district, and coordinates are world units (metres) — the same space as
+structures and resource nodes. The gateway owns the whole system (a
+`world_object` table behind an in-memory cache, hydrated on first use);
+zones know nothing about objects.
+
+| message | dir | payload | status |
+|---|---|---|---|
+| `object.list` | C→S | — (request the full current object roster) | **live** |
+| `object.list` | S→C | `objects` (`[{id, kind, x, y}, …]`) — answered from the gateway's cache; explicit even when empty, so a client never confuses "no answer yet" with "nothing placed". Request once when the world is up, then stay current via the broadcasts below | **live** |
+| `object.place` | C→S | `kind`, `x`, `y` — place one object. Requires `role == "editor"`; `kind` must be registered (`poison_tree`), `(x, y)` inside the world | **live** |
+| `object.delete` | C→S | `object_id` — delete one placed object. Requires `role == "editor"`; the row delete is the claim, so racing deletes of the same object produce one `object.removed` and one error | **live** |
+| `object.placed` | S→C | `id`, `kind`, `x`, `y` — pushed to **every** connected client after an accepted place (the author included — clients render acks, the `terrain.delta_patch` reconcile shape) | **live** |
+| `object.removed` | S→C | `id` — pushed to every connected client after an accepted delete | **live** |
+| `object.edit_error` | S→C | `message` — the place/delete was rejected (not an editor / unknown kind / out of bounds / no such object / malformed / no database); nothing was saved | **live** |
+
 ### `rent.*` — rent (M4 §4.7)
 
 | type | dir | fields | status |
