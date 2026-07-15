@@ -75,6 +75,22 @@ const EDIT_MAX_CELLS_PER_OP: usize = 16_384;
 /// tick, #88, reads `poison_tree` positions from the object cache).
 const OBJECT_KINDS: &[&str] = &["poison_tree"];
 
+/// Environmental tick cadence (#87): how often every connected player's
+/// environment flags (submerged; poison sources, #88) are recomputed and
+/// pushed to their owning zone. The push is unconditional each tick, not
+/// on-change: at human player counts the traffic is trivial, and it makes
+/// entity recreation (split/merge/respawn/migrate resets zone-side flags to
+/// their defaults) self-heal within a second with zero bookkeeping.
+const ENV_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// Depth clause of the submerged test: composited ground more than this
+/// below sea level counts as underwater even OUTSIDE the baked water mask —
+/// it's what makes an editor-dug pond drown. Inside the mask the depth is
+/// irrelevant (see `env_tick_once`: the river/bay bed is mostly the LiDAR
+/// NoData fill at exactly 0m, so a depth-only rule would make most of the
+/// river non-drowning — being in the water is the signal, per the original
+/// design: "goes in water → hold breath").
+const SUBMERGED_DEPTH_M: f32 = 1.5;
+
 /// Must be within this of a build board — or a build order's own placement — to
 /// contribute to it.
 const BOARD_RANGE: i32 = 60;
@@ -2763,8 +2779,10 @@ impl Proxy {
     /// elevation (fall damage, water simulation, 3D-aware movement
     /// validation, Phase 2 terraforming rules...).
     ///
-    /// The #80 audit found there is **no such consumer today**: movement
-    /// validation is pure 2D clamping (`zone_server::clamp_world`/
+    /// The #80 audit found no such consumer at the time; the **first real
+    /// one is `env_tick_once` (#87)**, which reads it ~once per player per
+    /// second to decide "submerged". Otherwise the audit's findings stand:
+    /// movement validation is pure 2D clamping (`zone_server::clamp_world`/
     /// `clamp_region`), there is no server-side ground-snap (the client
     /// snaps visually via `Protocol.w2v`), and `is_walkable`/`nav_flags`
     /// have no production call sites. The only production `sample_height`
@@ -2781,7 +2799,6 @@ impl Proxy {
     /// consumer ever appears, add an in-memory delta cache maintained by
     /// `apply_terrain_edit_op`/`apply_terrain_revert_op` (both already
     /// serialize under `terrain_edit_lock`) and invalidate there.
-    #[allow(dead_code)] // no gameplay consumer yet — exercised by tests; see the doc above
     async fn composited_ground_height(&self, x: f32, y: f32) -> f32 {
         let terrain = &self.capital.terrain;
         let Some(db) = &self.db else {
@@ -2796,6 +2813,80 @@ impl Proxy {
             .flatten()
             .and_then(|d| d.height_delta);
         terrain.sample_height_with_delta(x, y, delta.as_ref())
+    }
+
+    /// One environmental pass (#87): compute every connected player's
+    /// environment flags from the gateway's live position cache and push them
+    /// to the player's owning zone as an `env_state` command (the same channel
+    /// `spawn_entity` uses). The zone applies drain/damage authoritatively in
+    /// its own tick — the split brain stays split: the gateway knows terrain
+    /// and object positions but doesn't own hp; the zone owns hp but knows no
+    /// terrain.
+    ///
+    /// Submerged = **in the baked water mask** (the bake's own per-cell
+    /// verdict of where the river/bay is — matching the design's "goes in
+    /// water → hold breath"; a mask cell's bed is usually the flat 0m NoData
+    /// fill, so depth carries no signal there) **or** composited ground (the
+    /// #80 door, making this that audit's first real gameplay consumer) more
+    /// than `SUBMERGED_DEPTH_M` below sea level — the clause that makes an
+    /// editor-dug pond drown. The bank fringe the client's water plane
+    /// visually floods stays land in the mask (the bake clamps land at/below
+    /// sea UP to +0.2m), so the wet-looking shoreline rim is harmless.
+    /// Known limit: the mask is base-static — an editor *raising* a mask
+    /// cell above the waterline still reads as water until a rebake.
+    ///
+    /// The per-call delta load composited_ground_height documents is ~one DB
+    /// point-read per player per second here — nowhere near needing the
+    /// cache that doc reserves as the escalation path.
+    ///
+    /// Factored out of `env_monitor`'s loop so tests can drive single passes.
+    async fn env_tick_once(&self) {
+        let sea_level = self.capital.terrain.manifest().sea_level_m;
+        // Connected players joined with their cached positions — entity_state
+        // follows the zones' status_updates, the same view every other
+        // gateway consumer trusts. Snapshot under the locks, compute after.
+        let players: Vec<(String, i32, i32, String)> = {
+            let clients = self.clients.lock().unwrap();
+            let cache = self.entity_state.lock().unwrap();
+            clients
+                .values()
+                .filter_map(|c| {
+                    cache
+                        .get(&c.player_id)
+                        .map(|e| (c.player_id.clone(), e.x, e.y, c.current_zone.clone()))
+                })
+                .collect()
+        };
+        for (pid, x, y, zone_id) in players {
+            let in_mask = self.capital.terrain.is_water(x as f32, y as f32);
+            let submerged = in_mask || {
+                let ground = self.composited_ground_height(x as f32, y as f32).await;
+                sea_level - ground > SUBMERGED_DEPTH_M
+            };
+            let tx = self.zones.lock().unwrap().get(&zone_id).map(|z| z.tx.clone());
+            if let Some(tx) = tx {
+                // poison_sources is part of the env_state contract from day
+                // one; the poison tick (#88) fills it in from the object cache.
+                let _ = tx.send(Message::Text(
+                    json!({
+                        "type": "env_state",
+                        "player_id": pid,
+                        "submerged": submerged,
+                        "poison_sources": 0,
+                    })
+                    .to_string(),
+                ));
+            }
+        }
+    }
+
+    /// The environment ticker (#87): `env_tick_once` every ENV_TICK_INTERVAL.
+    async fn env_monitor(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(ENV_TICK_INTERVAL);
+        loop {
+            interval.tick().await;
+            self.env_tick_once().await;
+        }
     }
 
     /// Push one message to every connected client — the fanout for
@@ -3867,6 +3958,11 @@ impl Proxy {
         // Periodic persistence flush for connected durable characters.
         let me = self.clone();
         tokio::spawn(async move { me.persistence_flush().await });
+
+        // Environmental tick (#87): per-player submerged/poison flags pushed
+        // to owning zones every second.
+        let me = self.clone();
+        tokio::spawn(async move { me.env_monitor().await });
 
         // Auto-scaler: split overpopulated zones.
         let me = self.clone();
@@ -7044,6 +7140,98 @@ mod tests {
         assert_eq!(objects.len(), 1, "the restarted gateway must hydrate its cache from the table");
         assert_eq!(objects[0]["id"].as_str().unwrap(), id);
         assert_eq!(objects[0]["x"].as_i64().unwrap(), 5000);
+
+        drop(ws);
+    }
+
+    // --- vitals (#87): the gateway environment tick ----------------------------
+
+    /// Skip zone-bound frames until an `env_state` for `pid` arrives.
+    async fn recv_env_state(zone: &mut FakeZone, pid: &str) -> Value {
+        loop {
+            let v = recv_value(&mut zone.from_proxy).await;
+            if v["type"] == "env_state" && v["player_id"] == pid {
+                return v;
+            }
+        }
+    }
+
+    /// `env_tick_once` pushes each connected player's flags to their owning
+    /// zone: dry on the high-ground spawn, submerged over the genuinely deep
+    /// river/bay channel, and submerged in an editor-dug pit below sea level
+    /// — the last one proving the check reads *composited* ground (#80's
+    /// door), not the immutable base bake.
+    #[tokio::test]
+    async fn env_tick_flags_deep_water_dry_land_and_editor_dug_ponds() {
+        let (proxy, db, _dbf, mut zone) = proxy_with_shared_db().await;
+
+        let email = format!("swimmer_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Swimmer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+
+        // 1. At the spawn point (high ground, seeded into entity_state by the
+        //    welcome relocate): dry.
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["submerged"], false, "the town-centre spawn must not drown anyone");
+
+        // 2. Standing in the river/bay (the baked water mask): submerged.
+        //    Scan for a mask cell with a 100m margin of water around it (mid
+        //    river, not a shoreline corner case) rather than hard-coding one.
+        let terrain = &proxy.capital.terrain;
+        let sea = terrain.manifest().sea_level_m;
+        let mut wet = None;
+        'scan: for gy in (0..WORLD_SIZE).step_by(400) {
+            for gx in (0..WORLD_SIZE).step_by(400) {
+                let all_water = [(0, 0), (100, 0), (-100, 0), (0, 100), (0, -100)]
+                    .iter()
+                    .all(|(ox, oy)| terrain.is_water((gx + ox) as f32, (gy + oy) as f32));
+                if all_water {
+                    wet = Some((gx, gy));
+                    break 'scan;
+                }
+            }
+        }
+        let (dx, dy) = wet.expect("the v3 bake has open water (~10% of the world is masked)");
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100, gather: None });
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["submerged"], true, "open water at ({dx},{dy}) must submerge even over the flat 0m NoData fill");
+
+        // 3. An editor-dug pit on dry land: dig one corner of the plot field
+        //    below sea level via the delta store, stand there, and the
+        //    *composited* ground must read as underwater.
+        let (px, py) = (50.0f32, 50.0f32); // corner (10,10) of chunk (0,0), flattened plot field
+        let base = terrain.sample_height(px, py);
+        assert!(!terrain.is_water(px, py), "precondition: the pit site is not mask water");
+        assert!(sea - base < SUBMERGED_DEPTH_M, "precondition: the pit site starts dry");
+        let side = terrain.manifest().tile_size as usize + 1;
+        let mut hd = terrain_common::SparseHeightDelta::new(side);
+        let dig_cm = -(((base - sea) + SUBMERGED_DEPTH_M + 1.0) * 100.0);
+        hd.set_offset_cm(10, 10, dig_cm as i16);
+        db.save_terrain_delta(&terrain_common::TerrainDelta {
+            chunk_tx: 0,
+            chunk_ty: 0,
+            bake_hash: terrain.manifest().bake_hash.clone(),
+            revision: 0,
+            height_delta: Some(hd),
+            provenance: terrain_common::Provenance {
+                author: terrain_common::AuthorId::Editor("test-digger".to_string()),
+                edited_at: 0,
+            },
+        })
+        .await
+        .unwrap();
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100, gather: None });
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
 
         drop(ws);
     }

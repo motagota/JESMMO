@@ -59,6 +59,21 @@ const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
 const GATHER_XP: i64 = 10; // gathering-skill xp per unit
 const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 
+// --- Environmental vitals (player-attributes epic #83, #87) --------------------
+// The zone knows no terrain: "underwater" arrives from the gateway as an
+// `env_state` flag (~1/s, computed against composited ground height vs sea
+// level). These consts turn that flag into drain/damage in the tick.
+/// Full lungs: ~10s of submersion before suffocation starts (20 Hz ticks).
+const BREATH_MAX_TICKS: i32 = 200;
+/// Breath regained per tick while not submerged — empty to full in ~3.3s.
+const BREATH_REFILL_PER_TICK: i32 = 3;
+/// Suffocation once breath is gone: `DROWN_DAMAGE` hp every
+/// `DROWN_PERIOD_TICKS` = 15 hp/s — dead from full hp in ~6.7s. Deliberately
+/// faster than any mob: deep water is the pen around the starting area, not
+/// a place to linger.
+const DROWN_DAMAGE: i32 = 3;
+const DROWN_PERIOD_TICKS: i32 = 4;
+
 // --- Storage ------------------------------------------------------------------
 const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use it
 
@@ -118,6 +133,18 @@ struct Entity {
     swinging: bool,
     /// Mob wander heading, re-rolled periodically when no player is in range.
     wander: (i32, i32),
+    /// Underwater, per the gateway's latest `env_state` push (#87) — the zone
+    /// knows no terrain, so this is the gateway's verdict, not a computation.
+    /// Defaults to false on (re)creation; the gateway re-pushes every player's
+    /// flags ~1/s, so a migrated/respawned entity reconverges within a tick of
+    /// that cadence.
+    submerged: bool,
+    /// Breath remaining, in ticks (players only; full at spawn). Drains while
+    /// `submerged`, refills fast on surfacing; at 0 suffocation damage starts.
+    breath: i32,
+    /// Cycles 0..DROWN_PERIOD_TICKS while suffocating, so the per-second
+    /// damage rate is tick-rate-independent of the integer hp type.
+    drown_phase: i32,
 }
 
 impl Entity {
@@ -132,6 +159,9 @@ impl Entity {
             attack_cooldown: 0,
             swinging: false,
             wander: (0, 0),
+            submerged: false,
+            breath: BREATH_MAX_TICKS,
+            drown_phase: 0,
         }
     }
 
@@ -147,6 +177,9 @@ impl Entity {
             attack_cooldown: 0,
             swinging: false,
             wander: (rng.gen_range(-1..=1), rng.gen_range(-1..=1)),
+            submerged: false,
+            breath: BREATH_MAX_TICKS,
+            drown_phase: 0,
         }
     }
 }
@@ -264,6 +297,13 @@ fn entity_status_json(id: &str, e: &Entity, gathering: Option<&GatherJob>) -> Va
         "type": e.kind.as_str(),
         "facing": [e.facing.0, e.facing.1],
     });
+    // Vitals (#87) ride the same state dict hp does, players only — the HUD
+    // (#89) shows a breath meter while submerged.
+    if e.kind == EntityKind::Player {
+        state["breath"] = json!(e.breath);
+        state["max_breath"] = json!(BREATH_MAX_TICKS);
+        state["submerged"] = json!(e.submerged);
+    }
     if let Some(job) = gathering {
         state["gather_node"] = json!(job.node_id);
         state["gather_progress"] = json!(job.progress);
@@ -445,6 +485,16 @@ impl ZoneServer {
             .district_for_region(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1))
             .map(|d| d.safety == mmo::world::Safety::Safe)
             .unwrap_or(false)
+    }
+
+    /// Store a gateway-computed `env_state` verdict (#87) on the live entity;
+    /// the tick consumes it. A message for an entity not (or no longer) here
+    /// is a silent no-op — the gateway re-pushes every second, so whichever
+    /// zone actually owns the player converges on the next tick.
+    fn apply_env_state(&self, player_id: &str, submerged: bool) {
+        if let Some(e) = self.entities.lock().unwrap().get_mut(player_id) {
+            e.submerged = submerged;
+        }
     }
 
     /// Report our current entity count to the proxy (feeds the admin count).
@@ -682,6 +732,15 @@ impl ZoneServer {
                     // boards — otherwise a logged-in player sees no resources to gather.
                     self.send_all_nodes();
                     self.send_zone_stats();
+                }
+                "env_state" => {
+                    // Per-player environment flags, computed gateway-side (#87)
+                    // — the gateway owns terrain and object positions; this
+                    // zone just stores the verdict for the tick to consume.
+                    // Pushed ~1/s for every player unconditionally, so a stale
+                    // flag on a recreated entity self-heals.
+                    let submerged = data.get("submerged").and_then(|v| v.as_bool()).unwrap_or(false);
+                    self.apply_env_state(&player_id, submerged);
                 }
                 "attack" => {
                     // Flag the swing; damage is resolved authoritatively in the tick.
@@ -928,6 +987,35 @@ impl ZoneServer {
                             e.hp -= dmg;
                             changed.insert(pid);
                         }
+                    }
+                }
+
+                // --- 1b. Environmental vitals (#87): breath & suffocation. ---
+                // Deliberately NOT gated on `safe`: the safe-hub guard above
+                // exists to stop mob/PvP damage in the capital, but the river
+                // must drown you anywhere — environmental hazards ARE the pen
+                // around the starting area, and the whole capital is a safe
+                // district. Death goes through the ordinary path below (#12):
+                // hp hits 0, the gateway respawns at bed-or-spawn, and the
+                // fresh entity starts with full breath.
+                for (id, e) in entities.iter_mut().filter(|(_, e)| e.kind == EntityKind::Player) {
+                    if e.submerged {
+                        if e.breath > 0 {
+                            e.breath -= 1;
+                            e.drown_phase = 0;
+                        } else {
+                            // First suffocating tick hits immediately, then
+                            // every DROWN_PERIOD_TICKS.
+                            if e.drown_phase == 0 {
+                                e.hp -= DROWN_DAMAGE;
+                            }
+                            e.drown_phase = (e.drown_phase + 1) % DROWN_PERIOD_TICKS;
+                        }
+                        changed.insert(id.clone());
+                    } else if e.breath < BREATH_MAX_TICKS {
+                        e.breath = (e.breath + BREATH_REFILL_PER_TICK).min(BREATH_MAX_TICKS);
+                        e.drown_phase = 0;
+                        changed.insert(id.clone());
                     }
                 }
 
@@ -1416,6 +1504,111 @@ mod tests {
         assert!(packets.iter().any(|p| p.contains("\"player_died\"") && p.contains("\"p1\"")
             && p.contains(&format!("\"hp\":{PLAYER_MAX_HP}"))),
             "the gateway should be told the death happened, with the hp to respawn at");
+    }
+
+    // --- #87: breath & drowning (environmental vitals) -------------------------
+
+    /// A submerged player drains breath, then suffocates to death — and the
+    /// death takes the ordinary #12 handoff. Runs in the SAFE civic district
+    /// on purpose: the safe-hub guard suppresses mob/PvP damage only, never
+    /// environmental damage (the whole capital is safe, so a safe-gated river
+    /// could never drown anyone).
+    #[tokio::test]
+    async fn submerged_player_suffocates_to_death_even_in_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity {
+                submerged: true,
+                breath: 2,
+                hp: 6,
+                ..Entity::player(12800, 12800, PLAYER_MAX_HP)
+            },
+        );
+        // breath 2 -> 0 in two ticks, first 3-damage on the next, second one
+        // DROWN_PERIOD_TICKS later kills — well inside 12 ticks.
+        let packets = drive(zone.clone(), 12).await;
+
+        assert!(!zone.entities.lock().unwrap().contains_key("p1"), "the drowned player should be removed for the gateway handoff");
+        assert!(packets.iter().any(|p| p.contains("\"you_died\"") && p.contains("\"p1\"")),
+            "the drowning player's client should learn it died");
+        assert!(packets.iter().any(|p| p.contains("\"player_died\"") && p.contains("\"p1\"")),
+            "the gateway should be told so bed-or-spawn respawn happens");
+        // Vitals ride status updates while the drowning was in progress.
+        assert!(packets.iter().any(|p| p.contains("\"breath\"") && p.contains("\"submerged\":true")),
+            "status updates should carry breath/submerged while in the water");
+    }
+
+    /// Holding breath is survivable: a submerged player with plenty of breath
+    /// takes no damage at all — only the timer runs.
+    #[tokio::test]
+    async fn submerged_with_breath_left_takes_no_damage() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity { submerged: true, ..Entity::player(12800, 12800, PLAYER_MAX_HP) },
+        );
+        drive(zone.clone(), 5).await;
+        let entities = zone.entities.lock().unwrap();
+        let e = entities.get("p1").expect("still alive");
+        assert_eq!(e.hp, PLAYER_MAX_HP, "no damage while breath lasts");
+        assert!(e.breath < BREATH_MAX_TICKS, "but the breath timer must be draining");
+    }
+
+    /// Surfacing refills breath quickly (faster than it drained), and a dry
+    /// player with full lungs is completely untouched by the vitals step.
+    #[tokio::test]
+    async fn breath_refills_on_surfacing_and_dry_land_is_harmless() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "wet".to_string(),
+            Entity { breath: 10, ..Entity::player(12800, 12800, PLAYER_MAX_HP) },
+        );
+        zone.entities.lock().unwrap().insert(
+            "dry".to_string(),
+            Entity::player(12810, 12810, PLAYER_MAX_HP),
+        );
+        drive(zone.clone(), 4).await;
+        let entities = zone.entities.lock().unwrap();
+        let wet = entities.get("wet").unwrap();
+        assert!(wet.breath > 10 + BREATH_REFILL_PER_TICK, "surfaced breath should refill by several ticks' worth (got {})", wet.breath);
+        assert_eq!(wet.hp, PLAYER_MAX_HP);
+        let dry = entities.get("dry").unwrap();
+        assert_eq!((dry.hp, dry.breath), (PLAYER_MAX_HP, BREATH_MAX_TICKS), "a dry, full-lunged player is untouched");
+    }
+
+    /// `env_state` flips the live entity's flag both ways, ignores unknown
+    /// players, and a recreated entity (fresh `spawn_entity` after respawn or
+    /// migration) starts dry-by-default — the gateway's 1/s unconditional
+    /// re-push is what reconverges it, by design.
+    #[test]
+    fn apply_env_state_sets_and_clears_and_recreation_resets() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(12800, 12800, PLAYER_MAX_HP),
+        );
+        zone.apply_env_state("p1", true);
+        assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
+        zone.apply_env_state("p1", false);
+        assert!(!zone.entities.lock().unwrap().get("p1").unwrap().submerged);
+        zone.apply_env_state("ghost", true); // unknown player: silent no-op
+
+        // Recreation (what spawn_entity does) resets to defaults...
+        zone.apply_env_state("p1", true);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(12800, 12800, PLAYER_MAX_HP),
+        );
+        let fresh_ok = {
+            let entities = zone.entities.lock().unwrap();
+            let e = entities.get("p1").unwrap();
+            !e.submerged && e.breath == BREATH_MAX_TICKS
+        };
+        assert!(fresh_ok, "a recreated entity starts dry with full lungs");
+        // ...and the next gateway push restores the truth.
+        zone.apply_env_state("p1", true);
+        assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
     }
 
     // --- #7: resource gathering -----------------------------------------------
