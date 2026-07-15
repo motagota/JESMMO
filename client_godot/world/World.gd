@@ -18,9 +18,30 @@ const _ROAD_COLOR := Color(0.45, 0.33, 0.20)
 const _PLOT_FILL_STEPS := 8       # fill-grid subdivisions per plot axis
 const _PLOT_EDGE_STEP := 10.0     # plot edges are short; sample tighter than roads
 
+## Sea level in world metres — the DEM's own water-surface convention: the
+## river/bay NoData footprint is filled flat at exactly 0.0m (see
+## terrain.toml's header), so 0.0 IS the water surface, and everything at
+## or below it belongs under this plane.
+const _WATER_LEVEL_M := 0.0
+## Scene-space lift for the water plane, chosen against three floors it must
+## clear: (1) the flat 0m NoData fill itself, which the coarse backdrop
+## renders at scene 0 and streamed fine tiles at +0.3
+## (`TerrainStreamer._STREAM_Y_BIAS`) — a plane at sea level exactly would
+## z-fight both; (2) the bake's [detail] noise, which (with terrain.toml's
+## water mask empty) adds up to ~±0.6m (~0.9 scene) of micro-relief ON the
+## fill, poking dry speckles through any lower plane; (3) enough water
+## column over both ground tiers that the shader's murk saturates on each,
+## so the ±0.3 bias step doesn't draw itself as a blocky tint change along
+## the streaming ring's edge. The ~0.8m of world height 1.2 nominally floods
+## (1.2 / HEIGHT_SCALE) is riverbank fringe that already paints silt-brown
+## (GroundPaint), so the waterline lands inside the wet-mud band where it
+## belongs.
+const _WATER_Y := 1.2
+
 var world_size := 6400.0
 
 var _ground: MeshInstance3D
+var _water: MeshInstance3D
 ## Backdrop residency mask (one texel per terrain tile): white = a fine
 ## streamed tile is resident there, and the backdrop shader discards its
 ## fragments so the coarse mesh can never poke up through the real 5m
@@ -139,6 +160,7 @@ func _maybe_build_static() -> void:
     if _built_static or not _partition_received or not _terrain_ready:
         return
     _build_ground()
+    _build_water()
     _build_town_centre_marker()
     _built_static = true
 
@@ -293,6 +315,31 @@ func _build_ground() -> void:
         Vector2(world_size, world_size) * Protocol.WORLD_SCALE)
     _ground.material_override = mat
     add_child(_ground)
+
+## The bay/river water surface: one world-spanning translucent plane at sea
+## level (`_WATER_LEVEL_M` + `_WATER_Y`, see those constants). A single
+## static plane is correct here, not a per-tile or masked mesh: sea level is
+## one global height, the terrain itself decides where water is visible
+## (everywhere the ground dips below the plane — exactly the NoData 0m fill
+## plus the real below-sea channel cells), and the shader's depth-buffer
+## shore fade makes the waterline follow whichever ground LOD is currently
+## rendered. Nav is untouched — terrain.toml's [water] mask stays empty, so
+## this is purely a visual layer (its note says to revisit nav-blocking once
+## water RENDERING exists; blocking is a separate, server-side decision).
+func _build_water() -> void:
+    var plane := PlaneMesh.new()
+    plane.size = Vector2(world_size, world_size) * Protocol.WORLD_SCALE
+    _water = MeshInstance3D.new()
+    _water.mesh = plane
+    var mid := world_size * 0.5 * Protocol.WORLD_SCALE
+    _water.position = Vector3(mid,
+        _WATER_LEVEL_M * Protocol.HEIGHT_SCALE + _WATER_Y, mid)
+    var mat := ShaderMaterial.new()
+    mat.shader = load("res://world/water.gdshader")
+    _water.material_override = mat
+    # A 25.6km translucent sheet must never contribute to shadows.
+    _water.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+    add_child(_water)
 
 func _build_town_centre_marker() -> void:
     var mid := world_size * 0.5
