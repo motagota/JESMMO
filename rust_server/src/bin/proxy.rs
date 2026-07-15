@@ -82,6 +82,10 @@ const OBJECT_KINDS: &[&str] = &["poison_tree"];
 /// entity recreation (split/merge/respawn/migrate resets zone-side flags to
 /// their defaults) self-heal within a second with zero bookkeeping.
 const ENV_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// A poison tree poisons within this many metres (#88). Matches the object
+/// tool's world scale (1 unit = 1m); the zone turns the resulting source
+/// count into buildup/proc/DoT.
+const POISON_RADIUS_M: i64 = 15;
 /// Depth clause of the submerged test: composited ground more than this
 /// below sea level counts as underwater even OUTSIDE the baked water mask —
 /// it's what makes an editor-dug pond drown. Inside the mask the depth is
@@ -2857,22 +2861,41 @@ impl Proxy {
                 })
                 .collect()
         };
+        // Poison-tree positions, snapshotted once per pass from the object
+        // cache (#85 — never the DB). A linear scan per player is fine at
+        // authored-forest counts; bucket spatially only if profiling ever
+        // says otherwise.
+        let trees: Vec<(i64, i64)> = self
+            .world_object_cache()
+            .await
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|o| o.kind == "poison_tree")
+            .map(|o| (o.x as i64, o.y as i64))
+            .collect();
+        let radius2 = POISON_RADIUS_M * POISON_RADIUS_M;
         for (pid, x, y, zone_id) in players {
             let in_mask = self.capital.terrain.is_water(x as f32, y as f32);
             let submerged = in_mask || {
                 let ground = self.composited_ground_height(x as f32, y as f32).await;
                 sea_level - ground > SUBMERGED_DEPTH_M
             };
+            let poison_sources = trees
+                .iter()
+                .filter(|(tx_, ty_)| {
+                    let (dx, dy) = (tx_ - x as i64, ty_ - y as i64);
+                    dx * dx + dy * dy <= radius2
+                })
+                .count() as i64;
             let tx = self.zones.lock().unwrap().get(&zone_id).map(|z| z.tx.clone());
             if let Some(tx) = tx {
-                // poison_sources is part of the env_state contract from day
-                // one; the poison tick (#88) fills it in from the object cache.
                 let _ = tx.send(Message::Text(
                     json!({
                         "type": "env_state",
                         "player_id": pid,
                         "submerged": submerged,
-                        "poison_sources": 0,
+                        "poison_sources": poison_sources,
                     })
                     .to_string(),
                 ));
@@ -7232,6 +7255,55 @@ mod tests {
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
+
+        drop(ws);
+    }
+
+    /// The env tick's `poison_sources` counts poison trees within
+    /// POISON_RADIUS_M of the player, from the object cache (#85): zero far
+    /// away, exactly the in-radius count in a grove, back to zero after the
+    /// trees are deleted.
+    #[tokio::test]
+    async fn env_tick_counts_poison_trees_in_radius() {
+        let (proxy, db, _dbf, mut zone) = proxy_with_shared_db().await;
+
+        // Seed a grove BEFORE the cache's first touch: two trees inside the
+        // radius of (2000, 2000), one just outside it.
+        let near_a = db.insert_world_object("poison_tree", 2005, 2000, "editor:t", 0).await.unwrap();
+        let _near_b = db.insert_world_object("poison_tree", 2000, 2010, "editor:t", 0).await.unwrap();
+        let _far = db
+            .insert_world_object("poison_tree", 2000 + POISON_RADIUS_M as i32 + 5, 2000, "editor:t", 0)
+            .await
+            .unwrap();
+
+        let email = format!("forager_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Forager"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let welcome = recv_until(&mut ws, "welcome").await;
+        let pid = welcome["player_id"].as_str().unwrap().to_string();
+
+        // At spawn (town centre, nowhere near the grove): clean.
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["poison_sources"], 0);
+
+        // In the grove: exactly the two in-radius trees count.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100, gather: None });
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["poison_sources"], 2, "two trees in radius, the third is just outside");
+
+        // Deleting a tree (the editor's delete path keeps the cache
+        // write-through) takes effect on the next pass.
+        assert!(db.delete_world_object(&near_a.id).await.unwrap());
+        proxy.world_object_cache().await.lock().unwrap().remove(&near_a.id);
+        proxy.env_tick_once().await;
+        let flags = recv_env_state(&mut zone, &pid).await;
+        assert_eq!(flags["poison_sources"], 1);
 
         drop(ws);
     }

@@ -434,20 +434,29 @@ succeeds), and **`home_structure_removed`** `{id}` (a rent reclaim demolished it
 `store.deposit`/`store.withdraw`/`craft.make` on proximity to the *specific*
 structure (#13) — it never learns or needs to know who owns it.
 
-**`env_state`** `{player_id, submerged, poison_sources}` (#87) is the same
+**`env_state`** `{player_id, submerged, poison_sources}` (#87/#88) is the same
 downward pattern for the environment: the zone owns hp and the damage tick but
-knows no terrain, so the gateway's ~1/s environment ticker computes each
-connected player's flags (submerged = the baked water mask, or composited
-ground more than a threshold below sea level — so editor-dug ponds count) and
-pushes them unconditionally to the player's owning zone; the zone stores the
-verdict on the live entity and its tick applies breath drain / suffocation
-damage. Unconditional re-send (rather than on-change) makes entity recreation
-(split/merge/respawn/migrate resets zone-side flags to their dry defaults)
-self-heal within a second with zero bookkeeping. Environmental damage
+knows no terrain or object positions, so the gateway's ~1/s environment ticker
+computes each connected player's flags (submerged = the baked water mask, or
+composited ground more than a threshold below sea level — so editor-dug ponds
+count; `poison_sources` = poison trees within `POISON_RADIUS_M` of the player,
+from the #85 object cache) and pushes them unconditionally to the player's
+owning zone; the zone stores the verdict on the live entity and its tick
+applies the mechanics. Unconditional re-send (rather than on-change) makes
+entity recreation (split/merge/respawn/migrate resets zone-side flags to
+their defaults) self-heal within a second with zero bookkeeping.
+
+The zone-side mechanics (#87 breath, #88 poison): while `submerged`, breath
+drains (~10s), then suffocation damage (~15 hp/s); surfacing refills at 3×.
+While `poison_sources > 0`, `poison_buildup` rises (5s to the threshold near
+one tree, faster among more), and decays (~2.5s) once clear; at the threshold
+it **procs** — `poisoned` sticks, dealing ~20 hp/s with no cure in v1; only
+death (respawn recreates the entity clean) ends it. Environmental damage
 deliberately ignores the safe-district guard — that guard is scoped to mob/PvP
 damage, and the whole capital is safe, so a safe-gated river could never drown
-anyone. Player `status_update`s gain `breath` / `max_breath` / `submerged`
-alongside `hp` for the vitals HUD (#89).
+anyone. Player `status_update`s gain `breath` / `max_breath` / `submerged` /
+`poison_buildup` / `max_poison` / `poisoned` alongside `hp` for the vitals HUD
+(#89).
 
 Resource nodes, storage points, build boards, completed city structures, and home
 structures are synced to clients as `status_update`s with `state.type` `"resource"` /

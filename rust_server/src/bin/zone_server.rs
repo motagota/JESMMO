@@ -73,6 +73,21 @@ const BREATH_REFILL_PER_TICK: i32 = 3;
 /// a place to linger.
 const DROWN_DAMAGE: i32 = 3;
 const DROWN_PERIOD_TICKS: i32 = 4;
+/// Poison buildup (#88) accrues while near poison trees (`poison_sources`
+/// > 0 in the gateway's env_state) and PROCS at this threshold.
+const POISON_PROC_AT: i32 = 100;
+/// Buildup per tick near one tree — 5s from clean to proc, so the forest
+/// EDGE telegraphs (buildup visibly climbing) with time to turn around.
+/// Each additional 2 trees in range add +1/tick: a dense forest interior
+/// procs in a second or two ("mildly with source count").
+const POISON_BUILDUP_PER_TICK: i32 = 1;
+/// Buildup shed per tick once clear of every tree (~2.5s from the brink
+/// back to clean) — escaping the edge in time really does save you.
+const POISON_DECAY_PER_TICK: i32 = 2;
+/// Once procced, poison deals 1 hp/tick = 20 hp/s — dead from full hp in
+/// 5s, and there is no cure in v1: the proc IS the death sentence, only
+/// respawn clears it. "Dies quick", per the design.
+const POISON_DAMAGE_PER_TICK: i32 = 1;
 
 // --- Storage ------------------------------------------------------------------
 const STORAGE_RANGE: i32 = 60; // must be within this of a storage point to use it
@@ -145,6 +160,13 @@ struct Entity {
     /// Cycles 0..DROWN_PERIOD_TICKS while suffocating, so the per-second
     /// damage rate is tick-rate-independent of the integer hp type.
     drown_phase: i32,
+    /// Poison trees currently in range, per the gateway's `env_state` (#88) —
+    /// same push/default/reconverge story as `submerged`.
+    poison_sources: i32,
+    /// 0..=POISON_PROC_AT: rises near trees, decays clear of them.
+    poison_buildup: i32,
+    /// The proc: sticks until death (no cure in v1); only respawn clears it.
+    poisoned: bool,
 }
 
 impl Entity {
@@ -162,6 +184,9 @@ impl Entity {
             submerged: false,
             breath: BREATH_MAX_TICKS,
             drown_phase: 0,
+            poison_sources: 0,
+            poison_buildup: 0,
+            poisoned: false,
         }
     }
 
@@ -180,6 +205,9 @@ impl Entity {
             submerged: false,
             breath: BREATH_MAX_TICKS,
             drown_phase: 0,
+            poison_sources: 0,
+            poison_buildup: 0,
+            poisoned: false,
         }
     }
 }
@@ -297,12 +325,16 @@ fn entity_status_json(id: &str, e: &Entity, gathering: Option<&GatherJob>) -> Va
         "type": e.kind.as_str(),
         "facing": [e.facing.0, e.facing.1],
     });
-    // Vitals (#87) ride the same state dict hp does, players only — the HUD
-    // (#89) shows a breath meter while submerged.
+    // Vitals (#87/#88) ride the same state dict hp does, players only — the
+    // HUD (#89) shows a breath meter while submerged and a poison gauge
+    // while buildup is non-zero.
     if e.kind == EntityKind::Player {
         state["breath"] = json!(e.breath);
         state["max_breath"] = json!(BREATH_MAX_TICKS);
         state["submerged"] = json!(e.submerged);
+        state["poison_buildup"] = json!(e.poison_buildup);
+        state["max_poison"] = json!(POISON_PROC_AT);
+        state["poisoned"] = json!(e.poisoned);
     }
     if let Some(job) = gathering {
         state["gather_node"] = json!(job.node_id);
@@ -487,13 +519,14 @@ impl ZoneServer {
             .unwrap_or(false)
     }
 
-    /// Store a gateway-computed `env_state` verdict (#87) on the live entity;
-    /// the tick consumes it. A message for an entity not (or no longer) here
-    /// is a silent no-op — the gateway re-pushes every second, so whichever
-    /// zone actually owns the player converges on the next tick.
-    fn apply_env_state(&self, player_id: &str, submerged: bool) {
+    /// Store a gateway-computed `env_state` verdict (#87/#88) on the live
+    /// entity; the tick consumes it. A message for an entity not (or no
+    /// longer) here is a silent no-op — the gateway re-pushes every second,
+    /// so whichever zone actually owns the player converges on the next tick.
+    fn apply_env_state(&self, player_id: &str, submerged: bool, poison_sources: i32) {
         if let Some(e) = self.entities.lock().unwrap().get_mut(player_id) {
             e.submerged = submerged;
+            e.poison_sources = poison_sources;
         }
     }
 
@@ -526,19 +559,6 @@ impl ZoneServer {
                 .to_string(),
             ));
             println!("[Zone {}] Migrate request: {id} left region at ({x}, {y})", self.zone_id);
-        }
-    }
-
-    /// Report a player death to the gateway, which alone knows where they should
-    /// reappear (their bed, if one's set, else the default spawn) and — since
-    /// that point may be owned by a different zone — handles the hand-off exactly
-    /// like a `migrate_request` (#12). The entity has already been removed from
-    /// this zone's map by the caller.
-    fn send_player_died(&self, id: &str, hp: i32) {
-        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
-            let _ = tx.send(Message::Text(
-                json!({ "type": "player_died", "player_id": id, "hp": hp }).to_string(),
-            ));
         }
     }
 
@@ -740,7 +760,8 @@ impl ZoneServer {
                     // Pushed ~1/s for every player unconditionally, so a stale
                     // flag on a recreated entity self-heals.
                     let submerged = data.get("submerged").and_then(|v| v.as_bool()).unwrap_or(false);
-                    self.apply_env_state(&player_id, submerged);
+                    let poison_sources = data.get("poison_sources").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    self.apply_env_state(&player_id, submerged, poison_sources);
                 }
                 "attack" => {
                     // Flag the swing; damage is resolved authoritatively in the tick.
@@ -902,7 +923,7 @@ impl ZoneServer {
             let mut rng = rand::thread_rng();
             let mut changed: HashSet<String> = HashSet::new();
             let mut despawns: Vec<String> = Vec::new();
-            let mut died: Vec<String> = Vec::new();
+            let mut died: Vec<(String, i32)> = Vec::new(); // (player_id, respawn max_hp)
             let mut packets: Vec<String> = Vec::new();
 
             {
@@ -1017,6 +1038,27 @@ impl ZoneServer {
                         e.drown_phase = 0;
                         changed.insert(id.clone());
                     }
+
+                    // Poison (#88): buildup near trees, proc at the threshold,
+                    // then an uncurable DoT until death. Buildup scales mildly
+                    // with tree count (+1/tick per 2 extra trees), so the
+                    // forest edge telegraphs while the interior kills fast.
+                    if e.poisoned {
+                        e.hp -= POISON_DAMAGE_PER_TICK;
+                        changed.insert(id.clone());
+                    } else if e.poison_sources > 0 {
+                        e.poison_buildup = (e.poison_buildup
+                            + POISON_BUILDUP_PER_TICK
+                            + (e.poison_sources - 1) / 2)
+                            .min(POISON_PROC_AT);
+                        if e.poison_buildup >= POISON_PROC_AT {
+                            e.poisoned = true;
+                        }
+                        changed.insert(id.clone());
+                    } else if e.poison_buildup > 0 {
+                        e.poison_buildup = (e.poison_buildup - POISON_DECAY_PER_TICK).max(0);
+                        changed.insert(id.clone());
+                    }
                 }
 
                 // --- 2. Resolve player melee swings against mobs in the arc. ---
@@ -1076,11 +1118,19 @@ impl ZoneServer {
                     // (#12). Removing them here (rather than leaving a stale entity)
                     // is safe even when the gateway ends up sending them right back to
                     // this same zone — `spawn_entity` inserts fresh either way.
+                    //
+                    // `player_died` is queued into `packets` (after `you_died`, see
+                    // below) rather than sent immediately: the gateway routes
+                    // player-addressed frames only while the client still points at
+                    // this zone, and it relocates the client the moment it processes
+                    // `player_died` — sending that first meant a death whose respawn
+                    // point another zone owns silently dropped the client's
+                    // `you_died` (found live in #88; drowning in an unsplit world
+                    // never crossed zones, so #87's testing missed it).
                     let max_hp = entities.get(id).map(|e| e.max_hp).unwrap_or(PLAYER_MAX_HP);
                     entities.remove(id);
                     despawns.push(id.clone());
-                    died.push(id.clone());
-                    self.send_player_died(id, max_hp);
+                    died.push((id.clone(), max_hp));
                 }
 
                 // --- 4. Trickle mobs back (slowly, so a zone can be cleared). ---
@@ -1246,8 +1296,14 @@ impl ZoneServer {
             for id in &despawns {
                 packets.push(json!({"type": "despawn", "player_id": id}).to_string());
             }
-            for id in &died {
+            // Order matters: `you_died` must reach the gateway while the dead
+            // player's client still points at THIS zone (see the death block
+            // above) — `player_died` triggers the relocate, so it goes last.
+            for (id, _) in &died {
                 packets.push(json!({"type": "you_died", "player_id": id}).to_string());
+            }
+            for (id, max_hp) in &died {
+                packets.push(json!({ "type": "player_died", "player_id": id, "hp": max_hp }).to_string());
             }
 
             // Report capture state when ownership flips or the bar moves noticeably.
@@ -1504,6 +1560,14 @@ mod tests {
         assert!(packets.iter().any(|p| p.contains("\"player_died\"") && p.contains("\"p1\"")
             && p.contains(&format!("\"hp\":{PLAYER_MAX_HP}"))),
             "the gateway should be told the death happened, with the hp to respawn at");
+        // Ordering is load-bearing (#88 regression): the gateway relocates the
+        // client the moment it processes `player_died`, and only routes
+        // player-addressed frames while the client still points at this zone —
+        // so `you_died` must be on the wire FIRST or a cross-zone respawn
+        // silently swallows it.
+        let you_died_at = packets.iter().position(|p| p.contains("\"you_died\"")).unwrap();
+        let died_at = packets.iter().position(|p| p.contains("\"player_died\"")).unwrap();
+        assert!(you_died_at < died_at, "you_died must precede player_died on the wire");
     }
 
     // --- #87: breath & drowning (environmental vitals) -------------------------
@@ -1588,14 +1652,14 @@ mod tests {
             "p1".to_string(),
             Entity::player(12800, 12800, PLAYER_MAX_HP),
         );
-        zone.apply_env_state("p1", true);
+        zone.apply_env_state("p1", true, 0);
         assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
-        zone.apply_env_state("p1", false);
+        zone.apply_env_state("p1", false, 0);
         assert!(!zone.entities.lock().unwrap().get("p1").unwrap().submerged);
-        zone.apply_env_state("ghost", true); // unknown player: silent no-op
+        zone.apply_env_state("ghost", true, 0); // unknown player: silent no-op
 
         // Recreation (what spawn_entity does) resets to defaults...
-        zone.apply_env_state("p1", true);
+        zone.apply_env_state("p1", true, 0);
         zone.entities.lock().unwrap().insert(
             "p1".to_string(),
             Entity::player(12800, 12800, PLAYER_MAX_HP),
@@ -1607,8 +1671,104 @@ mod tests {
         };
         assert!(fresh_ok, "a recreated entity starts dry with full lungs");
         // ...and the next gateway push restores the truth.
-        zone.apply_env_state("p1", true);
+        zone.apply_env_state("p1", true, 0);
         assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
+    }
+
+    // --- #88: poison buildup, proc, DoT -----------------------------------------
+
+    /// Standing among poison trees builds up, procs at the threshold, and the
+    /// DoT then kills through the ordinary #12 handoff — in the SAFE civic
+    /// district, same environmental-damage-bypasses-the-safe-guard rule as
+    /// drowning.
+    #[tokio::test]
+    async fn poison_builds_up_procs_and_kills_even_in_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity {
+                poison_sources: 1,
+                poison_buildup: POISON_PROC_AT - 2,
+                hp: 3,
+                ..Entity::player(12800, 12800, PLAYER_MAX_HP)
+            },
+        );
+        // 2 ticks to proc, then 1 hp/tick: dead within ~6 ticks.
+        let packets = drive(zone.clone(), 10).await;
+
+        assert!(!zone.entities.lock().unwrap().contains_key("p1"), "the poisoned player should die and hand off");
+        assert!(packets.iter().any(|p| p.contains("\"you_died\"") && p.contains("\"p1\"")));
+        assert!(packets.iter().any(|p| p.contains("\"player_died\"") && p.contains("\"p1\"")));
+        assert!(packets.iter().any(|p| p.contains("\"poisoned\":true")),
+            "status updates should have carried the proc");
+    }
+
+    /// Leaving the trees before the proc drains the buildup — the forest edge
+    /// gives real escape time, and short exposure costs nothing but nerves.
+    #[tokio::test]
+    async fn poison_buildup_decays_without_proc_when_clear_of_trees() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity {
+                poison_sources: 0,
+                poison_buildup: POISON_PROC_AT - 10, // was at the brink, stepped out in time
+                ..Entity::player(12800, 12800, PLAYER_MAX_HP)
+            },
+        );
+        drive(zone.clone(), 6).await;
+        let entities = zone.entities.lock().unwrap();
+        let e = entities.get("p1").expect("alive and well");
+        assert!(!e.poisoned, "no proc once clear of the trees");
+        assert!(e.poison_buildup < POISON_PROC_AT - 10, "buildup must decay (got {})", e.poison_buildup);
+        assert_eq!(e.hp, PLAYER_MAX_HP, "buildup alone never damages");
+    }
+
+    /// More trees in range build up faster — a dense forest interior procs in
+    /// a fraction of the single-tree time.
+    #[tokio::test]
+    async fn poison_builds_faster_among_more_trees() {
+        let zone = zone_for_region(CIVIC);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("edge".to_string(), Entity { poison_sources: 1, ..Entity::player(12800, 12800, PLAYER_MAX_HP) });
+            es.insert("deep".to_string(), Entity { poison_sources: 7, ..Entity::player(12810, 12810, PLAYER_MAX_HP) });
+        }
+        drive(zone.clone(), 6).await;
+        let entities = zone.entities.lock().unwrap();
+        let edge = entities.get("edge").unwrap().poison_buildup;
+        let deep = entities.get("deep").unwrap().poison_buildup;
+        assert!(deep >= edge * 3, "7 trees should build up ~4x one tree (edge={edge}, deep={deep})");
+    }
+
+    /// The proc is a death sentence: once poisoned, walking out of the forest
+    /// (sources back to 0, buildup irrelevant) does NOT stop the DoT — only
+    /// death (and the fresh respawned entity) clears it in v1.
+    #[tokio::test]
+    async fn poisoned_state_sticks_after_leaving_the_forest() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity {
+                poisoned: true,
+                poison_sources: 0,
+                poison_buildup: 0,
+                ..Entity::player(12800, 12800, PLAYER_MAX_HP)
+            },
+        );
+        drive(zone.clone(), 6).await;
+        let entities = zone.entities.lock().unwrap();
+        let e = entities.get("p1").expect("not dead yet from full hp");
+        assert!(e.poisoned, "no cure in v1");
+        assert!(e.hp < PLAYER_MAX_HP, "the DoT keeps ticking outside the forest (hp={})", e.hp);
+        // And the recreated entity (respawn) is clean — same reset the
+        // env_state recreation test proves for submerged.
+        drop(entities);
+        zone.entities.lock().unwrap().insert("p1".to_string(), Entity::player(12800, 12800, PLAYER_MAX_HP));
+        let entities = zone.entities.lock().unwrap();
+        let fresh = entities.get("p1").unwrap();
+        assert!(!fresh.poisoned);
+        assert_eq!(fresh.poison_buildup, 0);
     }
 
     // --- #7: resource gathering -----------------------------------------------
