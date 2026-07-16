@@ -145,8 +145,9 @@ func _process(delta: float) -> void:
         apply_plot_roster(_roster_plots, _my_plot_id)
     for id in _dirt_roads:
         var rec: Dictionary = _dirt_roads[id]
-        rec["node"].queue_free()
-        rec["node"] = _build_road_ribbon(rec["a"], rec["b"])
+        for n in rec["nodes"]:
+            n.queue_free()
+        rec["nodes"] = _build_road_path(rec["path"])
     for id in _road_plans:
         _restake_plan(id)
 
@@ -376,12 +377,28 @@ func _build_town_centre_marker() -> void:
 ## follows the terrain's hills its whole length instead of floating/clipping
 ## between two flat endpoints. `id` is the `status_update` id
 ## (`structure_<build order kind>`) — idempotent, since a road never moves.
+## A completed dirt road. Editor-laid roads (#96) carry their full multi-run
+## grid `path`; the mayor's two-click segments still arrive as x/y..x1/y1 and
+## render as the single run they are — both store the same
+## `{"path": [Vector2, ...], "nodes": [ribbon, ...]}` shape.
 func upsert_dirt_road(id: String, state: Dictionary) -> void:
     if _dirt_roads.has(id):
         return
-    var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
-    var b := Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))
-    _dirt_roads[id] = {"a": a, "b": b, "node": _build_road_ribbon(a, b)}
+    var path: Array = []
+    var raw: Array = state.get("path", [])
+    if raw.size() >= 2:
+        for p in raw:
+            path.append(Vector2(float(p[0]), float(p[1])))
+    else:
+        var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
+        path = [a, Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))]
+    _dirt_roads[id] = {"path": path, "nodes": _build_road_path(path)}
+
+func _build_road_path(path: Array) -> Array:
+    var nodes: Array = []
+    for i in range(1, path.size()):
+        nodes.append(_build_road_ribbon(path[i - 1], path[i]))
+    return nodes
 
 func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     return _build_ribbon(_roads_root, a, b, _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y, _ROAD_SEGMENT_STEP)

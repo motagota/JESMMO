@@ -412,15 +412,21 @@ fn plot_roster_entry_json(cell: &mmo::world::PlotCell, p: &mmo::persistence::Plo
 /// A completed city structure as a render entity (`status_update`, `state.type =
 /// "structure"`). Its id is stable per order kind so re-sends update in place.
 /// A live-render `status_update` for a completed build order's own placement.
-fn structure_status_json(kind: &str, p: &mmo::persistence::BuildPlacement) -> Value {
-    json!({
+/// `path_json` (road orders, #96) carries the full multi-run grid path so the
+/// client renders the whole road, not just the first-run segment.
+fn structure_status_json(kind: &str, p: &mmo::persistence::BuildPlacement, path_json: Option<&str>) -> Value {
+    let mut v = json!({
         "type": "status_update",
         "player_id": format!("structure_{}", kind),
         "state": {
             "x": p.x, "y": p.y, "x1": p.x1, "y1": p.y1,
             "type": "structure", "kind": p.structure_kind, "facing": [0, 0],
         },
-    })
+    });
+    if let Some(path) = path_json.and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+        v["state"]["path"] = path;
+    }
+    v
 }
 
 /// A home structure row (`build.placed`'s `structure` field) — plain fields, not
@@ -2164,13 +2170,31 @@ impl Proxy {
     /// (Locked tech-tree dependents are omitted; they appear via `build.unlocked`.)
     async fn send_build_orders(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        let zone_id = match self.clients.lock().unwrap().get(pid).map(|i| i.current_zone.clone()) {
-            Some(z) => z,
-            None => return,
-        };
-        let district = match self.district_for_zone(&zone_id) {
+        // District from the player's cached POSITION, not the zone's region
+        // centre — `district_for_zone` only tells districts apart when each
+        // has its own shard (see `send_plot_roster`'s doc for the full
+        // reasoning; found again in #94 when a post-split town-centre player
+        // was handed a neighbouring district's board, hiding staked road
+        // plans). Zone fallback only for a client with no cached position yet.
+        let by_position = self
+            .entity_state
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|c| (c.x, c.y))
+            .and_then(|(x, y)| self.capital.district_at(x, y).map(|d| d.id.to_string()));
+        let district = match by_position {
             Some(d) => d,
-            None => return,
+            None => {
+                let zone_id = match self.clients.lock().unwrap().get(pid).map(|i| i.current_zone.clone()) {
+                    Some(z) => z,
+                    None => return,
+                };
+                match self.district_for_zone(&zone_id) {
+                    Some(d) => d,
+                    None => return,
+                }
+            }
         };
         if let Ok(orders) = db.build_orders_for_district(&district).await {
             let arr: Vec<Value> = orders.iter().filter(|o| o.state != "locked").map(build_order_json).collect();
@@ -2196,7 +2220,7 @@ impl Proxy {
             let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
             for o in orders.iter().filter(|o| o.state == "completed") {
                 if let Some(p) = o.placement() {
-                    self.push_to_player(pid, structure_status_json(&o.kind, &p));
+                    self.push_to_player(pid, structure_status_json(&o.kind, &p, o.path_json.as_deref()));
                 }
             }
         }
@@ -2233,7 +2257,7 @@ impl Proxy {
             .unwrap_or_default()
             .iter()
             .any(|b| dist2(px, py, b.x, b.y) <= (BOARD_RANGE as i64).pow(2));
-        let near_order = match (order.x, order.y) {
+        let mut near_order = match (order.x, order.y) {
             (Some(ox), Some(oy)) => {
                 let d2 = match (order.x1, order.y1) {
                     (Some(ox1), Some(oy1)) => point_segment_dist2(
@@ -2245,6 +2269,21 @@ impl Proxy {
             }
             _ => false,
         };
+        // Road orders (#96): near ANY run of the stored path counts — a
+        // multi-run road is buildable from its far end, not just from the
+        // first run the placement columns carry.
+        if !near_order {
+            if let Some(runs) = order
+                .path_json
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<Vec<(i64, i64)>>(p).ok())
+            {
+                near_order = runs.windows(2).any(|w| {
+                    point_segment_dist2(px, py, w[0].0 as i32, w[0].1 as i32, w[1].0 as i32, w[1].1 as i32)
+                        <= (BOARD_RANGE as i64).pow(2)
+                });
+            }
+        }
         if !near_board && !near_order {
             return;
         }
@@ -2283,9 +2322,11 @@ impl Proxy {
         self.broadcast_to_district(&res.district, json!({
             "type": "build.completed", "order_id": order_id, "structures": structures,
         }));
-        // Render the new structure for every connected client.
+        // Render the new structure for every connected client. The order row
+        // fetched for the proximity gate above still carries the road path
+        // (contributions never touch path_json).
         if let Some(p) = &res.placement {
-            let entity = structure_status_json(&res.kind, p).to_string();
+            let entity = structure_status_json(&res.kind, p, order.path_json.as_deref()).to_string();
             let clients = self.clients.lock().unwrap();
             for info in clients.values() {
                 self.push_to_client(info, Message::Text(entity.clone()));
@@ -7544,6 +7585,131 @@ mod tests {
 
         drop(ws);
         drop(player_ws);
+    }
+
+    /// A road order accepts contributions anywhere along its path — including
+    /// a middle/far run well away from both the board and the first-run
+    /// placement — and rejects them away from the path entirely. Completing
+    /// the order broadcasts a structure that carries the full path (#96).
+    #[tokio::test]
+    async fn road_contributions_work_along_the_path_and_completion_carries_it() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // 50m east then 100m south = 150m -> 37 stone (deliberately under the
+        // 50-item carry cap so one hauler can finish it in a single trip).
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.plan", "points": [[12800, 12800], [12850, 12800], [12850, 12900]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let order_id = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+
+        let email = format!("hauler_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hauler"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Stone in the pockets (as mining would put it).
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 40, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        // Far from the board, far from run 1, far from every run: rejected.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100, gather: None });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order_id, "item_id": "stone", "qty": 1,
+            }).to_string()))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let order = db.build_order_by_id(&order_id).await.unwrap().unwrap();
+        assert_eq!(order.progress_json, "{}", "far from the whole path: contribution refused");
+
+        // Near the SECOND run's far end (~90m from the placement segment,
+        // ~100m from the civic board): accepted.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100, gather: None });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order_id, "item_id": "stone", "qty": 1,
+            }).to_string()))
+            .unwrap();
+        let progress = recv_until(&mut ws, "build.progress").await;
+        assert_eq!(progress["progress"]["stone"].as_i64(), Some(1), "mid-path contribution accepted");
+
+        // Pour in the rest: completion broadcasts a structure with the path.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order_id, "item_id": "stone", "qty": 36,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "build.completed").await;
+        let structure = loop {
+            let v = recv_until(&mut ws, "status_update").await;
+            if v["state"]["type"] == "structure" && v["state"]["kind"] == "dirt_road" {
+                break v;
+            }
+        };
+        assert_eq!(
+            structure["state"]["path"],
+            json!([[12800, 12800], [12850, 12800], [12850, 12900]]),
+            "the built road carries its full multi-run path"
+        );
+
+        drop(editor_ws);
+        drop(ws);
+    }
+
+    /// `build.list` resolves the board from the player's cached POSITION —
+    /// the #94 quirk: a zone's region centre only identifies the district
+    /// when every district has its own shard.
+    #[tokio::test]
+    async fn build_list_board_follows_the_players_position() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        db.insert_build_order("suburbs", "test_hut", r#"{"wood":5}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+        db.insert_build_order("civic", "test_fountain", r#"{"stone":5}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+
+        let email = format!("walker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Walker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Standing at the town centre (the welcome relocate cached it): civic.
+        ws.send(Message::Text(json!({"type": "build.list"}).to_string())).await.unwrap();
+        let board = recv_until(&mut ws, "build.list").await;
+        let kinds: Vec<&str> = board["orders"].as_array().unwrap().iter().filter_map(|o| o["kind"].as_str()).collect();
+        assert!(kinds.contains(&"test_fountain"), "town centre = the civic board (got {kinds:?})");
+
+        // Walk (cache-wise) into the suburbs: the board follows the player,
+        // not the zone's region centre.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100, gather: None });
+        ws.send(Message::Text(json!({"type": "build.list"}).to_string())).await.unwrap();
+        let board = recv_until(&mut ws, "build.list").await;
+        let kinds: Vec<&str> = board["orders"].as_array().unwrap().iter().filter_map(|o| o["kind"].as_str()).collect();
+        assert!(kinds.contains(&"test_hut") && !kinds.contains(&"test_fountain"),
+            "suburbs position = the suburbs board (got {kinds:?})");
+
+        drop(ws);
     }
 
     /// The env tick's `poison_sources` counts poison trees within
