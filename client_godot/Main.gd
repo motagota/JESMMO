@@ -48,6 +48,7 @@ var _editor_cam_centred := false
 var _brush: BrushController
 var _history: HistoryPanel
 var _object_tool: ObjectTool
+var _road_tool: RoadTool
 var _world_objects: WorldObjects
 
 var _my_id := ""
@@ -271,9 +272,15 @@ func _wire_signals() -> void:
     _net.skill_update.connect(_on_skill_update)
     _net.skill_levelup.connect(func(skill_id, level): _hud.flash_levelup(skill_id, level))
     _net.store_update.connect(func(items): _storage.set_storage(items))
-    _net.build_list.connect(func(orders): _build.set_orders(orders))
+    _net.build_list.connect(func(orders):
+        _build.set_orders(orders)
+        # Staked road plans (#95): every client renders open road orders'
+        # paths so players can see where stone is wanted.
+        _world.apply_road_plans(orders))
     _net.build_progress.connect(func(order_id, required, progress): _build.update_progress(order_id, required, progress))
-    _net.build_completed.connect(func(order_id, _structures): _build.mark_completed(order_id))
+    _net.build_completed.connect(func(order_id, _structures):
+        _build.mark_completed(order_id)
+        _world.remove_road_plan(order_id)) # the built road (#96) takes over
     _net.build_unlocked.connect(func(_ids): _net.send_build_list())
     _net.plot_assigned.connect(_on_plot_assigned)
     _net.build_placed.connect(func(structure): _hud.flash_announce("Placed %s" % String(structure.get("kind", ""))))
@@ -414,9 +421,25 @@ func _setup_editor() -> void:
     _object_tool.place_requested.connect(func(kind, x, y): _net.send_object_place(kind, x, y))
     _object_tool.delete_requested.connect(func(object_id): _net.send_object_delete(object_id))
     _object_tool.status_changed.connect(func(text): _hud.flash_announce(text))
-    _object_tool.mode_changed.connect(func(mode): _brush.set_enabled(mode == "off"))
     _net.object_edit_error.connect(func(message): _hud.flash_announce("Editor: %s" % message))
-    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, [O] object tool, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
+    # Road tool (#95): [R] toggles grid-snapped road laying; committed plans
+    # go up as one road.plan and come back as a staked build order.
+    _road_tool = RoadTool.new()
+    _road_tool.camera = _editor_cam
+    add_child(_road_tool)
+    _road_tool.plan_committed.connect(func(points): _net.send_road_plan(points))
+    _road_tool.status_changed.connect(func(text): _hud.flash_announce(text))
+    _net.road_planned.connect(func(_order_id): _hud.flash_announce("Road: plan accepted — stone wanted!"))
+    _net.road_plan_error.connect(func(message): _hud.flash_announce("Road: %s" % message))
+    # Exactly one editor tool owns the mouse: the brush runs only while both
+    # pointed tools are off, and the two pointed tools lock each other out.
+    _object_tool.mode_changed.connect(func(mode):
+        _brush.set_enabled(mode == "off" and not _road_tool.active)
+        _road_tool.enabled = mode == "off")
+    _road_tool.mode_changed.connect(func(road_active):
+        _brush.set_enabled(not road_active and _object_tool.mode == "off")
+        _object_tool.enabled = not road_active)
+    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, [O] object tool, [R] road tool, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any

@@ -55,6 +55,10 @@ signal object_list(objects: Array)
 signal object_placed(id: String, kind: String, x: float, y: float)
 signal object_removed(id: String)
 signal object_edit_error(message: String)
+## Road plans (#95): this editor's own plan was accepted (the order arrives
+## via the ordinary build.list broadcast) / rejected.
+signal road_planned(order_id: String)
+signal road_plan_error(message: String)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -244,6 +248,10 @@ func _handle_text(text: String) -> void:
             object_removed.emit(String(msg.get("id", "")))
         Protocol.S_OBJECT_EDIT_ERROR:
             object_edit_error.emit(String(msg.get("message", "object edit rejected")))
+        Protocol.S_ROAD_PLANNED:
+            road_planned.emit(String(msg.get("order_id", "")))
+        Protocol.S_ROAD_PLAN_ERROR:
+            road_plan_error.emit(String(msg.get("message", "road plan rejected")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -375,6 +383,12 @@ func send_object_place(kind: String, x: int, y: int) -> void:
 ## `object.removed` on success).
 func send_object_delete(object_id: String) -> void:
     _send({"type": Protocol.C_OBJECT_DELETE, "object_id": object_id})
+
+## Submit a road plan (editor role only): `points` is `[[x, y], ...]` lattice
+## coordinates whose consecutive pairs are axis-aligned runs. Answered with
+## `road.planned` (and a district `build.list` broadcast) or `road.plan_error`.
+func send_road_plan(points: Array) -> void:
+    _send({"type": Protocol.C_ROAD_PLAN, "points": points})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

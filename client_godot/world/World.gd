@@ -96,6 +96,15 @@ var _zones: Array = []
 ## Each entry keeps its endpoints (`{a, b, node}`) so `refresh_plot_markers`
 ## can re-drape the ribbon when the terrain under it changes.
 var _dirt_roads: Dictionary = {}
+## Staked road plans (#95): accepted-but-unbuilt road orders, keyed by
+## order_id — {"path": [Vector2, ...], "nodes": [MeshInstance3D, ...]}.
+## Replaced wholesale on every `build.list` push and dropped on completion
+## (#96's built road takes over).
+var _road_plans: Dictionary = {}
+## Surveyor-stake look: a narrow translucent strip slightly above the road
+## height so a plan never z-fights the road that later replaces it.
+const _PLAN_COLOR := Color(0.95, 0.8, 0.25, 0.5)
+const _PLAN_WIDTH := 1.6
 ## What the plot markers were last drawn from, so they can be redrawn against
 ## fresh terrain heights (see `refresh_plot_markers`).
 var _home_bounds: Dictionary = {}
@@ -138,6 +147,8 @@ func _process(delta: float) -> void:
         var rec: Dictionary = _dirt_roads[id]
         rec["node"].queue_free()
         rec["node"] = _build_road_ribbon(rec["a"], rec["b"])
+    for id in _road_plans:
+        _restake_plan(id)
 
 ## Rebuild the district name labels from a `partition` message; lazily build
 ## the static ground/roads once the world size and the terrain heightmap are
@@ -375,6 +386,48 @@ func upsert_dirt_road(id: String, state: Dictionary) -> void:
 func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     return _build_ribbon(_roads_root, a, b, _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y, _ROAD_SEGMENT_STEP)
 
+## Staked road plans (#95): rebuild the whole set from a `build.list` push.
+## Replace-not-merge — the board is authoritative, so a plan that finished
+## (or a stale render from before a reconnect) simply isn't re-staked.
+func apply_road_plans(orders: Array) -> void:
+    for id in _road_plans.keys():
+        for n in _road_plans[id]["nodes"]:
+            n.queue_free()
+    _road_plans.clear()
+    for o_v in orders:
+        var o: Dictionary = o_v
+        if String(o.get("state", "")) != "open":
+            continue
+        var raw: Array = o.get("path", [])
+        if raw.size() < 2:
+            continue
+        var path: Array = []
+        for p in raw:
+            path.append(Vector2(float(p[0]), float(p[1])))
+        _road_plans[String(o.get("order_id", ""))] = {"path": path, "nodes": []}
+    for id in _road_plans:
+        _restake_plan(id)
+
+## An order completed (#96 renders the built road) — drop its stakes.
+func remove_road_plan(order_id: String) -> void:
+    if not _road_plans.has(order_id):
+        return
+    for n in _road_plans[order_id]["nodes"]:
+        n.queue_free()
+    _road_plans.erase(order_id)
+
+func _restake_plan(order_id: String) -> void:
+    var rec: Dictionary = _road_plans[order_id]
+    for n in rec["nodes"]:
+        n.queue_free()
+    var nodes: Array = []
+    var path: Array = rec["path"]
+    for i in range(1, path.size()):
+        nodes.append(_build_ribbon(
+            _roads_root, path[i - 1], path[i],
+            _PLAN_WIDTH, _PLAN_COLOR, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
+    rec["nodes"] = nodes
+
 ## A terrain-following strip of `width` from `a` to `b`: every cross-section
 ## is placed with its own `Protocol.w2v` sample, so it drapes over hills and
 ## edited ground instead of floating/clipping between two flat endpoints.
@@ -413,6 +466,10 @@ func _build_ribbon(parent: Node3D, a: Vector2, b: Vector2, width: float, color: 
     strip.mesh = st.commit()
     var mat := StandardMaterial3D.new()
     mat.albedo_color = color
+    if color.a < 1.0:
+        # Translucent ribbons (the staked road plans, #95) — opaque callers
+        # keep the cheap path.
+        mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
     strip.material_override = mat
     parent.add_child(strip)
     return strip

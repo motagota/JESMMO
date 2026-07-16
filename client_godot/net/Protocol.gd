@@ -108,6 +108,21 @@ const S_OBJECT_PLACED := "object.placed" # {id, kind, x, y} -- broadcast to ever
 const S_OBJECT_REMOVED := "object.removed" # {id} -- broadcast to everyone
 const S_OBJECT_EDIT_ERROR := "object.edit_error" # {message}
 
+# --- road.* — editor-laid grid roads (roads & quarry epic #93, #94/#95) -------
+## `road.plan {points}`: a lattice polyline of axis-aligned runs (integer
+## metres — the world's native 1m grid). Editor-role-gated server-side; an
+## accepted plan becomes one ordinary build order (its full path rides the
+## `build.list` entries as `path`, so every client can render the staked
+## plan). Rejected with `road.plan_error`.
+const C_ROAD_PLAN := "road.plan"
+const S_ROAD_PLANNED := "road.planned" # {order_id}
+const S_ROAD_PLAN_ERROR := "road.plan_error" # {message}
+## Display-only mirror of the server's road cost consts (proxy.rs
+## ROAD_STONE_PER_M_*/ROAD_MIN_STONE) — the ghost's readout; the server's
+## number is authoritative.
+const ROAD_STONE_PER_M_DEN := 4
+const ROAD_MIN_STONE := 5
+
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
 const C_RENT_PAY := "rent.pay"

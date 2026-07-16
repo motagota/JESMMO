@@ -27,6 +27,9 @@ const DELETE_PICK_RADIUS := 6.0
 
 var camera: Camera3D
 var objects: WorldObjects
+## False while another editor tool (the RoadTool, #95) owns the mouse — the
+## mode key and clicks are both ignored.
+var enabled := true
 
 var mode := "off"
 var _ghost: Node3D
@@ -35,6 +38,8 @@ var _lmb_down := false
 var _key_down := false
 
 func _process(_delta: float) -> void:
+	if not enabled:
+		return
 	_handle_mode_key()
 	if camera == null or mode == "off":
 		return

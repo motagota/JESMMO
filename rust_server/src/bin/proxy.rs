@@ -376,7 +376,7 @@ const RECLAIM_LOG_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Render a build order as the client-facing board entry used by `build.list`.
 fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
-    json!({
+    let mut v = json!({
         "order_id": o.id,
         "kind": o.kind,
         "required": serde_json::from_str::<Value>(&o.required_json).unwrap_or_else(|_| json!({})),
@@ -386,7 +386,13 @@ fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
         // "requires <skill> <level>" for players below the threshold.
         "required_skill": o.required_skill,
         "required_level": o.required_level,
-    })
+    });
+    // Road orders (#94/#95): the full grid path, so every client can render
+    // the staked (accepted-but-unbuilt) plan and know where to haul stone.
+    if let Some(path) = o.path_json.as_deref().and_then(|p| serde_json::from_str::<Value>(p).ok()) {
+        v["path"] = path;
+    }
+    v
 }
 
 /// An `item -> qty` cost map as a JSON object (for `build.progress`).
