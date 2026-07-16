@@ -504,7 +504,11 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_market_tree_1", district: "market", item_id: "wood", x: 23600, y: 8800, qty: 5 },
         ResourceNodeSpawn { id: "node_market_rock_0", district: "market", item_id: "stone", x: 21600, y: 14400, qty: 5 },
         ResourceNodeSpawn { id: "node_market_tree_2", district: "market", item_id: "wood", x: 24000, y: 20000, qty: 5 },
-        ResourceNodeSpawn { id: "node_market_rock_1", district: "market", item_id: "stone", x: 20400, y: 24400, qty: 5 },
+        // (20400, 24400) drowned when #84's real water mask landed — the map's
+        // SE corner is genuinely Moreton Bay. Relocated to the nearest dry
+        // market-district ground: the Toohey-forest hillside at the band's
+        // west edge (h ~140m — a rock node on a hill reads fine).
+        ResourceNodeSpawn { id: "node_market_rock_1", district: "market", item_id: "stone", x: 19300, y: 22600, qty: 5 },
         ResourceNodeSpawn { id: "node_suburbs_tree_0", district: "suburbs", item_id: "wood", x: 1600, y: 3200, qty: 5 },
         ResourceNodeSpawn { id: "node_suburbs_tree_1", district: "suburbs", item_id: "wood", x: 4000, y: 9600, qty: 5 },
         ResourceNodeSpawn { id: "node_suburbs_rock_0", district: "suburbs", item_id: "stone", x: 2400, y: 16000, qty: 5 },
@@ -615,6 +619,68 @@ mod tests {
         }
         // Only the suburbs carry a grid; the capital total matches.
         assert_eq!(c.starter_plots().len(), 240);
+    }
+
+    /// #84 made the river/bay a real water mask (`sea_level_m = 0`). Two
+    /// invariants any future rebake must preserve: the mask is genuinely
+    /// non-empty (drowning needs real water), and every authored gameplay
+    /// anchor — spawn, plots, resource nodes, storage points — is on dry
+    /// land. The v3 crop was *placed* so these hold (see terrain.toml's
+    /// header); this asserts it instead of assuming it.
+    #[test]
+    fn water_mask_is_real_and_authored_gameplay_points_stay_dry() {
+        let c = capital();
+        let t = loaded_terrain();
+
+        let (tx, ty) = c.town_centre;
+        assert!(!t.is_water(tx as f32, ty as f32), "spawn/town centre is underwater");
+
+        for n in &c.resource_nodes {
+            assert!(!t.is_water(n.x as f32, n.y as f32), "resource node {} is underwater", n.id);
+        }
+        for s in &c.storage_points {
+            assert!(!t.is_water(s.x as f32, s.y as f32), "storage point {} is underwater", s.id);
+        }
+        for (_, cell) in c.starter_plots() {
+            // Corners and centre — a plot partially in the river is still broken.
+            for (px, py) in [
+                (cell.x, cell.y),
+                (cell.x + cell.w - 1, cell.y),
+                (cell.x, cell.y + cell.h - 1),
+                (cell.x + cell.w - 1, cell.y + cell.h - 1),
+                (cell.x + cell.w / 2, cell.y + cell.h / 2),
+            ] {
+                assert!(
+                    !t.is_water(px as f32, py as f32),
+                    "plot ({},{}) is underwater at ({px},{py})",
+                    cell.grid_x, cell.grid_y
+                );
+            }
+        }
+
+        // The mask is non-empty: a coarse 100m scan must find the river/bay
+        // (~10% of the world). Guards against silently rebaking with the old
+        // empty-mask sea level.
+        let mut water_samples = 0u32;
+        let mut total = 0u32;
+        let step = 100;
+        let mut y = step / 2;
+        while y < WORLD_SIZE {
+            let mut x = step / 2;
+            while x < WORLD_SIZE {
+                total += 1;
+                if t.is_water(x as f32, y as f32) {
+                    water_samples += 1;
+                }
+                x += step;
+            }
+            y += step;
+        }
+        let frac = water_samples as f64 / total as f64;
+        assert!(
+            frac > 0.05,
+            "water mask looks empty ({water_samples}/{total} coarse samples) — was the bake run with the old sea_level_m = -25?"
+        );
     }
 
     #[test]
@@ -869,3 +935,4 @@ mod tests {
         }
     }
 }
+

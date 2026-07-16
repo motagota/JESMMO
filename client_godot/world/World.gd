@@ -23,20 +23,23 @@ const _PLOT_EDGE_STEP := 10.0     # plot edges are short; sample tighter than ro
 ## terrain.toml's header), so 0.0 IS the water surface, and everything at
 ## or below it belongs under this plane.
 const _WATER_LEVEL_M := 0.0
-## Scene-space lift for the water plane, chosen against three floors it must
+## Scene-space lift for the water plane, chosen against two floors it must
 ## clear: (1) the flat 0m NoData fill itself, which the coarse backdrop
 ## renders at scene 0 and streamed fine tiles at +0.3
 ## (`TerrainStreamer._STREAM_Y_BIAS`) — a plane at sea level exactly would
-## z-fight both; (2) the bake's [detail] noise, which (with terrain.toml's
-## water mask empty) adds up to ~±0.6m (~0.9 scene) of micro-relief ON the
-## fill, poking dry speckles through any lower plane; (3) enough water
-## column over both ground tiers that the shader's murk saturates on each,
-## so the ±0.3 bias step doesn't draw itself as a blocky tint change along
-## the streaming ring's edge. The ~0.8m of world height 1.2 nominally floods
-## (1.2 / HEIGHT_SCALE) is riverbank fringe that already paints silt-brown
-## (GroundPaint), so the waterline lands inside the wet-mud band where it
-## belongs.
-const _WATER_Y := 1.2
+## z-fight both; (2) enough water column over BOTH ground tiers that the
+## shader's murk and alpha saturate on each (see `murk_depth` and
+## `shore_fade` in water.gdshader — 0.6 leaves 0.3 over the streamed fill,
+## exactly full-alpha and ~4 murk depths), so the ±0.3 bias step doesn't
+## draw itself as a blocky tint change along the streaming ring's edge.
+## This was 1.2 while terrain.toml's water mask was empty and [detail]
+## noise put ~±0.9 scene of dry-speckle micro-relief ON the fill; the #84
+## sea_level_m = 0 rebake masks the fill (noise skipped, bed truly flat),
+## which retired that third, tallest floor. The ~0.4m of world height 0.6
+## nominally floods (0.6 / HEIGHT_SCALE) is riverbank fringe that already
+## paints silt-brown (GroundPaint), so the waterline lands inside the
+## wet-mud band where it belongs.
+const _WATER_Y := 0.6
 
 var world_size := 6400.0
 

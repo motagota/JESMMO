@@ -25,6 +25,7 @@ var _entities: EntityManager
 var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
+var _vitals: VitalsHud
 var _minimap: Minimap
 var _storage: StoragePanel
 var _inventory: InventoryPanel
@@ -46,6 +47,8 @@ var _editor_cam: EditorCamera
 var _editor_cam_centred := false
 var _brush: BrushController
 var _history: HistoryPanel
+var _object_tool: ObjectTool
+var _world_objects: WorldObjects
 
 var _my_id := ""
 var _plot_id := ""
@@ -71,12 +74,19 @@ func _ready() -> void:
     _entities = EntityManager.new()
     add_child(_entities)
 
+    # Placed world props (#86) — every client renders them, editor or not.
+    _world_objects = WorldObjects.new()
+    add_child(_world_objects)
+
     _player = LocalPlayer.new()
     _player.visible = false
     add_child(_player)
 
     _hud = Hud.new()
     add_child(_hud)
+
+    _vitals = VitalsHud.new()
+    add_child(_vitals)
 
     _minimap = Minimap.new()
     add_child(_minimap)
@@ -222,6 +232,9 @@ func _wire_signals() -> void:
     # sit on the ground instead of staying buried under streamed-in or
     # brush-raised terrain.
     _streamer.terrain_changed.connect(_world.refresh_plot_markers)
+    # Placed props ground-snap the same way plot markers do: re-snap whenever
+    # the displayed surface changes (streamed tiles in/out, accepted edits).
+    _streamer.terrain_changed.connect(_world_objects.refresh_heights)
     # Hide the coarse backdrop under every resident fine tile: its ~66m
     # interpolation runs metres above the true 5m ground in places, and
     # without the mask it renders as a phantom surface swallowing the
@@ -244,7 +257,9 @@ func _wire_signals() -> void:
         _minimap.set_plots(plots, _plot_id))
     _net.despawn.connect(func(id): _entities.remove(id))
     _net.zone_migration.connect(func(zone): _hud.set_zone(zone))
-    _net.you_died.connect(func(): _hud.set_conn("you died — respawning…"))
+    # Death gets a proper overlay (#89) instead of the old connection-label
+    # hack; the respawn's status stream restores the vitals bars underneath.
+    _net.you_died.connect(func(): _vitals.show_death())
     _net.gather_progress.connect(func(_node_id, pct): _hud.set_gather_progress(pct))
     _net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
     _net.inv_update.connect(func(items, used, capacity):
@@ -271,6 +286,10 @@ func _wire_signals() -> void:
     _net.rent_reclaimed.connect(func(_plot_id_arg, _moved): _hud.flash_announce(
         "Your plot lapsed — your belongings are safe in storage, flair untouched."))
     _net.district_ready.connect(func(): _transition.mark_server_ready())
+    # Placed world props (#86): the roster answer plus the live broadcasts.
+    _net.object_list.connect(func(objects): _world_objects.apply_list(objects))
+    _net.object_placed.connect(func(id, kind, x, y): _world_objects.on_placed(id, kind, x, y))
+    _net.object_removed.connect(func(id): _world_objects.on_removed(id))
 
     _storage.do_deposit.connect(func(item_id, qty): _net.send_store_deposit(item_id, qty))
     _storage.do_withdraw.connect(func(item_id, qty): _net.send_store_withdraw(item_id, qty))
@@ -357,6 +376,7 @@ func _on_welcome(data: Dictionary) -> void:
         _player.activate()
     _net.send_craft_list() # the recipe registry is static; pull it once per session
     _net.send_terrain_list() # the heightmap is static; pull it once per session
+    _net.send_object_list() # placed props: roster once, then broadcasts keep it live
     _mayor_road.is_mayor = String(data.get("role", "player")) == "mayor"
     if _mayor_road.is_mayor:
         _hud.flash_announce("You are the mayor — press M to commission a dirt path")
@@ -383,7 +403,20 @@ func _setup_editor() -> void:
     _history.do_revert.connect(func(op_id): _net.send_terrain_revert_op(op_id))
     _net.terrain_edit_ack.connect(func(op_id, brush): _history.record_op(op_id, brush))
     _net.terrain_revert_ack.connect(func(op_id): _history.mark_reverted(op_id))
-    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
+    # Object placement tool (#86): [O] cycles off/place/delete; while it's
+    # on, the terrain brush yields the mouse (a placement click must not
+    # also carve the ground). Placement renders via the server broadcast —
+    # the tool itself never touches WorldObjects' contents.
+    _object_tool = ObjectTool.new()
+    _object_tool.camera = _editor_cam
+    _object_tool.objects = _world_objects
+    add_child(_object_tool)
+    _object_tool.place_requested.connect(func(kind, x, y): _net.send_object_place(kind, x, y))
+    _object_tool.delete_requested.connect(func(object_id): _net.send_object_delete(object_id))
+    _object_tool.status_changed.connect(func(text): _hud.flash_announce(text))
+    _object_tool.mode_changed.connect(func(mode): _brush.set_enabled(mode == "off"))
+    _net.object_edit_error.connect(func(message): _hud.flash_announce("Editor: %s" % message))
+    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, [O] object tool, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any
@@ -445,6 +478,14 @@ func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
     if id == _my_id:
         if _editor_mode:
             return # the editor's idle character isn't controlled or rendered
+        # Vitals (#89): server-authoritative hp/breath/poison, straight off
+        # the wire — the HUD never predicts drain rates.
+        _vitals.set_vitals(
+            int(state.get("hp", 100)), int(state.get("max_hp", 100)),
+            int(state.get("breath", 0)), int(state.get("max_breath", 1)),
+            bool(state.get("submerged", false)),
+            int(state.get("poison_buildup", 0)), int(state.get("max_poison", 1)),
+            bool(state.get("poisoned", false)))
         if not _seeded_position:
             # First authoritative snapshot: place us exactly where the server spawned us.
             _seeded_position = true

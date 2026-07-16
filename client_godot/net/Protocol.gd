@@ -94,6 +94,20 @@ const S_TERRAIN_EDIT_ACK := "terrain.edit_ack"
 const C_TERRAIN_REVERT_OP := "terrain.revert_op"
 const S_TERRAIN_REVERT_ACK := "terrain.revert_ack"
 
+# --- object.* — placed world props (player-attributes epic #83, #85/#86) ------
+## Editor-authored props with gameplay meaning (first kind: "poison_tree").
+## World-scoped like terrain: request the roster once (`object.list` answers
+## even when empty), then stay current via the placed/removed broadcasts.
+## Place/delete are editor-role-gated server-side; rejected with
+## `object.edit_error`.
+const C_OBJECT_LIST := "object.list"
+const S_OBJECT_LIST := "object.list" # {objects: [{id, kind, x, y}, ...]}
+const C_OBJECT_PLACE := "object.place" # {kind, x, y}
+const C_OBJECT_DELETE := "object.delete" # {object_id}
+const S_OBJECT_PLACED := "object.placed" # {id, kind, x, y} -- broadcast to everyone
+const S_OBJECT_REMOVED := "object.removed" # {id} -- broadcast to everyone
+const S_OBJECT_EDIT_ERROR := "object.edit_error" # {message}
+
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"
 const C_RENT_PAY := "rent.pay"

@@ -325,6 +325,26 @@ while the respawn point belongs to another, the zone doesn't respawn the player
 itself — it reports the death (`player_died`, see below) and the gateway resolves
 the destination and hands off exactly like a `migrate_request`.
 
+### `object.*` — placed world props (player-attributes epic #83, #85)
+
+Editor-authored props with gameplay meaning; first kind: `poison_tree` (the
+poison hazard, #88, reads placed trees' positions). World-scoped like
+`terrain.*`: every connected client sees every object regardless of
+zone/district, and coordinates are world units (metres) — the same space as
+structures and resource nodes. The gateway owns the whole system (a
+`world_object` table behind an in-memory cache, hydrated on first use);
+zones know nothing about objects.
+
+| message | dir | payload | status |
+|---|---|---|---|
+| `object.list` | C→S | — (request the full current object roster) | **live** |
+| `object.list` | S→C | `objects` (`[{id, kind, x, y}, …]`) — answered from the gateway's cache; explicit even when empty, so a client never confuses "no answer yet" with "nothing placed". Request once when the world is up, then stay current via the broadcasts below | **live** |
+| `object.place` | C→S | `kind`, `x`, `y` — place one object. Requires `role == "editor"`; `kind` must be registered (`poison_tree`), `(x, y)` inside the world | **live** |
+| `object.delete` | C→S | `object_id` — delete one placed object. Requires `role == "editor"`; the row delete is the claim, so racing deletes of the same object produce one `object.removed` and one error | **live** |
+| `object.placed` | S→C | `id`, `kind`, `x`, `y` — pushed to **every** connected client after an accepted place (the author included — clients render acks, the `terrain.delta_patch` reconcile shape) | **live** |
+| `object.removed` | S→C | `id` — pushed to every connected client after an accepted delete | **live** |
+| `object.edit_error` | S→C | `message` — the place/delete was rejected (not an editor / unknown kind / out of bounds / no such object / malformed / no database); nothing was saved | **live** |
+
 ### `rent.*` — rent (M4 §4.7)
 
 | type | dir | fields | status |
@@ -413,6 +433,30 @@ succeeds), and **`home_structure_removed`** `{id}` (a rent reclaim demolished it
 #14). The zone caches these purely as geometry (kind + position) to gate
 `store.deposit`/`store.withdraw`/`craft.make` on proximity to the *specific*
 structure (#13) — it never learns or needs to know who owns it.
+
+**`env_state`** `{player_id, submerged, poison_sources}` (#87/#88) is the same
+downward pattern for the environment: the zone owns hp and the damage tick but
+knows no terrain or object positions, so the gateway's ~1/s environment ticker
+computes each connected player's flags (submerged = the baked water mask, or
+composited ground more than a threshold below sea level — so editor-dug ponds
+count; `poison_sources` = poison trees within `POISON_RADIUS_M` of the player,
+from the #85 object cache) and pushes them unconditionally to the player's
+owning zone; the zone stores the verdict on the live entity and its tick
+applies the mechanics. Unconditional re-send (rather than on-change) makes
+entity recreation (split/merge/respawn/migrate resets zone-side flags to
+their defaults) self-heal within a second with zero bookkeeping.
+
+The zone-side mechanics (#87 breath, #88 poison): while `submerged`, breath
+drains (~10s), then suffocation damage (~15 hp/s); surfacing refills at 3×.
+While `poison_sources > 0`, `poison_buildup` rises (5s to the threshold near
+one tree, faster among more), and decays (~2.5s) once clear; at the threshold
+it **procs** — `poisoned` sticks, dealing ~20 hp/s with no cure in v1; only
+death (respawn recreates the entity clean) ends it. Environmental damage
+deliberately ignores the safe-district guard — that guard is scoped to mob/PvP
+damage, and the whole capital is safe, so a safe-gated river could never drown
+anyone. Player `status_update`s gain `breath` / `max_breath` / `submerged` /
+`poison_buildup` / `max_poison` / `poisoned` alongside `hp` for the vitals HUD
+(#89).
 
 Resource nodes, storage points, build boards, completed city structures, and home
 structures are synced to clients as `status_update`s with `state.type` `"resource"` /

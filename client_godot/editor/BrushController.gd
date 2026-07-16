@@ -27,6 +27,9 @@ const _MAX_CELLS_PER_STROKE := 16384
 
 var camera: Camera3D
 var streamer: TerrainStreamer
+## False while another editor tool (the ObjectTool, #86) owns the mouse — a
+## placement click must not also paint terrain.
+var enabled := true
 
 var _brush_name := "raise"
 var _falloff := "smooth"
@@ -65,8 +68,16 @@ func _load_brush(name_: String) -> void:
 	_strength_min = float(strength.get("min", _strength_min))
 	_strength_max = float(strength.get("max", _strength_max))
 
+## Toggle the brush; disabling mid-stroke commits the stroke in flight (it
+## was painted intentionally — losing it to a tool switch would be hostile).
+func set_enabled(on: bool) -> void:
+	if not on and _painting:
+		_painting = false
+		_commit_stroke()
+	enabled = on
+
 func _process(delta: float) -> void:
-	if camera == null or streamer == null:
+	if camera == null or streamer == null or not enabled:
 		return
 	_handle_param_keys()
 	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)

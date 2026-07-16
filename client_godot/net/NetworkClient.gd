@@ -48,6 +48,13 @@ signal terrain_edit_error(message: String)
 signal terrain_edit_ack(op_id: String, brush: String)
 ## This client's own revert was applied (patches arrive separately).
 signal terrain_revert_ack(op_id: String)
+## Placed world props (#86): the full roster (answer to `object.list`), and
+## the per-object broadcasts every client receives on an accepted editor
+## place/delete. `object_edit_error` is this client's own rejected op.
+signal object_list(objects: Array)
+signal object_placed(id: String, kind: String, x: float, y: float)
+signal object_removed(id: String)
+signal object_edit_error(message: String)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -225,6 +232,18 @@ func _handle_text(text: String) -> void:
             terrain_edit_ack.emit(String(msg.get("op_id", "")), String(msg.get("brush", "")))
         Protocol.S_TERRAIN_REVERT_ACK:
             terrain_revert_ack.emit(String(msg.get("op_id", "")))
+        Protocol.S_OBJECT_LIST:
+            object_list.emit(msg.get("objects", []))
+        Protocol.S_OBJECT_PLACED:
+            object_placed.emit(
+                String(msg.get("id", "")),
+                String(msg.get("kind", "")),
+                float(msg.get("x", 0)),
+                float(msg.get("y", 0)))
+        Protocol.S_OBJECT_REMOVED:
+            object_removed.emit(String(msg.get("id", "")))
+        Protocol.S_OBJECT_EDIT_ERROR:
+            object_edit_error.emit(String(msg.get("message", "object edit rejected")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -339,6 +358,23 @@ func send_terrain_edit_op(brush: String, cells: Array) -> void:
 ## Undo one accepted edit op by its acked id (terrain editing #79).
 func send_terrain_revert_op(op_id: String) -> void:
     _send({"type": Protocol.C_TERRAIN_REVERT_OP, "op_id": op_id})
+
+## Request the full placed-object roster (#86) — sent once per session after
+## `welcome` (the answer is explicit even when empty), then the
+## placed/removed broadcasts keep the client current.
+func send_object_list() -> void:
+    _send({"type": Protocol.C_OBJECT_LIST})
+
+## Place a world object (editor role only; the server broadcasts
+## `object.placed` to everyone on success, `object.edit_error` back on
+## rejection).
+func send_object_place(kind: String, x: int, y: int) -> void:
+    _send({"type": Protocol.C_OBJECT_PLACE, "kind": kind, "x": x, "y": y})
+
+## Delete a placed world object by id (editor role only; broadcast
+## `object.removed` on success).
+func send_object_delete(object_id: String) -> void:
+    _send({"type": Protocol.C_OBJECT_DELETE, "object_id": object_id})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

@@ -35,10 +35,13 @@ uniform vec3 deep_color : source_color = vec3(0.17, 0.19, 0.14);
 // toward it so grazing-angle water reads as reflected sky.
 uniform vec3 sky_color : source_color = vec3(0.55, 0.63, 0.72);
 // Vertical scene-units of water at which the murk color saturates. Small on
-// purpose: with ~0.9 of column over the streamed 0m fill (and ~1.2 over the
-// coarse backdrop's un-biased fill), both tiers must land on the saturated
-// end so the streamed-ring boundary doesn't draw itself as a murk step.
-uniform float murk_depth = 0.15;
+// purpose: with ~0.3 of column over the streamed 0m fill (and ~0.6 over the
+// coarse backdrop's un-biased fill — see World._WATER_Y, lowered when the
+// #84 rebake made the fill truly flat), both tiers must land on the
+// saturated end so the streamed-ring boundary doesn't draw itself as a murk
+// step: 0.08 puts the streamed tier at ~4 murk depths (98%), the backdrop
+// at ~7 (99.9%).
+uniform float murk_depth = 0.08;
 // Alpha ramps 0->full over this much vertical depth: a soft waterline a few
 // metres wide on a typical bank slope instead of a hard polygon edge.
 uniform float shore_fade = 0.25;
