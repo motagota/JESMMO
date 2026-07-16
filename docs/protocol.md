@@ -345,6 +345,22 @@ zones know nothing about objects.
 | `object.removed` | S→C | `id` — pushed to every connected client after an accepted delete | **live** |
 | `object.edit_error` | S→C | `message` — the place/delete was rejected (not an editor / unknown kind / out of bounds / no such object / malformed / no database); nothing was saved | **live** |
 
+### `road.*` — editor-laid grid roads (roads & quarry epic #93, #94)
+
+An editor lays a road along the world's native **1m lattice** (positions are
+integer metres already); an accepted plan becomes ONE ordinary build order
+(`structure_kind: "dirt_road"`) that players fulfil through the normal
+`build.contribute` flow — the contribution is the labour. The order's
+placement columns carry the path's **first run** (so every segment-based
+proximity/completion consumer keeps working); the full polyline rides the
+order row's `path_json` (migration 0012) for multi-run consumers (#96).
+
+| message | dir | payload | status |
+|---|---|---|---|
+| `road.plan` | C→S | `points` (`[[x, y], …]`) — lattice polyline whose consecutive pairs are **axis-aligned runs** (insert a corner point to turn). Requires `role == "editor"`. Validated: ≥2 points, ≤64 corners, in-world, non-degenerate runs, total length ≤ 4000m, and no run crossing a claimed plot (start/mid/end sampled, the `mayor.build_create` rule). Stone cost = 1 per 4m, floor 5. District resolved server-side from the path start | **live** |
+| `road.planned` | S→C | `order_id` — the plan was accepted; the order itself arrives through the ordinary `build.list` broadcast | **live** |
+| `road.plan_error` | S→C | `message` — rejected (not an editor / malformed / diagonal / off-world / over cap / privately owned land / no db); nothing was saved | **live** |
+
 ### `rent.*` — rent (M4 §4.7)
 
 | type | dir | fields | status |

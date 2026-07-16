@@ -169,3 +169,17 @@ pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume cont
 // Restricted to the account with `role = "mayor"`; rejected for everyone else.
 pub const C_MAYOR_BUILD_CREATE: &str = "mayor.build_create"; // {district, kind, structure_kind, required_json, x, y, x1?, y1?}
 pub const S_MAYOR_BUILD_ERROR: &str = "mayor.build_error"; // {message} -- rejected (not mayor / not on city land)
+
+// --- road.* — editor-laid grid roads (roads & quarry epic #93, #94) -------------
+// {points: [[x, y], ...]} -- a polyline of lattice points (integer metres, the
+// world's native 1m grid) whose consecutive pairs are AXIS-ALIGNED runs. One
+// accepted plan becomes ONE ordinary build order (structure_kind "dirt_road",
+// stone cost scaled by total path length) that players fulfil via the normal
+// build.contribute flow. Restricted to role == "editor".
+pub const C_ROAD_PLAN: &str = "road.plan";
+// {order_id} -- the plan was accepted and its work order created (the order
+// itself arrives through the ordinary build.list broadcast).
+pub const S_ROAD_PLANNED: &str = "road.planned";
+// {message} -- the plan was rejected (not an editor / malformed / diagonal
+// run / off-world / over the length cap / crossing an owned plot / no db).
+pub const S_ROAD_PLAN_ERROR: &str = "road.plan_error";

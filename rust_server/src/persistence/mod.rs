@@ -597,6 +597,11 @@ pub struct BuildOrder {
     pub y: Option<i64>,
     pub x1: Option<i64>,
     pub y1: Option<i64>,
+    /// Road orders only (#94): the full grid path as a JSON `[[x, y], ...]`
+    /// polyline of axis-aligned runs. The placement columns still carry the
+    /// first run (so segment-based proximity/completion code keeps working);
+    /// this is the whole shape. `None` for every non-road order.
+    pub path_json: Option<String>,
 }
 
 impl BuildOrder {
@@ -1417,6 +1422,7 @@ impl Db {
         required_skill: Option<&str>,
         required_level: i64,
         placement: Option<BuildPlacement>,
+        path_json: Option<&str>,
     ) -> Result<BuildOrder, DbError> {
         let id = Uuid::new_v4().to_string();
         let (structure_kind, x, y, x1, y1) = match &placement {
@@ -1426,8 +1432,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO build_order \
              (id, district, kind, required_json, progress_json, state, issued_at, required_skill, required_level, \
-              structure_kind, x, y, x1, y1) \
-             VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              structure_kind, x, y, x1, y1, path_json) \
+             VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(district)
@@ -1442,6 +1448,7 @@ impl Db {
         .bind(y)
         .bind(x1)
         .bind(y1)
+        .bind(path_json)
         .execute(&self.pool)
         .await?;
         Ok(BuildOrder {
@@ -1460,6 +1467,7 @@ impl Db {
             y: placement.as_ref().map(|p| p.y),
             x1: placement.as_ref().and_then(|p| p.x1),
             y1: placement.as_ref().and_then(|p| p.y1),
+            path_json: path_json.map(|s| s.to_string()),
         })
     }
 
@@ -1787,6 +1795,7 @@ impl Db {
                     o.required_skill,
                     o.required_level,
                     placement,
+                    None,
                 )
                 .await?;
             }
@@ -2324,7 +2333,7 @@ mod tests {
         db.add_flair(&cid, Some(&plot.id), "rug", 1, 1, 0).await.unwrap();
 
         let order = db
-            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100, None, 0, None)
+            .insert_build_order("market", "town_well", r#"{"wood":20}"#, "open", 100, None, 0, None, None)
             .await
             .unwrap();
         db.save_build_order_progress(&order.id, r#"{"wood":20}"#, "completed", Some(200))
@@ -2452,7 +2461,7 @@ mod tests {
     async fn build_order_pools_contributions_and_completes() {
         let (db, _t) = TempDb::open().await;
         let order = db
-            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0, None)
+            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0, None, None)
             .await
             .unwrap();
 
@@ -2492,7 +2501,7 @@ mod tests {
     #[tokio::test]
     async fn open_build_order_unlocks_a_locked_dependent() {
         let (db, _t) = TempDb::open().await;
-        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0, None, 0, None)
+        db.insert_build_order("civic", "wall_section", r#"{"stone":30}"#, "locked", 0, None, 0, None, None)
             .await
             .unwrap();
         // Unlock flips it open and returns it; a second call is a no-op.
@@ -2501,7 +2510,7 @@ mod tests {
         assert!(db.open_build_order("civic", "wall_section").await.unwrap().is_none());
         // A locked order rejects contributions until opened.
         let locked = db
-            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0, None, 0, None)
+            .insert_build_order("civic", "market_stall", r#"{"wood":40}"#, "locked", 0, None, 0, None, None)
             .await
             .unwrap();
         let cid = a_character(&db).await;
@@ -2515,7 +2524,7 @@ mod tests {
         let (db, _t) = TempDb::open().await;
         // An open order that still requires Building 1 to contribute to.
         let order = db
-            .insert_build_order("civic", "watchtower", r#"{"wood":30}"#, "open", 0, Some("building"), 1, None)
+            .insert_build_order("civic", "watchtower", r#"{"wood":30}"#, "open", 0, Some("building"), 1, None, None)
             .await
             .unwrap();
         let cid = a_character(&db).await;

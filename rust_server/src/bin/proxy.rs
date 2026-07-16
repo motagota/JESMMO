@@ -75,6 +75,19 @@ const EDIT_MAX_CELLS_PER_OP: usize = 16_384;
 /// tick, #88, reads `poison_tree` positions from the object cache).
 const OBJECT_KINDS: &[&str] = &["poison_tree"];
 
+/// Road plans (#94): stone cost per metre of laid path — 1 stone per 4m,
+/// with a floor so even a stub road costs something. Consts like every
+/// other tuning knob; the client mirrors them for display only.
+const ROAD_STONE_PER_M_NUM: i64 = 1;
+const ROAD_STONE_PER_M_DEN: i64 = 4;
+const ROAD_MIN_STONE: i64 = 5;
+/// Total path length cap — a single plan longer than this is a mis-drag or
+/// abuse, not a road (lay long routes as multiple plans).
+const ROAD_MAX_LENGTH_M: i64 = 4_000;
+/// Points cap: with axis-aligned runs, each point past the first is a
+/// corner; a real road plan has a handful, not hundreds.
+const ROAD_MAX_POINTS: usize = 64;
+
 /// Environmental tick cadence (#87): how often every connected player's
 /// environment flags (submerged; poison sources, #88) are recomputed and
 /// pushed to their owning zone. The push is unconditional each tick, not
@@ -2370,11 +2383,132 @@ impl Proxy {
         }
 
         let placement = Some(mmo::persistence::BuildPlacement { structure_kind, x, y, x1, y1 });
-        match db.insert_build_order(&district, &kind, &required_json, "open", now_secs(), None, 0, placement).await {
+        match db.insert_build_order(&district, &kind, &required_json, "open", now_secs(), None, 0, placement, None).await {
             Ok(_) => self.broadcast_build_list(&district).await,
             Err(_) => self.push_to_player(pid, json!({
                 "type": protocol::S_MAYOR_BUILD_ERROR, "message": "failed to create the order",
             })),
+        }
+    }
+
+    /// Apply an editor's `road.plan` (#94): validate a lattice polyline of
+    /// axis-aligned runs on the world's native 1m grid and turn it into ONE
+    /// ordinary build order (structure_kind `dirt_road`, stone cost scaled by
+    /// total length) that players fulfil through the normal `build.contribute`
+    /// flow — the contribution IS the labour. Explicit-error posture like the
+    /// other editor ops (`road.plan_error {message}`).
+    ///
+    /// The placement columns carry the FIRST run (so every existing
+    /// segment-based proximity/completion consumer keeps working); the full
+    /// path rides `build_order.path_json` for the multi-run consumers (#96).
+    async fn apply_road_plan(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "road.plan_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may lay road plans");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("road planning requires persistence (no database)");
+            return;
+        };
+        let Some(raw) = data.get("points").and_then(|v| v.as_array()) else {
+            reject("malformed road.plan (points required)");
+            return;
+        };
+        if raw.len() < 2 {
+            reject("a road needs at least two points");
+            return;
+        }
+        if raw.len() > ROAD_MAX_POINTS {
+            reject("too many corners in one plan");
+            return;
+        }
+        let world = WORLD_SIZE as i64;
+        let mut points: Vec<(i64, i64)> = Vec::with_capacity(raw.len());
+        for p in raw {
+            let (Some(x), Some(y)) = (
+                p.get(0).and_then(|v| v.as_i64()),
+                p.get(1).and_then(|v| v.as_i64()),
+            ) else {
+                reject("malformed point (want [x, y] integers)");
+                return;
+            };
+            if !(0..world).contains(&x) || !(0..world).contains(&y) {
+                reject("road point is outside the world");
+                return;
+            }
+            points.push((x, y));
+        }
+        let mut length: i64 = 0;
+        for w in points.windows(2) {
+            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+            if dx != 0 && dy != 0 {
+                reject("runs must be axis-aligned (insert a corner point to turn)");
+                return;
+            }
+            if dx == 0 && dy == 0 {
+                reject("degenerate run (repeated point)");
+                return;
+            }
+            length += dx.abs() + dy.abs();
+        }
+        if length > ROAD_MAX_LENGTH_M {
+            reject("plan exceeds the single-road length cap (lay long routes as multiple plans)");
+            return;
+        }
+        // City land only, mirroring `apply_mayor_build_create`: check each
+        // run's start, end, and midpoint against every owned plot.
+        for w in points.windows(2) {
+            let mid = ((w[0].0 + w[1].0) / 2, (w[0].1 + w[1].1) / 2);
+            for (px, py) in [w[0], w[1], mid] {
+                if self.on_owned_plot(px as i32, py as i32, &db).await {
+                    reject("the road would cross privately owned land");
+                    return;
+                }
+            }
+        }
+        // District resolved server-side from the path start (the mayor tool
+        // sends its district; the editor shouldn't have to know it).
+        let Some(district) = self
+            .capital
+            .district_at(points[0].0 as i32, points[0].1 as i32)
+            .map(|d| d.id.to_string())
+        else {
+            reject("the road must start inside the capital");
+            return;
+        };
+        let stone = (length * ROAD_STONE_PER_M_NUM / ROAD_STONE_PER_M_DEN).max(ROAD_MIN_STONE);
+        let required_json = json!({ "stone": stone }).to_string();
+        let path_json = match serde_json::to_string(&points) {
+            Ok(s) => s,
+            Err(_) => {
+                reject("failed to encode the path");
+                return;
+            }
+        };
+        let kind = format!("road_{}", Uuid::new_v4().simple());
+        let placement = Some(mmo::persistence::BuildPlacement {
+            structure_kind: "dirt_road".to_string(),
+            x: points[0].0,
+            y: points[0].1,
+            x1: Some(points[1].0),
+            y1: Some(points[1].1),
+        });
+        match db
+            .insert_build_order(&district, &kind, &required_json, "open", now_secs(), None, 0, placement, Some(&path_json))
+            .await
+        {
+            Ok(order) => {
+                self.push_to_player(pid, json!({"type": "road.planned", "order_id": order.id}));
+                self.broadcast_build_list(&district).await;
+            }
+            Err(e) => {
+                eprintln!("[Proxy] road.plan: creating the order failed: {e}");
+                reject("failed to create the road order");
+            }
         }
     }
 
@@ -3772,6 +3906,13 @@ impl Proxy {
                     }
                     if data.get("type").and_then(|v| v.as_str()) == Some("object.delete") {
                         self.apply_object_delete(&player_id, data).await;
+                        continue;
+                    }
+                    // `road.plan` (#94) is role/geometry/db-checked with no
+                    // live-position dependency — same direct-answer reasoning
+                    // as `terrain.edit_op` and `mayor.build_create`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("road.plan") {
+                        self.apply_road_plan(&player_id, data).await;
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -5431,6 +5572,7 @@ mod tests {
                     structure_kind: "well".to_string(),
                     x: tcx as i64, y: (tcy - 40) as i64, x1: None, y1: None,
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -6097,7 +6239,7 @@ mod tests {
         let db = Db::connect(dbf.url()).await.unwrap();
         // A runtime-commissioned order (as `mayor.build_create` would insert) so
         // there's civic content for `build.list` to report.
-        db.insert_build_order("civic", "test_well", r#"{"wood":20}"#, "open", 0, None, 0, None)
+        db.insert_build_order("civic", "test_well", r#"{"wood":20}"#, "open", 0, None, 0, None, None)
             .await
             .unwrap();
 
@@ -7257,6 +7399,145 @@ mod tests {
         assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
 
         drop(ws);
+    }
+
+    // --- road plans (#94): road.plan -> build order -----------------------------
+
+    /// A non-editor's `road.plan` is rejected with an explicit error and
+    /// persists nothing.
+    #[tokio::test]
+    async fn road_plan_is_rejected_for_non_editors() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+
+        let email = format!("paver_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Paver"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "road.plan", "points": [[12800, 12800], [12900, 12800]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("editor"));
+
+        let orders = db.build_orders_for_district("civic").await.unwrap();
+        assert!(!orders.iter().any(|o| o.kind.starts_with("road_")), "a rejected plan must persist nothing");
+        drop(ws);
+    }
+
+    /// A valid L-shaped plan creates ONE ordinary build order: stone cost
+    /// scaled by total length, placement = the first run, the full path in
+    /// path_json, district resolved server-side — and the editor gets the
+    /// `road.planned` ack.
+    #[tokio::test]
+    async fn road_plan_creates_a_length_costed_order_with_the_full_path() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        // Two runs: 100m east then 200m south = 300m -> 75 stone.
+        let points = json!([[12800, 12800], [12900, 12800], [12900, 13000]]);
+        ws.send(Message::Text(json!({"type": "road.plan", "points": points}).to_string()))
+            .await
+            .unwrap();
+        let ack = recv_until(&mut ws, "road.planned").await;
+        let order_id = ack["order_id"].as_str().unwrap().to_string();
+
+        let orders = db.build_orders_for_district("civic").await.unwrap();
+        let order = orders.iter().find(|o| o.id == order_id).expect("the acked order exists");
+        assert!(order.kind.starts_with("road_"));
+        assert_eq!(order.state, "open");
+        let required: Value = serde_json::from_str(&order.required_json).unwrap();
+        assert_eq!(required["stone"].as_i64().unwrap(), 75, "300m at 1 stone / 4m");
+        assert_eq!(order.structure_kind.as_deref(), Some("dirt_road"));
+        assert_eq!((order.x, order.y, order.x1, order.y1), (Some(12800), Some(12800), Some(12900), Some(12800)),
+            "placement carries the FIRST run for segment-based consumers");
+        let path: Value = serde_json::from_str(order.path_json.as_deref().unwrap()).unwrap();
+        assert_eq!(path, json!([[12800, 12800], [12900, 12800], [12900, 13000]]),
+            "the full polyline rides path_json");
+        drop(ws);
+    }
+
+    /// Geometry validation: diagonal runs, repeated points, too-short plans,
+    /// off-world points, and over-cap total length are all explicit errors,
+    /// and a stub road still costs the minimum stone.
+    #[tokio::test]
+    async fn road_plan_validates_geometry_and_floors_the_cost() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut ws = dial_editor(&proxy, &db).await;
+
+        let cases = [
+            (json!([[100, 100], [200, 200]]), "axis-aligned"),
+            (json!([[100, 100], [100, 100]]), "degenerate"),
+            (json!([[100, 100]]), "two points"),
+            (json!([[100, 100], [100, -5]]), "outside the world"),
+            (json!([[100, 100], [100, 4200]]), "length cap"),
+        ];
+        for (points, want) in cases {
+            ws.send(Message::Text(json!({"type": "road.plan", "points": points}).to_string()))
+                .await
+                .unwrap();
+            let err = recv_until(&mut ws, "road.plan_error").await;
+            assert!(
+                err["message"].as_str().unwrap().contains(want),
+                "expected '{want}' in: {}",
+                err["message"]
+            );
+        }
+        assert!(
+            !db.build_orders_for_district("civic").await.unwrap().iter().any(|o| o.kind.starts_with("road_")),
+            "nothing persisted by any rejected plan"
+        );
+
+        // A 4m stub still costs the ROAD_MIN_STONE floor.
+        ws.send(Message::Text(
+            json!({"type": "road.plan", "points": [[12800, 12800], [12804, 12800]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let ack = recv_until(&mut ws, "road.planned").await;
+        let order = db.build_order_by_id(ack["order_id"].as_str().unwrap()).await.unwrap().unwrap();
+        let required: Value = serde_json::from_str(&order.required_json).unwrap();
+        assert_eq!(required["stone"].as_i64().unwrap(), ROAD_MIN_STONE, "stub roads cost the floor");
+        drop(ws);
+    }
+
+    /// A plan crossing a claimed starter plot is rejected — roads are city
+    /// work on city land, same rule as the mayor's tool.
+    #[tokio::test]
+    async fn road_plan_rejects_privately_owned_land() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // A registered player claims their starter plot (in the suburbs).
+        let mut player_ws = dial(&proxy).await;
+        let (_pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut player_ws, "Homeowner").await;
+        let px = bounds["x"].as_i64().unwrap() + bounds["w"].as_i64().unwrap() / 2;
+        let py = bounds["y"].as_i64().unwrap() + bounds["h"].as_i64().unwrap() / 2;
+
+        let mut ws = dial_editor(&proxy, &db).await;
+        // A run starting on the claimed plot (the first starter plot sits at
+        // the world's NW corner, so extend east rather than straddle it).
+        ws.send(Message::Text(
+            json!({"type": "road.plan", "points": [[px, py], [px + 150, py]]}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "road.plan_error").await;
+        assert!(
+            err["message"].as_str().unwrap().contains("privately owned"),
+            "unexpected rejection: {}",
+            err["message"]
+        );
+
+        drop(ws);
+        drop(player_ws);
     }
 
     /// The env tick's `poison_sources` counts poison trees within
