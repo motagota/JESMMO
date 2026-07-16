@@ -25,6 +25,7 @@ var _entities: EntityManager
 var _player: LocalPlayer
 var _login: Login
 var _hud: Hud
+var _vitals: VitalsHud
 var _minimap: Minimap
 var _storage: StoragePanel
 var _inventory: InventoryPanel
@@ -83,6 +84,9 @@ func _ready() -> void:
 
     _hud = Hud.new()
     add_child(_hud)
+
+    _vitals = VitalsHud.new()
+    add_child(_vitals)
 
     _minimap = Minimap.new()
     add_child(_minimap)
@@ -253,7 +257,9 @@ func _wire_signals() -> void:
         _minimap.set_plots(plots, _plot_id))
     _net.despawn.connect(func(id): _entities.remove(id))
     _net.zone_migration.connect(func(zone): _hud.set_zone(zone))
-    _net.you_died.connect(func(): _hud.set_conn("you died — respawning…"))
+    # Death gets a proper overlay (#89) instead of the old connection-label
+    # hack; the respawn's status stream restores the vitals bars underneath.
+    _net.you_died.connect(func(): _vitals.show_death())
     _net.gather_progress.connect(func(_node_id, pct): _hud.set_gather_progress(pct))
     _net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
     _net.inv_update.connect(func(items, used, capacity):
@@ -472,6 +478,14 @@ func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
     if id == _my_id:
         if _editor_mode:
             return # the editor's idle character isn't controlled or rendered
+        # Vitals (#89): server-authoritative hp/breath/poison, straight off
+        # the wire — the HUD never predicts drain rates.
+        _vitals.set_vitals(
+            int(state.get("hp", 100)), int(state.get("max_hp", 100)),
+            int(state.get("breath", 0)), int(state.get("max_breath", 1)),
+            bool(state.get("submerged", false)),
+            int(state.get("poison_buildup", 0)), int(state.get("max_poison", 1)),
+            bool(state.get("poisoned", false)))
         if not _seeded_position:
             # First authoritative snapshot: place us exactly where the server spawned us.
             _seeded_position = true
