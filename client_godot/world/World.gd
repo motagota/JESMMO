@@ -96,6 +96,15 @@ var _zones: Array = []
 ## Each entry keeps its endpoints (`{a, b, node}`) so `refresh_plot_markers`
 ## can re-drape the ribbon when the terrain under it changes.
 var _dirt_roads: Dictionary = {}
+## Staked road plans (#95): accepted-but-unbuilt road orders, keyed by
+## order_id — {"path": [Vector2, ...], "nodes": [MeshInstance3D, ...]}.
+## Replaced wholesale on every `build.list` push and dropped on completion
+## (#96's built road takes over).
+var _road_plans: Dictionary = {}
+## Surveyor-stake look: a narrow translucent strip slightly above the road
+## height so a plan never z-fights the road that later replaces it.
+const _PLAN_COLOR := Color(0.95, 0.8, 0.25, 0.5)
+const _PLAN_WIDTH := 1.6
 ## What the plot markers were last drawn from, so they can be redrawn against
 ## fresh terrain heights (see `refresh_plot_markers`).
 var _home_bounds: Dictionary = {}
@@ -136,8 +145,11 @@ func _process(delta: float) -> void:
         apply_plot_roster(_roster_plots, _my_plot_id)
     for id in _dirt_roads:
         var rec: Dictionary = _dirt_roads[id]
-        rec["node"].queue_free()
-        rec["node"] = _build_road_ribbon(rec["a"], rec["b"])
+        for n in rec["nodes"]:
+            n.queue_free()
+        rec["nodes"] = _build_road_path(rec["path"])
+    for id in _road_plans:
+        _restake_plan(id)
 
 ## Rebuild the district name labels from a `partition` message; lazily build
 ## the static ground/roads once the world size and the terrain heightmap are
@@ -165,6 +177,7 @@ func _maybe_build_static() -> void:
     _build_ground()
     _build_water()
     _build_town_centre_marker()
+    _build_quarry_marker()
     _built_static = true
 
 ## Repaint the backdrop's residency mask from the streamer's current
@@ -358,6 +371,40 @@ func _build_town_centre_marker() -> void:
     marker.material_override = mm
     _roads_root.add_child(marker)
 
+## The quarry site marker (#97; relocated to Mt Coot-tha's east flank in
+## #99): a floor slab + distance-culled label at the authored working face's
+## centre (mirrors `world.rs`'s `node_quarry_*` cluster, the same way the
+## town-centre marker mirrors WORLD_SIZE/2). The rocks themselves are live
+## resource nodes rendered by EntityManager.
+const _QUARRY_SITE := Vector2(8232, 13915)
+
+func _build_quarry_marker() -> void:
+    var slab := MeshInstance3D.new()
+    var cyl := CylinderMesh.new()
+    cyl.top_radius = 22.0 * Protocol.WORLD_SCALE
+    cyl.bottom_radius = 22.0 * Protocol.WORLD_SCALE
+    cyl.height = 0.4
+    slab.mesh = cyl
+    slab.position = Protocol.w2v(_QUARRY_SITE.x, _QUARRY_SITE.y, 0.2)
+    var sm := StandardMaterial3D.new()
+    sm.albedo_color = Color(0.60, 0.57, 0.50) # worked, dusty ground
+    slab.material_override = sm
+    _roads_root.add_child(slab)
+
+    var label := Label3D.new()
+    label.text = "⛏ Quarry"
+    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.no_depth_test = true
+    label.fixed_size = true
+    label.pixel_size = 0.004
+    label.modulate = Color(0.95, 0.9, 0.75)
+    label.outline_size = 8
+    label.position = Protocol.w2v(_QUARRY_SITE.x, _QUARRY_SITE.y, 8.0)
+    label.visibility_range_end = 900.0
+    label.visibility_range_end_margin = 100.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+    _roads_root.add_child(label)
+
 ## Render a completed `dirt_road` build order — a segment from `(x,y)` to
 ## `(x1,y1)` — as a real road: a multi-vertex ribbon, not a single rigid box.
 ## Every cross-section along the segment is placed with its own `Protocol.w2v`
@@ -365,15 +412,73 @@ func _build_town_centre_marker() -> void:
 ## follows the terrain's hills its whole length instead of floating/clipping
 ## between two flat endpoints. `id` is the `status_update` id
 ## (`structure_<build order kind>`) — idempotent, since a road never moves.
+## A completed dirt road. Editor-laid roads (#96) carry their full multi-run
+## grid `path`; the mayor's two-click segments still arrive as x/y..x1/y1 and
+## render as the single run they are — both store the same
+## `{"path": [Vector2, ...], "nodes": [ribbon, ...]}` shape.
 func upsert_dirt_road(id: String, state: Dictionary) -> void:
     if _dirt_roads.has(id):
         return
-    var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
-    var b := Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))
-    _dirt_roads[id] = {"a": a, "b": b, "node": _build_road_ribbon(a, b)}
+    var path: Array = []
+    var raw: Array = state.get("path", [])
+    if raw.size() >= 2:
+        for p in raw:
+            path.append(Vector2(float(p[0]), float(p[1])))
+    else:
+        var a := Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
+        path = [a, Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))]
+    _dirt_roads[id] = {"path": path, "nodes": _build_road_path(path)}
+
+func _build_road_path(path: Array) -> Array:
+    var nodes: Array = []
+    for i in range(1, path.size()):
+        nodes.append(_build_road_ribbon(path[i - 1], path[i]))
+    return nodes
 
 func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     return _build_ribbon(_roads_root, a, b, _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y, _ROAD_SEGMENT_STEP)
+
+## Staked road plans (#95): rebuild the whole set from a `build.list` push.
+## Replace-not-merge — the board is authoritative, so a plan that finished
+## (or a stale render from before a reconnect) simply isn't re-staked.
+func apply_road_plans(orders: Array) -> void:
+    for id in _road_plans.keys():
+        for n in _road_plans[id]["nodes"]:
+            n.queue_free()
+    _road_plans.clear()
+    for o_v in orders:
+        var o: Dictionary = o_v
+        if String(o.get("state", "")) != "open":
+            continue
+        var raw: Array = o.get("path", [])
+        if raw.size() < 2:
+            continue
+        var path: Array = []
+        for p in raw:
+            path.append(Vector2(float(p[0]), float(p[1])))
+        _road_plans[String(o.get("order_id", ""))] = {"path": path, "nodes": []}
+    for id in _road_plans:
+        _restake_plan(id)
+
+## An order completed (#96 renders the built road) — drop its stakes.
+func remove_road_plan(order_id: String) -> void:
+    if not _road_plans.has(order_id):
+        return
+    for n in _road_plans[order_id]["nodes"]:
+        n.queue_free()
+    _road_plans.erase(order_id)
+
+func _restake_plan(order_id: String) -> void:
+    var rec: Dictionary = _road_plans[order_id]
+    for n in rec["nodes"]:
+        n.queue_free()
+    var nodes: Array = []
+    var path: Array = rec["path"]
+    for i in range(1, path.size()):
+        nodes.append(_build_ribbon(
+            _roads_root, path[i - 1], path[i],
+            _PLAN_WIDTH, _PLAN_COLOR, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
+    rec["nodes"] = nodes
 
 ## A terrain-following strip of `width` from `a` to `b`: every cross-section
 ## is placed with its own `Protocol.w2v` sample, so it drapes over hills and
@@ -413,6 +518,10 @@ func _build_ribbon(parent: Node3D, a: Vector2, b: Vector2, width: float, color: 
     strip.mesh = st.commit()
     var mat := StandardMaterial3D.new()
     mat.albedo_color = color
+    if color.a < 1.0:
+        # Translucent ribbons (the staked road plans, #95) — opaque callers
+        # keep the cheap path.
+        mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
     strip.material_override = mat
     parent.add_child(strip)
     return strip

@@ -46,7 +46,7 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 
 	if not _entities.has(id):
 		_entities[id] = {
-			"node": _make_node(kind, state),
+			"node": _make_node(kind, state, id),
 			"target": target,
 			"kind": kind,
 		}
@@ -142,7 +142,7 @@ func _height_for(kind: String) -> float:
 		"crafting": return 0.9
 		_: return 1.2
 
-func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
+func _make_node(kind: String, state: Dictionary, id := "") -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	match kind:
 		"mob":
@@ -151,8 +151,17 @@ func _make_node(kind: String, state: Dictionary) -> MeshInstance3D:
 			mi.mesh = box
 			mi.material_override = _solid(Color(0.85, 0.25, 0.25))
 		"resource":
-			# Trees (wood) as green cones, rocks (stone) as grey boxes.
-			if String(state.get("item_id", "")) == "stone":
+			# Trees (wood) as green cones, rocks (stone) as grey boxes. The
+			# quarry's rich nodes (#97, authored ids `node_quarry_*`) render
+			# as larger, paler cut blocks set at a slight skew so the working
+			# face reads as *the* stone source next to ordinary field rocks.
+			if id.begins_with("node_quarry_"):
+				var block := BoxMesh.new()
+				block.size = Vector3(3.2, 2.8, 2.6)
+				mi.mesh = block
+				mi.rotation_degrees = Vector3(0, 25, 0)
+				mi.material_override = _solid(Color(0.72, 0.70, 0.64))
+			elif String(state.get("item_id", "")) == "stone":
 				var rock := BoxMesh.new()
 				rock.size = Vector3(2.0, 2.0, 2.0)
 				mi.mesh = rock

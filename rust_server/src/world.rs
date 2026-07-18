@@ -522,6 +522,25 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_old_quarter_rock_0", district: "old_quarter", item_id: "stone", x: 12800, y: 23600, qty: 5 },
         ResourceNodeSpawn { id: "node_old_quarter_tree_1", district: "old_quarter", item_id: "wood", x: 17600, y: 21600, qty: 5 },
         ResourceNodeSpawn { id: "node_old_quarter_rock_1", district: "old_quarter", item_id: "stone", x: 11200, y: 24400, qty: 5 },
+        // The QUARRY (roads & quarry epic #93, #97; relocated in #99): the
+        // pen's stone-economy anchor — a working face of eight rich stone
+        // nodes on MT COOT-THA's east flank. The bake is real Brisbane, and
+        // the 281m summit at world (6800, 14000) IS Mt Coot-tha (real height
+        // 287m) — the face sits on its NE bench (probed: h ~150–175, dry),
+        // ~300m uphill of the Mt Coot-tha roundabout at the slope's base
+        // (~8500, 14250), where Milton Road (#99's inaugural road order)
+        // arrives from the town centre. Deliberately 5x the qty of a field
+        // rock so hauling for road orders (#94–96) centres here; mining is
+        // the ordinary gather verb. The client draws a "Quarry" site marker
+        // at the face's centre (~8232, 13915).
+        ResourceNodeSpawn { id: "node_quarry_rock_0", district: "civic", item_id: "stone", x: 8210, y: 13900, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_1", district: "civic", item_id: "stone", x: 8225, y: 13905, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_2", district: "civic", item_id: "stone", x: 8240, y: 13900, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_3", district: "civic", item_id: "stone", x: 8255, y: 13905, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_4", district: "civic", item_id: "stone", x: 8210, y: 13925, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_5", district: "civic", item_id: "stone", x: 8225, y: 13930, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_6", district: "civic", item_id: "stone", x: 8240, y: 13925, qty: 25 },
+        ResourceNodeSpawn { id: "node_quarry_rock_7", district: "civic", item_id: "stone", x: 8255, y: 13930, qty: 25 },
     ];
 
     // A public town storehouse beside the town centre (the M2 stash). Per-plot
@@ -619,6 +638,28 @@ mod tests {
         }
         // Only the suburbs carry a grid; the capital total matches.
         assert_eq!(c.starter_plots().len(), 240);
+    }
+
+    /// The quarry (#97, relocated to Mt Coot-tha's east flank in #99): the
+    /// pen's stone source is a tight cluster of rich nodes on the mountain
+    /// bench above the Milton Road roundabout, inside the civic district.
+    /// (Dryness is covered for every node by the water-mask anchor test
+    /// below; this pins the quarry's own contract.)
+    #[test]
+    fn quarry_is_a_rich_stone_cluster_on_mt_coottha() {
+        let c = capital();
+        let t = loaded_terrain();
+        let site = Rect::new(8150, 13850, 8350, 13990);
+        let quarry: Vec<_> = c.resource_nodes.iter().filter(|n| n.id.starts_with("node_quarry_")).collect();
+        assert!(quarry.len() >= 6, "a quarry needs a working face, not a pebble (got {})", quarry.len());
+        for n in &quarry {
+            assert_eq!(n.item_id, "stone", "{} must be stone", n.id);
+            assert_eq!(n.district, "civic", "{} must sit in the civic district", n.id);
+            assert!(site.contains(n.x, n.y), "{} at ({},{}) escapes the authored site", n.id, n.x, n.y);
+            assert!(n.qty >= 20, "{} should be rich (5x a field rock), got {}", n.id, n.qty);
+            let h = t.sample_height(n.x as f32, n.y as f32);
+            assert!(h > 100.0, "{} should sit on the mountain bench (h={h:.1})", n.id);
+        }
     }
 
     /// #84 made the river/bay a real water mask (`sea_level_m = 0`). Two

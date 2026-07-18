@@ -1,0 +1,12 @@
+-- Road plans (roads & quarry epic #93, issue #94): an editor-laid road is an
+-- ordinary build order whose structure is a multi-run path on the world's 1m
+-- lattice, not a single segment. The full polyline rides the order row --
+-- completed city structures are derived from the completed order (there is
+-- no structure-table row for them), so this column IS the road's durable
+-- shape, from staked plan through built road.
+--
+-- `path_json` is a JSON array of [x, y] lattice points whose consecutive
+-- pairs are axis-aligned runs (validated at road.plan time). NULL for every
+-- non-road order; the legacy mayor two-click segment keeps using the
+-- x/y/x1/y1 placement columns unchanged.
+ALTER TABLE build_order ADD COLUMN path_json TEXT;
