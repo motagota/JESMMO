@@ -119,5 +119,66 @@ func _initialize() -> void:
 		_fail("cancel should drop the picked plan silently"); return
 	tool.set_active(false)
 
-	print("SMOKE_OK: road snapping/cost math, the anchor/corner/commit machine, staked-plan rendering, and move-mode pick/edit/replan all behave")
+	# --- demolish tool (#107) ----------------------------------------------------
+	# Board with: a pristine plan, a progressed plan, a demolition order (not
+	# a target), and a built road.
+	world.apply_road_plans([
+		{"order_id": "pristine", "state": "open", "kind": "road_a", "path": [[300, 100], [400, 100]], "progress": {}},
+		{"order_id": "progressed", "state": "open", "kind": "road_b", "path": [[300, 200], [400, 200]], "progress": {"stone": 7}},
+		{"order_id": "demo1", "state": "open", "kind": "demo_x", "path": [[300, 300], [400, 300]], "progress": {}},
+		{"order_id": "built", "state": "completed", "kind": "road_c", "path": [[300, 400], [400, 400]]},
+	])
+	if not world._completed_road_orders.has("built"):
+		_fail("completed road orders should be tracked for demolition picking"); return
+	# Demolition orders stake RED with the salvage label.
+	if not world._road_plans.has("demo1"):
+		_fail("demolition orders stake like plans"); return
+
+	var demo_tool := DemolishTool.new()
+	demo_tool.world_ref = world
+	root.add_child(demo_tool)
+	var cancels: Array = []
+	var demolishes: Array = []
+	demo_tool.cancel_requested.connect(func(id): cancels.append(id))
+	demo_tool.demolish_requested.connect(func(id): demolishes.append(id))
+	demo_tool.set_active(true)
+
+	# Picking: nearest target; demo orders excluded; built roads included.
+	if demo_tool.pick_target(Vector2(350, 302)).get("order_id", "") != "":
+		_fail("a demolition order must not be a demolish target"); return
+	if demo_tool.pick_target(Vector2(350, 402)).get("order_id", "") != "built":
+		_fail("built roads are pickable from the board data"); return
+
+	# One click targets, the second confirms; routing by progress/built.
+	demo_tool.click(Vector2(350, 101))
+	if not cancels.is_empty() or not demolishes.is_empty():
+		_fail("first click must never fire"); return
+	demo_tool.click(Vector2(352, 100))
+	if cancels != ["pristine"] or not demolishes.is_empty():
+		_fail("pristine plan confirm should route to road.cancel (got %s/%s)" % [str(cancels), str(demolishes)]); return
+	demo_tool.click(Vector2(350, 201))
+	demo_tool.click(Vector2(350, 199))
+	if demolishes != ["progressed"]:
+		_fail("progressed plan confirm should route to road.demolish (got %s)" % str(demolishes)); return
+	demo_tool.click(Vector2(350, 401))
+	demo_tool.click(Vector2(350, 402))
+	if demolishes != ["progressed", "built"]:
+		_fail("built road confirm should route to road.demolish (got %s)" % str(demolishes)); return
+	# Clicking a DIFFERENT target between clicks re-targets, never fires.
+	cancels.clear()
+	demo_tool.click(Vector2(350, 101))
+	demo_tool.click(Vector2(350, 201))
+	demo_tool.click(Vector2(350, 101))
+	if not cancels.is_empty():
+		_fail("switching targets must reset the confirmation"); return
+
+	# A demolished built road's despawn un-renders the ribbon.
+	world.upsert_dirt_road("structure_road_c", {"path": [[300, 400], [400, 400]]})
+	if not world._dirt_roads.has("structure_road_c"):
+		_fail("built road should render"); return
+	world.remove_dirt_road("structure_road_c")
+	if world._dirt_roads.has("structure_road_c"):
+		_fail("despawn should un-render the demolished road"); return
+
+	print("SMOKE_OK: road snapping/cost math, laying, staking, move-mode, and demolish pick/route/confirm all behave")
 	quit(0)

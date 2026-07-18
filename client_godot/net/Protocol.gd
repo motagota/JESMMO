@@ -122,6 +122,14 @@ const S_ROAD_PLAN_ERROR := "road.plan_error" # {message}
 ## order on the spot). Acked with road.planned / rejected with
 ## road.plan_error. Built roads don't move — demolish + re-lay.
 const C_ROAD_REPLAN := "road.replan" # {order_id, points}
+## Removal (#106): cancel is free only for pristine (zero-progress) open
+## plans; anything with stone in it takes a demolition order (kind demo_*,
+## requires a tool_kit, worked on site) whose completion removes the road
+## and refunds the banked stone to the demolishers' town storage.
+const C_ROAD_CANCEL := "road.cancel" # {order_id}
+const S_ROAD_CANCELLED := "road.cancelled" # {order_id}
+const C_ROAD_DEMOLISH := "road.demolish" # {order_id}
+const S_ROAD_DEMOLITION_PLANNED := "road.demolition_planned" # {order_id, demo_order_id}
 ## Display-only mirror of the server's road cost consts (proxy.rs
 ## ROAD_STONE_PER_M_*/ROAD_MIN_STONE) — the ghost's readout; the server's
 ## number is authoritative.

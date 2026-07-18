@@ -32,6 +32,7 @@ var active := "brush"
 var _brush: BrushController
 var _object_tool: ObjectTool
 var _road_tool: RoadTool
+var _demolish_tool: DemolishTool
 var _history: HistoryPanel
 
 var _buttons: Dictionary = {} # id -> Button
@@ -61,7 +62,7 @@ func _init() -> void:
 	row.add_theme_constant_override("separation", 6)
 	bar.add_child(row)
 
-	for id_label in [["brush", "🖌 Brush"], ["objects", "🌳 Objects  [O]"], ["road", "🛣 Road  [R]"], ["road_move", "🔀 Move  [M]"]]:
+	for id_label in [["brush", "🖌 Brush"], ["objects", "🌳 Objects  [O]"], ["road", "🛣 Road  [R]"], ["road_move", "🔀 Move  [M]"], ["demolish", "🔨 Demolish  [X]"]]:
 		var b := Button.new()
 		b.text = id_label[1]
 		b.toggle_mode = true
@@ -91,15 +92,19 @@ func _init() -> void:
 ## Wire the tools this toolbar governs. Their `status_changed` streams feed
 ## the hint line from here on (Main routes them), and their mode signals
 ## keep the buttons honest when hotkeys drive the switch.
-func setup(brush: BrushController, object_tool: ObjectTool, road_tool: RoadTool, history: HistoryPanel) -> void:
+func setup(brush: BrushController, object_tool: ObjectTool, road_tool: RoadTool, demolish_tool: DemolishTool, history: HistoryPanel) -> void:
 	_brush = brush
 	_object_tool = object_tool
 	_road_tool = road_tool
+	_demolish_tool = demolish_tool
 	_history = history
 	_object_tool.mode_changed.connect(func(_m):
 		if not _applying:
 			_apply_state())
 	_road_tool.mode_changed.connect(func(_a):
+		if not _applying:
+			_apply_state())
+	_demolish_tool.mode_changed.connect(func(_a):
 		if not _applying:
 			_apply_state())
 	_apply_state()
@@ -114,16 +119,24 @@ func select(id: String) -> void:
 		"brush":
 			_object_tool.set_mode("off")
 			_road_tool.set_active(false)
+			_demolish_tool.set_active(false)
 		"objects":
 			_road_tool.set_active(false)
+			_demolish_tool.set_active(false)
 			if _object_tool.mode == "off":
 				_object_tool.set_mode("place")
 		"road":
 			_object_tool.set_mode("off")
+			_demolish_tool.set_active(false)
 			_road_tool.set_active(true) # also switches move mode -> lay
 		"road_move":
 			_object_tool.set_mode("off")
+			_demolish_tool.set_active(false)
 			_road_tool.set_move_active(true)
+		"demolish":
+			_object_tool.set_mode("off")
+			_road_tool.set_active(false)
+			_demolish_tool.set_active(true)
 	_applying = false
 	_apply_state()
 
@@ -138,12 +151,16 @@ func set_hint(text: String) -> void:
 func _apply_state() -> void:
 	var road_on := _road_tool.active
 	var objects_on := _object_tool.mode != "off"
-	_brush.set_enabled(not road_on and not objects_on)
-	# A pointed tool's hotkey stays dead while the other pointed tool owns
+	var demo_on := _demolish_tool.active
+	_brush.set_enabled(not road_on and not objects_on and not demo_on)
+	# A pointed tool's hotkey stays dead while another pointed tool owns
 	# the mouse (pre-toolbar behaviour); buttons can always switch.
-	_object_tool.enabled = not road_on
-	_road_tool.enabled = not objects_on
-	if road_on:
+	_object_tool.enabled = not road_on and not demo_on
+	_road_tool.enabled = not objects_on and not demo_on
+	_demolish_tool.enabled = not objects_on and not road_on
+	if demo_on:
+		active = "demolish"
+	elif road_on:
 		active = "road_move" if _road_tool.move_mode else "road"
 	else:
 		active = "objects" if objects_on else "brush"
@@ -158,4 +175,6 @@ func _apply_state() -> void:
 			set_hint("Road — click to anchor/corner, [Enter] commit, [Esc] cancel, [Backspace] undo corner")
 		"road_move":
 			set_hint("Move — click a staked plan to pick it up, edit, [Enter] commit, [Esc] drop")
+		"demolish":
+			set_hint("Demolish — click a plan or built road, click again to confirm (stone refunds via the salvage job)")
 	tool_changed.emit(active)

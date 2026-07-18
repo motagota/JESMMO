@@ -2028,6 +2028,146 @@ impl Db {
         Ok(ReplanOutcome { applied: true, completed, contributors })
     }
 
+    /// Cancel a pristine road plan (`road.cancel`, #106): only an OPEN road
+    /// order with ZERO progress goes — anything with contributed stone must
+    /// take the demolition route so players' hauling is never vaporised.
+    /// Returns whether the row was removed; `false` = wrong state/progress
+    /// (the caller rejects with a pointer to demolition).
+    pub async fn cancel_road_order(&self, order_id: &str) -> Result<bool, DbError> {
+        let res = sqlx::query(
+            "DELETE FROM build_order WHERE id = ? AND state = 'open' \
+             AND path_json IS NOT NULL AND progress_json = '{}'",
+        )
+        .bind(order_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Create a demolition order for a road (`road.demolish`, #106),
+    /// transactionally:
+    /// - the target must be a road order that's either COMPLETED (a built
+    ///   road) or OPEN WITH PROGRESS (a part-built plan; pristine plans are
+    ///   for `road.cancel`);
+    /// - an open plan flips to state `demolishing` so contributions stop
+    ///   (contribute() only feeds `open` orders) and its stakes drop off the
+    ///   boards; a built road keeps rendering until the demolition finishes;
+    /// - the demolition order's kind is `demo_<target order id>` — the link
+    ///   back — and doubles as the double-demolition guard;
+    /// - the demo order carries the road's path (so the ordinary
+    ///   contribution proximity gate means the work happens on site) but NO
+    ///   placement — completing it must never spawn a structure.
+    pub async fn create_demolition(
+        &self,
+        target_order_id: &str,
+        now: i64,
+    ) -> Result<Result<BuildOrder, &'static str>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(target) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(target_order_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(Err("no such order"));
+        };
+        let Some(path_json) = target.path_json.clone() else {
+            tx.commit().await?;
+            return Ok(Err("that order is not a road"));
+        };
+        let demo_kind = format!("demo_{}", target.id);
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM build_order WHERE kind = ? LIMIT 1")
+                .bind(&demo_kind)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(Err("a demolition for that road is already posted"));
+        }
+        match target.state.as_str() {
+            "completed" => {} // a built road: keeps rendering until the job's done
+            "open" => {
+                if target.progress_json == "{}" {
+                    tx.commit().await?;
+                    return Ok(Err("nothing built there yet — cancel the plan instead"));
+                }
+                sqlx::query("UPDATE build_order SET state = 'demolishing' WHERE id = ? AND state = 'open'")
+                    .bind(&target.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            _ => {
+                tx.commit().await?;
+                return Ok(Err("that road can't be demolished right now"));
+            }
+        }
+        let demo_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO build_order (id, district, kind, required_json, progress_json, state, issued_at, path_json) \
+             VALUES (?, ?, ?, ?, '{}', 'open', ?, ?)",
+        )
+        .bind(&demo_id)
+        .bind(&target.district)
+        .bind(&demo_kind)
+        .bind(r#"{"tool_kit":1}"#)
+        .bind(now)
+        .bind(&path_json)
+        .execute(&mut *tx)
+        .await?;
+        let demo = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(&demo_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Ok(demo))
+    }
+
+    /// Finish a completed demolition (#106): compute the refund from the
+    /// target (a built road refunds its full required cost; a part-built
+    /// plan refunds its contributed progress), delete the target order (and
+    /// its contribution rows), and return the refund map. The caller pays it
+    /// out and broadcasts the removal.
+    pub async fn settle_demolition(
+        &self,
+        target_order_id: &str,
+    ) -> Result<Option<(BuildOrder, BTreeMap<String, i64>)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(target) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(target_order_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let refund = if target.state == "completed" {
+            parse_cost(&target.required_json)
+        } else {
+            parse_cost(&target.progress_json)
+        };
+        sqlx::query("DELETE FROM build_contribution WHERE order_id = ?")
+            .bind(&target.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM build_order WHERE id = ?")
+            .bind(&target.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((target, refund)))
+    }
+
+    /// Mint items straight into a character's town storage (#106's refunds
+    /// — storage sidesteps the carry cap, and it's the established safe
+    /// stash). Not a transfer: demolition returns what the road absorbed.
+    pub async fn grant_storage(&self, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        add_storage_in_tx(&mut tx, character_id, item_id, qty).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // --- placed world props (player-attributes epic #83, issue #85) ---------
 
     /// Persist a newly placed world object (editor `object.place`). The id is

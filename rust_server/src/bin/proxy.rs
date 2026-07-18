@@ -2304,6 +2304,13 @@ impl Proxy {
         if !res.completed {
             return;
         }
+        // A completed DEMOLITION order (#106) tears its target road out and
+        // pays the salvage before the ordinary completion announcements (so
+        // the board refresh at the end already shows the road gone). Demo
+        // orders carry no placement, so no structure spawns from them.
+        if res.kind.starts_with("demo_") {
+            self.finish_demolition(&db, &res.kind, &res.contributors).await;
+        }
         self.announce_order_completion(
             &db, order_id, &res.kind, &res.district,
             &res.contributors, res.placement.as_ref(), order.path_json.as_deref(),
@@ -2680,6 +2687,137 @@ impl Proxy {
                 eprintln!("[Proxy] road.replan: updating the order failed: {e}");
                 reject("failed to update the road order");
             }
+        }
+    }
+
+    /// Apply an editor's `road.cancel` (#106): remove a pristine (open,
+    /// zero-progress) road plan outright. Anything with contributed stone is
+    /// refused toward the demolition route — no silent vaporising of
+    /// players' hauling.
+    async fn apply_road_cancel(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "road.plan_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may cancel road plans");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("road planning requires persistence (no database)");
+            return;
+        };
+        let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if order_id.is_empty() {
+            reject("malformed road.cancel (order_id required)");
+            return;
+        }
+        // District for the board refresh, read before the row goes.
+        let district = match db.build_order_by_id(&order_id).await {
+            Ok(Some(o)) => o.district,
+            _ => {
+                reject("no such order");
+                return;
+            }
+        };
+        match db.cancel_road_order(&order_id).await {
+            Ok(true) => {
+                self.push_to_player(pid, json!({"type": "road.cancelled", "order_id": order_id}));
+                self.broadcast_build_list(&district).await;
+            }
+            Ok(false) => reject("that plan has contributed stone (or is built) — demolish it instead"),
+            Err(e) => {
+                eprintln!("[Proxy] road.cancel: {e}");
+                reject("failed to cancel the plan");
+            }
+        }
+    }
+
+    /// Apply an editor's `road.demolish` (#106): post a demolition order for
+    /// a built road or a part-built plan. The job requires one tool_kit,
+    /// contributed on site (the demo order carries the road's path for the
+    /// proximity gate); completing it removes the road and refunds its
+    /// banked stone — see the demo branch in `apply_build_contribute`.
+    async fn apply_road_demolish(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "road.plan_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may post demolitions");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("road planning requires persistence (no database)");
+            return;
+        };
+        let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if order_id.is_empty() {
+            reject("malformed road.demolish (order_id required)");
+            return;
+        }
+        match db.create_demolition(&order_id, now_secs()).await {
+            Ok(Ok(demo)) => {
+                self.push_to_player(pid, json!({
+                    "type": "road.demolition_planned",
+                    "order_id": order_id,
+                    "demo_order_id": demo.id,
+                }));
+                self.broadcast_build_list(&demo.district).await;
+            }
+            Ok(Err(msg)) => reject(msg),
+            Err(e) => {
+                eprintln!("[Proxy] road.demolish: {e}");
+                reject("failed to post the demolition");
+            }
+        }
+    }
+
+    /// A demolition order completed (#106): tear the road out and pay the
+    /// salvage. The refund basis comes from the TARGET (a built road refunds
+    /// its full required cost, a part-built plan its contributed progress);
+    /// the recipients are the DEMOLITION order's contributors — they did the
+    /// salvage work — pro-rata by contributed units, paid into town storage
+    /// (the carry cap would strand a big refund). The target order row goes,
+    /// the built road's render entity is despawned everywhere, and the
+    /// board refresh (from the caller's ordinary completion flow) shows the
+    /// road gone.
+    async fn finish_demolition(&self, db: &Db, demo_kind: &str, contributors: &[(String, i64)]) {
+        let Some(target_id) = demo_kind.strip_prefix("demo_") else { return };
+        let Ok(Some((target, refund))) = db.settle_demolition(target_id).await else {
+            eprintln!("[Proxy] demolition {demo_kind}: target already gone");
+            return;
+        };
+        // Pay the salvage pro-rata by demo-order units (integer split,
+        // remainder to the largest contributor first by ordering).
+        let total_units: i64 = contributors.iter().map(|(_, u)| u).sum();
+        if total_units > 0 {
+            for (item, qty) in &refund {
+                let mut remaining = *qty;
+                for (i, (cid, units)) in contributors.iter().enumerate() {
+                    let share = if i + 1 == contributors.len() {
+                        remaining // last takes the remainder — nothing lost
+                    } else {
+                        qty * units / total_units
+                    };
+                    if share > 0 {
+                        if let Err(e) = db.grant_storage(cid, item, share).await {
+                            eprintln!("[Proxy] demolition refund to {cid} failed: {e}");
+                        } else {
+                            self.send_storage(cid).await; // online recipients see it land
+                        }
+                        remaining -= share;
+                    }
+                }
+            }
+        }
+        // The built road's render entity disappears for everyone. (A
+        // part-built plan had no structure; the despawn is a no-op there.)
+        let entity_id = format!("structure_{}", target.kind);
+        let msg = json!({"type": "despawn", "player_id": entity_id}).to_string();
+        let clients = self.clients.lock().unwrap();
+        for info in clients.values() {
+            self.push_to_client(info, Message::Text(msg.clone()));
         }
     }
 
@@ -4082,6 +4220,15 @@ impl Proxy {
                     // `road.replan` (#104): role/DB-checked like road.plan.
                     if data.get("type").and_then(|v| v.as_str()) == Some("road.replan") {
                         self.apply_road_replan(&player_id, data).await;
+                        continue;
+                    }
+                    // `road.cancel` / `road.demolish` (#106): same reasoning.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("road.cancel") {
+                        self.apply_road_cancel(&player_id, data).await;
+                        continue;
+                    }
+                    if data.get("type").and_then(|v| v.as_str()) == Some("road.demolish") {
+                        self.apply_road_demolish(&player_id, data).await;
                         continue;
                     }
                     // `road.plan` (#94) is role/geometry/db-checked with no
@@ -7953,6 +8100,209 @@ mod tests {
 
         drop(editor_ws);
         drop(player_ws);
+    }
+
+    /// `road.cancel` + `road.demolish` (#106): the full removal economy —
+    /// pristine plans cancel free, anything with stone in it takes a
+    /// demolition job that refunds the banked stone to the demolisher's
+    /// storage on completion, and the built road's entity despawns.
+    #[tokio::test]
+    async fn road_cancel_and_demolition_refund_the_banked_stone() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // A pristine 100m plan cancels outright.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.plan", "points": [[13400, 12600], [13500, 12600]]}).to_string()))
+            .await
+            .unwrap();
+        let pristine = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+        // Demolishing a pristine plan is refused toward cancel...
+        editor_ws
+            .send(Message::Text(json!({"type": "road.demolish", "order_id": pristine}).to_string()))
+            .await
+            .unwrap();
+        let err = recv_until(&mut editor_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("cancel"), "pristine demolish points at cancel");
+        // ...and cancel removes it.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.cancel", "order_id": pristine}).to_string()))
+            .await
+            .unwrap();
+        recv_until(&mut editor_ws, "road.cancelled").await;
+        assert!(db.build_order_by_id(&pristine).await.unwrap().is_none(), "cancelled plan row gone");
+
+        // Build a 40m stub road (10 stone) end-to-end with a worker.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.plan", "points": [[13400, 12600], [13440, 12600]]}).to_string()))
+            .await
+            .unwrap();
+        let road_order = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+        let email = format!("wrecker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Wrecker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 10, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100, gather: None });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": road_order, "item_id": "stone", "qty": 10,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "build.completed").await;
+
+        // A cancel on the built road is refused; demolish posts the job.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.cancel", "order_id": road_order}).to_string()))
+            .await
+            .unwrap();
+        let err = recv_until(&mut editor_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("demolish"));
+        editor_ws
+            .send(Message::Text(json!({"type": "road.demolish", "order_id": road_order}).to_string()))
+            .await
+            .unwrap();
+        let posted = recv_until(&mut editor_ws, "road.demolition_planned").await;
+        let demo_id = posted["demo_order_id"].as_str().unwrap().to_string();
+        let demo = db.build_order_by_id(&demo_id).await.unwrap().unwrap();
+        assert_eq!(demo.kind, format!("demo_{road_order}"));
+        assert_eq!(demo.required_json, r#"{"tool_kit":1}"#);
+        assert!(demo.placement().is_none(), "a demolition must never spawn a structure");
+        assert!(demo.path_json.is_some(), "the demo order carries the path for on-site work");
+        // Double-demolition guarded.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.demolish", "order_id": road_order}).to_string()))
+            .await
+            .unwrap();
+        let err = recv_until(&mut editor_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("already"));
+
+        // The wrecker crafts up a tool kit (granted as a gather would) and
+        // works the demolition on site.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "tool_kit", "qty": 1, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": demo_id, "item_id": "tool_kit", "qty": 1,
+            }).to_string()))
+            .unwrap();
+
+        // Wire order: the refund lands (store.update) before the despawn.
+        let storage = recv_until(&mut ws, "store.update").await;
+        let items = storage["items"].as_array().unwrap();
+        assert!(
+            items.iter().any(|it| it["item_id"] == "stone" && it["qty"].as_i64() == Some(10)),
+            "the full banked stone refunds to the demolisher's storage (got {items:?})"
+        );
+        // The road's render entity despawns for connected clients...
+        loop {
+            let v = recv_until(&mut ws, "despawn").await;
+            if v["player_id"].as_str().unwrap().starts_with("structure_road_") {
+                break;
+            }
+        }
+        // ...and the target order row is gone.
+        assert!(db.build_order_by_id(&road_order).await.unwrap().is_none(), "demolished road order deleted");
+
+        drop(editor_ws);
+        drop(ws);
+    }
+
+    /// Demolishing a part-built plan refunds its contributed progress (not
+    /// the full cost), and posting the demolition freezes contributions.
+    #[tokio::test]
+    async fn demolishing_a_part_built_plan_refunds_its_progress() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // 200m plan = 50 stone; contribute 12.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.plan", "points": [[13400, 12500], [13600, 12500]]}).to_string()))
+            .await
+            .unwrap();
+        let road_order = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+        let email = format!("hauler2_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hauler2"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 13, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100, gather: None });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": road_order, "item_id": "stone", "qty": 12,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "build.progress").await;
+
+        editor_ws
+            .send(Message::Text(json!({"type": "road.demolish", "order_id": road_order}).to_string()))
+            .await
+            .unwrap();
+        let posted = recv_until(&mut editor_ws, "road.demolition_planned").await;
+        let demo_id = posted["demo_order_id"].as_str().unwrap().to_string();
+        // The frozen plan takes no more stone.
+        assert_eq!(db.build_order_by_id(&road_order).await.unwrap().unwrap().state, "demolishing");
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": road_order, "item_id": "stone", "qty": 1,
+            }).to_string()))
+            .unwrap();
+
+        // Work the demolition; the refund is the 12 contributed, not 50.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "tool_kit", "qty": 1, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": demo_id, "item_id": "tool_kit", "qty": 1,
+            }).to_string()))
+            .unwrap();
+        // Wire order: refund first, then the completion announcements.
+        let storage = recv_until(&mut ws, "store.update").await;
+        let items = storage["items"].as_array().unwrap();
+        assert!(
+            items.iter().any(|it| it["item_id"] == "stone" && it["qty"].as_i64() == Some(12)),
+            "a part-built plan refunds its contributed progress (got {items:?})"
+        );
+        recv_until(&mut ws, "build.completed").await;
+        assert!(db.build_order_by_id(&road_order).await.unwrap().is_none());
+
+        drop(editor_ws);
+        drop(ws);
     }
 
     /// The env tick's `poison_sources` counts poison trees within

@@ -26,13 +26,15 @@ func _initialize() -> void:
 	root.add_child(objects)
 	var road := RoadTool.new()
 	root.add_child(road)
+	var demolish := DemolishTool.new()
+	root.add_child(demolish)
 	var history := HistoryPanel.new()
 	root.add_child(history)
 	var bar := EditorToolbar.new()
 	root.add_child(bar)
 	var changes: Array = []
 	bar.tool_changed.connect(func(id): changes.append(id))
-	bar.setup(brush, objects, road, history)
+	bar.setup(brush, objects, road, demolish, history)
 
 	# Fresh state: brush owns the mouse.
 	if bar.active != "brush" or not brush.enabled:
@@ -91,6 +93,16 @@ func _initialize() -> void:
 	road.set_move_active(true) # the [M] hotkey path
 	if bar.active != "road_move":
 		_fail("hotkey move activation should light the Move button"); return
+
+	# --- the Demolish slot (#107) ------------------------------------------------
+	bar.select("demolish")
+	if bar.active != "demolish" or not demolish.active:
+		_fail("demolish click should activate the tool"); return
+	if brush.enabled or objects.enabled or road.enabled or road.active:
+		_fail("demolish owns the mouse: brush/objects/road all yield"); return
+	demolish.set_active(false) # the [X] hotkey path back off
+	if bar.active != "brush" or not brush.enabled:
+		_fail("demolish off should fall back to the brush"); return
 	bar.select("brush")
 
 	# Every transition emitted tool_changed.
