@@ -61,7 +61,7 @@ func _init() -> void:
 	row.add_theme_constant_override("separation", 6)
 	bar.add_child(row)
 
-	for id_label in [["brush", "🖌 Brush"], ["objects", "🌳 Objects  [O]"], ["road", "🛣 Road  [R]"]]:
+	for id_label in [["brush", "🖌 Brush"], ["objects", "🌳 Objects  [O]"], ["road", "🛣 Road  [R]"], ["road_move", "🔀 Move  [M]"]]:
 		var b := Button.new()
 		b.text = id_label[1]
 		b.toggle_mode = true
@@ -120,8 +120,10 @@ func select(id: String) -> void:
 				_object_tool.set_mode("place")
 		"road":
 			_object_tool.set_mode("off")
-			if not _road_tool.active:
-				_road_tool.set_active(true)
+			_road_tool.set_active(true) # also switches move mode -> lay
+		"road_move":
+			_object_tool.set_mode("off")
+			_road_tool.set_move_active(true)
 	_applying = false
 	_apply_state()
 
@@ -141,7 +143,10 @@ func _apply_state() -> void:
 	# the mouse (pre-toolbar behaviour); buttons can always switch.
 	_object_tool.enabled = not road_on
 	_road_tool.enabled = not objects_on
-	active = "road" if road_on else ("objects" if objects_on else "brush")
+	if road_on:
+		active = "road_move" if _road_tool.move_mode else "road"
+	else:
+		active = "objects" if objects_on else "brush"
 	for id in _buttons:
 		_buttons[id].set_pressed_no_signal(id == active)
 	match active:
@@ -151,4 +156,6 @@ func _apply_state() -> void:
 			set_hint("Objects (%s) — [O] cycles place/delete/off" % _object_tool.mode)
 		"road":
 			set_hint("Road — click to anchor/corner, [Enter] commit, [Esc] cancel, [Backspace] undo corner")
+		"road_move":
+			set_hint("Move — click a staked plan to pick it up, edit, [Enter] commit, [Esc] drop")
 	tool_changed.emit(active)

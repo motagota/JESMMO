@@ -117,6 +117,11 @@ const S_OBJECT_EDIT_ERROR := "object.edit_error" # {message}
 const C_ROAD_PLAN := "road.plan"
 const S_ROAD_PLANNED := "road.planned" # {order_id}
 const S_ROAD_PLAN_ERROR := "road.plan_error" # {message}
+## Re-route an OPEN road plan (#104): same validation as road.plan, cost
+## recomputed, contributed progress kept (covering progress completes the
+## order on the spot). Acked with road.planned / rejected with
+## road.plan_error. Built roads don't move — demolish + re-lay.
+const C_ROAD_REPLAN := "road.replan" # {order_id, points}
 ## Display-only mirror of the server's road cost consts (proxy.rs
 ## ROAD_STONE_PER_M_*/ROAD_MIN_STONE) — the ghost's readout; the server's
 ## number is authoritative.

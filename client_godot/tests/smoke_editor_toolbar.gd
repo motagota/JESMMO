@@ -79,8 +79,22 @@ func _initialize() -> void:
 	if bar._hint.text != "custom status":
 		_fail("tools' status stream should override the hint"); return
 
+	# --- the Move slot (#105) ----------------------------------------------------
+	bar.select("road_move")
+	if bar.active != "road_move" or not road.move_mode or not road.active:
+		_fail("road_move click should enter move mode (active=%s move=%s)" % [bar.active, road.move_mode]); return
+	if brush.enabled or objects.enabled:
+		_fail("move mode owns the mouse like lay mode"); return
+	bar.select("road")
+	if bar.active != "road" or road.move_mode:
+		_fail("road click from move mode should switch to lay mode"); return
+	road.set_move_active(true) # the [M] hotkey path
+	if bar.active != "road_move":
+		_fail("hotkey move activation should light the Move button"); return
+	bar.select("brush")
+
 	# Every transition emitted tool_changed.
-	if changes.is_empty() or changes[-1] != "road":
+	if changes.is_empty() or changes[-1] != "brush":
 		_fail("tool_changed should have tracked the transitions (got %s)" % str(changes)); return
 
 	print("SMOKE_OK: the toolbar owns the exclusivity matrix — clicks and hotkey paths converge, brush falls back, hints track")

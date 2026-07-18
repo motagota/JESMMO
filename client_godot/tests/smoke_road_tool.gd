@@ -86,5 +86,38 @@ func _initialize() -> void:
 	if not world._road_plans.is_empty():
 		_fail("a board push without the order should un-stake it"); return
 
-	print("SMOKE_OK: road snapping/cost math, the anchor/corner/commit machine, and staked-plan rendering all behave")
+	# --- move mode (#105) --------------------------------------------------------
+	world.apply_road_plans(orders) # re-stake r1 for picking
+	tool.world_ref = world
+	var replans: Array = []
+	tool.replan_committed.connect(func(oid, pts): replans.append([oid, pts]))
+
+	# Pick math: nearest run within radius; nothing outside it.
+	if RoadTool.pick_plan(world._road_plans, Vector2(150, 104), 10.0) != "r1":
+		_fail("pick_plan should find r1 4m from its first run"); return
+	if RoadTool.pick_plan(world._road_plans, Vector2(150, 140), 10.0) != "":
+		_fail("pick_plan should find nothing 40m out"); return
+
+	tool.set_move_active(true)
+	if not tool.active or not tool.move_mode:
+		_fail("set_move_active should enter move mode"); return
+	tool.pick_at(Vector2(150, 103))
+	if tool.editing_order_id != "r1" or tool.points != [Vector2i(100, 100), Vector2i(200, 100), Vector2i(200, 300)]:
+		_fail("picking should load the plan's exact polyline (got %s / %s)" % [tool.editing_order_id, str(tool.points)]); return
+	# Edit: trim the last corner, extend east instead.
+	tool.points.pop_back()
+	tool.add_corner(Vector2(260.4, 102.0))
+	tool.commit()
+	if replans.size() != 1 or replans[0][0] != "r1" or replans[0][1] != [[100, 100], [200, 100], [260, 100]]:
+		_fail("move commit should emit road.replan with the edited polyline (got %s)" % str(replans)); return
+	if tool.editing_order_id != "" or not tool.points.is_empty():
+		_fail("move commit should clear the editing state"); return
+	# A fresh pick then Esc drops the selection without emitting.
+	tool.pick_at(Vector2(150, 103))
+	tool.cancel()
+	if replans.size() != 1 or tool.editing_order_id != "":
+		_fail("cancel should drop the picked plan silently"); return
+	tool.set_active(false)
+
+	print("SMOKE_OK: road snapping/cost math, the anchor/corner/commit machine, staked-plan rendering, and move-mode pick/edit/replan all behave")
 	quit(0)

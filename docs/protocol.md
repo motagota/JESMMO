@@ -360,6 +360,7 @@ order row's `path_json` (migration 0012) for multi-run consumers (#96).
 | `road.plan` | C→S | `points` (`[[x, y], …]`) — lattice polyline whose consecutive pairs are **axis-aligned runs** (insert a corner point to turn). Requires `role == "editor"`. Validated: ≥2 points, ≤64 corners, in-world, non-degenerate runs, total length ≤ 4000m, and no run crossing a claimed plot (start/mid/end sampled, the `mayor.build_create` rule). Stone cost = 1 per 4m, floor 5. District resolved server-side from the path start | **live** |
 | `road.planned` | S→C | `order_id` — the plan was accepted; the order itself arrives through the ordinary `build.list` broadcast | **live** |
 | `road.plan_error` | S→C | `message` — rejected (not an editor / malformed / diagonal / off-world / over cap / privately owned land / no db); nothing was saved | **live** |
+| `road.replan` | C→S | `order_id`, `points` — re-route an **open** road plan (#104): same validation as `road.plan`, stone cost recomputed from the new length, **contributed progress kept** (progress covering the recomputed cost completes the order on the spot through the ordinary completion flow). Acked with `road.planned`; rejected with `road.plan_error` (plus: unknown order / not a road / not open — "demolish a built road instead"). A district-crossing replan refreshes both boards | **live** |
 
 ### `rent.*` — rent (M4 §4.7)
 

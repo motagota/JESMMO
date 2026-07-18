@@ -390,6 +390,11 @@ func send_object_delete(object_id: String) -> void:
 func send_road_plan(points: Array) -> void:
     _send({"type": Protocol.C_ROAD_PLAN, "points": points})
 
+## Re-route an open road plan (#104/#105, editor role only). Same shape as
+## send_road_plan plus the order being moved.
+func send_road_replan(order_id: String, points: Array) -> void:
+    _send({"type": Protocol.C_ROAD_REPLAN, "order_id": order_id, "points": points})
+
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:
     _send({"type": Protocol.C_CRAFT_MAKE, "recipe_id": recipe_id})

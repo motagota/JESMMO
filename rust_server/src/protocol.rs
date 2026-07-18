@@ -183,3 +183,9 @@ pub const S_ROAD_PLANNED: &str = "road.planned";
 // {message} -- the plan was rejected (not an editor / malformed / diagonal
 // run / off-world / over the length cap / crossing an owned plot / no db).
 pub const S_ROAD_PLAN_ERROR: &str = "road.plan_error";
+// {order_id, points} -- re-route an OPEN road plan (#104): full road.plan
+// validation, stone cost recomputed from the new length, contributed
+// progress kept (if it already covers the new cost the order completes on
+// the spot). Editor-gated; acked with road.planned, rejected with
+// road.plan_error. Built roads don't move -- demolish + re-lay (#106).
+pub const C_ROAD_REPLAN: &str = "road.replan";

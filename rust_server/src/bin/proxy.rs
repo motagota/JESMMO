@@ -2304,9 +2304,31 @@ impl Proxy {
         if !res.completed {
             return;
         }
+        self.announce_order_completion(
+            &db, order_id, &res.kind, &res.district,
+            &res.contributors, res.placement.as_ref(), order.path_json.as_deref(),
+        )
+        .await;
+    }
 
+    /// Everything that happens when an order completes, AFTER the durable
+    /// state flip: contributor XP, the `build.completed` broadcast, the
+    /// structure render push, dependent unlocks, and the board refresh.
+    /// Shared by the ordinary contribute path and `road.replan`'s
+    /// covered-by-kept-progress edge (#104) so a completion is a completion,
+    /// whichever door it came through.
+    async fn announce_order_completion(
+        &self,
+        db: &Db,
+        order_id: &str,
+        kind: &str,
+        district: &str,
+        contributors: &[(String, i64)],
+        placement: Option<&mmo::persistence::BuildPlacement>,
+        path_json: Option<&str>,
+    ) {
         // Lump-sum building XP to each contributor, split by units contributed.
-        for (cid, units) in &res.contributors {
+        for (cid, units) in contributors {
             let amount = units * mmo::persistence::BUILD_XP_PER_UNIT;
             if let Ok(gain) = db.grant_skill_xp(cid, "building", amount).await {
                 self.push_skill_gain(cid, &gain);
@@ -2314,19 +2336,17 @@ impl Proxy {
         }
 
         // This order's own placement (set at creation — mayor-commissioned or authored).
-        let structures: Vec<Value> = res
-            .placement
+        let structures: Vec<Value> = placement
             .iter()
             .map(|p| json!({"kind": p.structure_kind, "x": p.x, "y": p.y, "x1": p.x1, "y1": p.y1}))
             .collect();
-        self.broadcast_to_district(&res.district, json!({
+        self.broadcast_to_district(district, json!({
             "type": "build.completed", "order_id": order_id, "structures": structures,
         }));
-        // Render the new structure for every connected client. The order row
-        // fetched for the proximity gate above still carries the road path
-        // (contributions never touch path_json).
-        if let Some(p) = &res.placement {
-            let entity = structure_status_json(&res.kind, p, order.path_json.as_deref()).to_string();
+        // Render the new structure for every connected client (path_json:
+        // roads render their full multi-run path, #96).
+        if let Some(p) = placement {
+            let entity = structure_status_json(kind, p, path_json).to_string();
             let clients = self.clients.lock().unwrap();
             for info in clients.values() {
                 self.push_to_client(info, Message::Text(entity.clone()));
@@ -2338,7 +2358,7 @@ impl Proxy {
             .capital
             .build_orders
             .iter()
-            .filter(|o| o.prereq == Some(res.kind.as_str()))
+            .filter(|o| o.prereq == Some(kind))
             .map(|o| (o.district, o.kind))
             .collect();
         let mut unlocked_ids: Vec<String> = Vec::new();
@@ -2348,12 +2368,12 @@ impl Proxy {
             }
         }
         if !unlocked_ids.is_empty() {
-            self.broadcast_to_district(&res.district, json!({
+            self.broadcast_to_district(district, json!({
                 "type": "build.unlocked", "order_ids": unlocked_ids,
             }));
         }
         // Refresh the board for the district (the newly opened orders now appear).
-        self.broadcast_build_list(&res.district).await;
+        self.broadcast_build_list(district).await;
     }
 
     /// Whether `(x,y)` falls inside a currently-owned plot — i.e. is *not*
@@ -2438,6 +2458,62 @@ impl Proxy {
         }
     }
 
+    /// Parse + validate a road path payload (`points`, shared by `road.plan`
+    /// and `road.replan` #104): a lattice polyline whose consecutive pairs
+    /// are axis-aligned runs, in-world, under the point/length caps, and not
+    /// crossing privately owned land. Returns `(points, length_m)` or the
+    /// `road.plan_error` message.
+    async fn parse_road_path(&self, db: &Db, data: &Value) -> Result<(Vec<(i64, i64)>, i64), &'static str> {
+        let Some(raw) = data.get("points").and_then(|v| v.as_array()) else {
+            return Err("malformed road plan (points required)");
+        };
+        if raw.len() < 2 {
+            return Err("a road needs at least two points");
+        }
+        if raw.len() > ROAD_MAX_POINTS {
+            return Err("too many corners in one plan");
+        }
+        let world = WORLD_SIZE as i64;
+        let mut points: Vec<(i64, i64)> = Vec::with_capacity(raw.len());
+        for p in raw {
+            let (Some(x), Some(y)) = (
+                p.get(0).and_then(|v| v.as_i64()),
+                p.get(1).and_then(|v| v.as_i64()),
+            ) else {
+                return Err("malformed point (want [x, y] integers)");
+            };
+            if !(0..world).contains(&x) || !(0..world).contains(&y) {
+                return Err("road point is outside the world");
+            }
+            points.push((x, y));
+        }
+        let mut length: i64 = 0;
+        for w in points.windows(2) {
+            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+            if dx != 0 && dy != 0 {
+                return Err("runs must be axis-aligned (insert a corner point to turn)");
+            }
+            if dx == 0 && dy == 0 {
+                return Err("degenerate run (repeated point)");
+            }
+            length += dx.abs() + dy.abs();
+        }
+        if length > ROAD_MAX_LENGTH_M {
+            return Err("plan exceeds the single-road length cap (lay long routes as multiple plans)");
+        }
+        // City land only, mirroring `apply_mayor_build_create`: check each
+        // run's start, end, and midpoint against every owned plot.
+        for w in points.windows(2) {
+            let mid = ((w[0].0 + w[1].0) / 2, (w[0].1 + w[1].1) / 2);
+            for (px, py) in [w[0], w[1], mid] {
+                if self.on_owned_plot(px as i32, py as i32, db).await {
+                    return Err("the road would cross privately owned land");
+                }
+            }
+        }
+        Ok((points, length))
+    }
+
     /// Apply an editor's `road.plan` (#94): validate a lattice polyline of
     /// axis-aligned runs on the world's native 1m grid and turn it into ONE
     /// ordinary build order (structure_kind `dirt_road`, stone cost scaled by
@@ -2461,62 +2537,13 @@ impl Proxy {
             reject("road planning requires persistence (no database)");
             return;
         };
-        let Some(raw) = data.get("points").and_then(|v| v.as_array()) else {
-            reject("malformed road.plan (points required)");
-            return;
+        let (points, length) = match self.parse_road_path(&db, &data).await {
+            Ok(v) => v,
+            Err(msg) => {
+                reject(msg);
+                return;
+            }
         };
-        if raw.len() < 2 {
-            reject("a road needs at least two points");
-            return;
-        }
-        if raw.len() > ROAD_MAX_POINTS {
-            reject("too many corners in one plan");
-            return;
-        }
-        let world = WORLD_SIZE as i64;
-        let mut points: Vec<(i64, i64)> = Vec::with_capacity(raw.len());
-        for p in raw {
-            let (Some(x), Some(y)) = (
-                p.get(0).and_then(|v| v.as_i64()),
-                p.get(1).and_then(|v| v.as_i64()),
-            ) else {
-                reject("malformed point (want [x, y] integers)");
-                return;
-            };
-            if !(0..world).contains(&x) || !(0..world).contains(&y) {
-                reject("road point is outside the world");
-                return;
-            }
-            points.push((x, y));
-        }
-        let mut length: i64 = 0;
-        for w in points.windows(2) {
-            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
-            if dx != 0 && dy != 0 {
-                reject("runs must be axis-aligned (insert a corner point to turn)");
-                return;
-            }
-            if dx == 0 && dy == 0 {
-                reject("degenerate run (repeated point)");
-                return;
-            }
-            length += dx.abs() + dy.abs();
-        }
-        if length > ROAD_MAX_LENGTH_M {
-            reject("plan exceeds the single-road length cap (lay long routes as multiple plans)");
-            return;
-        }
-        // City land only, mirroring `apply_mayor_build_create`: check each
-        // run's start, end, and midpoint against every owned plot.
-        for w in points.windows(2) {
-            let mid = ((w[0].0 + w[1].0) / 2, (w[0].1 + w[1].1) / 2);
-            for (px, py) in [w[0], w[1], mid] {
-                if self.on_owned_plot(px as i32, py as i32, &db).await {
-                    reject("the road would cross privately owned land");
-                    return;
-                }
-            }
-        }
         // District resolved server-side from the path start (the mayor tool
         // sends its district; the editor shouldn't have to know it).
         let Some(district) = self
@@ -2555,6 +2582,103 @@ impl Proxy {
             Err(e) => {
                 eprintln!("[Proxy] road.plan: creating the order failed: {e}");
                 reject("failed to create the road order");
+            }
+        }
+    }
+
+    /// Apply an editor's `road.replan` (#104): re-route an OPEN road plan.
+    /// Full `road.plan` path validation, stone cost recomputed from the new
+    /// length, contributed progress kept — and if the kept progress already
+    /// covers the recomputed cost, the order completes on the spot through
+    /// the ordinary completion announcements (never a zombie order no
+    /// contribution can finish). Built roads deliberately don't move: that's
+    /// demolish + re-lay (#106), which is the economy working.
+    async fn apply_road_replan(&self, pid: &str, data: Value) {
+        let reject = |message: &str| {
+            self.push_to_player(pid, json!({"type": "road.plan_error", "message": message}));
+        };
+        let role = self.clients.lock().unwrap().get(pid).map(|c| c.role.clone()).unwrap_or_default();
+        if role != "editor" {
+            reject("only an editor may move road plans");
+            return;
+        }
+        let Some(db) = self.db.clone() else {
+            reject("road planning requires persistence (no database)");
+            return;
+        };
+        let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if order_id.is_empty() {
+            reject("malformed road.replan (order_id required)");
+            return;
+        }
+        let Ok(Some(order)) = db.build_order_by_id(&order_id).await else {
+            reject("no such order");
+            return;
+        };
+        if order.path_json.is_none() {
+            reject("that order is not a road plan");
+            return;
+        }
+        if order.state != "open" {
+            reject("only open plans can be moved — demolish a built road instead");
+            return;
+        }
+        let (points, length) = match self.parse_road_path(&db, &data).await {
+            Ok(v) => v,
+            Err(msg) => {
+                reject(msg);
+                return;
+            }
+        };
+        let Some(district) = self
+            .capital
+            .district_at(points[0].0 as i32, points[0].1 as i32)
+            .map(|d| d.id.to_string())
+        else {
+            reject("the road must start inside the capital");
+            return;
+        };
+        let stone = (length * ROAD_STONE_PER_M_NUM / ROAD_STONE_PER_M_DEN).max(ROAD_MIN_STONE);
+        let required_json = json!({ "stone": stone }).to_string();
+        let path_json = match serde_json::to_string(&points) {
+            Ok(s) => s,
+            Err(_) => {
+                reject("failed to encode the path");
+                return;
+            }
+        };
+        let placement = mmo::persistence::BuildPlacement {
+            structure_kind: "dirt_road".to_string(),
+            x: points[0].0,
+            y: points[0].1,
+            x1: Some(points[1].0),
+            y1: Some(points[1].1),
+        };
+        match db
+            .replan_road_order(&order_id, &district, &required_json, &path_json, &placement, now_secs())
+            .await
+        {
+            Ok(outcome) if outcome.applied => {
+                self.push_to_player(pid, json!({"type": "road.planned", "order_id": order_id}));
+                if outcome.completed {
+                    self.announce_order_completion(
+                        &db, &order_id, &order.kind, &district,
+                        &outcome.contributors, Some(&placement), Some(&path_json),
+                    )
+                    .await;
+                } else {
+                    self.broadcast_build_list(&district).await;
+                }
+                // A replan can carry the plan into a different district's
+                // board — the old board must drop it too.
+                if district != order.district {
+                    self.broadcast_build_list(&order.district).await;
+                }
+            }
+            Ok(_) => reject("the order changed while you were editing — try again"),
+            Err(e) => {
+                eprintln!("[Proxy] road.replan: updating the order failed: {e}");
+                reject("failed to update the road order");
             }
         }
     }
@@ -3953,6 +4077,11 @@ impl Proxy {
                     }
                     if data.get("type").and_then(|v| v.as_str()) == Some("object.delete") {
                         self.apply_object_delete(&player_id, data).await;
+                        continue;
+                    }
+                    // `road.replan` (#104): role/DB-checked like road.plan.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("road.replan") {
+                        self.apply_road_replan(&player_id, data).await;
                         continue;
                     }
                     // `road.plan` (#94) is role/geometry/db-checked with no
@@ -7710,6 +7839,120 @@ mod tests {
             "suburbs position = the suburbs board (got {kinds:?})");
 
         drop(ws);
+    }
+
+    /// `road.replan` (#104): re-routes an open plan (path + recomputed cost,
+    /// progress kept), rejects everything it should, and completes on the
+    /// spot when kept progress covers the recomputed cost.
+    #[tokio::test]
+    async fn road_replan_moves_open_plans_and_completes_when_covered() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // A 200m plan (50 stone).
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.plan", "points": [[13000, 13000], [13200, 13000]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let order_id = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+
+        // Non-editor: rejected.
+        let email = format!("meddler_{}@t.test", Uuid::new_v4().simple());
+        let mut player_ws = dial(&proxy).await;
+        player_ws
+            .send(Message::Text(
+                json!({"type": "register", "email": email, "password": "pw12", "name": "Meddler"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let pid = recv_until(&mut player_ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        player_ws
+            .send(Message::Text(
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13100, 13000]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let err = recv_until(&mut player_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("editor"));
+
+        // Diagonal runs: rejected with the shared validation.
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13100, 13100]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let err = recv_until(&mut editor_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("axis-aligned"));
+
+        // Contribute 10 of the 50 first — the move must carry it.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 10, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut player_ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100, gather: None });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order_id, "item_id": "stone", "qty": 10,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut player_ws, "build.progress").await;
+
+        // Replan to a 300m L: cost recomputes to 75, progress 10 kept.
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13200, 13000], [13200, 13100]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        recv_until(&mut editor_ws, "road.planned").await;
+        let moved = db.build_order_by_id(&order_id).await.unwrap().unwrap();
+        assert_eq!(moved.state, "open");
+        assert_eq!(moved.required_json, r#"{"stone":75}"#, "cost recomputed from the new length");
+        assert_eq!(moved.progress_json, r#"{"stone":10}"#, "contributed progress kept");
+        assert_eq!(
+            moved.path_json.as_deref(),
+            Some("[[13000,13000],[13200,13000],[13200,13100]]"),
+            "path swapped"
+        );
+
+        // Replan down to a 36m stub (floor cost 9): progress 10 covers it —
+        // the order completes on the spot through the ordinary flow.
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13036, 13000]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        recv_until(&mut editor_ws, "road.planned").await;
+        let done = recv_until(&mut player_ws, "build.completed").await;
+        assert_eq!(done["order_id"].as_str().unwrap(), order_id, "covered-by-progress replan completes");
+        let structure = loop {
+            let v = recv_until(&mut player_ws, "status_update").await;
+            if v["state"]["type"] == "structure" && v["state"]["kind"] == "dirt_road" {
+                break v;
+            }
+        };
+        assert_eq!(structure["state"]["path"], json!([[13000, 13000], [13036, 13000]]));
+
+        // A completed road can't be moved any more.
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13100, 13000]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let err = recv_until(&mut editor_ws, "road.plan_error").await;
+        assert!(err["message"].as_str().unwrap().contains("demolish"), "built roads move via demolition (got {})", err["message"]);
+
+        drop(editor_ws);
+        drop(player_ws);
     }
 
     /// The env tick's `poison_sources` counts poison trees within

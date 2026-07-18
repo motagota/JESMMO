@@ -426,8 +426,10 @@ func _setup_editor() -> void:
     # go up as one road.plan and come back as a staked build order.
     _road_tool = RoadTool.new()
     _road_tool.camera = _editor_cam
+    _road_tool.world_ref = _world # staked-plan source for move-mode picking (#105)
     add_child(_road_tool)
     _road_tool.plan_committed.connect(func(points): _net.send_road_plan(points))
+    _road_tool.replan_committed.connect(func(order_id, points): _net.send_road_replan(order_id, points))
     _net.road_planned.connect(func(_order_id): _hud.flash_announce("Road: plan accepted — stone wanted!"))
     _net.road_plan_error.connect(func(message): _hud.flash_announce("Road: %s" % message))
     # The toolbar (#103) owns tool exclusivity — one active-tool state

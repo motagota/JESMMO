@@ -19,8 +19,11 @@ class_name RoadTool
 extends Node3D
 
 signal plan_committed(points: Array)
+## Move mode (#105): an existing open plan re-routed — Main wires this to
+## `NetworkClient.send_road_replan`.
+signal replan_committed(order_id: String, points: Array)
 signal status_changed(text: String)
-## true while the tool owns the mouse — Main disables the brush/object tool.
+## true while the tool owns the mouse — the toolbar disables the other tools.
 signal mode_changed(active: bool)
 
 const _GHOST_COLOR := Color(0.95, 0.8, 0.25, 0.5)
@@ -29,12 +32,24 @@ const _GHOST_Y := 0.35
 ## slopes instead of floating.
 const _GHOST_STEP_M := 4.0
 
+## Move-mode pick radius: click within this of a staked plan's runs to
+## select it (matches the feel of the object tool's delete pick).
+const MOVE_PICK_RADIUS := 10.0
+
 var camera: Camera3D
 ## False while another editor tool (brush stroke in flight, object tool
 ## active) owns the mouse.
 var enabled := true
+## The staked-plan source for move-mode picking (#105) — Main hands the
+## World in; the tool only reads `_road_plans`' paths.
+var world_ref: World
 
 var active := false
+## Move mode (#105): [M] — clicks pick an existing plan instead of
+## anchoring a new one; the picked polyline loads into this same laying
+## machine and commits as a `road.replan`.
+var move_mode := false
+var editing_order_id := ""
 var points: Array = [] # committed Vector2i lattice corners
 var _preview_end := Vector2i.ZERO
 var _last_ground := Vector2.ZERO
@@ -50,7 +65,15 @@ func _process(_delta: float) -> void:
 	if not enabled:
 		return
 	if _key_edge(KEY_R):
-		set_active(not active)
+		if active and not move_mode:
+			_set_state(false, false)
+		else:
+			_set_state(true, false)
+	if _key_edge(KEY_M):
+		if active and move_mode:
+			_set_state(false, false)
+		else:
+			_set_state(true, true)
 	if not active or camera == null:
 		return
 	_last_ground = Protocol.pick_ground(camera, get_viewport().get_mouse_position(), _last_ground)
@@ -64,7 +87,9 @@ func _process(_delta: float) -> void:
 	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) \
 		and get_viewport().gui_get_hovered_control() == null
 	if lmb and not _lmb_down:
-		if points.is_empty():
+		if move_mode and editing_order_id == "":
+			pick_at(_last_ground)
+		elif points.is_empty():
 			anchor(_last_ground)
 		else:
 			add_corner(_last_ground)
@@ -80,16 +105,63 @@ func _process(_delta: float) -> void:
 		_announce_progress()
 
 func set_active(on: bool) -> void:
-	if on == active:
+	_set_state(on, false)
+
+## Enter/leave move mode (#105) — the toolbar's "Move" slot.
+func set_move_active(on: bool) -> void:
+	_set_state(on, on)
+
+func _set_state(on: bool, mv: bool) -> void:
+	if on == active and (mv == move_mode or not on):
 		return
 	active = on
+	move_mode = mv if on else false
+	points.clear()
+	editing_order_id = ""
+	_clear_ghost()
 	if not active:
-		points.clear()
-		_clear_ghost()
-	status_changed.emit(
-		"Road: click to anchor, click to corner, [Enter] commit, [Esc] cancel, [Backspace] undo corner"
-		if active else "Road tool off")
+		status_changed.emit("Road tool off")
+	elif move_mode:
+		status_changed.emit("Move: click within %dm of a staked plan to pick it up" % int(MOVE_PICK_RADIUS))
+	else:
+		status_changed.emit("Road: click to anchor, click to corner, [Enter] commit, [Esc] cancel, [Backspace] undo corner")
 	mode_changed.emit(active)
+
+## Move mode: pick the staked plan nearest the click (#105) and load its
+## polyline into the laying machine — from here on Backspace/clicks/Enter
+## behave exactly as when laying, but commit as a replan. The original
+## stakes stay rendered underneath as the reference until the server's
+## board broadcast re-stakes the moved plan.
+func pick_at(ground: Vector2) -> void:
+	if world_ref == null:
+		return
+	var id := pick_plan(world_ref._road_plans, ground, MOVE_PICK_RADIUS)
+	if id == "":
+		status_changed.emit("Move: no planned road there — click within %dm of a staked plan" % int(MOVE_PICK_RADIUS))
+		return
+	var path: Array = world_ref._road_plans[id]["path"]
+	points.clear()
+	for p in path:
+		points.append(Vector2i(p))
+	editing_order_id = id
+	_preview_end = points[-1]
+	_rebuild_ghost()
+	status_changed.emit("Move: editing plan %s (%dm) — click corners to extend, [Backspace] to trim, [Enter] commit, [Esc] drop" % [id.substr(0, 8), path_length(points)])
+
+## The staked plan whose runs pass nearest `g` (within `max_d`), or "".
+## `plans` is World's `_road_plans` shape: id -> {"path": [Vector2, ...]}.
+static func pick_plan(plans: Dictionary, g: Vector2, max_d: float) -> String:
+	var best := ""
+	var best_d := max_d
+	for id in plans:
+		var path: Array = plans[id]["path"]
+		for i in range(1, path.size()):
+			var c := Geometry2D.get_closest_point_to_segment(g, path[i - 1], path[i])
+			var d := g.distance_to(c)
+			if d <= best_d:
+				best_d = d
+				best = id
+	return best
 
 ## First click: the path's start, snapped to the lattice.
 func anchor(ground: Vector2) -> void:
@@ -118,13 +190,19 @@ func commit() -> void:
 	var out: Array = []
 	for p in points:
 		out.append([p.x, p.y])
-	plan_committed.emit(out)
-	status_changed.emit("Road: plan submitted (%dm, ~%d stone)" % [path_length(points), stone_cost(path_length(points))])
+	if editing_order_id != "":
+		replan_committed.emit(editing_order_id, out)
+		status_changed.emit("Move: replan submitted (%dm, ~%d stone)" % [path_length(points), stone_cost(path_length(points))])
+		editing_order_id = ""
+	else:
+		plan_committed.emit(out)
+		status_changed.emit("Road: plan submitted (%dm, ~%d stone)" % [path_length(points), stone_cost(path_length(points))])
 	points.clear()
 	_clear_ghost()
 
 func cancel() -> void:
 	points.clear()
+	editing_order_id = ""
 	_clear_ghost()
 	status_changed.emit("Road: cancelled")
 
