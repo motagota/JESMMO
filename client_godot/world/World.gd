@@ -177,6 +177,7 @@ func _maybe_build_static() -> void:
     _build_ground()
     _build_water()
     _build_town_centre_marker()
+    _build_quarry_marker()
     _built_static = true
 
 ## Repaint the backdrop's residency mask from the streamer's current
@@ -369,6 +370,39 @@ func _build_town_centre_marker() -> void:
     mm.albedo_color = Color(0.95, 0.85, 0.30)
     marker.material_override = mm
     _roads_root.add_child(marker)
+
+## The quarry site marker (#97): a floor slab + distance-culled label at the
+## authored working face's centre (mirrors `world.rs`'s `node_quarry_*`
+## cluster, the same way the town-centre marker mirrors WORLD_SIZE/2). The
+## rocks themselves are live resource nodes rendered by EntityManager.
+const _QUARRY_SITE := Vector2(10872, 13445)
+
+func _build_quarry_marker() -> void:
+    var slab := MeshInstance3D.new()
+    var cyl := CylinderMesh.new()
+    cyl.top_radius = 22.0 * Protocol.WORLD_SCALE
+    cyl.bottom_radius = 22.0 * Protocol.WORLD_SCALE
+    cyl.height = 0.4
+    slab.mesh = cyl
+    slab.position = Protocol.w2v(_QUARRY_SITE.x, _QUARRY_SITE.y, 0.2)
+    var sm := StandardMaterial3D.new()
+    sm.albedo_color = Color(0.60, 0.57, 0.50) # worked, dusty ground
+    slab.material_override = sm
+    _roads_root.add_child(slab)
+
+    var label := Label3D.new()
+    label.text = "⛏ Quarry"
+    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.no_depth_test = true
+    label.fixed_size = true
+    label.pixel_size = 0.004
+    label.modulate = Color(0.95, 0.9, 0.75)
+    label.outline_size = 8
+    label.position = Protocol.w2v(_QUARRY_SITE.x, _QUARRY_SITE.y, 8.0)
+    label.visibility_range_end = 900.0
+    label.visibility_range_end_margin = 100.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+    _roads_root.add_child(label)
 
 ## Render a completed `dirt_road` build order — a segment from `(x,y)` to
 ## `(x1,y1)` — as a real road: a multi-vertex ribbon, not a single rigid box.
