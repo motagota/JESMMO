@@ -101,10 +101,16 @@ var _dirt_roads: Dictionary = {}
 ## Replaced wholesale on every `build.list` push and dropped on completion
 ## (#96's built road takes over).
 var _road_plans: Dictionary = {}
-## Surveyor-stake look: a narrow translucent strip slightly above the road
-## height so a plan never z-fights the road that later replaces it.
-const _PLAN_COLOR := Color(0.95, 0.8, 0.25, 0.5)
-const _PLAN_WIDTH := 1.6
+## Surveyor look for a planned road: a bright translucent strip the width of
+## the future road, orange survey stakes marching along it, and a floating
+## "planned road" label — a player must be able to SEE where stone is
+## wanted from a distance, not squint for a faint line (user feedback after
+## #99 shipped). The strip sits slightly above road height so a plan never
+## z-fights the road that later replaces it.
+const _PLAN_COLOR := Color(1.0, 0.82, 0.20, 0.75)
+const _PLAN_WIDTH := 4.5
+const _STAKE_COLOR := Color(1.0, 0.45, 0.10)
+const _STAKE_EVERY_M := 24.0
 ## What the plot markers were last drawn from, so they can be redrawn against
 ## fresh terrain heights (see `refresh_plot_markers`).
 var _home_bounds: Dictionary = {}
@@ -170,6 +176,10 @@ func apply_partition(msg: Dictionary) -> void:
 func on_terrain_data() -> void:
     _terrain_ready = true
     _maybe_build_static()
+    # Anything staked before the heightmap arrived (the board hydration can
+    # beat terrain.data on login) was draped over the flat 0.0 fallback —
+    # buried under real ground. Re-drape it now.
+    refresh_plot_markers()
 
 func _maybe_build_static() -> void:
     if _built_static or not _partition_received or not _terrain_ready:
@@ -474,11 +484,52 @@ func _restake_plan(order_id: String) -> void:
         n.queue_free()
     var nodes: Array = []
     var path: Array = rec["path"]
+    var total := 0.0
     for i in range(1, path.size()):
+        var a: Vector2 = path[i - 1]
+        var b: Vector2 = path[i]
+        total += a.distance_to(b)
         nodes.append(_build_ribbon(
-            _roads_root, path[i - 1], path[i],
+            _roads_root, a, b,
             _PLAN_WIDTH, _PLAN_COLOR, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
+        # Survey stakes marching along the run (plus one on each corner).
+        var stakes := maxi(1, int(a.distance_to(b) / _STAKE_EVERY_M))
+        for s2 in range(stakes + 1):
+            nodes.append(_plan_stake(a.lerp(b, float(s2) / float(stakes))))
+    # A floating label at the path's midpoint so the build site announces
+    # itself from a distance (same treatment as fixture labels).
+    var mid: Vector2 = path[path.size() / 2]
+    var label := Label3D.new()
+    label.text = "🚧 Planned road — bring stone"
+    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    label.no_depth_test = true
+    label.fixed_size = true
+    label.pixel_size = 0.004
+    label.modulate = Color(1.0, 0.85, 0.4)
+    label.outline_size = 8
+    label.position = Protocol.w2v(mid.x, mid.y, 6.0)
+    label.visibility_range_end = 700.0
+    label.visibility_range_end_margin = 80.0
+    label.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+    _roads_root.add_child(label)
+    nodes.append(label)
     rec["nodes"] = nodes
+
+## One orange survey stake, planted on the ground.
+func _plan_stake(p: Vector2) -> MeshInstance3D:
+    var mi := MeshInstance3D.new()
+    var post := BoxMesh.new()
+    post.size = Vector3(0.28, 1.5, 0.28)
+    mi.mesh = post
+    var m := StandardMaterial3D.new()
+    m.albedo_color = _STAKE_COLOR
+    m.emission_enabled = true
+    m.emission = _STAKE_COLOR
+    m.emission_energy_multiplier = 0.25
+    mi.material_override = m
+    mi.position = Protocol.w2v(p.x, p.y, 0.9)
+    _roads_root.add_child(mi)
+    return mi
 
 ## A terrain-following strip of `width` from `a` to `b`: every cross-section
 ## is placed with its own `Protocol.w2v` sample, so it drapes over hills and
@@ -501,14 +552,19 @@ func _build_ribbon(parent: Node3D, a: Vector2, b: Vector2, width: float, color: 
         var left := Protocol.w2v(p.x + perp.x, p.y + perp.y, y)
         var right := Protocol.w2v(p.x - perp.x, p.y - perp.y, y)
         if i > 0:
-            # Mirrors `_build_ground`'s winding (p00,p10,p11 / p00,p11,p01) so
-            # generated normals point up here too.
+            # Winding: Godot front faces are CLOCKWISE seen from the camera,
+            # so an upward-facing strip must wind clockwise viewed from
+            # above (the same order `_build_ground`/`_add_plot_fill` use).
+            # The original (prev_left, left, right / …) order here was
+            # counter-clockwise from above — every ribbon (dirt roads, plot
+            # borders, staked plans) rendered only from UNDERNEATH, found
+            # via the #99 stake-visibility report.
             st.add_vertex(prev_left)
+            st.add_vertex(right)
             st.add_vertex(left)
-            st.add_vertex(right)
             st.add_vertex(prev_left)
-            st.add_vertex(right)
             st.add_vertex(prev_right)
+            st.add_vertex(right)
         prev_left = left
         prev_right = right
     st.index()

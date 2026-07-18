@@ -73,8 +73,10 @@ func _initialize() -> void:
 	world.apply_road_plans(orders)
 	if world._road_plans.size() != 1 or not world._road_plans.has("r1"):
 		_fail("only OPEN orders with a path get staked (got %s)" % str(world._road_plans.keys())); return
-	if world._road_plans["r1"]["nodes"].size() != 2:
-		_fail("a two-run plan stakes two ribbons"); return
+	# A two-run plan renders 2 strip ribbons + marching survey stakes + the
+	# floating "planned road" label — assert the full surveyor kit is out.
+	if world._road_plans["r1"]["nodes"].size() < 10:
+		_fail("a 300m plan should stake strips + stakes + label (got %d nodes)" % world._road_plans["r1"]["nodes"].size()); return
 	world.remove_road_plan("r1")
 	if not world._road_plans.is_empty():
 		_fail("completion should drop the stakes"); return
