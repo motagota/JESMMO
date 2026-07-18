@@ -371,11 +371,12 @@ func _build_town_centre_marker() -> void:
     marker.material_override = mm
     _roads_root.add_child(marker)
 
-## The quarry site marker (#97): a floor slab + distance-culled label at the
-## authored working face's centre (mirrors `world.rs`'s `node_quarry_*`
-## cluster, the same way the town-centre marker mirrors WORLD_SIZE/2). The
-## rocks themselves are live resource nodes rendered by EntityManager.
-const _QUARRY_SITE := Vector2(10872, 13445)
+## The quarry site marker (#97; relocated to Mt Coot-tha's east flank in
+## #99): a floor slab + distance-culled label at the authored working face's
+## centre (mirrors `world.rs`'s `node_quarry_*` cluster, the same way the
+## town-centre marker mirrors WORLD_SIZE/2). The rocks themselves are live
+## resource nodes rendered by EntityManager.
+const _QUARRY_SITE := Vector2(8232, 13915)
 
 func _build_quarry_marker() -> void:
     var slab := MeshInstance3D.new()

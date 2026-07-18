@@ -8,24 +8,27 @@ within DEDUPE_M of its spot is skipped, so it's safe to re-run (and to resume
 a partial run).
 
 The pen (geometry read off the baked water mask; #90, west wall moved out in
-#98 to enclose the quarry):
+#98, extended around Mt Coot-tha in #99):
 
-    (10400,11900) ────────────── north wall ────────────── (15500,11900)
+    (6200,11900) ─────────────── north wall ─────────────── (15500,11900)
         │                                                        │
-     west wall    QUARRY (~10872,13445)                      east wall
-        │                        SPAWN (12800,12800)             │
-    (10400,16000) ─ SW leg ─ (11950,16000)                  (15500,14650)
-                              └ west channel bank    east channel bank ┘
+     west wall   MT COOT-THA (summit 6800,14000, h=281)      east wall
+        │           QUARRY (~8232,13915) ── Milton Rd ──┐        │
+        │           ROUNDABOUT (~8500,14250)     SPAWN (12800,12800)
+        │                                                   (15500,14650)
+    (6200,16700) ────── SW leg ────── (11650,16700)   east channel bank ┘
+                                       └ west channel bank
 
 The south/southeast side is the Brisbane River itself (west channel → CBD
 S-bend → east channel — one continuous snake); each wall's far end anchors
 into a river bank, so forest + water close the loop. (There is NO water west
 of ~x=11600 at these latitudes — probed in #98 — hence the L: the west wall
-runs south past the hills, then the SW leg runs east along y=16000 into the
-channel.) Walls are 3 staggered rows, ROW_GAP_M apart, SPACING_M along the
-line: with the 15m poison radius that yields >=1 poison source everywhere in
-a ~55m-deep band — crossing at walk speed (8 m/s) is ~7s of exposure, which
-procs (uncurable) well before the far edge.
+runs south BEHIND Mt Coot-tha, then the SW leg runs east along y=16700 into
+the channel; the leg fords a small creek mid-span, where trees simply stand
+in the shallows.) Walls are 3 staggered rows, ROW_GAP_M apart, SPACING_M
+along the line: with the 15m poison radius that yields >=1 poison source
+everywhere in a ~55m-deep band — crossing at walk speed (8 m/s) is ~7s of
+exposure, which procs (uncurable) well before the far edge.
 
 Usage:
     python scripts/seed_poison_pen.py [--url ws://127.0.0.1:8766]
@@ -48,12 +51,12 @@ EDITOR_PASSWORD = "editor12345"
 
 # (x0, y0) -> (x1, y1) wall centre-lines, in world metres.
 WALLS = [
-    ((10400, 16000), (10400, 11900)),  # west: SW corner -> NW corner (#98)
+    ((6200, 16700), (6200, 11900)),  # west: SW corner -> NW corner, behind Mt Coot-tha (#99)
     # SW leg: the river has no water west of ~x=11600 here, so the pen
     # closes with an east-running leg that anchors into the west channel
-    # bank (~11900-12100 at y=16000).
-    ((10400, 16000), (11950, 16000)),
-    ((10400, 11900), (15500, 11900)),  # north: NW corner -> NE corner
+    # bank (~11600-11800 at y=16700).
+    ((6200, 16700), (11650, 16700)),
+    ((6200, 11900), (15500, 11900)),  # north: NW corner -> NE corner
     # East: NE corner -> river. The east channel is a meander whose two water
     # strips leave a walkable land corridor at x~15500, y 14050-14550 (found
     # by the #90 perimeter probe at azimuth 30deg) — the wall runs THROUGH
