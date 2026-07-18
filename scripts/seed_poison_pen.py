@@ -7,24 +7,31 @@ fresh database. Idempotent: any planned tree that already has a poison tree
 within DEDUPE_M of its spot is skipped, so it's safe to re-run (and to resume
 a partial run).
 
-The pen (geometry read off the baked water mask, see issue #90):
+The pen (geometry read off the baked water mask; #90, west wall moved out in
+#98 to enclose the quarry):
 
-    (12000,11900) ─────────── north wall ─────────── (15500,11900)
-        │                                                  │
-     west wall              SPAWN (12800,12800)        east wall
-        │                                                  │
-    (12000,15850)                                     (15500,14050)
-     └─ west channel bank        ...river...      east channel bank ─┘
+    (10400,11900) ────────────── north wall ────────────── (15500,11900)
+        │                                                        │
+     west wall    QUARRY (~10872,13445)                      east wall
+        │                        SPAWN (12800,12800)             │
+    (10400,16000) ─ SW leg ─ (11950,16000)                  (15500,14650)
+                              └ west channel bank    east channel bank ┘
 
 The south/southeast side is the Brisbane River itself (west channel → CBD
 S-bend → east channel — one continuous snake); each wall's far end anchors
-into a river bank, so forest + water close the loop. Walls are 3 staggered
-rows, ROW_GAP_M apart, SPACING_M along the line: with the 15m poison radius
-that yields >=1 poison source everywhere in a ~55m-deep band — crossing at
-walk speed (8 m/s) is ~7s of exposure, which procs (uncurable) well before
-the far edge.
+into a river bank, so forest + water close the loop. (There is NO water west
+of ~x=11600 at these latitudes — probed in #98 — hence the L: the west wall
+runs south past the hills, then the SW leg runs east along y=16000 into the
+channel.) Walls are 3 staggered rows, ROW_GAP_M apart, SPACING_M along the
+line: with the 15m poison radius that yields >=1 poison source everywhere in
+a ~55m-deep band — crossing at walk speed (8 m/s) is ~7s of exposure, which
+procs (uncurable) well before the far edge.
 
-Usage: python scripts/seed_poison_pen.py [--url ws://127.0.0.1:8766]
+Usage:
+    python scripts/seed_poison_pen.py [--url ws://127.0.0.1:8766]
+    python scripts/seed_poison_pen.py --prune   # also DELETE placed trees
+        # that aren't in the current plan — a wall relocation (like #98's
+        # west-wall move) is one idempotent --prune run.
 """
 
 import argparse
@@ -41,8 +48,12 @@ EDITOR_PASSWORD = "editor12345"
 
 # (x0, y0) -> (x1, y1) wall centre-lines, in world metres.
 WALLS = [
-    ((12000, 15850), (12000, 11900)),  # west: river bank -> NW corner
-    ((12000, 11900), (15500, 11900)),  # north: NW corner -> NE corner
+    ((10400, 16000), (10400, 11900)),  # west: SW corner -> NW corner (#98)
+    # SW leg: the river has no water west of ~x=11600 here, so the pen
+    # closes with an east-running leg that anchors into the west channel
+    # bank (~11900-12100 at y=16000).
+    ((10400, 16000), (11950, 16000)),
+    ((10400, 11900), (15500, 11900)),  # north: NW corner -> NE corner
     # East: NE corner -> river. The east channel is a meander whose two water
     # strips leave a walkable land corridor at x~15500, y 14050-14550 (found
     # by the #90 perimeter probe at azimuth 30deg) — the wall runs THROUGH
@@ -73,7 +84,7 @@ def plan() -> list[tuple[int, int]]:
     return list(spots.values())
 
 
-async def main(url: str) -> None:
+async def main(url: str, prune: bool) -> None:
     async with websockets.connect(url, max_size=16 * 1024 * 1024) as ws:
         async def until(t: str):
             while True:
@@ -88,16 +99,21 @@ async def main(url: str) -> None:
             raise SystemExit(f"need the editor account (got role {w.get('role')})")
 
         await ws.send(json.dumps({"type": "object.list"}))
-        existing = [(o["x"], o["y"]) for o in (await until("object.list"))["objects"]
+        existing = [(o["id"], int(o["x"]), int(o["y"])) for o in (await until("object.list"))["objects"]
                     if o.get("kind") == "poison_tree"]
         # Bucket existing trees for the dedupe lookup.
         occupied = set()
-        for ex, ey in existing:
-            occupied.add((int(ex) // DEDUPE_M, int(ey) // DEDUPE_M))
+        for _oid, ex, ey in existing:
+            occupied.add((ex // DEDUPE_M, ey // DEDUPE_M))
 
         wanted = plan()
+        wanted_buckets = {(x // DEDUPE_M, y // DEDUPE_M) for x, y in wanted}
         todo = [(x, y) for x, y in wanted if (x // DEDUPE_M, y // DEDUPE_M) not in occupied]
-        print(f"pen plan: {len(wanted)} trees; {len(existing)} already placed; placing {len(todo)}")
+        orphans = [(oid, x, y) for oid, x, y in existing
+                   if (x // DEDUPE_M, y // DEDUPE_M) not in wanted_buckets]
+        print(f"pen plan: {len(wanted)} trees; {len(existing)} already placed; "
+              f"placing {len(todo)}; {len(orphans)} orphans"
+              + (" (pruning)" if prune else " (kept — rerun with --prune to remove)"))
 
         placed = 0
         for x, y in todo:
@@ -109,12 +125,27 @@ async def main(url: str) -> None:
                 raise SystemExit(f"place at ({x},{y}) rejected: {m.get('message')}")
             placed += 1
             if placed % 200 == 0:
-                print(f"  ...{placed}/{len(todo)}")
-        print(f"done: placed {placed} trees (pen total ~{len(wanted)})")
+                print(f"  ...{placed}/{len(todo)} placed")
+
+        pruned = 0
+        if prune:
+            for oid, x, y in orphans:
+                await ws.send(json.dumps({"type": "object.delete", "object_id": oid}))
+                m = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                while m.get("type") not in ("object.removed", "object.edit_error"):
+                    m = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                if m["type"] == "object.edit_error":
+                    raise SystemExit(f"delete of {oid} at ({x},{y}) rejected: {m.get('message')}")
+                pruned += 1
+                if pruned % 200 == 0:
+                    print(f"  ...{pruned}/{len(orphans)} pruned")
+        print(f"done: placed {placed}, pruned {pruned} (pen total ~{len(wanted)})")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="ws://127.0.0.1:8766")
+    ap.add_argument("--prune", action="store_true",
+                    help="delete placed poison trees that aren't in the current plan")
     main_args = ap.parse_args()
-    asyncio.run(main(main_args.url))
+    asyncio.run(main(main_args.url, main_args.prune))
