@@ -59,7 +59,10 @@ func _process(_delta: float) -> void:
 		if snapped != _preview_end:
 			_preview_end = snapped
 			_rebuild_ghost()
-	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	# Clicks over UI (the editor toolbar, #103) are button presses, not
+	# corners — the raw poll can't tell the difference on its own.
+	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) \
+		and get_viewport().gui_get_hovered_control() == null
 	if lmb and not _lmb_down:
 		if points.is_empty():
 			anchor(_last_ground)

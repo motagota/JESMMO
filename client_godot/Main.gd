@@ -49,6 +49,7 @@ var _brush: BrushController
 var _history: HistoryPanel
 var _object_tool: ObjectTool
 var _road_tool: RoadTool
+var _toolbar: EditorToolbar
 var _world_objects: WorldObjects
 
 var _my_id := ""
@@ -404,7 +405,7 @@ func _setup_editor() -> void:
     _brush.streamer = _streamer
     add_child(_brush)
     _brush.stroke_committed.connect(func(brush, cells): _net.send_terrain_edit_op(brush, cells))
-    _brush.status_changed.connect(func(text): _hud.flash_announce(text))
+    # (Brush status routes to the toolbar hint line below, #103.)
     _history = HistoryPanel.new()
     add_child(_history)
     _history.do_revert.connect(func(op_id): _net.send_terrain_revert_op(op_id))
@@ -420,7 +421,6 @@ func _setup_editor() -> void:
     add_child(_object_tool)
     _object_tool.place_requested.connect(func(kind, x, y): _net.send_object_place(kind, x, y))
     _object_tool.delete_requested.connect(func(object_id): _net.send_object_delete(object_id))
-    _object_tool.status_changed.connect(func(text): _hud.flash_announce(text))
     _net.object_edit_error.connect(func(message): _hud.flash_announce("Editor: %s" % message))
     # Road tool (#95): [R] toggles grid-snapped road laying; committed plans
     # go up as one road.plan and come back as a staked build order.
@@ -428,18 +428,19 @@ func _setup_editor() -> void:
     _road_tool.camera = _editor_cam
     add_child(_road_tool)
     _road_tool.plan_committed.connect(func(points): _net.send_road_plan(points))
-    _road_tool.status_changed.connect(func(text): _hud.flash_announce(text))
     _net.road_planned.connect(func(_order_id): _hud.flash_announce("Road: plan accepted — stone wanted!"))
     _net.road_plan_error.connect(func(message): _hud.flash_announce("Road: %s" % message))
-    # Exactly one editor tool owns the mouse: the brush runs only while both
-    # pointed tools are off, and the two pointed tools lock each other out.
-    _object_tool.mode_changed.connect(func(mode):
-        _brush.set_enabled(mode == "off" and not _road_tool.active)
-        _road_tool.enabled = mode == "off")
-    _road_tool.mode_changed.connect(func(road_active):
-        _brush.set_enabled(not road_active and _object_tool.mode == "off")
-        _object_tool.enabled = not road_active)
-    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, [O] object tool, [R] road tool, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
+    # The toolbar (#103) owns tool exclusivity — one active-tool state
+    # drives the whole enabled matrix, buttons and hotkeys converge on it,
+    # and the tools' status streams show in its persistent hint line
+    # instead of scrolling away as announce toasts.
+    _toolbar = EditorToolbar.new()
+    add_child(_toolbar)
+    _toolbar.setup(_brush, _object_tool, _road_tool, _history)
+    _object_tool.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _road_tool.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _brush.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _hud.flash_announce("EDITOR — RMB-drag look, WASD/QE fly; tools on the toolbar")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any
