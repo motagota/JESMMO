@@ -212,22 +212,20 @@ func cancel() -> void:
 static func snap_lattice(g: Vector2) -> Vector2i:
 	return Vector2i(roundi(g.x), roundi(g.y))
 
-## The pending leg's endpoint: from `last`, an axis-aligned run along the
-## dominant axis of the cursor offset, snapped to the lattice.
-static func snap_next_point(last: Vector2i, ground: Vector2) -> Vector2i:
-	var d := ground - Vector2(last)
-	if absf(d.x) >= absf(d.y):
-		return Vector2i(last.x + roundi(d.x), last.y)
-	return Vector2i(last.x, last.y + roundi(d.y))
+## The pending leg's endpoint: the cursor snapped to the lattice — segments
+## run at ANY angle now (#112; the axis-dominant snap died with the
+## staircase roads). `_last` only matters for the no-op-corner equality
+## check in `add_corner`.
+static func snap_next_point(_last: Vector2i, ground: Vector2) -> Vector2i:
+	return snap_lattice(ground)
 
-## Total run length of a corner list, in metres.
+## Total chord length of a corner list, in metres (Euclidean — mirrors the
+## server's #111 pricing; identical to Manhattan for axis-aligned paths).
 static func path_length(corners: Array) -> int:
-	var total := 0
+	var total := 0.0
 	for i in range(1, corners.size()):
-		var a: Vector2i = corners[i - 1]
-		var b: Vector2i = corners[i]
-		total += absi(b.x - a.x) + absi(b.y - a.y)
-	return total
+		total += Vector2(corners[i - 1]).distance_to(Vector2(corners[i]))
+	return roundi(total)
 
 ## Display-only mirror of the server's cost rule.
 static func stone_cost(length_m: int) -> int:
@@ -247,8 +245,9 @@ func _clear_ghost() -> void:
 	for c in _ghost_root.get_children():
 		c.queue_free()
 
-## Rebuild the ghost strips: every committed run plus the pending leg, as
-## short ground-sampled slabs so they follow the terrain.
+## Rebuild the ghost: the SAME smoothed spline the world will stake/build
+## (#112 — World.sample_spline through committed corners + the pending
+## point), as short ground-sampled slabs so it follows the terrain.
 func _rebuild_ghost() -> void:
 	_clear_ghost()
 	var corners := points.duplicate()
@@ -259,22 +258,18 @@ func _rebuild_ghost() -> void:
 	if corners.size() == 1:
 		_ghost_slab(Vector2(corners[0]), Vector2(corners[0]) + Vector2(1, 0), 1.0)
 		return
-	for i in range(1, corners.size()):
-		var a := Vector2(corners[i - 1])
-		var b := Vector2(corners[i])
-		var length := a.distance_to(b)
-		var chunks := maxi(1, ceili(length / _GHOST_STEP_M))
-		for c in range(chunks):
-			var t0 := float(c) / float(chunks)
-			var t1 := float(c + 1) / float(chunks)
-			_ghost_slab(a.lerp(b, t0), a.lerp(b, t1), 1.2)
+	var path: Array = []
+	for c in corners:
+		path.append(Vector2(c))
+	var samples := World.sample_spline(path, _GHOST_STEP_M)
+	for i in range(1, samples.size()):
+		_ghost_slab(samples[i - 1], samples[i], 1.2)
 
 func _ghost_slab(a: Vector2, b: Vector2, width: float) -> void:
 	var mi := MeshInstance3D.new()
 	var box := BoxMesh.new()
-	var horizontal := absf(b.x - a.x) >= absf(b.y - a.y)
 	var length := a.distance_to(b)
-	box.size = Vector3(length, 0.08, width) if horizontal else Vector3(width, 0.08, length)
+	box.size = Vector3(maxf(length, 0.5), 0.08, width)
 	mi.mesh = box
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = _GHOST_COLOR
@@ -282,6 +277,9 @@ func _ghost_slab(a: Vector2, b: Vector2, width: float) -> void:
 	mi.material_override = mat
 	var mid := (a + b) * 0.5
 	mi.position = Protocol.w2v(mid.x, mid.y, _GHOST_Y)
+	# Segments run at any angle now: yaw the slab along a->b (world y is
+	# scene z, so the 2D angle maps to a negative yaw).
+	mi.rotation.y = -(b - a).angle()
 	_ghost_root.add_child(mi)
 
 func _key_edge(key: Key) -> bool:

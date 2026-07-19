@@ -447,11 +447,77 @@ func upsert_dirt_road(id: String, state: Dictionary) -> void:
         path = [a, Vector2(float(state.get("x1", a.x)), float(state.get("y1", a.y)))]
     _dirt_roads[id] = {"path": path, "nodes": _build_road_path(path)}
 
+## Sample a smooth Catmull-Rom spline through a road's waypoints (#112):
+## endpoints doubled (so the curve starts/ends exactly on them), every
+## control point is a sample, ~`spacing` metres between samples. Colinear
+## waypoints yield a perfectly straight line, so pre-spline axis-aligned
+## roads and 2-point mayor segments render unchanged (their corners just
+## round). Static: the RoadTool's ghost samples the same curve.
+static func sample_spline(path: Array, spacing := 4.0) -> PackedVector2Array:
+    var out := PackedVector2Array()
+    if path.is_empty():
+        return out
+    out.append(path[0])
+    for i in range(path.size() - 1):
+        var p0: Vector2 = path[maxi(i - 1, 0)]
+        var p1: Vector2 = path[i]
+        var p2: Vector2 = path[i + 1]
+        var p3: Vector2 = path[mini(i + 2, path.size() - 1)]
+        var steps := maxi(1, ceili(p1.distance_to(p2) / spacing))
+        for s2 in range(1, steps + 1):
+            out.append(_catmull_rom(p0, p1, p2, p3, float(s2) / float(steps)))
+    return out
+
+static func _catmull_rom(p0: Vector2, p1: Vector2, p2: Vector2, p3: Vector2, t: float) -> Vector2:
+    var t2 := t * t
+    var t3 := t2 * t
+    return 0.5 * ((2.0 * p1) + (-p0 + p2) * t         + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2         + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+
+## One continuous terrain-following strip along pre-sampled points (#112):
+## per-sample perpendiculars from central differences, every cross-section
+## placed with its own w2v, and the clockwise-from-above winding the #100
+## fix established. One mesh per road, however curvy.
+func _build_ribbon_poly(parent: Node3D, samples: PackedVector2Array, width: float,
+        color: Color, y: float) -> MeshInstance3D:
+    var st := SurfaceTool.new()
+    st.begin(Mesh.PRIMITIVE_TRIANGLES)
+    var prev_left := Vector3.ZERO
+    var prev_right := Vector3.ZERO
+    for i in range(samples.size()):
+        var dir := Vector2.RIGHT
+        if samples.size() > 1:
+            var ahead: Vector2 = samples[mini(i + 1, samples.size() - 1)]
+            var behind: Vector2 = samples[maxi(i - 1, 0)]
+            var d := ahead - behind
+            if d.length() > 0.001:
+                dir = d.normalized()
+        var perp := Vector2(-dir.y, dir.x) * (width * 0.5)
+        var p := samples[i]
+        var left := Protocol.w2v(p.x + perp.x, p.y + perp.y, y)
+        var right := Protocol.w2v(p.x - perp.x, p.y - perp.y, y)
+        if i > 0:
+            st.add_vertex(prev_left)
+            st.add_vertex(right)
+            st.add_vertex(left)
+            st.add_vertex(prev_left)
+            st.add_vertex(prev_right)
+            st.add_vertex(right)
+        prev_left = left
+        prev_right = right
+    st.index()
+    st.generate_normals()
+    var strip := MeshInstance3D.new()
+    strip.mesh = st.commit()
+    var mat := StandardMaterial3D.new()
+    mat.albedo_color = color
+    if color.a < 1.0:
+        mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+    strip.material_override = mat
+    parent.add_child(strip)
+    return strip
+
 func _build_road_path(path: Array) -> Array:
-    var nodes: Array = []
-    for i in range(1, path.size()):
-        nodes.append(_build_road_ribbon(path[i - 1], path[i]))
-    return nodes
+    return [_build_ribbon_poly(_roads_root, sample_spline(path), _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y)]
 
 func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
     return _build_ribbon(_roads_root, a, b, _ROAD_WIDTH, _ROAD_COLOR, _ROAD_Y, _ROAD_SEGMENT_STEP)
@@ -514,21 +580,19 @@ func _restake_plan(order_id: String) -> void:
     var demo: bool = String(rec.get("kind", "")).begins_with("demo_")
     var strip_color := _DEMO_COLOR if demo else _PLAN_COLOR
     var stake_color := _DEMO_STAKE_COLOR if demo else _STAKE_COLOR
-    var total := 0.0
-    for i in range(1, path.size()):
-        var a: Vector2 = path[i - 1]
-        var b: Vector2 = path[i]
-        total += a.distance_to(b)
-        nodes.append(_build_ribbon(
-            _roads_root, a, b,
-            _PLAN_WIDTH, strip_color, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
-        # Survey stakes marching along the run (plus one on each corner).
-        var stakes := maxi(1, int(a.distance_to(b) / _STAKE_EVERY_M))
-        for s2 in range(stakes + 1):
-            nodes.append(_plan_stake(a.lerp(b, float(s2) / float(stakes)), stake_color))
+    # The strip follows the smooth spline (#112); stakes march along it.
+    var samples := sample_spline(path)
+    nodes.append(_build_ribbon_poly(_roads_root, samples, _PLAN_WIDTH, strip_color, _ROAD_Y + 0.15))
+    var since := _STAKE_EVERY_M # plant one at the very start
+    for i in range(samples.size()):
+        if i > 0:
+            since += samples[i - 1].distance_to(samples[i])
+        if since >= _STAKE_EVERY_M or i == samples.size() - 1:
+            since = 0.0
+            nodes.append(_plan_stake(samples[i], stake_color))
     # A floating label at the path's midpoint so the build site announces
     # itself from a distance (same treatment as fixture labels).
-    var mid: Vector2 = path[path.size() / 2]
+    var mid: Vector2 = samples[samples.size() / 2]
     var label := Label3D.new()
     label.text = "🔨 Demolition — bring a tool kit" if demo else "🚧 Planned road — bring stone"
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED

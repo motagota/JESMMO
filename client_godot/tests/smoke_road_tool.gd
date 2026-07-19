@@ -10,19 +10,43 @@ func _fail(message: String) -> void:
 	quit(1)
 
 func _initialize() -> void:
-	# --- snapping / cost math ---------------------------------------------------
+	# --- snapping / cost math (#112: free-angle) ---------------------------------
 	if RoadTool.snap_lattice(Vector2(100.4, 99.6)) != Vector2i(100, 100):
 		_fail("lattice snap should round to the nearest metre"); return
-	# Dominant axis east; y locked to the last corner.
-	if RoadTool.snap_next_point(Vector2i(100, 100), Vector2(130.3, 111.0)) != Vector2i(130, 100):
-		_fail("pending leg should run along the dominant axis (east)"); return
-	# Dominant axis south.
-	if RoadTool.snap_next_point(Vector2i(100, 100), Vector2(108.0, 140.7)) != Vector2i(100, 141):
-		_fail("pending leg should run along the dominant axis (south)"); return
+	# Segments run at any angle now: the pending leg is just the cursor on
+	# the lattice, wherever it is.
+	if RoadTool.snap_next_point(Vector2i(100, 100), Vector2(130.3, 111.0)) != Vector2i(130, 111):
+		_fail("pending leg should follow the cursor freely"); return
 	if RoadTool.path_length([Vector2i(0, 0), Vector2i(100, 0), Vector2i(100, 200)]) != 300:
-		_fail("path length should sum the runs"); return
+		_fail("axis path length unchanged (Euclidean == Manhattan there)"); return
+	if RoadTool.path_length([Vector2i(0, 0), Vector2i(30, 40)]) != 50:
+		_fail("diagonal length should be the Euclidean chord (3-4-5)"); return
 	if RoadTool.stone_cost(300) != 75 or RoadTool.stone_cost(4) != Protocol.ROAD_MIN_STONE:
 		_fail("cost mirror should be length/4 with the floor"); return
+
+	# --- the spline sampler (#112) -----------------------------------------------
+	var straight := World.sample_spline([Vector2(0, 0), Vector2(40, 0)])
+	for sp in straight:
+		if absf(sp.y) > 0.001:
+			_fail("a straight path must stay straight through the spline"); return
+	var bend := World.sample_spline([Vector2(0, 0), Vector2(100, 0), Vector2(100, 100)])
+	if bend[0] != Vector2(0, 0) or bend[-1] != Vector2(100, 100):
+		_fail("the spline must pass through its endpoints"); return
+	var has_corner_sample := false
+	var rounds_corner := false
+	for sp in bend:
+		if sp.distance_to(Vector2(100, 0)) < 0.001:
+			has_corner_sample = true
+		# Smoothing = some sample leaves the straight arms entirely (the
+		# curve eases around the corner instead of tracing the L exactly).
+		var d1 := Geometry2D.get_closest_point_to_segment(sp, Vector2(0, 0), Vector2(100, 0))
+		var d2 := Geometry2D.get_closest_point_to_segment(sp, Vector2(100, 0), Vector2(100, 100))
+		if sp.distance_to(d1) > 1.0 and sp.distance_to(d2) > 1.0:
+			rounds_corner = true
+	if not has_corner_sample:
+		_fail("control points must be exact samples"); return
+	if not rounds_corner:
+		_fail("a right-angle path should ease around the corner"); return
 
 	# --- the laying state machine ------------------------------------------------
 	var tool := RoadTool.new()
@@ -37,13 +61,13 @@ func _initialize() -> void:
 	if not committed.is_empty():
 		_fail("committing with no runs must be refused"); return
 	tool.anchor(Vector2(12800.2, 12799.8))
-	tool.add_corner(Vector2(12900.4, 12805.0)) # east-dominant -> (12900, 12800)
-	tool.add_corner(Vector2(12902.0, 12950.6)) # south-dominant -> (12900, 12951)
-	tool.add_corner(Vector2(12900.3, 12951.2)) # cursor hasn't left the corner: no-op
+	tool.add_corner(Vector2(12900.4, 12805.0)) # free angle -> (12900, 12805)
+	tool.add_corner(Vector2(12902.0, 12950.6)) # -> (12902, 12951)
+	tool.add_corner(Vector2(12902.3, 12950.9)) # cursor on the same lattice point: no-op
 	if tool.points.size() != 3:
 		_fail("expected anchor + two corners (got %d)" % tool.points.size()); return
 	tool.commit()
-	if committed.size() != 1 or committed[0] != [[12800, 12800], [12900, 12800], [12900, 12951]]:
+	if committed.size() != 1 or committed[0] != [[12800, 12800], [12900, 12805], [12902, 12951]]:
 		_fail("commit should emit the exact lattice polyline (got %s)" % str(committed)); return
 	if not tool.points.is_empty():
 		_fail("commit should clear the tool for the next road"); return
@@ -106,9 +130,9 @@ func _initialize() -> void:
 		_fail("picking should load the plan's exact polyline (got %s / %s)" % [tool.editing_order_id, str(tool.points)]); return
 	# Edit: trim the last corner, extend east instead.
 	tool.points.pop_back()
-	tool.add_corner(Vector2(260.4, 102.0))
+	tool.add_corner(Vector2(260.4, 102.0)) # free angle -> (260, 102)
 	tool.commit()
-	if replans.size() != 1 or replans[0][0] != "r1" or replans[0][1] != [[100, 100], [200, 100], [260, 100]]:
+	if replans.size() != 1 or replans[0][0] != "r1" or replans[0][1] != [[100, 100], [200, 100], [260, 102]]:
 		_fail("move commit should emit road.replan with the edited polyline (got %s)" % str(replans)); return
 	if tool.editing_order_id != "" or not tool.points.is_empty():
 		_fail("move commit should clear the editing state"); return
