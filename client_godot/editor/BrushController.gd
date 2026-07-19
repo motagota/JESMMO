@@ -80,7 +80,11 @@ func _process(delta: float) -> void:
 	if camera == null or streamer == null or not enabled:
 		return
 	_handle_param_keys()
-	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	# Clicks over UI (the editor toolbar/panels, #103) must not paint — the
+	# raw-input poll can't tell a button press from a canvas press. Treating
+	# it as mouse-up also commits any stroke in flight, never losing it.
+	var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) \
+		and get_viewport().gui_get_hovered_control() == null
 	if lmb:
 		var g := _raycast_ground()
 		var lower := Input.is_physical_key_pressed(KEY_SHIFT)

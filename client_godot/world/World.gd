@@ -111,6 +111,14 @@ const _PLAN_COLOR := Color(1.0, 0.82, 0.20, 0.75)
 const _PLAN_WIDTH := 4.5
 const _STAKE_COLOR := Color(1.0, 0.45, 0.10)
 const _STAKE_EVERY_M := 24.0
+## Demolition sites (#107, kind `demo_*`) wear red so "coming down" never
+## reads as "going up".
+const _DEMO_COLOR := Color(0.95, 0.18, 0.14, 0.75)
+const _DEMO_STAKE_COLOR := Color(0.95, 0.12, 0.10)
+## Built road orders (state completed, kind road_*) tracked from the board
+## for the demolish tool's picking (#107): order_id -> {"path": [Vector2..]}.
+## Data only — the built ribbon renders via the structure entity.
+var _completed_road_orders: Dictionary = {}
 ## What the plot markers were last drawn from, so they can be redrawn against
 ## fresh terrain heights (see `refresh_plot_markers`).
 var _home_bounds: Dictionary = {}
@@ -456,19 +464,38 @@ func apply_road_plans(orders: Array) -> void:
         for n in _road_plans[id]["nodes"]:
             n.queue_free()
     _road_plans.clear()
+    _completed_road_orders.clear()
     for o_v in orders:
         var o: Dictionary = o_v
-        if String(o.get("state", "")) != "open":
-            continue
         var raw: Array = o.get("path", [])
         if raw.size() < 2:
             continue
         var path: Array = []
         for p in raw:
             path.append(Vector2(float(p[0]), float(p[1])))
-        _road_plans[String(o.get("order_id", ""))] = {"path": path, "nodes": []}
+        var state := String(o.get("state", ""))
+        var kind := String(o.get("kind", ""))
+        if state == "open":
+            var progress_total := 0
+            for v in (o.get("progress", {}) as Dictionary).values():
+                progress_total += int(v)
+            _road_plans[String(o.get("order_id", ""))] = {
+                "path": path, "nodes": [], "kind": kind, "progress_total": progress_total,
+            }
+        elif state == "completed" and kind.begins_with("road_"):
+            # Built roads, for the demolish tool's picking (#107).
+            _completed_road_orders[String(o.get("order_id", ""))] = {"path": path}
     for id in _road_plans:
         _restake_plan(id)
+
+## A built road was demolished (#107): its structure entity despawned —
+## un-render the ribbons. No-op for non-road despawns.
+func remove_dirt_road(id: String) -> void:
+    if not _dirt_roads.has(id):
+        return
+    for n in _dirt_roads[id]["nodes"]:
+        n.queue_free()
+    _dirt_roads.erase(id)
 
 ## An order completed (#96 renders the built road) — drop its stakes.
 func remove_road_plan(order_id: String) -> void:
@@ -484,6 +511,9 @@ func _restake_plan(order_id: String) -> void:
         n.queue_free()
     var nodes: Array = []
     var path: Array = rec["path"]
+    var demo: bool = String(rec.get("kind", "")).begins_with("demo_")
+    var strip_color := _DEMO_COLOR if demo else _PLAN_COLOR
+    var stake_color := _DEMO_STAKE_COLOR if demo else _STAKE_COLOR
     var total := 0.0
     for i in range(1, path.size()):
         var a: Vector2 = path[i - 1]
@@ -491,16 +521,16 @@ func _restake_plan(order_id: String) -> void:
         total += a.distance_to(b)
         nodes.append(_build_ribbon(
             _roads_root, a, b,
-            _PLAN_WIDTH, _PLAN_COLOR, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
+            _PLAN_WIDTH, strip_color, _ROAD_Y + 0.15, _PLOT_EDGE_STEP))
         # Survey stakes marching along the run (plus one on each corner).
         var stakes := maxi(1, int(a.distance_to(b) / _STAKE_EVERY_M))
         for s2 in range(stakes + 1):
-            nodes.append(_plan_stake(a.lerp(b, float(s2) / float(stakes))))
+            nodes.append(_plan_stake(a.lerp(b, float(s2) / float(stakes)), stake_color))
     # A floating label at the path's midpoint so the build site announces
     # itself from a distance (same treatment as fixture labels).
     var mid: Vector2 = path[path.size() / 2]
     var label := Label3D.new()
-    label.text = "🚧 Planned road — bring stone"
+    label.text = "🔨 Demolition — bring a tool kit" if demo else "🚧 Planned road — bring stone"
     label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
     label.no_depth_test = true
     label.fixed_size = true
@@ -515,16 +545,16 @@ func _restake_plan(order_id: String) -> void:
     nodes.append(label)
     rec["nodes"] = nodes
 
-## One orange survey stake, planted on the ground.
-func _plan_stake(p: Vector2) -> MeshInstance3D:
+## One survey stake, planted on the ground (orange = plan, red = demolition).
+func _plan_stake(p: Vector2, color: Color = _STAKE_COLOR) -> MeshInstance3D:
     var mi := MeshInstance3D.new()
     var post := BoxMesh.new()
     post.size = Vector3(0.28, 1.5, 0.28)
     mi.mesh = post
     var m := StandardMaterial3D.new()
-    m.albedo_color = _STAKE_COLOR
+    m.albedo_color = color
     m.emission_enabled = true
-    m.emission = _STAKE_COLOR
+    m.emission = color
     m.emission_energy_multiplier = 0.25
     mi.material_override = m
     mi.position = Protocol.w2v(p.x, p.y, 0.9)

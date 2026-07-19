@@ -49,6 +49,8 @@ var _brush: BrushController
 var _history: HistoryPanel
 var _object_tool: ObjectTool
 var _road_tool: RoadTool
+var _demolish_tool: DemolishTool
+var _toolbar: EditorToolbar
 var _world_objects: WorldObjects
 
 var _my_id := ""
@@ -256,7 +258,9 @@ func _wire_signals() -> void:
     _net.plot_district.connect(func(plots):
         _world.apply_plot_roster(plots, _plot_id)
         _minimap.set_plots(plots, _plot_id))
-    _net.despawn.connect(func(id): _entities.remove(id))
+    _net.despawn.connect(func(id):
+        _entities.remove(id)
+        _world.remove_dirt_road(id)) # a demolished road's ribbon (#107)
     _net.zone_migration.connect(func(zone): _hud.set_zone(zone))
     # Death gets a proper overlay (#89) instead of the old connection-label
     # hack; the respawn's status stream restores the vitals bars underneath.
@@ -404,7 +408,7 @@ func _setup_editor() -> void:
     _brush.streamer = _streamer
     add_child(_brush)
     _brush.stroke_committed.connect(func(brush, cells): _net.send_terrain_edit_op(brush, cells))
-    _brush.status_changed.connect(func(text): _hud.flash_announce(text))
+    # (Brush status routes to the toolbar hint line below, #103.)
     _history = HistoryPanel.new()
     add_child(_history)
     _history.do_revert.connect(func(op_id): _net.send_terrain_revert_op(op_id))
@@ -420,26 +424,39 @@ func _setup_editor() -> void:
     add_child(_object_tool)
     _object_tool.place_requested.connect(func(kind, x, y): _net.send_object_place(kind, x, y))
     _object_tool.delete_requested.connect(func(object_id): _net.send_object_delete(object_id))
-    _object_tool.status_changed.connect(func(text): _hud.flash_announce(text))
     _net.object_edit_error.connect(func(message): _hud.flash_announce("Editor: %s" % message))
     # Road tool (#95): [R] toggles grid-snapped road laying; committed plans
     # go up as one road.plan and come back as a staked build order.
     _road_tool = RoadTool.new()
     _road_tool.camera = _editor_cam
+    _road_tool.world_ref = _world # staked-plan source for move-mode picking (#105)
     add_child(_road_tool)
     _road_tool.plan_committed.connect(func(points): _net.send_road_plan(points))
-    _road_tool.status_changed.connect(func(text): _hud.flash_announce(text))
+    _road_tool.replan_committed.connect(func(order_id, points): _net.send_road_replan(order_id, points))
     _net.road_planned.connect(func(_order_id): _hud.flash_announce("Road: plan accepted — stone wanted!"))
     _net.road_plan_error.connect(func(message): _hud.flash_announce("Road: %s" % message))
-    # Exactly one editor tool owns the mouse: the brush runs only while both
-    # pointed tools are off, and the two pointed tools lock each other out.
-    _object_tool.mode_changed.connect(func(mode):
-        _brush.set_enabled(mode == "off" and not _road_tool.active)
-        _road_tool.enabled = mode == "off")
-    _road_tool.mode_changed.connect(func(road_active):
-        _brush.set_enabled(not road_active and _object_tool.mode == "off")
-        _object_tool.enabled = not road_active)
-    _hud.flash_announce("EDITOR — LMB raise, Shift+LMB lower, [ ] radius, -/= strength, [O] object tool, [R] road tool, Ctrl+Z undo, [H] history, RMB-drag look, WASD/QE fly")
+    # The toolbar (#103) owns tool exclusivity — one active-tool state
+    # drives the whole enabled matrix, buttons and hotkeys converge on it,
+    # and the tools' status streams show in its persistent hint line
+    # instead of scrolling away as announce toasts.
+    # Demolish tool (#107): cancel pristine plans free; anything with stone
+    # in it gets a salvage job that refunds on completion.
+    _demolish_tool = DemolishTool.new()
+    _demolish_tool.camera = _editor_cam
+    _demolish_tool.world_ref = _world
+    add_child(_demolish_tool)
+    _demolish_tool.cancel_requested.connect(func(order_id): _net.send_road_cancel(order_id))
+    _demolish_tool.demolish_requested.connect(func(order_id): _net.send_road_demolish(order_id))
+    _net.road_cancelled.connect(func(_order_id): _hud.flash_announce("Road: plan cancelled"))
+    _net.road_demolition_planned.connect(func(_order_id, _demo_id): _hud.flash_announce("Road: demolition posted — bring a tool kit!"))
+    _toolbar = EditorToolbar.new()
+    add_child(_toolbar)
+    _toolbar.setup(_brush, _object_tool, _road_tool, _demolish_tool, _history)
+    _demolish_tool.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _object_tool.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _road_tool.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _brush.status_changed.connect(func(text): _toolbar.set_hint(text))
+    _hud.flash_announce("EDITOR — RMB-drag look, WASD/QE fly; tools on the toolbar")
 
 ## A mayor-drawn dirt path (#55): pick the district from its start point and
 ## commission it with a flat cost — any player can then fill it, same as any

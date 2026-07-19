@@ -574,6 +574,19 @@ pub struct BuildPlacement {
     pub y1: Option<i64>,
 }
 
+/// The outcome of a [`Db::replan_road_order`] call (#104).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplanOutcome {
+    /// Whether the swap landed (`false` = the order wasn't an open road any
+    /// more — completed/cancelled under the editor's feet; retry).
+    pub applied: bool,
+    /// Whether kept progress covered the recomputed cost, completing the
+    /// order in the same transaction.
+    pub completed: bool,
+    /// On completion, `(character_id, units)` per contributor (for XP).
+    pub contributors: Vec<(String, i64)>,
+}
+
 /// A district-scoped city build quest.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct BuildOrder {
@@ -1942,6 +1955,217 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(Some(rows))
+    }
+
+    /// Re-route an OPEN road order (`road.replan`, #104): transactionally
+    /// swap in the new path/placement/district and the recomputed cost,
+    /// keeping contributed progress (it's stone in the project, not the old
+    /// geometry). If the kept progress already covers the recomputed cost —
+    /// a part-built road re-routed much shorter — the order completes right
+    /// here (state flip + contributor list), so the caller can run the
+    /// ordinary completion announcements; any excess progress beyond the new
+    /// cost is absorbed (rare, small, and #106's demolition is the doorway
+    /// for getting stone back out of a road).
+    ///
+    /// The `state = 'open'` guard makes the swap race-safe against a
+    /// concurrent completing contribution: `applied == false` means the
+    /// order changed under the editor, who just retries.
+    pub async fn replan_road_order(
+        &self,
+        order_id: &str,
+        district: &str,
+        required_json: &str,
+        path_json: &str,
+        placement: &BuildPlacement,
+        now: i64,
+    ) -> Result<ReplanOutcome, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let applied = sqlx::query(
+            "UPDATE build_order SET district = ?, required_json = ?, path_json = ?, \
+             structure_kind = ?, x = ?, y = ?, x1 = ?, y1 = ? \
+             WHERE id = ? AND state = 'open' AND path_json IS NOT NULL",
+        )
+        .bind(district)
+        .bind(required_json)
+        .bind(path_json)
+        .bind(&placement.structure_kind)
+        .bind(placement.x)
+        .bind(placement.y)
+        .bind(placement.x1)
+        .bind(placement.y1)
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !applied {
+            tx.commit().await?;
+            return Ok(ReplanOutcome::default());
+        }
+        let order = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let required = parse_cost(&order.required_json);
+        let progress = parse_cost(&order.progress_json);
+        let completed = !required.is_empty()
+            && required.iter().all(|(k, v)| progress.get(k).copied().unwrap_or(0) >= *v);
+        let mut contributors = Vec::new();
+        if completed {
+            sqlx::query("UPDATE build_order SET state = 'completed', completed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            contributors = sqlx::query_as::<_, (String, i64)>(
+                "SELECT character_id, units FROM build_contribution WHERE order_id = ? ORDER BY character_id",
+            )
+            .bind(order_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(ReplanOutcome { applied: true, completed, contributors })
+    }
+
+    /// Cancel a pristine road plan (`road.cancel`, #106): only an OPEN road
+    /// order with ZERO progress goes — anything with contributed stone must
+    /// take the demolition route so players' hauling is never vaporised.
+    /// Returns whether the row was removed; `false` = wrong state/progress
+    /// (the caller rejects with a pointer to demolition).
+    pub async fn cancel_road_order(&self, order_id: &str) -> Result<bool, DbError> {
+        let res = sqlx::query(
+            "DELETE FROM build_order WHERE id = ? AND state = 'open' \
+             AND path_json IS NOT NULL AND progress_json = '{}'",
+        )
+        .bind(order_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Create a demolition order for a road (`road.demolish`, #106),
+    /// transactionally:
+    /// - the target must be a road order that's either COMPLETED (a built
+    ///   road) or OPEN WITH PROGRESS (a part-built plan; pristine plans are
+    ///   for `road.cancel`);
+    /// - an open plan flips to state `demolishing` so contributions stop
+    ///   (contribute() only feeds `open` orders) and its stakes drop off the
+    ///   boards; a built road keeps rendering until the demolition finishes;
+    /// - the demolition order's kind is `demo_<target order id>` — the link
+    ///   back — and doubles as the double-demolition guard;
+    /// - the demo order carries the road's path (so the ordinary
+    ///   contribution proximity gate means the work happens on site) but NO
+    ///   placement — completing it must never spawn a structure.
+    pub async fn create_demolition(
+        &self,
+        target_order_id: &str,
+        now: i64,
+    ) -> Result<Result<BuildOrder, &'static str>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(target) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(target_order_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(Err("no such order"));
+        };
+        let Some(path_json) = target.path_json.clone() else {
+            tx.commit().await?;
+            return Ok(Err("that order is not a road"));
+        };
+        let demo_kind = format!("demo_{}", target.id);
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM build_order WHERE kind = ? LIMIT 1")
+                .bind(&demo_kind)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(Err("a demolition for that road is already posted"));
+        }
+        match target.state.as_str() {
+            "completed" => {} // a built road: keeps rendering until the job's done
+            "open" => {
+                if target.progress_json == "{}" {
+                    tx.commit().await?;
+                    return Ok(Err("nothing built there yet — cancel the plan instead"));
+                }
+                sqlx::query("UPDATE build_order SET state = 'demolishing' WHERE id = ? AND state = 'open'")
+                    .bind(&target.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            _ => {
+                tx.commit().await?;
+                return Ok(Err("that road can't be demolished right now"));
+            }
+        }
+        let demo_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO build_order (id, district, kind, required_json, progress_json, state, issued_at, path_json) \
+             VALUES (?, ?, ?, ?, '{}', 'open', ?, ?)",
+        )
+        .bind(&demo_id)
+        .bind(&target.district)
+        .bind(&demo_kind)
+        .bind(r#"{"tool_kit":1}"#)
+        .bind(now)
+        .bind(&path_json)
+        .execute(&mut *tx)
+        .await?;
+        let demo = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(&demo_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Ok(demo))
+    }
+
+    /// Finish a completed demolition (#106): compute the refund from the
+    /// target (a built road refunds its full required cost; a part-built
+    /// plan refunds its contributed progress), delete the target order (and
+    /// its contribution rows), and return the refund map. The caller pays it
+    /// out and broadcasts the removal.
+    pub async fn settle_demolition(
+        &self,
+        target_order_id: &str,
+    ) -> Result<Option<(BuildOrder, BTreeMap<String, i64>)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(target) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(target_order_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let refund = if target.state == "completed" {
+            parse_cost(&target.required_json)
+        } else {
+            parse_cost(&target.progress_json)
+        };
+        sqlx::query("DELETE FROM build_contribution WHERE order_id = ?")
+            .bind(&target.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM build_order WHERE id = ?")
+            .bind(&target.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((target, refund)))
+    }
+
+    /// Mint items straight into a character's town storage (#106's refunds
+    /// — storage sidesteps the carry cap, and it's the established safe
+    /// stash). Not a transfer: demolition returns what the road absorbed.
+    pub async fn grant_storage(&self, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        add_storage_in_tx(&mut tx, character_id, item_id, qty).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     // --- placed world props (player-attributes epic #83, issue #85) ---------

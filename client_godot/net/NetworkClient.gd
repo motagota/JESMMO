@@ -59,6 +59,8 @@ signal object_edit_error(message: String)
 ## via the ordinary build.list broadcast) / rejected.
 signal road_planned(order_id: String)
 signal road_plan_error(message: String)
+signal road_cancelled(order_id: String)
+signal road_demolition_planned(order_id: String, demo_order_id: String)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -252,6 +254,12 @@ func _handle_text(text: String) -> void:
             road_planned.emit(String(msg.get("order_id", "")))
         Protocol.S_ROAD_PLAN_ERROR:
             road_plan_error.emit(String(msg.get("message", "road plan rejected")))
+        Protocol.S_ROAD_CANCELLED:
+            road_cancelled.emit(String(msg.get("order_id", "")))
+        Protocol.S_ROAD_DEMOLITION_PLANNED:
+            road_demolition_planned.emit(
+                String(msg.get("order_id", "")),
+                String(msg.get("demo_order_id", "")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -389,6 +397,19 @@ func send_object_delete(object_id: String) -> void:
 ## `road.planned` (and a district `build.list` broadcast) or `road.plan_error`.
 func send_road_plan(points: Array) -> void:
     _send({"type": Protocol.C_ROAD_PLAN, "points": points})
+
+## Re-route an open road plan (#104/#105, editor role only). Same shape as
+## send_road_plan plus the order being moved.
+func send_road_replan(order_id: String, points: Array) -> void:
+    _send({"type": Protocol.C_ROAD_REPLAN, "order_id": order_id, "points": points})
+
+## Remove a pristine road plan (#106, editor role only).
+func send_road_cancel(order_id: String) -> void:
+    _send({"type": Protocol.C_ROAD_CANCEL, "order_id": order_id})
+
+## Post a demolition order for a built/part-built road (#106, editor only).
+func send_road_demolish(order_id: String) -> void:
+    _send({"type": Protocol.C_ROAD_DEMOLISH, "order_id": order_id})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

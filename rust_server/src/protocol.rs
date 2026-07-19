@@ -183,3 +183,22 @@ pub const S_ROAD_PLANNED: &str = "road.planned";
 // {message} -- the plan was rejected (not an editor / malformed / diagonal
 // run / off-world / over the length cap / crossing an owned plot / no db).
 pub const S_ROAD_PLAN_ERROR: &str = "road.plan_error";
+// {order_id, points} -- re-route an OPEN road plan (#104): full road.plan
+// validation, stone cost recomputed from the new length, contributed
+// progress kept (if it already covers the new cost the order completes on
+// the spot). Editor-gated; acked with road.planned, rejected with
+// road.plan_error. Built roads don't move -- demolish + re-lay (#106).
+pub const C_ROAD_REPLAN: &str = "road.replan";
+// {order_id} -- remove a pristine (open, zero-progress) road plan (#106).
+// Progressed plans and built roads are refused toward road.demolish -- no
+// silent vaporising of players' hauled stone. Ack: road.cancelled.
+pub const C_ROAD_CANCEL: &str = "road.cancel";
+pub const S_ROAD_CANCELLED: &str = "road.cancelled"; // {order_id}
+// {order_id} -- post a DEMOLITION order for a built road or part-built plan
+// (#106): kind demo_<target id>, requires {tool_kit: 1}, worked on site via
+// the ordinary contribution proximity (it carries the road's path, no
+// placement). Completion removes the road everywhere and refunds its banked
+// stone (built: full required; plan: contributed progress) pro-rata to the
+// demolition's contributors, into town storage.
+pub const C_ROAD_DEMOLISH: &str = "road.demolish";
+pub const S_ROAD_DEMOLITION_PLANNED: &str = "road.demolition_planned"; // {order_id, demo_order_id}
