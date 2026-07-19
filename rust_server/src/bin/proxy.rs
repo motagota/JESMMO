@@ -84,7 +84,7 @@ const ROAD_MIN_STONE: i64 = 5;
 /// Total path length cap — a single plan longer than this is a mis-drag or
 /// abuse, not a road (lay long routes as multiple plans).
 const ROAD_MAX_LENGTH_M: i64 = 4_000;
-/// Points cap: with axis-aligned runs, each point past the first is a
+/// Points cap: each point past the first is a
 /// corner; a real road plan has a handful, not hundreds.
 const ROAD_MAX_POINTS: usize = 64;
 
@@ -2467,7 +2467,8 @@ impl Proxy {
 
     /// Parse + validate a road path payload (`points`, shared by `road.plan`
     /// and `road.replan` #104): a lattice polyline whose consecutive pairs
-    /// are axis-aligned runs, in-world, under the point/length caps, and not
+    /// are free-angle segments (#111 — the client splines through them),
+    /// in-world, under the point/length caps, and not
     /// crossing privately owned land. Returns `(points, length_m)` or the
     /// `road.plan_error` message.
     async fn parse_road_path(&self, db: &Db, data: &Value) -> Result<(Vec<(i64, i64)>, i64), &'static str> {
@@ -2494,17 +2495,19 @@ impl Proxy {
             }
             points.push((x, y));
         }
-        let mut length: i64 = 0;
+        // Segments run at ANY angle (#111 — the client renders a smooth
+        // spline through these waypoints); length is the Euclidean sum of
+        // the chords, which is identical to the old Manhattan sum for the
+        // axis-aligned roads that already exist, so nothing reprices.
+        let mut length_f = 0.0f64;
         for w in points.windows(2) {
             let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
-            if dx != 0 && dy != 0 {
-                return Err("runs must be axis-aligned (insert a corner point to turn)");
-            }
             if dx == 0 && dy == 0 {
                 return Err("degenerate run (repeated point)");
             }
-            length += dx.abs() + dy.abs();
+            length_f += ((dx * dx + dy * dy) as f64).sqrt();
         }
+        let length = length_f.round() as i64;
         if length > ROAD_MAX_LENGTH_M {
             return Err("plan exceeds the single-road length cap (lay long routes as multiple plans)");
         }
@@ -2522,7 +2525,7 @@ impl Proxy {
     }
 
     /// Apply an editor's `road.plan` (#94): validate a lattice polyline of
-    /// axis-aligned runs on the world's native 1m grid and turn it into ONE
+    /// free-angle waypoints on the world's native 1m grid and turn it into ONE
     /// ordinary build order (structure_kind `dirt_road`, stone cost scaled by
     /// total length) that players fulfil through the normal `build.contribute`
     /// flow — the contribution IS the labour. Explicit-error posture like the
@@ -7795,7 +7798,6 @@ mod tests {
         let mut ws = dial_editor(&proxy, &db).await;
 
         let cases = [
-            (json!([[100, 100], [200, 200]]), "axis-aligned"),
             (json!([[100, 100], [100, 100]]), "degenerate"),
             (json!([[100, 100]]), "two points"),
             (json!([[100, 100], [100, -5]]), "outside the world"),
@@ -7988,6 +7990,25 @@ mod tests {
         drop(ws);
     }
 
+    /// Free-angle roads (#111): a diagonal plan is accepted and priced by
+    /// its Euclidean length; the cap applies to that length too.
+    #[tokio::test]
+    async fn diagonal_road_plans_price_by_euclidean_length() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+        // A 3-4-5 triangle hypotenuse: 300m east, 400m south of it = 500m.
+        editor_ws
+            .send(Message::Text(
+                json!({"type": "road.plan", "points": [[13000, 12500], [13300, 12900]]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let order_id = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+        let order = db.build_order_by_id(&order_id).await.unwrap().unwrap();
+        assert_eq!(order.required_json, r#"{"stone":125}"#, "500m Euclidean -> 125 stone");
+        drop(editor_ws);
+    }
+
     /// `road.replan` (#104): re-routes an open plan (path + recomputed cost,
     /// progress kept), rejects everything it should, and completes on the
     /// spot when kept progress covers the recomputed cost.
@@ -8024,15 +8045,16 @@ mod tests {
         let err = recv_until(&mut player_ws, "road.plan_error").await;
         assert!(err["message"].as_str().unwrap().contains("editor"));
 
-        // Diagonal runs: rejected with the shared validation.
+        // A repeated point: rejected with the shared validation. (Diagonal
+        // runs are legal since #111 — roads are splines now.)
         editor_ws
             .send(Message::Text(
-                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13100, 13100]]}).to_string(),
+                json!({"type": "road.replan", "order_id": order_id, "points": [[13000, 13000], [13000, 13000]]}).to_string(),
             ))
             .await
             .unwrap();
         let err = recv_until(&mut editor_ws, "road.plan_error").await;
-        assert!(err["message"].as_str().unwrap().contains("axis-aligned"));
+        assert!(err["message"].as_str().unwrap().contains("degenerate"));
 
         // Contribute 10 of the 50 first — the move must carry it.
         zone.to_proxy
