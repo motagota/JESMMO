@@ -31,6 +31,8 @@ const _PITCH_MAX := 0.35 # ~20 deg; a little above level, without going overhead
 # Predicted authoritative position in *world* units (the source of truth we render).
 var _pos := Vector2(3200, 3200) # default at the town centre until the first snapshot
 var _facing := Vector2(1, 0)
+## Fractional movement banked between integer wire steps (#113).
+var _step_carry := Vector2.ZERO
 var _move_accum := 0.0
 var _attack_accum := 0.0
 var _gather_down := false
@@ -140,18 +142,27 @@ func _process(delta: float) -> void:
 	if dir != Vector2.ZERO:
 		_facing = dir
 
-	# Send + predict on a steady tick rather than every frame.
+	# Send + predict on a steady tick rather than every frame. Steps are
+	# integers (the wire protocol), but the DIRECTION is the camera's true
+	# float heading (#113): each tick we round `dir * step + carry` and
+	# carry the rounding error forward, so the sum of the integer steps
+	# tracks exactly where the camera points instead of snapping to the
+	# nearest of 8 compass directions (up to 22.5° of drift before).
 	_move_accum += delta
 	while _move_accum >= Protocol.MOVE_TICK:
 		_move_accum -= Protocol.MOVE_TICK
 		if dir != Vector2.ZERO:
-			var dx := int(dir.x) * Protocol.MOVE_STEP
-			var dy := int(dir.y) * Protocol.MOVE_STEP
-			move_requested.emit(dx, dy)
-			# Prediction: apply the same delta now, clamped to the world.
-			_pos.x = clampf(_pos.x + dx, 0.0, _world_size)
-			_pos.y = clampf(_pos.y + dy, 0.0, _world_size)
-			position_changed.emit(_pos.x, _pos.y)
+			var stepped := step_with_carry(dir, float(Protocol.MOVE_STEP), _step_carry)
+			var d: Vector2i = stepped[0]
+			_step_carry = stepped[1]
+			if d != Vector2i.ZERO:
+				move_requested.emit(d.x, d.y)
+				# Prediction: apply the same delta now, clamped to the world.
+				_pos.x = clampf(_pos.x + d.x, 0.0, _world_size)
+				_pos.y = clampf(_pos.y + d.y, 0.0, _world_size)
+				position_changed.emit(_pos.x, _pos.y)
+		else:
+			_step_carry = Vector2.ZERO # never bank movement while standing still
 
 	if Input.is_physical_key_pressed(KEY_SPACE):
 		_try_attack()
@@ -170,7 +181,9 @@ func _try_attack() -> void:
 	if _attack_accum < _ATTACK_COOLDOWN:
 		return
 	_attack_accum = 0.0
-	attack_requested.emit(int(_facing.x), int(_facing.y))
+	# The melee swing wants an 8-way aim; quantize the float facing (#113).
+	attack_requested.emit(int(signf(_facing.x)) if absf(_facing.x) > 0.38 else 0,
+		int(signf(_facing.y)) if absf(_facing.y) > 0.38 else 0)
 
 ## WASD / arrow keys -> a unit-ish world direction, camera-relative: "forward"
 ## (W) always means "away from the camera," whatever the current orbit yaw is.
@@ -191,10 +204,25 @@ func _input_dir() -> Vector2:
 		v.x += 1
 	if v == Vector2.ZERO:
 		return v
-	var forward3 := Vector3.FORWARD.rotated(Vector3.UP, _cam_yaw)
-	var right3 := Vector3.RIGHT.rotated(Vector3.UP, _cam_yaw)
+	return camera_relative_dir(v, _cam_yaw)
+
+## The camera-relative unit heading for raw (strafe, forward) input at a
+## given orbit yaw — the TRUE float direction, not an 8-way snap (#113).
+## Static so the headless test drives the same math the keys do.
+static func camera_relative_dir(v: Vector2, yaw: float) -> Vector2:
+	var forward3 := Vector3.FORWARD.rotated(Vector3.UP, yaw)
+	var right3 := Vector3.RIGHT.rotated(Vector3.UP, yaw)
 	var world := right3 * v.x + forward3 * (-v.y)
-	return Vector2(signf(world.x), signf(world.z))
+	var w := Vector2(world.x, world.z)
+	return w.normalized() if w.length() > 0.0001 else Vector2.ZERO
+
+## One integer wire step along a float heading: round `dir*step + carry`
+## and hand the rounding error back — the running sum of the returned
+## deltas converges on the true heading. Returns [Vector2i delta, carry].
+static func step_with_carry(dir: Vector2, step: float, carry: Vector2) -> Array:
+	var want := dir * step + carry
+	var d := Vector2i(roundi(want.x), roundi(want.y))
+	return [d, want - Vector2(d.x, d.y)]
 
 func world_pos() -> Vector2:
 	return _pos

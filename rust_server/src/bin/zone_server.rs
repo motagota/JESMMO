@@ -55,6 +55,10 @@ const CAPTURE_DECAY: f32 = 0.5; // bar units/tick lost when a capture stalls
 
 // --- Resource gathering -------------------------------------------------------
 const GATHER_RANGE: i32 = 50; // must be within this of a node to gather it
+/// Gathering is a channel: stepping more than this from where you started
+/// interrupts it (#114). The generous GATHER_RANGE stays as the start/
+/// targeting radius and a backstop only.
+const GATHER_MOVE_BREAK_M: i32 = 3;
 const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
 const GATHER_XP: i64 = 10; // gathering-skill xp per unit
 const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
@@ -241,6 +245,9 @@ struct HomeStructureRef {
 struct GatherJob {
     node_id: String,
     progress: i32,
+    /// Where the player stood when the channel started/resumed (#114):
+    /// moving more than GATHER_MOVE_BREAK_M from here interrupts it.
+    anchor: (i32, i32),
 }
 
 fn node_status_json(n: &ResourceNode) -> Value {
@@ -742,7 +749,7 @@ impl ZoneServer {
                         if self.nodes.lock().unwrap().contains_key(node_id) {
                             self.gathering.lock().unwrap().insert(
                                 player_id.clone(),
-                                GatherJob { node_id: node_id.to_string(), progress },
+                                GatherJob { node_id: node_id.to_string(), progress, anchor: (x, y) },
                             );
                         }
                     }
@@ -790,9 +797,16 @@ impl ZoneServer {
                         }
                     };
                     if ok {
+                        let anchor = self
+                            .entities
+                            .lock()
+                            .unwrap()
+                            .get(&player_id)
+                            .map(|p| (p.x, p.y))
+                            .unwrap_or((0, 0));
                         self.gathering.lock().unwrap().insert(
                             player_id.clone(),
-                            GatherJob { node_id, progress: 0 },
+                            GatherJob { node_id, progress: 0, anchor },
                         );
                     }
                 }
@@ -1231,7 +1245,19 @@ impl ZoneServer {
                         Some(n) => (n.x, n.y, n.qty > 0),
                         None => { finished.push(pid.clone()); continue; }
                     };
-                    if !has_stock || dist2(px, py, nx, ny) > (GATHER_RANGE as i64).pow(2) {
+                    // Gathering is a channel — walking away interrupts it
+                    // (#114). The anchor check is the real gate; the node
+                    // range stays as a backstop.
+                    let moved = dist2(px, py, job.anchor.0, job.anchor.1)
+                        > (GATHER_MOVE_BREAK_M as i64).pow(2);
+                    if moved || !has_stock || dist2(px, py, nx, ny) > (GATHER_RANGE as i64).pow(2) {
+                        // Tell the client the channel broke — without this
+                        // the HUD's "gathering…" line froze at its last pct
+                        // forever (#114, user report).
+                        packets.push(json!({
+                            "type": "gather.progress", "player_id": pid,
+                            "node_id": job.node_id, "pct": 0,
+                        }).to_string());
                         finished.push(pid.clone());
                         continue;
                     }
@@ -1675,6 +1701,43 @@ mod tests {
         assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
     }
 
+    // --- #114: gathering interrupts when you walk away ---------------------------
+
+    /// Moving more than GATHER_MOVE_BREAK_M from where the channel started
+    /// cancels it — and the cancellation pushes a pct=0 progress so the HUD
+    /// clears (it used to freeze at the last value forever).
+    #[tokio::test]
+    async fn walking_away_interrupts_gathering_and_clears_the_hud() {
+        let zone = civic_zone_on_tree();
+        zone.gathering.lock().unwrap().insert(
+            "p1".to_string(),
+            GatherJob { node_id: TREE.to_string(), progress: 3, anchor: (12740, 12740) },
+        );
+        // Step 6m away (still WELL inside the 50m node range).
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12746;
+        let packets = drive(zone.clone(), 2).await;
+
+        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "the channel must break on movement");
+        assert!(
+            packets.iter().any(|p| p.contains("\"gather.progress\"") && p.contains("\"pct\":0")),
+            "the cancellation must push pct=0 so the HUD clears"
+        );
+    }
+
+    /// Standing at the anchor keeps the channel running (progress advances).
+    #[tokio::test]
+    async fn standing_still_keeps_gathering() {
+        let zone = civic_zone_on_tree();
+        zone.gathering.lock().unwrap().insert(
+            "p1".to_string(),
+            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
+        );
+        drive(zone.clone(), 3).await;
+        let gathering = zone.gathering.lock().unwrap();
+        let job = gathering.get("p1").expect("still gathering");
+        assert!(job.progress > 0, "progress should advance while standing at the anchor");
+    }
+
     // --- #88: poison buildup, proc, DoT -----------------------------------------
 
     /// Standing among poison trees builds up, procs at the threshold, and the
@@ -1810,7 +1873,7 @@ mod tests {
         let zone = civic_zone_on_tree();
         zone.gathering.lock().unwrap().insert(
             "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0 },
+            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
         );
         // One GATHER_PERIOD plus slack -> exactly one unit yielded.
         let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
@@ -1832,7 +1895,7 @@ mod tests {
         zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 1; // one unit left
         zone.gathering.lock().unwrap().insert(
             "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0 },
+            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
         );
         let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
 
@@ -1853,7 +1916,7 @@ mod tests {
         zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 13000;
         zone.gathering.lock().unwrap().insert(
             "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0 },
+            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
         );
         let packets = drive(zone.clone(), 6).await;
 
