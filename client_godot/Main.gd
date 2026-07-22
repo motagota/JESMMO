@@ -160,6 +160,13 @@ func _process(_delta: float) -> void:
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
 
+    # Auto-fire (mining/abilities epic #123, #120): re-attempt every
+    # auto-armed, ready slot each frame — a no-target miss is silent
+    # (the slot just idles until a rock comes back in range), same as a
+    # manual press would round-trip and get rejected as `exhausted`.
+    for id in _hotbar.ready_auto_ids():
+        _on_hotbar_use(id, true)
+
     # Feed the placement ghost the camera (to raycast the mouse onto the
     # ground), the player's own plot bounds, and the live entity roster (both
     # needed for its red/green validity preview), and offer "sleep / set
@@ -532,19 +539,22 @@ func _on_gather_pressed() -> void:
         _net.send_gather_start(node_id)
 
 ## Resolve a hotbar press to a target node and send `ability.use` (mining/
-## abilities epic #123, #119). For a non-harvesting ability (none exist yet)
-## `target_item` is "" and any node_id is sent (server-side validated).
-## Nothing in range is a purely local no-op with a toast — no point in a
-## round trip the zone will just reject as `exhausted`.
-func _on_hotbar_use(ability_id: String) -> void:
+## abilities epic #123, #119/#120). For a non-harvesting ability (none exist
+## yet) `target_item` is "" and any node_id is sent (server-side validated).
+## Nothing in range is a purely local no-op — no point in a round trip the
+## zone will just reject as `exhausted` — toasted only for an explicit
+## press; `silent` (auto-fire's per-frame poll, #120) skips the toast so
+## standing away from any rock with auto armed doesn't spam the HUD.
+func _on_hotbar_use(ability_id: String, silent: bool = false) -> void:
     var target_item := Protocol.ability_target_item(ability_id)
-    if target_item == "":
-        _net.send_ability_use(ability_id, "")
-        return
-    var node_id := _entities.nearest_resource_item(_player.world_pos(), Protocol.PICK_RANGE, target_item)
-    if node_id == "":
-        _hud.flash_announce("Nothing to swing at — get closer to a rock")
-        return
+    var node_id := ""
+    if target_item != "":
+        node_id = _entities.nearest_resource_item(_player.world_pos(), Protocol.PICK_RANGE, target_item)
+        if node_id == "":
+            if not silent:
+                _hud.flash_announce("Nothing to swing at — get closer to a rock")
+            return
+    _hotbar.mark_sent(ability_id)
     _net.send_ability_use(ability_id, node_id)
 
 ## Human text for an `ability.result` failure reason.
