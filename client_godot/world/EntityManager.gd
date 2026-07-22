@@ -57,11 +57,34 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 	_entities[id]["wpos"] = Vector2(wx, wy)
 	_entities[id]["item_id"] = String(state.get("item_id", ""))
 	_entities[id]["qty"] = int(state.get("qty", 0))
+	_entities[id]["name"] = String(state.get("name", ""))
 
 ## The id of the nearest live resource node within `max_dist` world units of
 ## `from` (world coords), or "" if none. Used by the gather interaction.
 func nearest_resource(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "resource", true)
+
+## The id of the nearest live resource node of a SPECIFIC item within
+## `max_dist`, or "" if none — ability targeting (mining/abilities epic
+## #123, #119): Pick only ever wants a stone node, never a tree.
+func nearest_resource_item(from: Vector2, max_dist: float, item_id: String) -> String:
+	return _nearest(from, max_dist, "resource", true, item_id)
+
+## The id of the nearest NPC within `max_dist`, or "" if none (mining/
+## abilities epic #123, #121) — the E-key priority check against gathering.
+func nearest_npc(from: Vector2, max_dist: float) -> String:
+	return _nearest(from, max_dist, "npc", false)
+
+## `id`'s last known world position, or `Vector2.ZERO` if unknown — lets a
+## caller compare two candidate interactions' actual distances (#121: NPC
+## wins a tie only when it's genuinely nearer than the nearest node, not
+## merely "in range too").
+func wpos_of(id: String) -> Vector2:
+	return _entities.get(id, {}).get("wpos", Vector2.ZERO)
+
+## `id`'s display name (NPCs only carry one), or "" if unknown/none.
+func name_of(id: String) -> String:
+	return _entities.get(id, {}).get("name", "")
 
 ## The id of the nearest storage point within `max_dist`, or "" if none.
 func nearest_storage(from: Vector2, max_dist: float) -> String:
@@ -102,7 +125,7 @@ func overlaps_home_structure(corner: Vector2, footprint: Vector2) -> bool:
 			return true
 	return false
 
-func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
+func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool, item_id: String = "") -> String:
 	var best := ""
 	var best_d := max_dist
 	for id in _entities:
@@ -110,6 +133,8 @@ func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) ->
 		if rec.get("kind", "") != kind:
 			continue
 		if need_stock and int(rec.get("qty", 0)) <= 0:
+			continue
+		if item_id != "" and String(rec.get("item_id", "")) != item_id:
 			continue
 		var d := from.distance_to(rec.get("wpos", Vector2.ZERO))
 		if d <= best_d:
@@ -140,6 +165,7 @@ func _height_for(kind: String) -> float:
 		"structure": return 1.0
 		"bed": return 0.5
 		"crafting": return 0.9
+		"npc": return 1.1
 		_: return 1.2
 
 func _make_node(kind: String, state: Dictionary, id := "") -> MeshInstance3D:
@@ -210,6 +236,18 @@ func _make_node(kind: String, state: Dictionary, id := "") -> MeshInstance3D:
 			mi.mesh = bench
 			mi.material_override = _solid(Color(0.65, 0.45, 0.2))
 			_add_label(mi, "🛠 Craft", 1.8, Color(1.0, 0.85, 0.5))
+		"npc":
+			# An NPC (mining/abilities epic #123, #121; first one: the quarry
+			# foreman) — a warm-toned figure distinct from the blue player/mob
+			# capsules, with its authored name floating above so it reads as
+			# "someone to talk to" from a distance.
+			var figure := CapsuleMesh.new()
+			figure.radius = 0.65
+			figure.height = 2.3
+			mi.mesh = figure
+			mi.material_override = _solid(Color(0.85, 0.6, 0.35))
+			var npc_name := String(state.get("name", ""))
+			_add_label(mi, npc_name if npc_name != "" else "?", 2.0, Color(1.0, 0.9, 0.7))
 		_:
 			var cap := CapsuleMesh.new()
 			cap.radius = 0.6

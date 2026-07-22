@@ -63,6 +63,19 @@ const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
 const GATHER_XP: i64 = 10; // gathering-skill xp per unit
 const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 
+// --- Abilities (mining/abilities epic #123, #117) ------------------------------
+/// A swing must be this close to its target node — tighter than bare-hands
+/// GATHER_RANGE, since a swing is a deliberate melee-ish action, not "stand
+/// near and channel".
+const PICK_RANGE: i32 = 8;
+/// Mining-skill xp per successful swing (gathering's per-unit XP is 10; a
+/// swing is slightly more valuable since it's instant, not a multi-tick
+/// channel that can be walked away from).
+const PICK_XP_PER_SWING: i64 = 12;
+/// Must be this close to an NPC to talk to it — tighter than gathering,
+/// since talking is a deliberate face-to-face action.
+const NPC_TALK_RANGE: i32 = 10;
+
 // --- Environmental vitals (player-attributes epic #83, #87) --------------------
 // The zone knows no terrain: "underwater" arrives from the gateway as an
 // `env_state` flag (~1/s, computed against composited ground height vs sea
@@ -278,6 +291,17 @@ fn build_board_status_json(b: &mmo::world::BuildBoard) -> Value {
     })
 }
 
+/// An authored NPC as a render entity (mining/abilities epic #123, #118) —
+/// same `status_update` shape every other zone-cached entity uses, so it
+/// renders through the client's ordinary spawn path with no special case.
+fn npc_status_json(n: &mmo::world::NpcSpawn) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": n.id,
+        "state": { "x": n.x, "y": n.y, "type": "npc", "name": n.name, "facing": [0, 0] },
+    })
+}
+
 fn clamp_world(x: i32, y: i32) -> (i32, i32) {
     (x.clamp(0, WORLD_SIZE - 1), y.clamp(0, WORLD_SIZE - 1))
 }
@@ -386,6 +410,9 @@ struct ZoneServer {
     /// pushed by the gateway — gates deposit/withdraw/craft to "near the
     /// specific structure", not just "on some plot" (#13).
     home_structures: Mutex<Vec<HomeStructureRef>>,
+    /// Authored NPCs in this zone's region (mining/abilities epic #123, #118) —
+    /// fixed, never despawn, no runtime state beyond the authored spawn itself.
+    npcs: Mutex<Vec<mmo::world::NpcSpawn>>,
 }
 
 impl ZoneServer {
@@ -406,6 +433,7 @@ impl ZoneServer {
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
             home_structures: Mutex::new(Vec::new()),
+            npcs: Mutex::new(Vec::new()),
         })
     }
 
@@ -472,8 +500,16 @@ impl ZoneServer {
         self.plots.lock().unwrap().iter().any(|c| c.rect().contains(px, py))
     }
 
-    /// Push the current state of every node and storage point to the gateway (which
-    /// broadcasts it), so a just-joined client renders them.
+    /// (Re)cache the authored NPCs inside this zone's current region.
+    fn spawn_npcs(&self) {
+        let r = *self.region.lock().unwrap();
+        let npcs = self.capital.npcs_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        *self.npcs.lock().unwrap() = npcs;
+    }
+
+    /// Push the current state of every node, storage point, build board, and
+    /// NPC to the gateway (which broadcasts it), so a just-joined client
+    /// renders them.
     fn send_all_nodes(&self) {
         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
             for n in self.nodes.lock().unwrap().values() {
@@ -484,6 +520,9 @@ impl ZoneServer {
             }
             for b in self.build_boards.lock().unwrap().iter() {
                 let _ = tx.send(Message::Text(build_board_status_json(b).to_string()));
+            }
+            for n in self.npcs.lock().unwrap().iter() {
+                let _ = tx.send(Message::Text(npc_status_json(n).to_string()));
             }
         }
     }
@@ -569,6 +608,135 @@ impl ZoneServer {
         }
     }
 
+    /// Begin gathering a node: validate it exists, is in range, and has
+    /// stock; the per-unit yield is resolved authoritatively in the tick.
+    /// Solid rock (mining/abilities epic #123) refuses bare hands outright,
+    /// with a hint pointing at the fix — the pick ability, not this channel.
+    fn apply_gather_start(&self, pid: &str, node_id: &str) {
+        let (ok, is_rock) = {
+            let entities = self.entities.lock().unwrap();
+            let nodes = self.nodes.lock().unwrap();
+            match (entities.get(pid), nodes.get(node_id)) {
+                (Some(p), Some(n)) => (
+                    n.qty > 0 && dist2(p.x, p.y, n.x, n.y) <= (GATHER_RANGE as i64).pow(2),
+                    n.item_id == "stone",
+                ),
+                _ => (false, false),
+            }
+        };
+        if is_rock {
+            if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                let _ = tx.send(Message::Text(json!({
+                    "type": "gather.error", "player_id": pid,
+                    "message": "Solid rock — you need a pick. The quarry foreman can help.",
+                }).to_string()));
+            }
+            return;
+        }
+        if ok {
+            let anchor = self.entities.lock().unwrap().get(pid).map(|p| (p.x, p.y)).unwrap_or((0, 0));
+            self.gathering.lock().unwrap().insert(
+                pid.to_string(),
+                GatherJob { node_id: node_id.to_string(), progress: 0, anchor },
+            );
+        }
+    }
+
+    /// Push an ability's client-facing outcome. `ok=false` carries a
+    /// `reason` the hotbar can toast (#119, #117); `cooldown_ms` rides
+    /// along either way so the client's sweep always matches the gateway's
+    /// ledger, which already started it before this was even called.
+    fn send_ability_result(&self, pid: &str, ability_id: &str, ok: bool, reason: &str, cooldown_ms: i64) {
+        if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+            let mut v = json!({
+                "type": "ability.result", "player_id": pid,
+                "id": ability_id, "ok": ok, "cooldown_ms": cooldown_ms,
+            });
+            if !ok {
+                v["reason"] = json!(reason);
+            }
+            let _ = tx.send(Message::Text(v.to_string()));
+        }
+    }
+
+    /// Resolve a gateway-approved ability swing against this zone's live
+    /// state (mining/abilities epic #123, #117): the gateway already
+    /// checked the wielder's tool and cooldown; range, stock, and whether
+    /// the node is even the right kind for this ability are the zone's
+    /// call, since it alone knows live positions and node state. A
+    /// successful swing yields exactly like a gather tick would — the
+    /// internal `gather_yield` reuses the same gateway persistence path —
+    /// but instantly, with no channel.
+    fn apply_ability_swing(&self, pid: &str, ability_id: &str, node_id: &str, cooldown_ms: i64) {
+        let Some(target_item) = mmo::world::ability_target_item(ability_id) else { return };
+        let outcome = {
+            let entities = self.entities.lock().unwrap();
+            let mut nodes = self.nodes.lock().unwrap();
+            let Some(p) = entities.get(pid) else { return };
+            match nodes.get_mut(node_id) {
+                Some(node) if node.item_id == target_item && node.qty > 0 => {
+                    if dist2(p.x, p.y, node.x, node.y) > (PICK_RANGE as i64).pow(2) {
+                        Err("out_of_range")
+                    } else {
+                        node.qty -= 1;
+                        let depleted = node.qty <= 0;
+                        if depleted {
+                            node.respawn_timer = NODE_RESPAWN_TICKS;
+                        }
+                        Ok((node.item_id.clone(), depleted))
+                    }
+                }
+                _ => Err("exhausted"),
+            }
+        };
+        match outcome {
+            Ok((item_id, depleted)) => {
+                self.send_ability_result(pid, ability_id, true, "", cooldown_ms);
+                if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                    let skill = mmo::world::governing_skill(ability_id).unwrap_or("mining");
+                    let _ = tx.send(Message::Text(json!({
+                        "type": "gather_yield", "player_id": pid,
+                        "item_id": item_id, "qty": 1, "skill": skill, "xp": PICK_XP_PER_SWING,
+                    }).to_string()));
+                    let touch = if depleted {
+                        json!({"type": "despawn", "player_id": node_id})
+                    } else {
+                        match self.nodes.lock().unwrap().get(node_id) {
+                            Some(node) => node_status_json(node),
+                            None => return,
+                        }
+                    };
+                    let _ = tx.send(Message::Text(touch.to_string()));
+                }
+            }
+            Err(reason) => self.send_ability_result(pid, ability_id, false, reason, cooldown_ms),
+        }
+    }
+
+    /// Validate proximity to `npc_id` (mining/abilities epic #123, #118) and,
+    /// if close enough, forward an internal `npc_interact` to the gateway —
+    /// the only party that knows inventory/equipment, which is what decides
+    /// what the NPC actually says (and whether it hands over a pickaxe).
+    /// Too far, or an unknown NPC/player: silent no-op, same convention as
+    /// every other proximity-gated action in this file.
+    fn apply_npc_talk(&self, pid: &str, npc_id: &str) {
+        let in_range = {
+            let entities = self.entities.lock().unwrap();
+            let npcs = self.npcs.lock().unwrap();
+            match (entities.get(pid), npcs.iter().find(|n| n.id == npc_id)) {
+                (Some(p), Some(n)) => dist2(p.x, p.y, n.x, n.y) <= (NPC_TALK_RANGE as i64).pow(2),
+                _ => false,
+            }
+        };
+        if in_range {
+            if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                let _ = tx.send(Message::Text(json!({
+                    "type": "npc_interact", "player_id": pid, "npc_id": npc_id,
+                }).to_string()));
+            }
+        }
+    }
+
     async fn handle_proxy(self: Arc<Self>, raw: TcpStream) {
         let ws = match tokio_tungstenite::accept_async(raw).await {
             Ok(ws) => ws,
@@ -632,6 +800,7 @@ impl ZoneServer {
                 self.spawn_storage_points();
                 self.spawn_build_boards();
                 self.spawn_plots();
+                self.spawn_npcs();
                 *self.home_structures.lock().unwrap() = Vec::new();
                 continue;
             }
@@ -785,33 +954,25 @@ impl ZoneServer {
                     }
                 }
                 "gather.start" => {
-                    // Begin gathering a node: validate it exists, is in range, and has
-                    // stock; the per-unit yield is resolved authoritatively in the tick.
                     let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let ok = {
-                        let entities = self.entities.lock().unwrap();
-                        let nodes = self.nodes.lock().unwrap();
-                        match (entities.get(&player_id), nodes.get(&node_id)) {
-                            (Some(p), Some(n)) => n.qty > 0 && dist2(p.x, p.y, n.x, n.y) <= (GATHER_RANGE as i64).pow(2),
-                            _ => false,
-                        }
-                    };
-                    if ok {
-                        let anchor = self
-                            .entities
-                            .lock()
-                            .unwrap()
-                            .get(&player_id)
-                            .map(|p| (p.x, p.y))
-                            .unwrap_or((0, 0));
-                        self.gathering.lock().unwrap().insert(
-                            player_id.clone(),
-                            GatherJob { node_id, progress: 0, anchor },
-                        );
-                    }
+                    self.apply_gather_start(&player_id, &node_id);
                 }
                 "gather.stop" => {
                     self.gathering.lock().unwrap().remove(&player_id);
+                }
+                "ability_swing" => {
+                    // Internal: the gateway already confirmed the tool and the
+                    // cooldown (#117) — only range/stock/target-item are ours
+                    // to know, since only the zone has live positions and node
+                    // state.
+                    let ability_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let cooldown_ms = data.get("cooldown_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                    self.apply_ability_swing(&player_id, &ability_id, &node_id, cooldown_ms);
+                }
+                "npc.talk" => {
+                    let npc_id = data.get("npc_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    self.apply_npc_talk(&player_id, &npc_id);
                 }
                 "store.deposit" | "store.withdraw" => {
                     // Validate the player is at a storage point; the gateway performs
@@ -1453,6 +1614,7 @@ impl ZoneServer {
         self.spawn_storage_points();
         self.spawn_build_boards();
         self.spawn_plots();
+        self.spawn_npcs();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -1850,6 +2012,36 @@ mod tests {
         zone
     }
 
+    const ROCK: &str = "node_civic_rock_0"; // authored at (12800, 12690), stone, qty 5
+
+    /// Civic zone with its authored nodes spawned and a player standing on the rock.
+    fn civic_zone_on_rock() -> Arc<ZoneServer> {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_nodes();
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(12800, 12690, PLAYER_MAX_HP),
+        );
+        zone
+    }
+
+    /// Wire a fresh proxy_tx onto `zone` without starting the game loop — for
+    /// instant (non-tick-driven) handlers like `apply_ability_swing`, which
+    /// push their outcome synchronously the moment they're called.
+    fn wire_proxy_tx(zone: &Arc<ZoneServer>) -> mpsc::UnboundedReceiver<Message> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *zone.proxy_tx.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(Message::Text(t)) = rx.try_recv() {
+            out.push(t);
+        }
+        out
+    }
+
     /// Run the game loop for `ticks` and return every text packet the zone emitted.
     async fn drive(zone: Arc<ZoneServer>, ticks: u32) -> Vec<String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1923,6 +2115,143 @@ mod tests {
         assert_eq!(count(&packets, "\"gather.result\""), 0, "no yield out of range");
         assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job cancelled");
         assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node untouched");
+    }
+
+    // --- Mining/abilities epic #123, #117: pick swings & pick-only rock ---------
+
+    /// Bare hands refuse solid rock outright — no channel starts, and the
+    /// client gets a hint pointing at the fix (the pick) instead of silence.
+    #[tokio::test]
+    async fn gather_start_on_rock_is_refused_with_a_hint() {
+        let zone = civic_zone_on_rock();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_gather_start("p1", ROCK);
+
+        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "no channel should start on rock");
+        let packets = drain(&mut rx);
+        let err = packets.iter().find(|p| p.contains("\"gather.error\"")).expect("expected a gather.error");
+        assert!(err.contains("pick"), "the hint should mention the fix: {err}");
+    }
+
+    /// Trees are unaffected by the pick-only rule — bare-hands gathering on
+    /// wood still starts a channel exactly as before.
+    #[tokio::test]
+    async fn gather_start_on_a_tree_is_unaffected() {
+        let zone = civic_zone_on_tree();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_gather_start("p1", TREE);
+
+        assert!(zone.gathering.lock().unwrap().contains_key("p1"), "bare hands still work on wood");
+        assert!(drain(&mut rx).iter().all(|p| !p.contains("\"gather.error\"")));
+    }
+
+    /// A swing in range of a stocked rock yields exactly one stone, mining
+    /// XP, an `ability.result` success, and an updated node status — no
+    /// channel, no progress bar, all synchronous.
+    #[tokio::test]
+    async fn pick_swing_yields_stone_and_mining_xp() {
+        let zone = civic_zone_on_rock();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
+            && p.contains("\"cooldown_ms\":1600")), "expected a successful ability.result: {packets:?}");
+        assert!(packets.iter().any(|p| p.contains("\"gather_yield\"") && p.contains("\"item_id\":\"stone\"")
+            && p.contains("\"skill\":\"mining\"") && p.contains("\"xp\":12")),
+            "missing the internal gather_yield with mining xp: {packets:?}");
+        assert_eq!(zone.nodes.lock().unwrap().get(ROCK).unwrap().qty, 4, "one stone taken");
+    }
+
+    /// Depleting a node on the final swing despawns it and schedules a
+    /// respawn — same tail behaviour as a gather channel's last tick.
+    #[tokio::test]
+    async fn pick_swing_depletes_node_then_despawns_and_schedules_respawn() {
+        let zone = civic_zone_on_rock();
+        zone.nodes.lock().unwrap().get_mut(ROCK).unwrap().qty = 1;
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(ROCK)));
+        let nodes = zone.nodes.lock().unwrap();
+        let n = nodes.get(ROCK).unwrap();
+        assert_eq!(n.qty, 0);
+        assert!(n.respawn_timer > 0, "respawn should be scheduled");
+    }
+
+    /// Too far from the rock: rejected, nothing taken, no yield.
+    #[tokio::test]
+    async fn pick_swing_out_of_range_is_rejected() {
+        let zone = civic_zone_on_rock();
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12900; // well past PICK_RANGE
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":false")
+            && p.contains("\"reason\":\"out_of_range\"")));
+        assert!(packets.iter().all(|p| !p.contains("\"gather_yield\"")));
+        assert_eq!(zone.nodes.lock().unwrap().get(ROCK).unwrap().qty, 5, "node untouched");
+    }
+
+    /// An empty node (or a wrong node kind — a tree, say) can't be swung at.
+    #[tokio::test]
+    async fn pick_swing_on_an_exhausted_or_wrong_node_is_rejected() {
+        let zone = civic_zone_on_rock();
+        zone.nodes.lock().unwrap().get_mut(ROCK).unwrap().qty = 0;
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        assert!(drain(&mut rx).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
+
+        // Standing on a tree instead: pick only targets stone.
+        let zone2 = civic_zone_on_tree();
+        let mut rx2 = wire_proxy_tx(&zone2);
+        zone2.apply_ability_swing("p1", "pick", TREE, 1600);
+        assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
+        assert_eq!(zone2.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "wrong-target swing takes nothing");
+    }
+
+    // --- Mining/abilities epic #123, #118: quarry foreman NPC talk range --------
+
+    const FOREMAN: &str = "npc_quarry_foreman"; // authored at (8232, 13945)
+
+    /// Civic zone with its authored NPCs spawned and a player standing at the foreman.
+    fn civic_zone_at_foreman() -> Arc<ZoneServer> {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_npcs();
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(8232, 13945, PLAYER_MAX_HP),
+        );
+        zone
+    }
+
+    /// Standing close enough forwards an internal `npc_interact` — the
+    /// gateway decides what's actually said (and whether anything's handed
+    /// over); the zone only ever gates on proximity.
+    #[tokio::test]
+    async fn npc_talk_in_range_forwards_interact() {
+        let zone = civic_zone_at_foreman();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_npc_talk("p1", FOREMAN);
+        let packets = drain(&mut rx);
+        assert!(
+            packets.iter().any(|p| p.contains("\"npc_interact\"")
+                && p.contains(FOREMAN) && p.contains("\"p1\"")),
+            "expected a forwarded npc_interact: {packets:?}"
+        );
+    }
+
+    /// Too far away: silent no-op, same convention as every other
+    /// proximity-gated action in this file.
+    #[tokio::test]
+    async fn npc_talk_out_of_range_is_silent() {
+        let zone = civic_zone_at_foreman();
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 8500; // well past NPC_TALK_RANGE
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_npc_talk("p1", FOREMAN);
+        assert!(drain(&mut rx).is_empty(), "too far to talk");
     }
 
     #[tokio::test]

@@ -1347,6 +1347,73 @@ impl Db {
         Ok(true)
     }
 
+    // --- Equipment (mining/abilities epic #123) ---------------------------
+
+    /// Arm `item_id` into `slot`, atomically checked against carried
+    /// inventory (equipping doesn't consume or move the item — it's a
+    /// pointer, same shape as [`Db::set_respawn_structure`] — so re-arming a
+    /// different item just overwrites the row). Returns `false` without
+    /// writing anything if the character doesn't actually carry one.
+    pub async fn equip(&self, character_id: &str, slot: &str, item_id: &str) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let have: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if have.unwrap_or(0) <= 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO equipment (character_id, slot, item_id) VALUES (?, ?, ?) \
+             ON CONFLICT(character_id, slot) DO UPDATE SET item_id = excluded.item_id",
+        )
+        .bind(character_id)
+        .bind(slot)
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Clear whatever's armed in `slot`. A no-op (not an error) if nothing was.
+    pub async fn unequip(&self, character_id: &str, slot: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM equipment WHERE character_id = ? AND slot = ?")
+            .bind(character_id)
+            .bind(slot)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// What's currently armed in `slot`, if anything.
+    pub async fn equipped(&self, character_id: &str, slot: &str) -> Result<Option<String>, DbError> {
+        sqlx::query_scalar("SELECT item_id FROM equipment WHERE character_id = ? AND slot = ?")
+            .bind(character_id)
+            .bind(slot)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Total carried quantity of one item (0 if none) — a cheap point
+    /// lookup for "do they have any of X at all" without pulling the whole
+    /// inventory. Used by the quarry foreman's "already has a pick?" gate
+    /// (mining/abilities epic #123, #118).
+    pub async fn inventory_qty(&self, character_id: &str, item_id: &str) -> Result<i64, DbError> {
+        let qty: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(qty.unwrap_or(0))
+    }
+
     /// Set (or clear) which structure a character respawns at. `structure_id` is
     /// trusted by the caller to be a `bed`-kind structure the character owns
     /// (#12) — persistence just records the pointer.

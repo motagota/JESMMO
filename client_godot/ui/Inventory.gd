@@ -7,6 +7,10 @@ class_name InventoryPanel
 extends CanvasLayer
 
 signal do_withdraw(item_id: String, qty: int)
+## Right-clicked an equippable item (mining/abilities epic #123, #119) —
+## Main sends `equip`. Unequipping happens from the HUD's "in hand" line,
+## not here (there's nothing armed to right-click once it's already worn).
+signal do_equip(item_id: String)
 
 const COLS := 5
 
@@ -85,5 +89,8 @@ func _rebuild() -> void:
 		var di := DraggableItem.new(item_id, qty, "inventory")
 		di.text = "%s\nx%d" % [item_id, qty]
 		di.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		if Protocol.is_equippable(item_id):
+			di.tooltip_text = "Drag to move  |  Right-click to equip"
+			di.right_clicked.connect(func(id): do_equip.emit(id))
 		slot.add_child(di)
 		_grid.add_child(slot)

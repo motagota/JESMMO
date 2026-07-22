@@ -6,12 +6,18 @@
 class_name Hud
 extends CanvasLayer
 
+## Right-clicked/clicked to unequip (mining/abilities epic #123, #119) — the
+## "in hand" line doubles as the unarm affordance, so there's no separate
+## button crowding the corner.
+signal unequip_pressed
+
 var _status: Label
 var _inv: Label
 var _skill: Label
 var _gather: Label
 var _build_hint: Label
 var _rent_hint: Label
+var _tool: Button
 var _gain: Label
 var _levelup: Label
 var _announce: Label
@@ -21,6 +27,10 @@ var zone := "—"
 var pos := Vector2.ZERO
 var _home := Vector2.ZERO
 var _has_home := false
+## What pressing E does right now — "gather" by default; Main switches this
+## to "talk" whenever an NPC is the nearer of the two (mining/abilities
+## epic #123, #121).
+var _interact_verb := "gather"
 
 ## skill_id -> {level, xp}, so each skill renders on the one line independently.
 var _skills: Dictionary = {}
@@ -48,6 +58,19 @@ func _ready() -> void:
 	_rent_hint = _line(box)
 	_rent_hint.modulate = Color(1.0, 0.9, 0.5)
 	_rent_hint.text = "[P] plot & rent"
+
+	# In-hand line (mining/abilities epic #123, #119): a flat button so
+	# clicking it unequips — empty (no text, no click target) while nothing's
+	# armed, so it doesn't read as a dead affordance.
+	_tool = Button.new()
+	_tool.flat = true
+	_tool.focus_mode = Control.FOCUS_NONE
+	_tool.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_tool.add_theme_font_size_override("font_size", 14)
+	_tool.add_theme_color_override("font_color", Color(0.85, 0.95, 1.0))
+	_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE # nothing armed yet: not a click target
+	_tool.pressed.connect(func(): unequip_pressed.emit())
+	box.add_child(_tool)
 
 	# Floating gain feedback, centred-ish on screen.
 	_gain = Label.new()
@@ -93,6 +116,14 @@ func set_pos(wx: float, wy: float) -> void:
 	pos = Vector2(wx, wy)
 	_refresh_status()
 
+## Switch the E-key hint between "gather" and "talk" (mining/abilities epic
+## #123, #121) — Main recomputes this every frame from whichever's nearer,
+## an NPC or a gatherable node.
+func set_interact_verb(verb: String) -> void:
+	if _interact_verb != verb:
+		_interact_verb = verb
+		_refresh_status()
+
 ## The player's home plot centre (from `plot.assigned`), so the status line can
 ## show a distance/compass reading back to it (#11).
 func set_home(wx: float, wy: float) -> void:
@@ -105,8 +136,8 @@ func _refresh_status() -> void:
 		var home_part := ""
 		if _has_home:
 			home_part = "   |   home: %s %dm" % [_compass(_home - pos), int(round(pos.distance_to(_home)))]
-		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] gather" % [
-			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part]
+		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] %s" % [
+			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part, _interact_verb]
 
 ## A rough compass heading from the player toward `delta` (world units).
 func _compass(delta: Vector2) -> String:
@@ -135,6 +166,17 @@ func set_inventory(items: Array, used: int, capacity: int) -> void:
 		var it: Dictionary = it_v
 		parts.append("%s x%d" % [String(it.get("item_id", "?")), int(it.get("qty", 0))])
 	_inv.text = "inventory: " + ", ".join(parts) + cap
+
+## The armed tool, or "" for nothing equipped (mining/abilities epic #123,
+## #119). A blank in-hand line while empty means the click target only
+## exists once there's something to unequip.
+func set_tool(item_id: String) -> void:
+	if item_id == "":
+		_tool.text = ""
+		_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	else:
+		_tool.text = "In hand: %s %s   (click to unequip)" % [Protocol.item_icon(item_id), item_id]
+		_tool.mouse_filter = Control.MOUSE_FILTER_STOP
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
 	# Track each skill independently so a building-XP gain doesn't overwrite the

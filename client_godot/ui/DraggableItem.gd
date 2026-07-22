@@ -7,6 +7,12 @@
 class_name DraggableItem
 extends Button
 
+## Right-clicked (mining/abilities epic #123, #119): the inventory panel
+## turns this into "arm this in the tool slot" for equippable items. Uses
+## the Control base's `gui_input` SIGNAL (not the `_gui_input` virtual), so
+## it coexists with Button's own native left-click/drag handling untouched.
+signal right_clicked(item_id: String)
+
 var item_id: String
 var qty: int
 var source: String # "inventory" | "storage"
@@ -21,6 +27,11 @@ func _init(p_item_id: String = "", p_qty: int = 0, p_source: String = "") -> voi
 	alignment = HORIZONTAL_ALIGNMENT_LEFT
 	text = "≡ %s x%d" % [item_id, qty]
 	tooltip_text = "Drag to move"
+	gui_input.connect(_on_gui_input)
+
+func _on_gui_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
+		right_clicked.emit(item_id)
 
 func _get_drag_data(_at_position: Vector2) -> Variant:
 	if qty <= 0:

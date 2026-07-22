@@ -366,6 +366,11 @@ struct Proxy {
     /// editors interleaving load/save would silently drop one's cells. Edits
     /// are human-rate, so one async lock across the whole apply is plenty.
     terrain_edit_lock: tokio::sync::Mutex<()>,
+    /// Per-(character, ability) last-use instant (mining/abilities epic
+    /// #123, #117) — server-authoritative cooldown enforcement. In-memory
+    /// only: a gateway restart clears everyone's cooldowns, same as any
+    /// other session-scoped guard (e.g. `cooldowns` above, for zone splits).
+    ability_cooldowns: Mutex<HashMap<(String, String), Instant>>,
 }
 
 /// Cap on the rolling DB-latency sample window (#16) — recent-enough to be a
@@ -502,6 +507,7 @@ impl Proxy {
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
+            ability_cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -979,6 +985,15 @@ impl Proxy {
                         let y = data.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                         let rot = data.get("rot").and_then(|v| v.as_i64()).unwrap_or(0);
                         self.apply_build_place(pid, kind, x, y, rot).await;
+                    }
+                }
+                Some("npc_interact") => {
+                    // Internal: a zone validated talk-range proximity. Whether the
+                    // NPC hands over anything (mining/abilities epic #123, #118) is
+                    // authoritative here — only the gateway knows inventory/equipment.
+                    if let Some(pid) = target_player.as_deref() {
+                        let npc_id = data.get("npc_id").and_then(|v| v.as_str()).unwrap_or("");
+                        self.apply_npc_interact(pid, npc_id).await;
                     }
                 }
                 Some("craft_make") => {
@@ -3079,6 +3094,149 @@ impl Proxy {
         }
     }
 
+    // --- Equipment (mining/abilities epic #123) -----------------------------
+
+    /// Push a character's tool slot + the abilities it grants to its client as
+    /// `equip.update`. This is the **only** place ability cooldowns are
+    /// computed for display — each `cooldown_ms` is already level-scaled via
+    /// [`mmo::world::ability_cooldown_ms`], so the hotbar always shows exactly
+    /// what the gateway will enforce on `ability.use` (#117).
+    async fn send_equipment(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let tool = db.equipped(pid, "tool").await.ok().flatten();
+        let mut abilities: Vec<Value> = Vec::new();
+        if let Some(item_id) = &tool {
+            for a in mmo::world::abilities_for_item(item_id) {
+                let level = match mmo::world::governing_skill(a.id) {
+                    Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
+                    None => 0,
+                };
+                abilities.push(json!({
+                    "id": a.id, "name": a.name,
+                    "cooldown_ms": mmo::world::ability_cooldown_ms(a.id, level),
+                }));
+            }
+        }
+        self.push_to_player(pid, json!({
+            "type": "equip.update", "player_id": pid, "tool": tool, "abilities": abilities,
+        }));
+    }
+
+    /// Arm `item_id` in the slot it belongs to (mining/abilities epic #123).
+    /// An unrecognized/unequippable item id is silently ignored (a
+    /// well-behaved client only ever offers equippable items); not owning
+    /// one is the one case a legitimate client can hit — e.g. a stale
+    /// inventory view — so that gets an explicit `equip_error`.
+    async fn apply_equip(&self, pid: &str, item_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(slot) = mmo::world::equippable_slot(item_id) else { return };
+        match db.equip(pid, slot, item_id).await {
+            Ok(true) => self.send_equipment(pid).await,
+            Ok(false) => self.push_to_player(pid, json!({
+                "type": "equip_error", "message": "you don't have one of those",
+            })),
+            Err(_) => {}
+        }
+    }
+
+    /// Clear the tool slot.
+    async fn apply_unequip(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if db.unequip(pid, "tool").await.is_ok() {
+            self.send_equipment(pid).await;
+        }
+    }
+
+    // --- Abilities (mining/abilities epic #123, #117) -----------------------
+
+    /// The gateway's half of an ability use: confirm the wielder actually
+    /// has a tool granting `ability_id` and that its per-character cooldown
+    /// has elapsed — both server-authoritative, both things only the
+    /// gateway knows (equipment + skill levels live in the DB). If both
+    /// pass, hand off to the current zone for range/stock/target
+    /// validation, which is the only party with live positions and node
+    /// state. The cooldown ledger is stamped **before** forwarding — a
+    /// swing costs its cooldown the moment it's thrown, hit or miss, same
+    /// as a real swing would.
+    async fn apply_ability_use(&self, pid: &str, ability_id: &str, node_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let tool = db.equipped(pid, "tool").await.ok().flatten();
+        let granted = tool
+            .as_deref()
+            .map(|t| mmo::world::abilities_for_item(t).iter().any(|a| a.id == ability_id))
+            .unwrap_or(false);
+        if !granted {
+            self.push_to_player(pid, json!({
+                "type": "ability.result", "id": ability_id, "ok": false, "reason": "no_tool",
+            }));
+            return;
+        }
+        let level = match mmo::world::governing_skill(ability_id) {
+            Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
+            None => 0,
+        };
+        let cooldown_ms = mmo::world::ability_cooldown_ms(ability_id, level);
+        let now = Instant::now();
+        {
+            let mut ledger = self.ability_cooldowns.lock().unwrap();
+            let key = (pid.to_string(), ability_id.to_string());
+            if let Some(&last) = ledger.get(&key) {
+                if now.saturating_duration_since(last) < Duration::from_millis(cooldown_ms as u64) {
+                    self.push_to_player(pid, json!({
+                        "type": "ability.result", "id": ability_id, "ok": false,
+                        "reason": "cooldown", "cooldown_ms": cooldown_ms,
+                    }));
+                    return;
+                }
+            }
+            ledger.insert(key, now);
+        }
+        self.route_client_frame(pid, json!({
+            "type": "ability_swing", "id": ability_id, "node_id": node_id, "cooldown_ms": cooldown_ms,
+        }));
+    }
+
+    // --- NPCs (mining/abilities epic #123, #118) -----------------------------
+
+    /// Resolve a talk the zone already confirmed was in range: the quarry
+    /// foreman hands over a pickaxe the first time (and any time since —
+    /// it's a safety net, not a farm) a character has none at all, in
+    /// inventory or in hand; otherwise he just talks. Unknown NPC ids are a
+    /// silent no-op — only the foreman has dialogue today.
+    async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(npc) = mmo::world::npc(npc_id) else { return };
+        if npc_id != "npc_quarry_foreman" {
+            return;
+        }
+        let owned = db.inventory_qty(pid, "pickaxe").await.unwrap_or(0);
+        let equipped = db.equipped(pid, "tool").await.ok().flatten();
+        let has_one = owned > 0 || equipped.as_deref() == Some("pickaxe");
+        let mut granted = false;
+        if !has_one {
+            let added = db.add_to_inventory(pid, "pickaxe", 1).await.unwrap_or(0);
+            if added > 0 {
+                granted = true;
+                self.send_inventory(pid).await;
+            }
+        }
+        let lines: Vec<&str> = if granted {
+            vec![
+                "No pick? Take mine, and mind the edge.",
+                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
+            ]
+        } else {
+            vec![
+                "Keep that pick on the rock, not the ground between swings.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ]
+        };
+        self.push_to_player(pid, json!({
+            "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
+            "lines": lines, "granted": granted,
+        }));
+    }
+
     /// Apply a `craft_make` reported by a zone (which validated only that the
     /// player is standing on some plot). Confirm they own a `crafting`-kind
     /// structure somewhere on their own plot, then attempt the craft. Silent
@@ -4099,15 +4257,17 @@ impl Proxy {
             self.route_client_frame(&player_id, frame);
         }
 
-        // Hydrate the client's gameplay state: inventory, storage, skills, the
-        // district's build-order board, any already-completed city structures, the
-        // character's starter plot (allocating one on a brand-new character),
-        // every home structure in the district (everyone's homes, not just
-        // theirs), and their own plot's rent status.
+        // Hydrate the client's gameplay state: inventory, storage, skills,
+        // equipped tool + its abilities, the district's build-order board, any
+        // already-completed city structures, the character's starter plot
+        // (allocating one on a brand-new character), every home structure in
+        // the district (everyone's homes, not just theirs), and their own
+        // plot's rent status.
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
+            self.send_equipment(&player_id).await;
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
             self.send_plot(&player_id).await;
@@ -4162,6 +4322,29 @@ impl Proxy {
                     // no player position/proximity is relevant, so answer directly.
                     if data.get("type").and_then(|v| v.as_str()) == Some("craft.list") {
                         self.send_recipes(&player_id);
+                        continue;
+                    }
+                    // `equip`/`unequip` (mining/abilities epic #123): arming a
+                    // tool is pure inventory bookkeeping, no live position or
+                    // proximity involved — answer directly, same reasoning as
+                    // `craft.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("equip") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_equip(&player_id, &item_id).await;
+                        continue;
+                    }
+                    if data.get("type").and_then(|v| v.as_str()) == Some("unequip") {
+                        self.apply_unequip(&player_id).await;
+                        continue;
+                    }
+                    // `ability.use` (mining/abilities epic #123, #117) needs the
+                    // gateway's DB (equipped tool, skill level, cooldown ledger)
+                    // before the zone's range/stock check even makes sense —
+                    // answer directly like `equip`, then forward internally.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("ability.use") {
+                        let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_ability_use(&player_id, &id, &node_id).await;
                         continue;
                     }
                     // `terrain.list` is a stateless read of the static heightmap
@@ -4669,6 +4852,7 @@ mod tests {
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
+            ability_cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -6425,6 +6609,302 @@ mod tests {
             "type": "craft_make", "player_id": pid, "recipe_id": "tool_kit",
         }).to_string())).unwrap();
         assert!(recv_frame(&mut ws).await.is_none(), "missing stone should mean no craft");
+
+        drop(ws);
+    }
+
+    /// Pickaxe is a normal recipe (mining/abilities epic #123, #116): same
+    /// station+ingredients gate as any other craft.
+    #[tokio::test]
+    async fn pickaxe_recipe_crafts_at_a_station() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Smith").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "wood", "qty": 2, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "stone", "qty": 3, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        let (mut saw_wood, mut saw_stone) = (false, false);
+        while !(saw_wood && saw_stone) {
+            let v = recv_frame(&mut ws).await.expect("expected the stocking pushes");
+            if v["type"] == "inv.update" {
+                let items = v["items"].as_array().cloned().unwrap_or_default();
+                saw_wood = items.iter().any(|it| it["item_id"] == "wood" && it["qty"] == 2);
+                saw_stone = items.iter().any(|it| it["item_id"] == "stone" && it["qty"] == 3);
+            }
+        }
+
+        place_home_structure(&mut zone, &mut ws, &pid, "crafting", bx + 5, by + 5).await;
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "craft_make", "player_id": pid, "recipe_id": "pickaxe",
+        }).to_string())).unwrap();
+        let made = loop {
+            let v = recv_frame(&mut ws).await.expect("expected craft.made");
+            if v["type"] == "craft.made" { break v; }
+        };
+        assert_eq!(made["item_id"], "pickaxe");
+        assert_eq!(made["qty"], 1);
+
+        drop(ws);
+    }
+
+    /// Equip/unequip (mining/abilities epic #123, #116): arming a tool
+    /// requires actually owning it, grants the item's abilities on
+    /// `equip.update` with a cooldown already scaled by the governing skill's
+    /// level, and the armed tool survives a reconnect (it's durable, not
+    /// session state).
+    #[tokio::test]
+    async fn equip_requires_ownership_grants_abilities_and_persists() {
+        let (proxy, _dbf, zone) = proxy_with_db().await;
+        let email = format!("eq_{}@t.test", Uuid::new_v4().simple());
+
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Miner"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // No pickaxe yet: equipping is rejected, nothing persisted.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        let err = recv_until(&mut ws, "equip_error").await;
+        assert!(err["message"].as_str().unwrap().contains("don't have"), "unexpected: {err}");
+
+        // Grant one mining level's worth of xp (2500 -> level 5) and a pickaxe,
+        // as a foreman hand-out + some practice would. Drain both the
+        // inventory AND skill pushes (not just the first) before the next
+        // write — same idiom as the crafting test: firing straight into a
+        // transaction that's still committing races SQLite into "database
+        // is locked" rather than actually reordering anything.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
+        }).to_string())).unwrap();
+        let (mut saw_inv, mut saw_skill) = (false, false);
+        while !(saw_inv && saw_skill) {
+            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
+                Some("inv.update") => saw_inv = true,
+                Some("skill.update") => saw_skill = true,
+                _ => {}
+            }
+        }
+
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        let update = recv_until(&mut ws, "equip.update").await;
+        assert_eq!(update["tool"], "pickaxe");
+        let abilities = update["abilities"].as_array().unwrap();
+        assert_eq!(abilities.len(), 1);
+        assert_eq!(abilities[0]["id"], "pick");
+        assert_eq!(abilities[0]["cooldown_ms"], 2000 - 80 * 5, "level 5 shaves the swing cooldown");
+
+        // Unequip clears the slot and the granted abilities with it.
+        ws.send(Message::Text(json!({"type": "unequip"}).to_string())).await.unwrap();
+        let cleared = recv_until(&mut ws, "equip.update").await;
+        assert!(cleared["tool"].is_null());
+        assert!(cleared["abilities"].as_array().unwrap().is_empty());
+
+        // Re-arm, then reconnect: the tool is durable state, so login
+        // hydration re-sends the same equip.update without re-equipping.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        recv_until(&mut ws, "equip.update").await;
+        drop(ws);
+
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(
+            json!({"type": "login", "email": email, "password": "pw12"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws2, "welcome").await;
+        let rehydrated = recv_until(&mut ws2, "equip.update").await;
+        assert_eq!(rehydrated["tool"], "pickaxe", "the armed tool survives a reconnect");
+        drop(ws2);
+    }
+
+    /// Read `from_proxy` values until one of type `ty` arrives, discarding
+    /// anything else (registration/hydration housekeeping the zone doesn't
+    /// care about in these tests) — same "assert in wire order, skip the
+    /// rest" idiom as the client-side `recv_until`.
+    async fn recv_value_until(rx: &mut mpsc::UnboundedReceiver<Value>, ty: &str) -> Value {
+        loop {
+            let v = recv_value(rx).await;
+            if v.get("type").and_then(|x| x.as_str()) == Some(ty) {
+                return v;
+            }
+        }
+    }
+
+    /// `ability.use` with no tool equipped (mining/abilities epic #123,
+    /// #117) is rejected at the gateway — before the zone is ever involved,
+    /// since only the gateway knows what's equipped.
+    #[tokio::test]
+    async fn ability_use_without_a_tool_is_rejected() {
+        let (proxy, _dbf, mut zone) = proxy_with_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("ab_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Barehands"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let result = recv_until(&mut ws, "ability.result").await;
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], "no_tool");
+
+        // Nothing was forwarded to the zone — the gateway never got that far.
+        while zone.from_proxy.try_recv().is_ok() {} // drain registration housekeeping
+        assert!(zone.from_proxy.try_recv().is_err(), "no ability_swing should have been forwarded");
+        drop(ws);
+    }
+
+    /// With a pickaxe armed, `ability.use` is accepted, the forwarded
+    /// `ability_swing` carries a cooldown already scaled by the wielder's
+    /// mining level, and firing again before that cooldown elapses is
+    /// rejected server-side without a second forward — the client's hotbar
+    /// sweep is a prediction, this is the enforcement.
+    #[tokio::test]
+    async fn ability_use_forwards_a_level_scaled_swing_and_enforces_cooldown() {
+        let (proxy, _dbf, mut zone) = proxy_with_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("ab_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Swinger"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Level 5 (2500 xp): cooldown should come out to 2000 - 80*5 = 1600ms.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
+        }).to_string())).unwrap();
+        let (mut saw_inv, mut saw_skill) = (false, false);
+        while !(saw_inv && saw_skill) {
+            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
+                Some("inv.update") => saw_inv = true,
+                Some("skill.update") => saw_skill = true,
+                _ => {}
+            }
+        }
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        recv_until(&mut ws, "equip.update").await;
+
+        while zone.from_proxy.try_recv().is_ok() {} // drain registration/equip housekeeping
+
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let swing = recv_value_until(&mut zone.from_proxy, "ability_swing").await;
+        assert_eq!(swing["id"], "pick");
+        assert_eq!(swing["node_id"], "node_civic_rock_0");
+        assert_eq!(swing["player_id"], pid, "spoofable field must be the real id");
+        assert_eq!(swing["cooldown_ms"], 2000 - 80 * 5, "level 5 shaves the cooldown");
+
+        // Fire again immediately: rejected server-side, nothing forwarded.
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let result = recv_until(&mut ws, "ability.result").await;
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], "cooldown");
+        assert!(zone.from_proxy.try_recv().is_err(), "a cooling-down swing must not forward");
+
+        drop(ws);
+    }
+
+    /// The quarry foreman (mining/abilities epic #123, #118) hands over
+    /// exactly one pickaxe the first time a character has none at all —
+    /// then stops, whether they're holding it in their bags or in hand.
+    #[tokio::test]
+    async fn npc_interact_grants_a_pickaxe_only_while_the_character_has_none() {
+        // Shared DB handle so "no second grant" is a deterministic query
+        // against durable state, not a race against however many hydration
+        // frames (equip.update, build.list, rent.status, ...) happen to
+        // still be in flight when the assertion runs.
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("nf_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Newcomer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // First talk: no pickaxe anywhere -> granted, with the hand-out line.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let dialogue = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(dialogue["name"], "Sten");
+        assert_eq!(dialogue["granted"], true);
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1);
+
+        // Talk again, still carrying it: no second grant, and the mentoring
+        // line (not the hand-out one) plays instead.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let again = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(again["granted"], false);
+        assert_ne!(again["lines"], dialogue["lines"], "a returning visitor hears different lines");
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "no second grant");
+
+        // Equipping is a pointer, not a move (#116) — the pickaxe stays
+        // counted in the bag too. A third talk still grants nothing either
+        // way, whether the "owned" or the "equipped" half of the check fires.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        // Login hydration also pushes an `equip.update` (tool: null) — it
+        // races the npc_interact replies above over a different async path
+        // (the zone-listener task, not this client's), so it can still be
+        // sitting unread here. Loop past it to the one this equip actually
+        // produced (tool: "pickaxe").
+        loop {
+            if recv_until(&mut ws, "equip.update").await["tool"] == "pickaxe" {
+                break;
+            }
+        }
+        assert_eq!(db.equipped(&pid, "tool").await.unwrap().as_deref(), Some("pickaxe"));
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "equip doesn't move the item");
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let equipped_talk = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(equipped_talk["granted"], false, "an equipped pick still counts as owned");
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "still no second grant");
 
         drop(ws);
     }

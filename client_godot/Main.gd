@@ -36,6 +36,8 @@ var _build_place: BuildPlace
 var _mayor_road: MayorRoad
 var _rent: RentPanel
 var _transition: DistrictTransition
+var _hotbar: HotbarPanel
+var _npc_dialogue: NpcDialoguePanel
 
 var _editor_mode := false
 var _editor_cam: EditorCamera
@@ -113,6 +115,12 @@ func _ready() -> void:
     _craft.visible = false
     add_child(_craft)
 
+    _hotbar = HotbarPanel.new()
+    add_child(_hotbar)
+
+    _npc_dialogue = NpcDialoguePanel.new()
+    add_child(_npc_dialogue)
+
     _build_place = BuildPlace.new()
     add_child(_build_place)
 
@@ -155,6 +163,24 @@ func _process(_delta: float) -> void:
     _build.show_panel(near_board)
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
+
+    # NPCs win the E-key prompt over gathering exactly when one's actually
+    # nearer (mining/abilities epic #123, #121) — not merely "in range too";
+    # NPC_TALK_RANGE is already far tighter than GATHER_RANGE, but a rock
+    # could still sit closer than an NPC even with both in range.
+    var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
+    var gather_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
+    var npc_wins := npc_id != "" and (gather_id == "" or
+        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
+            <= _player.world_pos().distance_to(_entities.wpos_of(gather_id)))
+    _hud.set_interact_verb("talk" if npc_wins else "gather")
+
+    # Auto-fire (mining/abilities epic #123, #120): re-attempt every
+    # auto-armed, ready slot each frame — a no-target miss is silent
+    # (the slot just idles until a rock comes back in range), same as a
+    # manual press would round-trip and get rejected as `exhausted`.
+    for id in _hotbar.ready_auto_ids():
+        _on_hotbar_use(id, true)
 
     # Feed the placement ghost the camera (to raycast the mouse onto the
     # ground), the player's own plot bounds, and the live entity roster (both
@@ -317,13 +343,30 @@ func _wire_signals() -> void:
     _rent.do_pay.connect(func(plot_id): _net.send_rent_pay(plot_id))
     _rent.do_set_autopay.connect(func(plot_id, enabled): _net.send_rent_set_autopay(plot_id, enabled))
 
+    # Equipment & abilities (mining/abilities epic #123, #119).
+    _net.equip_update.connect(func(tool, abilities):
+        _hud.set_tool(tool)
+        _hotbar.set_abilities(abilities))
+    _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
+    _net.ability_result.connect(func(id, ok, cooldown_ms, reason):
+        _hotbar.on_ability_result(id, ok, cooldown_ms)
+        if not ok:
+            _hud.flash_announce(_ability_fail_text(reason)))
+    _inventory.do_equip.connect(func(item_id): _net.send_equip(item_id))
+    _hud.unequip_pressed.connect(func(): _net.send_unequip())
+    _hotbar.use_pressed.connect(_on_hotbar_use)
+    _net.npc_dialogue.connect(func(_npc_id, npc_name, lines, granted):
+        _npc_dialogue.show_dialogue(npc_name, lines, granted)
+        if granted:
+            _hud.flash_gain("pickaxe", 1))
+
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
     _login.do_guest.connect(func(): _net.guest())
 
     _player.move_requested.connect(func(dx, dy): _net.send_move(dx, dy))
     _player.attack_requested.connect(func(dx, dy): _net.send_attack(dx, dy))
-    _player.gather_pressed.connect(_on_gather_pressed)
+    _player.interact_pressed.connect(_on_interact_pressed)
     _player.position_changed.connect(func(wx, wy):
         _hud.set_pos(wx, wy)
         _minimap.set_player(wx, wy, _player.facing())
@@ -508,11 +551,53 @@ func _check_district_crossing(wx: float, wy: float) -> void:
     _transition.begin(d)
     _net.send_district_enter(from_district, d)
 
-## Gather the nearest in-range resource node (resolved from the entity manager).
-func _on_gather_pressed() -> void:
+## E was pressed (mining/abilities epic #123, #121): closes an open dialogue
+## first (E doubles as its close key — this must swallow the press, not
+## re-open a fresh talk on the same keystroke); otherwise talks to the
+## nearest NPC if it's the nearer of the two interactions, else gathers the
+## nearest in-range resource node. Mirrors the `_hud.set_interact_verb`
+## priority computed every frame in `_process`.
+func _on_interact_pressed() -> void:
+    if _npc_dialogue.visible:
+        _npc_dialogue.close()
+        return
+    var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
     var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
-    if node_id != "":
+    var npc_wins := npc_id != "" and (node_id == "" or
+        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
+            <= _player.world_pos().distance_to(_entities.wpos_of(node_id)))
+    if npc_wins:
+        _net.send_npc_talk(npc_id)
+    elif node_id != "":
         _net.send_gather_start(node_id)
+
+## Resolve a hotbar press to a target node and send `ability.use` (mining/
+## abilities epic #123, #119/#120). For a non-harvesting ability (none exist
+## yet) `target_item` is "" and any node_id is sent (server-side validated).
+## Nothing in range is a purely local no-op — no point in a round trip the
+## zone will just reject as `exhausted` — toasted only for an explicit
+## press; `silent` (auto-fire's per-frame poll, #120) skips the toast so
+## standing away from any rock with auto armed doesn't spam the HUD.
+func _on_hotbar_use(ability_id: String, silent: bool = false) -> void:
+    var target_item := Protocol.ability_target_item(ability_id)
+    var node_id := ""
+    if target_item != "":
+        node_id = _entities.nearest_resource_item(_player.world_pos(), Protocol.PICK_RANGE, target_item)
+        if node_id == "":
+            if not silent:
+                _hud.flash_announce("Nothing to swing at — get closer to a rock")
+            return
+    _hotbar.mark_sent(ability_id)
+    _net.send_ability_use(ability_id, node_id)
+
+## Human text for an `ability.result` failure reason.
+func _ability_fail_text(reason: String) -> String:
+    match reason:
+        "no_tool": return "You need a pickaxe in hand"
+        "cooldown": return "Still on cooldown"
+        "out_of_range": return "Too far from the rock"
+        "exhausted": return "Nothing to swing at there"
+        _: return "Swing failed"
 
 func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
     if id == _my_id:
