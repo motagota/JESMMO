@@ -257,6 +257,15 @@ pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
     }
 }
 
+/// The node item an ability harvests, for abilities that target a resource
+/// node at all (some future ability — a heal, say — might not).
+pub fn ability_target_item(ability_id: &str) -> Option<&'static str> {
+    match ability_id {
+        "pick" => Some("stone"),
+        _ => None,
+    }
+}
+
 /// An ability's swing/use cooldown (ms) at a given level of its governing
 /// skill (0 if ungoverned or the wielder hasn't trained it). Each ability
 /// hardcodes its own curve for now — there's exactly one — but this is the

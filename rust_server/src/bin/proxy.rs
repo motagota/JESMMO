@@ -366,6 +366,11 @@ struct Proxy {
     /// editors interleaving load/save would silently drop one's cells. Edits
     /// are human-rate, so one async lock across the whole apply is plenty.
     terrain_edit_lock: tokio::sync::Mutex<()>,
+    /// Per-(character, ability) last-use instant (mining/abilities epic
+    /// #123, #117) — server-authoritative cooldown enforcement. In-memory
+    /// only: a gateway restart clears everyone's cooldowns, same as any
+    /// other session-scoped guard (e.g. `cooldowns` above, for zone splits).
+    ability_cooldowns: Mutex<HashMap<(String, String), Instant>>,
 }
 
 /// Cap on the rolling DB-latency sample window (#16) — recent-enough to be a
@@ -502,6 +507,7 @@ impl Proxy {
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
+            ability_cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3132,6 +3138,55 @@ impl Proxy {
         }
     }
 
+    // --- Abilities (mining/abilities epic #123, #117) -----------------------
+
+    /// The gateway's half of an ability use: confirm the wielder actually
+    /// has a tool granting `ability_id` and that its per-character cooldown
+    /// has elapsed — both server-authoritative, both things only the
+    /// gateway knows (equipment + skill levels live in the DB). If both
+    /// pass, hand off to the current zone for range/stock/target
+    /// validation, which is the only party with live positions and node
+    /// state. The cooldown ledger is stamped **before** forwarding — a
+    /// swing costs its cooldown the moment it's thrown, hit or miss, same
+    /// as a real swing would.
+    async fn apply_ability_use(&self, pid: &str, ability_id: &str, node_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let tool = db.equipped(pid, "tool").await.ok().flatten();
+        let granted = tool
+            .as_deref()
+            .map(|t| mmo::world::abilities_for_item(t).iter().any(|a| a.id == ability_id))
+            .unwrap_or(false);
+        if !granted {
+            self.push_to_player(pid, json!({
+                "type": "ability.result", "id": ability_id, "ok": false, "reason": "no_tool",
+            }));
+            return;
+        }
+        let level = match mmo::world::governing_skill(ability_id) {
+            Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
+            None => 0,
+        };
+        let cooldown_ms = mmo::world::ability_cooldown_ms(ability_id, level);
+        let now = Instant::now();
+        {
+            let mut ledger = self.ability_cooldowns.lock().unwrap();
+            let key = (pid.to_string(), ability_id.to_string());
+            if let Some(&last) = ledger.get(&key) {
+                if now.saturating_duration_since(last) < Duration::from_millis(cooldown_ms as u64) {
+                    self.push_to_player(pid, json!({
+                        "type": "ability.result", "id": ability_id, "ok": false,
+                        "reason": "cooldown", "cooldown_ms": cooldown_ms,
+                    }));
+                    return;
+                }
+            }
+            ledger.insert(key, now);
+        }
+        self.route_client_frame(pid, json!({
+            "type": "ability_swing", "id": ability_id, "node_id": node_id, "cooldown_ms": cooldown_ms,
+        }));
+    }
+
     /// Apply a `craft_make` reported by a zone (which validated only that the
     /// player is standing on some plot). Confirm they own a `crafting`-kind
     /// structure somewhere on their own plot, then attempt the craft. Silent
@@ -4232,6 +4287,16 @@ impl Proxy {
                         self.apply_unequip(&player_id).await;
                         continue;
                     }
+                    // `ability.use` (mining/abilities epic #123, #117) needs the
+                    // gateway's DB (equipped tool, skill level, cooldown ledger)
+                    // before the zone's range/stock check even makes sense —
+                    // answer directly like `equip`, then forward internally.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("ability.use") {
+                        let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_ability_use(&player_id, &id, &node_id).await;
+                        continue;
+                    }
                     // `terrain.list` is a stateless read of the static heightmap
                     // grid (#54) — same reasoning as `craft.list`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("terrain.list") {
@@ -4737,6 +4802,7 @@ mod tests {
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
+            ability_cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -6620,6 +6686,111 @@ mod tests {
         let rehydrated = recv_until(&mut ws2, "equip.update").await;
         assert_eq!(rehydrated["tool"], "pickaxe", "the armed tool survives a reconnect");
         drop(ws2);
+    }
+
+    /// Read `from_proxy` values until one of type `ty` arrives, discarding
+    /// anything else (registration/hydration housekeeping the zone doesn't
+    /// care about in these tests) — same "assert in wire order, skip the
+    /// rest" idiom as the client-side `recv_until`.
+    async fn recv_value_until(rx: &mut mpsc::UnboundedReceiver<Value>, ty: &str) -> Value {
+        loop {
+            let v = recv_value(rx).await;
+            if v.get("type").and_then(|x| x.as_str()) == Some(ty) {
+                return v;
+            }
+        }
+    }
+
+    /// `ability.use` with no tool equipped (mining/abilities epic #123,
+    /// #117) is rejected at the gateway — before the zone is ever involved,
+    /// since only the gateway knows what's equipped.
+    #[tokio::test]
+    async fn ability_use_without_a_tool_is_rejected() {
+        let (proxy, _dbf, mut zone) = proxy_with_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("ab_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Barehands"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "welcome").await;
+
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let result = recv_until(&mut ws, "ability.result").await;
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], "no_tool");
+
+        // Nothing was forwarded to the zone — the gateway never got that far.
+        while zone.from_proxy.try_recv().is_ok() {} // drain registration housekeeping
+        assert!(zone.from_proxy.try_recv().is_err(), "no ability_swing should have been forwarded");
+        drop(ws);
+    }
+
+    /// With a pickaxe armed, `ability.use` is accepted, the forwarded
+    /// `ability_swing` carries a cooldown already scaled by the wielder's
+    /// mining level, and firing again before that cooldown elapses is
+    /// rejected server-side without a second forward — the client's hotbar
+    /// sweep is a prediction, this is the enforcement.
+    #[tokio::test]
+    async fn ability_use_forwards_a_level_scaled_swing_and_enforces_cooldown() {
+        let (proxy, _dbf, mut zone) = proxy_with_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("ab_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Swinger"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Level 5 (2500 xp): cooldown should come out to 2000 - 80*5 = 1600ms.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
+        }).to_string())).unwrap();
+        let (mut saw_inv, mut saw_skill) = (false, false);
+        while !(saw_inv && saw_skill) {
+            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
+                Some("inv.update") => saw_inv = true,
+                Some("skill.update") => saw_skill = true,
+                _ => {}
+            }
+        }
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        recv_until(&mut ws, "equip.update").await;
+
+        while zone.from_proxy.try_recv().is_ok() {} // drain registration/equip housekeeping
+
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let swing = recv_value_until(&mut zone.from_proxy, "ability_swing").await;
+        assert_eq!(swing["id"], "pick");
+        assert_eq!(swing["node_id"], "node_civic_rock_0");
+        assert_eq!(swing["player_id"], pid, "spoofable field must be the real id");
+        assert_eq!(swing["cooldown_ms"], 2000 - 80 * 5, "level 5 shaves the cooldown");
+
+        // Fire again immediately: rejected server-side, nothing forwarded.
+        ws.send(Message::Text(
+            json!({"type": "ability.use", "id": "pick", "node_id": "node_civic_rock_0"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let result = recv_until(&mut ws, "ability.result").await;
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], "cooldown");
+        assert!(zone.from_proxy.try_recv().is_err(), "a cooling-down swing must not forward");
+
+        drop(ws);
     }
 
     /// #12 acceptance: a player who has set a bed respawns exactly at it (even
