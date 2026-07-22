@@ -171,6 +171,10 @@ pub fn items() -> Vec<Item> {
         Item { id: "stone", name: "Stone", stack_size: 100, category: "stone" },
         Item { id: "plank", name: "Plank", stack_size: 100, category: "crafted" },
         Item { id: "tool_kit", name: "Tool Kit", stack_size: 100, category: "crafted" },
+        // Equippable tool (mining/abilities epic #123): arming one in the tool
+        // slot puts the Pick ability on the hotbar. stack_size 1 — it's worn,
+        // not stacked, though nothing stops carrying spares unequipped.
+        Item { id: "pickaxe", name: "Pickaxe", stack_size: 1, category: "tool" },
     ]
 }
 
@@ -199,12 +203,71 @@ pub fn recipes() -> Vec<Recipe> {
             id: "tool_kit", name: "Tool Kit", inputs: &[("wood", 1), ("stone", 1)],
             output_item: "tool_kit", output_qty: 1,
         },
+        Recipe {
+            id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 2), ("stone", 3)],
+            output_item: "pickaxe", output_qty: 1,
+        },
     ]
 }
 
 /// Look up a recipe definition by id.
 pub fn recipe(id: &str) -> Option<Recipe> {
     recipes().into_iter().find(|r| r.id == id)
+}
+
+// --- Equipment & abilities (mining/abilities epic #123) ---------------------
+//
+// A tiny slice of a bigger future system: one equipment slot ("tool") and one
+// ability ("pick"). The `equipment` table is already keyed by slot, and this
+// registry is already keyed by item/ability id, so a paper-doll with more
+// slots and more abilities is additive later, not a rewrite.
+
+/// The equipment slot an item can be armed into, if any. `None` means the
+/// item isn't equippable at all (most items — wood, stone, plank, ...).
+pub fn equippable_slot(item_id: &str) -> Option<&'static str> {
+    match item_id {
+        "pickaxe" => Some("tool"),
+        _ => None,
+    }
+}
+
+/// An ability an equipped item grants on the hotbar. `cooldown_ms` here is
+/// the item's own base speed; [`ability_cooldown_ms`] applies the wielder's
+/// skill level on top before anything is sent to a client.
+#[derive(Debug, Clone, Copy)]
+pub struct Ability {
+    pub id: &'static str,
+    pub name: &'static str,
+}
+
+/// The abilities granted by having `item_id` equipped (empty for anything
+/// not equippable, or equippable but ability-less).
+pub fn abilities_for_item(item_id: &str) -> &'static [Ability] {
+    match item_id {
+        "pickaxe" => &[Ability { id: "pick", name: "Pick" }],
+        _ => &[],
+    }
+}
+
+/// The skill whose level scales an ability's cooldown, if any.
+pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
+    match ability_id {
+        "pick" => Some("mining"),
+        _ => None,
+    }
+}
+
+/// An ability's swing/use cooldown (ms) at a given level of its governing
+/// skill (0 if ungoverned or the wielder hasn't trained it). Each ability
+/// hardcodes its own curve for now — there's exactly one — but this is the
+/// single place both the gateway (enforcement) and `equip.update` (display)
+/// compute it, so they can never disagree.
+pub fn ability_cooldown_ms(ability_id: &str, skill_level: i64) -> i64 {
+    match ability_id {
+        // 2000ms at level 0, -80ms per level, floors at 1200ms (~level 10+).
+        "pick" => (2000 - 80 * skill_level).max(1200),
+        _ => 1000,
+    }
 }
 
 /// Fixed footprint (world units) for a home structure kind, used both by

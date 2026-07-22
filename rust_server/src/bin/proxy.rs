@@ -3079,6 +3079,59 @@ impl Proxy {
         }
     }
 
+    // --- Equipment (mining/abilities epic #123) -----------------------------
+
+    /// Push a character's tool slot + the abilities it grants to its client as
+    /// `equip.update`. This is the **only** place ability cooldowns are
+    /// computed for display — each `cooldown_ms` is already level-scaled via
+    /// [`mmo::world::ability_cooldown_ms`], so the hotbar always shows exactly
+    /// what the gateway will enforce on `ability.use` (#117).
+    async fn send_equipment(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let tool = db.equipped(pid, "tool").await.ok().flatten();
+        let mut abilities: Vec<Value> = Vec::new();
+        if let Some(item_id) = &tool {
+            for a in mmo::world::abilities_for_item(item_id) {
+                let level = match mmo::world::governing_skill(a.id) {
+                    Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
+                    None => 0,
+                };
+                abilities.push(json!({
+                    "id": a.id, "name": a.name,
+                    "cooldown_ms": mmo::world::ability_cooldown_ms(a.id, level),
+                }));
+            }
+        }
+        self.push_to_player(pid, json!({
+            "type": "equip.update", "player_id": pid, "tool": tool, "abilities": abilities,
+        }));
+    }
+
+    /// Arm `item_id` in the slot it belongs to (mining/abilities epic #123).
+    /// An unrecognized/unequippable item id is silently ignored (a
+    /// well-behaved client only ever offers equippable items); not owning
+    /// one is the one case a legitimate client can hit — e.g. a stale
+    /// inventory view — so that gets an explicit `equip_error`.
+    async fn apply_equip(&self, pid: &str, item_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(slot) = mmo::world::equippable_slot(item_id) else { return };
+        match db.equip(pid, slot, item_id).await {
+            Ok(true) => self.send_equipment(pid).await,
+            Ok(false) => self.push_to_player(pid, json!({
+                "type": "equip_error", "message": "you don't have one of those",
+            })),
+            Err(_) => {}
+        }
+    }
+
+    /// Clear the tool slot.
+    async fn apply_unequip(&self, pid: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        if db.unequip(pid, "tool").await.is_ok() {
+            self.send_equipment(pid).await;
+        }
+    }
+
     /// Apply a `craft_make` reported by a zone (which validated only that the
     /// player is standing on some plot). Confirm they own a `crafting`-kind
     /// structure somewhere on their own plot, then attempt the craft. Silent
@@ -4099,15 +4152,17 @@ impl Proxy {
             self.route_client_frame(&player_id, frame);
         }
 
-        // Hydrate the client's gameplay state: inventory, storage, skills, the
-        // district's build-order board, any already-completed city structures, the
-        // character's starter plot (allocating one on a brand-new character),
-        // every home structure in the district (everyone's homes, not just
-        // theirs), and their own plot's rent status.
+        // Hydrate the client's gameplay state: inventory, storage, skills,
+        // equipped tool + its abilities, the district's build-order board, any
+        // already-completed city structures, the character's starter plot
+        // (allocating one on a brand-new character), every home structure in
+        // the district (everyone's homes, not just theirs), and their own
+        // plot's rent status.
         if identity.persistent {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
+            self.send_equipment(&player_id).await;
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
             self.send_plot(&player_id).await;
@@ -4162,6 +4217,19 @@ impl Proxy {
                     // no player position/proximity is relevant, so answer directly.
                     if data.get("type").and_then(|v| v.as_str()) == Some("craft.list") {
                         self.send_recipes(&player_id);
+                        continue;
+                    }
+                    // `equip`/`unequip` (mining/abilities epic #123): arming a
+                    // tool is pure inventory bookkeeping, no live position or
+                    // proximity involved — answer directly, same reasoning as
+                    // `craft.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("equip") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_equip(&player_id, &item_id).await;
+                        continue;
+                    }
+                    if data.get("type").and_then(|v| v.as_str()) == Some("unequip") {
+                        self.apply_unequip(&player_id).await;
                         continue;
                     }
                     // `terrain.list` is a stateless read of the static heightmap
@@ -6427,6 +6495,131 @@ mod tests {
         assert!(recv_frame(&mut ws).await.is_none(), "missing stone should mean no craft");
 
         drop(ws);
+    }
+
+    /// Pickaxe is a normal recipe (mining/abilities epic #123, #116): same
+    /// station+ingredients gate as any other craft.
+    #[tokio::test]
+    async fn pickaxe_recipe_crafts_at_a_station() {
+        let (proxy, dbf, mut zone) = proxy_with_db().await;
+        let db = Db::connect(dbf.url()).await.unwrap();
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Smith").await;
+        let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "wood", "qty": 2, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "stone", "qty": 3, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        let (mut saw_wood, mut saw_stone) = (false, false);
+        while !(saw_wood && saw_stone) {
+            let v = recv_frame(&mut ws).await.expect("expected the stocking pushes");
+            if v["type"] == "inv.update" {
+                let items = v["items"].as_array().cloned().unwrap_or_default();
+                saw_wood = items.iter().any(|it| it["item_id"] == "wood" && it["qty"] == 2);
+                saw_stone = items.iter().any(|it| it["item_id"] == "stone" && it["qty"] == 3);
+            }
+        }
+
+        place_home_structure(&mut zone, &mut ws, &pid, "crafting", bx + 5, by + 5).await;
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "craft_make", "player_id": pid, "recipe_id": "pickaxe",
+        }).to_string())).unwrap();
+        let made = loop {
+            let v = recv_frame(&mut ws).await.expect("expected craft.made");
+            if v["type"] == "craft.made" { break v; }
+        };
+        assert_eq!(made["item_id"], "pickaxe");
+        assert_eq!(made["qty"], 1);
+
+        drop(ws);
+    }
+
+    /// Equip/unequip (mining/abilities epic #123, #116): arming a tool
+    /// requires actually owning it, grants the item's abilities on
+    /// `equip.update` with a cooldown already scaled by the governing skill's
+    /// level, and the armed tool survives a reconnect (it's durable, not
+    /// session state).
+    #[tokio::test]
+    async fn equip_requires_ownership_grants_abilities_and_persists() {
+        let (proxy, _dbf, zone) = proxy_with_db().await;
+        let email = format!("eq_{}@t.test", Uuid::new_v4().simple());
+
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Miner"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // No pickaxe yet: equipping is rejected, nothing persisted.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        let err = recv_until(&mut ws, "equip_error").await;
+        assert!(err["message"].as_str().unwrap().contains("don't have"), "unexpected: {err}");
+
+        // Grant one mining level's worth of xp (2500 -> level 5) and a pickaxe,
+        // as a foreman hand-out + some practice would. Drain both the
+        // inventory AND skill pushes (not just the first) before the next
+        // write — same idiom as the crafting test: firing straight into a
+        // transaction that's still committing races SQLite into "database
+        // is locked" rather than actually reordering anything.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
+        }).to_string())).unwrap();
+        let (mut saw_inv, mut saw_skill) = (false, false);
+        while !(saw_inv && saw_skill) {
+            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
+                Some("inv.update") => saw_inv = true,
+                Some("skill.update") => saw_skill = true,
+                _ => {}
+            }
+        }
+
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        let update = recv_until(&mut ws, "equip.update").await;
+        assert_eq!(update["tool"], "pickaxe");
+        let abilities = update["abilities"].as_array().unwrap();
+        assert_eq!(abilities.len(), 1);
+        assert_eq!(abilities[0]["id"], "pick");
+        assert_eq!(abilities[0]["cooldown_ms"], 2000 - 80 * 5, "level 5 shaves the swing cooldown");
+
+        // Unequip clears the slot and the granted abilities with it.
+        ws.send(Message::Text(json!({"type": "unequip"}).to_string())).await.unwrap();
+        let cleared = recv_until(&mut ws, "equip.update").await;
+        assert!(cleared["tool"].is_null());
+        assert!(cleared["abilities"].as_array().unwrap().is_empty());
+
+        // Re-arm, then reconnect: the tool is durable state, so login
+        // hydration re-sends the same equip.update without re-equipping.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        recv_until(&mut ws, "equip.update").await;
+        drop(ws);
+
+        let mut ws2 = dial(&proxy).await;
+        ws2.send(Message::Text(
+            json!({"type": "login", "email": email, "password": "pw12"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        recv_until(&mut ws2, "welcome").await;
+        let rehydrated = recv_until(&mut ws2, "equip.update").await;
+        assert_eq!(rehydrated["tool"], "pickaxe", "the armed tool survives a reconnect");
+        drop(ws2);
     }
 
     /// #12 acceptance: a player who has set a bed respawns exactly at it (even
