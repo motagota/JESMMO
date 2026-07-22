@@ -36,6 +36,7 @@ var _build_place: BuildPlace
 var _mayor_road: MayorRoad
 var _rent: RentPanel
 var _transition: DistrictTransition
+var _hotbar: HotbarPanel
 
 var _editor_mode := false
 var _editor_cam: EditorCamera
@@ -112,6 +113,9 @@ func _ready() -> void:
     _craft = CraftPanel.new()
     _craft.visible = false
     add_child(_craft)
+
+    _hotbar = HotbarPanel.new()
+    add_child(_hotbar)
 
     _build_place = BuildPlace.new()
     add_child(_build_place)
@@ -317,6 +321,19 @@ func _wire_signals() -> void:
     _rent.do_pay.connect(func(plot_id): _net.send_rent_pay(plot_id))
     _rent.do_set_autopay.connect(func(plot_id, enabled): _net.send_rent_set_autopay(plot_id, enabled))
 
+    # Equipment & abilities (mining/abilities epic #123, #119).
+    _net.equip_update.connect(func(tool, abilities):
+        _hud.set_tool(tool)
+        _hotbar.set_abilities(abilities))
+    _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
+    _net.ability_result.connect(func(id, ok, cooldown_ms, reason):
+        _hotbar.on_ability_result(id, ok, cooldown_ms)
+        if not ok:
+            _hud.flash_announce(_ability_fail_text(reason)))
+    _inventory.do_equip.connect(func(item_id): _net.send_equip(item_id))
+    _hud.unequip_pressed.connect(func(): _net.send_unequip())
+    _hotbar.use_pressed.connect(_on_hotbar_use)
+
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
     _login.do_guest.connect(func(): _net.guest())
@@ -513,6 +530,31 @@ func _on_gather_pressed() -> void:
     var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
     if node_id != "":
         _net.send_gather_start(node_id)
+
+## Resolve a hotbar press to a target node and send `ability.use` (mining/
+## abilities epic #123, #119). For a non-harvesting ability (none exist yet)
+## `target_item` is "" and any node_id is sent (server-side validated).
+## Nothing in range is a purely local no-op with a toast — no point in a
+## round trip the zone will just reject as `exhausted`.
+func _on_hotbar_use(ability_id: String) -> void:
+    var target_item := Protocol.ability_target_item(ability_id)
+    if target_item == "":
+        _net.send_ability_use(ability_id, "")
+        return
+    var node_id := _entities.nearest_resource_item(_player.world_pos(), Protocol.PICK_RANGE, target_item)
+    if node_id == "":
+        _hud.flash_announce("Nothing to swing at — get closer to a rock")
+        return
+    _net.send_ability_use(ability_id, node_id)
+
+## Human text for an `ability.result` failure reason.
+func _ability_fail_text(reason: String) -> String:
+    match reason:
+        "no_tool": return "You need a pickaxe in hand"
+        "cooldown": return "Still on cooldown"
+        "out_of_range": return "Too far from the rock"
+        "exhausted": return "Nothing to swing at there"
+        _: return "Swing failed"
 
 func _on_status_update(id: String, zone: String, state: Dictionary) -> void:
     if id == _my_id:

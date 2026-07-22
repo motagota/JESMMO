@@ -63,6 +63,12 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 func nearest_resource(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "resource", true)
 
+## The id of the nearest live resource node of a SPECIFIC item within
+## `max_dist`, or "" if none — ability targeting (mining/abilities epic
+## #123, #119): Pick only ever wants a stone node, never a tree.
+func nearest_resource_item(from: Vector2, max_dist: float, item_id: String) -> String:
+	return _nearest(from, max_dist, "resource", true, item_id)
+
 ## The id of the nearest storage point within `max_dist`, or "" if none.
 func nearest_storage(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "storage", false)
@@ -102,7 +108,7 @@ func overlaps_home_structure(corner: Vector2, footprint: Vector2) -> bool:
 			return true
 	return false
 
-func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) -> String:
+func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool, item_id: String = "") -> String:
 	var best := ""
 	var best_d := max_dist
 	for id in _entities:
@@ -110,6 +116,8 @@ func _nearest(from: Vector2, max_dist: float, kind: String, need_stock: bool) ->
 		if rec.get("kind", "") != kind:
 			continue
 		if need_stock and int(rec.get("qty", 0)) <= 0:
+			continue
+		if item_id != "" and String(rec.get("item_id", "")) != item_id:
 			continue
 		var d := from.distance_to(rec.get("wpos", Vector2.ZERO))
 		if d <= best_d:

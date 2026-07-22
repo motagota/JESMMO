@@ -6,12 +6,18 @@
 class_name Hud
 extends CanvasLayer
 
+## Right-clicked/clicked to unequip (mining/abilities epic #123, #119) — the
+## "in hand" line doubles as the unarm affordance, so there's no separate
+## button crowding the corner.
+signal unequip_pressed
+
 var _status: Label
 var _inv: Label
 var _skill: Label
 var _gather: Label
 var _build_hint: Label
 var _rent_hint: Label
+var _tool: Button
 var _gain: Label
 var _levelup: Label
 var _announce: Label
@@ -48,6 +54,19 @@ func _ready() -> void:
 	_rent_hint = _line(box)
 	_rent_hint.modulate = Color(1.0, 0.9, 0.5)
 	_rent_hint.text = "[P] plot & rent"
+
+	# In-hand line (mining/abilities epic #123, #119): a flat button so
+	# clicking it unequips — empty (no text, no click target) while nothing's
+	# armed, so it doesn't read as a dead affordance.
+	_tool = Button.new()
+	_tool.flat = true
+	_tool.focus_mode = Control.FOCUS_NONE
+	_tool.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_tool.add_theme_font_size_override("font_size", 14)
+	_tool.add_theme_color_override("font_color", Color(0.85, 0.95, 1.0))
+	_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE # nothing armed yet: not a click target
+	_tool.pressed.connect(func(): unequip_pressed.emit())
+	box.add_child(_tool)
 
 	# Floating gain feedback, centred-ish on screen.
 	_gain = Label.new()
@@ -135,6 +154,17 @@ func set_inventory(items: Array, used: int, capacity: int) -> void:
 		var it: Dictionary = it_v
 		parts.append("%s x%d" % [String(it.get("item_id", "?")), int(it.get("qty", 0))])
 	_inv.text = "inventory: " + ", ".join(parts) + cap
+
+## The armed tool, or "" for nothing equipped (mining/abilities epic #123,
+## #119). A blank in-hand line while empty means the click target only
+## exists once there's something to unequip.
+func set_tool(item_id: String) -> void:
+	if item_id == "":
+		_tool.text = ""
+		_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	else:
+		_tool.text = "In hand: %s %s   (click to unequip)" % [Protocol.item_icon(item_id), item_id]
+		_tool.mouse_filter = Control.MOUSE_FILTER_STOP
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
 	# Track each skill independently so a building-XP gain doesn't overwrite the

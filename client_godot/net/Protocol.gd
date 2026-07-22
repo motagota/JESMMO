@@ -70,6 +70,49 @@ const S_CRAFT_RECIPES := "craft.recipes"
 const C_CRAFT_MAKE := "craft.make"
 const S_CRAFT_MADE := "craft.made"
 
+# --- gameplay: equipment & abilities (mining/abilities epic #123, #119) -------
+## Arming/clearing the tool slot. Answered with `equip.update` on success
+## (and pushed unprompted on login hydration); an unowned item comes back as
+## `equip_error`.
+const C_EQUIP := "equip" # {item_id}
+const C_UNEQUIP := "unequip"
+const S_EQUIP_UPDATE := "equip.update" # {tool, abilities: [{id, name, cooldown_ms}]}
+const S_EQUIP_ERROR := "equip_error" # {message}
+## One ability use (a Pick swing today). `cooldown_ms` on the result is
+## already level-scaled server-side — the hotbar just renders it.
+const C_ABILITY_USE := "ability.use" # {id, node_id}
+const S_ABILITY_RESULT := "ability.result" # {id, ok, cooldown_ms, reason?}
+## Must be this close to a node to swing at it (mirrors the server's
+## zone_server.rs PICK_RANGE).
+const PICK_RANGE := 8.0
+
+## Whether `item_id` can be armed in the tool slot at all — mirrors the
+## server's `mmo::world::equippable_slot`. Lets the inventory panel only
+## react to a right-click on something actually equippable.
+static func is_equippable(item_id: String) -> bool:
+    return item_id == "pickaxe"
+
+## An equippable item's display glyph, for the HUD's "in hand" line.
+static func item_icon(item_id: String) -> String:
+    match item_id:
+        "pickaxe": return "⛏"
+        _: return "✦"
+
+## The resource-node item an ability targets, mirroring the server's
+## `mmo::world::ability_target_item` — used to pick a swing's target
+## client-side before sending `ability.use`. "" for a non-harvesting ability.
+static func ability_target_item(ability_id: String) -> String:
+    match ability_id:
+        "pick": return "stone"
+        _: return ""
+
+## A hotbar slot's display glyph. Purely cosmetic — falls back to a plain
+## icon for any ability id not yet given a bespoke one.
+static func ability_icon(ability_id: String) -> String:
+    match ability_id:
+        "pick": return "⛏"
+        _: return "✦"
+
 # --- gameplay: cosmetic terrain heightmap (#54) + native-res tile streaming ----
 const C_TERRAIN_LIST := "terrain.list"
 const S_TERRAIN_DATA := "terrain.data"

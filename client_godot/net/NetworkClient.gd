@@ -33,6 +33,14 @@ signal plot_district(plots: Array)
 signal build_placed(structure: Dictionary)
 signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
+## Equipment (mining/abilities epic #123, #119): the tool slot changed (or
+## login hydration is reporting its current state) — `tool` is "" when
+## nothing's armed. `abilities` mirrors the server's `equip.update` shape.
+signal equip_update(tool: String, abilities: Array)
+signal equip_error(message: String)
+## One ability use's outcome. `reason` is only meaningful when `ok` is false
+## ("no_tool" | "cooldown" | "out_of_range" | "exhausted").
+signal ability_result(id: String, ok: bool, cooldown_ms: int, reason: String)
 signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
 signal terrain_tile_data(tx: int, ty: int, heights: PackedFloat32Array)
 ## `offsets` is a dense side*side meter-offset grid (zeros where unedited);
@@ -278,6 +286,20 @@ func _handle_text(text: String) -> void:
             district_ready.emit()
         Protocol.S_MAYOR_BUILD_ERROR:
             mayor_build_error.emit(String(msg.get("message", "that build order was rejected")))
+        Protocol.S_EQUIP_UPDATE:
+            # `tool` rides as JSON null (not just absent) when nothing's
+            # equipped — Dictionary.get's default only covers a missing key,
+            # so a present-but-null value must be handled explicitly.
+            var tool_v: Variant = msg.get("tool")
+            equip_update.emit(String(tool_v) if tool_v != null else "", msg.get("abilities", []))
+        Protocol.S_EQUIP_ERROR:
+            equip_error.emit(String(msg.get("message", "couldn't equip that")))
+        Protocol.S_ABILITY_RESULT:
+            ability_result.emit(
+                String(msg.get("id", "")),
+                bool(msg.get("ok", false)),
+                int(msg.get("cooldown_ms", 0)),
+                String(msg.get("reason", "")))
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -414,6 +436,20 @@ func send_road_demolish(order_id: String) -> void:
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:
     _send({"type": Protocol.C_CRAFT_MAKE, "recipe_id": recipe_id})
+
+## Arm an owned item in the tool slot (mining/abilities epic #123, #119).
+## Answered with `equip.update` on success, `equip_error` if not owned.
+func send_equip(item_id: String) -> void:
+    _send({"type": Protocol.C_EQUIP, "item_id": item_id})
+
+## Clear the tool slot.
+func send_unequip() -> void:
+    _send({"type": Protocol.C_UNEQUIP})
+
+## Use an equipped ability against a target node (validated server-side:
+## the tool grants it, its cooldown has elapsed, the node's in range/stocked).
+func send_ability_use(ability_id: String, node_id: String) -> void:
+    _send({"type": Protocol.C_ABILITY_USE, "id": ability_id, "node_id": node_id})
 
 ## Set a bed (must be on your own plot) as your respawn point.
 func send_home_set_respawn(bed_id: String) -> void:
