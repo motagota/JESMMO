@@ -86,6 +86,13 @@ const S_ABILITY_RESULT := "ability.result" # {id, ok, cooldown_ms, reason?}
 ## zone_server.rs PICK_RANGE).
 const PICK_RANGE := 8.0
 
+# --- gameplay: NPCs (mining/abilities epic #123, #121) -------------------------
+## Must be this close to an NPC to talk to it (mirrors the server's
+## zone_server.rs NPC_TALK_RANGE).
+const NPC_TALK_RANGE := 10.0
+const C_NPC_TALK := "npc.talk" # {npc_id}
+const S_NPC_DIALOGUE := "npc.dialogue" # {npc_id, name, lines, granted}
+
 ## Whether `item_id` can be armed in the tool slot at all — mirrors the
 ## server's `mmo::world::equippable_slot`. Lets the inventory panel only
 ## react to a right-click on something actually equippable.

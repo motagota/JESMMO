@@ -37,6 +37,7 @@ var _mayor_road: MayorRoad
 var _rent: RentPanel
 var _transition: DistrictTransition
 var _hotbar: HotbarPanel
+var _npc_dialogue: NpcDialoguePanel
 
 var _editor_mode := false
 var _editor_cam: EditorCamera
@@ -117,6 +118,9 @@ func _ready() -> void:
     _hotbar = HotbarPanel.new()
     add_child(_hotbar)
 
+    _npc_dialogue = NpcDialoguePanel.new()
+    add_child(_npc_dialogue)
+
     _build_place = BuildPlace.new()
     add_child(_build_place)
 
@@ -159,6 +163,17 @@ func _process(_delta: float) -> void:
     _build.show_panel(near_board)
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
+
+    # NPCs win the E-key prompt over gathering exactly when one's actually
+    # nearer (mining/abilities epic #123, #121) — not merely "in range too";
+    # NPC_TALK_RANGE is already far tighter than GATHER_RANGE, but a rock
+    # could still sit closer than an NPC even with both in range.
+    var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
+    var gather_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
+    var npc_wins := npc_id != "" and (gather_id == "" or
+        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
+            <= _player.world_pos().distance_to(_entities.wpos_of(gather_id)))
+    _hud.set_interact_verb("talk" if npc_wins else "gather")
 
     # Auto-fire (mining/abilities epic #123, #120): re-attempt every
     # auto-armed, ready slot each frame — a no-target miss is silent
@@ -340,6 +355,10 @@ func _wire_signals() -> void:
     _inventory.do_equip.connect(func(item_id): _net.send_equip(item_id))
     _hud.unequip_pressed.connect(func(): _net.send_unequip())
     _hotbar.use_pressed.connect(_on_hotbar_use)
+    _net.npc_dialogue.connect(func(_npc_id, npc_name, lines, granted):
+        _npc_dialogue.show_dialogue(npc_name, lines, granted)
+        if granted:
+            _hud.flash_gain("pickaxe", 1))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))
@@ -347,7 +366,7 @@ func _wire_signals() -> void:
 
     _player.move_requested.connect(func(dx, dy): _net.send_move(dx, dy))
     _player.attack_requested.connect(func(dx, dy): _net.send_attack(dx, dy))
-    _player.gather_pressed.connect(_on_gather_pressed)
+    _player.interact_pressed.connect(_on_interact_pressed)
     _player.position_changed.connect(func(wx, wy):
         _hud.set_pos(wx, wy)
         _minimap.set_player(wx, wy, _player.facing())
@@ -532,10 +551,24 @@ func _check_district_crossing(wx: float, wy: float) -> void:
     _transition.begin(d)
     _net.send_district_enter(from_district, d)
 
-## Gather the nearest in-range resource node (resolved from the entity manager).
-func _on_gather_pressed() -> void:
+## E was pressed (mining/abilities epic #123, #121): closes an open dialogue
+## first (E doubles as its close key — this must swallow the press, not
+## re-open a fresh talk on the same keystroke); otherwise talks to the
+## nearest NPC if it's the nearer of the two interactions, else gathers the
+## nearest in-range resource node. Mirrors the `_hud.set_interact_verb`
+## priority computed every frame in `_process`.
+func _on_interact_pressed() -> void:
+    if _npc_dialogue.visible:
+        _npc_dialogue.close()
+        return
+    var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
     var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
-    if node_id != "":
+    var npc_wins := npc_id != "" and (node_id == "" or
+        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
+            <= _player.world_pos().distance_to(_entities.wpos_of(node_id)))
+    if npc_wins:
+        _net.send_npc_talk(npc_id)
+    elif node_id != "":
         _net.send_gather_start(node_id)
 
 ## Resolve a hotbar press to a target node and send `ability.use` (mining/

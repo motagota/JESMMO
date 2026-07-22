@@ -27,6 +27,10 @@ var zone := "—"
 var pos := Vector2.ZERO
 var _home := Vector2.ZERO
 var _has_home := false
+## What pressing E does right now — "gather" by default; Main switches this
+## to "talk" whenever an NPC is the nearer of the two (mining/abilities
+## epic #123, #121).
+var _interact_verb := "gather"
 
 ## skill_id -> {level, xp}, so each skill renders on the one line independently.
 var _skills: Dictionary = {}
@@ -112,6 +116,14 @@ func set_pos(wx: float, wy: float) -> void:
 	pos = Vector2(wx, wy)
 	_refresh_status()
 
+## Switch the E-key hint between "gather" and "talk" (mining/abilities epic
+## #123, #121) — Main recomputes this every frame from whichever's nearer,
+## an NPC or a gatherable node.
+func set_interact_verb(verb: String) -> void:
+	if _interact_verb != verb:
+		_interact_verb = verb
+		_refresh_status()
+
 ## The player's home plot centre (from `plot.assigned`), so the status line can
 ## show a distance/compass reading back to it (#11).
 func set_home(wx: float, wy: float) -> void:
@@ -124,8 +136,8 @@ func _refresh_status() -> void:
 		var home_part := ""
 		if _has_home:
 			home_part = "   |   home: %s %dm" % [_compass(_home - pos), int(round(pos.distance_to(_home)))]
-		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] gather" % [
-			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part]
+		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] %s" % [
+			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part, _interact_verb]
 
 ## A rough compass heading from the player toward `delta` (world units).
 func _compass(delta: Vector2) -> String:

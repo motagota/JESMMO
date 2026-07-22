@@ -17,7 +17,11 @@ extends Node3D
 
 signal move_requested(dx: int, dy: int)
 signal attack_requested(dx: int, dy: int)
-signal gather_pressed
+## E pressed (edge-triggered). Named `interact` since #121: it can mean
+## "talk to the nearest NPC" or "gather the nearest node" — Main resolves
+## which, since it's the one holding both the entity roster and the priority
+## rule between them.
+signal interact_pressed
 signal position_changed(wx: float, wy: float)
 
 const _ATTACK_COOLDOWN := 0.3 # seconds; matches the server's swing cadence
@@ -167,10 +171,10 @@ func _process(delta: float) -> void:
 	if Input.is_physical_key_pressed(KEY_SPACE):
 		_try_attack()
 
-	# Gather: edge-detect the key so one press starts one gather request.
+	# Interact: edge-detect the key so one press starts one interaction.
 	var g := Input.is_physical_key_pressed(KEY_E)
 	if g and not _gather_down:
-		gather_pressed.emit()
+		interact_pressed.emit()
 	_gather_down = g
 
 	# Render: ease toward the predicted/authoritative world position.

@@ -41,6 +41,8 @@ signal equip_error(message: String)
 ## One ability use's outcome. `reason` is only meaningful when `ok` is false
 ## ("no_tool" | "cooldown" | "out_of_range" | "exhausted").
 signal ability_result(id: String, ok: bool, cooldown_ms: int, reason: String)
+## An NPC's reply to `npc.talk` (mining/abilities epic #123, #121).
+signal npc_dialogue(npc_id: String, npc_name: String, lines: Array, granted: bool)
 signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
 signal terrain_tile_data(tx: int, ty: int, heights: PackedFloat32Array)
 ## `offsets` is a dense side*side meter-offset grid (zeros where unedited);
@@ -300,6 +302,12 @@ func _handle_text(text: String) -> void:
                 bool(msg.get("ok", false)),
                 int(msg.get("cooldown_ms", 0)),
                 String(msg.get("reason", "")))
+        Protocol.S_NPC_DIALOGUE:
+            npc_dialogue.emit(
+                String(msg.get("npc_id", "")),
+                String(msg.get("name", "")),
+                msg.get("lines", []),
+                bool(msg.get("granted", false)))
         _:
             pass # zone_capture and any future server messages are ignored for now
 
@@ -450,6 +458,11 @@ func send_unequip() -> void:
 ## the tool grants it, its cooldown has elapsed, the node's in range/stocked).
 func send_ability_use(ability_id: String, node_id: String) -> void:
     _send({"type": Protocol.C_ABILITY_USE, "id": ability_id, "node_id": node_id})
+
+## Talk to an NPC (validated server-side by proximity). Answered with
+## `npc.dialogue` (mining/abilities epic #123, #121).
+func send_npc_talk(npc_id: String) -> void:
+    _send({"type": Protocol.C_NPC_TALK, "npc_id": npc_id})
 
 ## Set a bed (must be on your own plot) as your respawn point.
 func send_home_set_respawn(bed_id: String) -> void:
