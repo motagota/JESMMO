@@ -1399,6 +1399,21 @@ impl Db {
             .await
     }
 
+    /// Total carried quantity of one item (0 if none) — a cheap point
+    /// lookup for "do they have any of X at all" without pulling the whole
+    /// inventory. Used by the quarry foreman's "already has a pick?" gate
+    /// (mining/abilities epic #123, #118).
+    pub async fn inventory_qty(&self, character_id: &str, item_id: &str) -> Result<i64, DbError> {
+        let qty: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(qty.unwrap_or(0))
+    }
+
     /// Set (or clear) which structure a character respawns at. `structure_id` is
     /// trusted by the caller to be a `bed`-kind structure the character owns
     /// (#12) — persistence just records the pointer.

@@ -987,6 +987,15 @@ impl Proxy {
                         self.apply_build_place(pid, kind, x, y, rot).await;
                     }
                 }
+                Some("npc_interact") => {
+                    // Internal: a zone validated talk-range proximity. Whether the
+                    // NPC hands over anything (mining/abilities epic #123, #118) is
+                    // authoritative here — only the gateway knows inventory/equipment.
+                    if let Some(pid) = target_player.as_deref() {
+                        let npc_id = data.get("npc_id").and_then(|v| v.as_str()).unwrap_or("");
+                        self.apply_npc_interact(pid, npc_id).await;
+                    }
+                }
                 Some("craft_make") => {
                     // Internal: a zone validated the player is standing on some plot.
                     // Whether they own a crafting station there is authoritative here.
@@ -3184,6 +3193,47 @@ impl Proxy {
         }
         self.route_client_frame(pid, json!({
             "type": "ability_swing", "id": ability_id, "node_id": node_id, "cooldown_ms": cooldown_ms,
+        }));
+    }
+
+    // --- NPCs (mining/abilities epic #123, #118) -----------------------------
+
+    /// Resolve a talk the zone already confirmed was in range: the quarry
+    /// foreman hands over a pickaxe the first time (and any time since —
+    /// it's a safety net, not a farm) a character has none at all, in
+    /// inventory or in hand; otherwise he just talks. Unknown NPC ids are a
+    /// silent no-op — only the foreman has dialogue today.
+    async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Some(npc) = mmo::world::npc(npc_id) else { return };
+        if npc_id != "npc_quarry_foreman" {
+            return;
+        }
+        let owned = db.inventory_qty(pid, "pickaxe").await.unwrap_or(0);
+        let equipped = db.equipped(pid, "tool").await.ok().flatten();
+        let has_one = owned > 0 || equipped.as_deref() == Some("pickaxe");
+        let mut granted = false;
+        if !has_one {
+            let added = db.add_to_inventory(pid, "pickaxe", 1).await.unwrap_or(0);
+            if added > 0 {
+                granted = true;
+                self.send_inventory(pid).await;
+            }
+        }
+        let lines: Vec<&str> = if granted {
+            vec![
+                "No pick? Take mine, and mind the edge.",
+                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
+            ]
+        } else {
+            vec![
+                "Keep that pick on the rock, not the ground between swings.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ]
+        };
+        self.push_to_player(pid, json!({
+            "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
+            "lines": lines, "granted": granted,
         }));
     }
 
@@ -6789,6 +6839,72 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert_eq!(result["reason"], "cooldown");
         assert!(zone.from_proxy.try_recv().is_err(), "a cooling-down swing must not forward");
+
+        drop(ws);
+    }
+
+    /// The quarry foreman (mining/abilities epic #123, #118) hands over
+    /// exactly one pickaxe the first time a character has none at all —
+    /// then stops, whether they're holding it in their bags or in hand.
+    #[tokio::test]
+    async fn npc_interact_grants_a_pickaxe_only_while_the_character_has_none() {
+        // Shared DB handle so "no second grant" is a deterministic query
+        // against durable state, not a race against however many hydration
+        // frames (equip.update, build.list, rent.status, ...) happen to
+        // still be in flight when the assertion runs.
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("nf_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Newcomer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // First talk: no pickaxe anywhere -> granted, with the hand-out line.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let dialogue = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(dialogue["name"], "Sten");
+        assert_eq!(dialogue["granted"], true);
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1);
+
+        // Talk again, still carrying it: no second grant, and the mentoring
+        // line (not the hand-out one) plays instead.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let again = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(again["granted"], false);
+        assert_ne!(again["lines"], dialogue["lines"], "a returning visitor hears different lines");
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "no second grant");
+
+        // Equipping is a pointer, not a move (#116) — the pickaxe stays
+        // counted in the bag too. A third talk still grants nothing either
+        // way, whether the "owned" or the "equipped" half of the check fires.
+        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+            .await
+            .unwrap();
+        // Login hydration also pushes an `equip.update` (tool: null) — it
+        // races the npc_interact replies above over a different async path
+        // (the zone-listener task, not this client's), so it can still be
+        // sitting unread here. Loop past it to the one this equip actually
+        // produced (tool: "pickaxe").
+        loop {
+            if recv_until(&mut ws, "equip.update").await["tool"] == "pickaxe" {
+                break;
+            }
+        }
+        assert_eq!(db.equipped(&pid, "tool").await.unwrap().as_deref(), Some("pickaxe"));
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "equip doesn't move the item");
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        let equipped_talk = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(equipped_talk["granted"], false, "an equipped pick still counts as owned");
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "still no second grant");
 
         drop(ws);
     }

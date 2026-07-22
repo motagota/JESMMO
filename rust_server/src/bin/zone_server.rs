@@ -72,6 +72,9 @@ const PICK_RANGE: i32 = 8;
 /// swing is slightly more valuable since it's instant, not a multi-tick
 /// channel that can be walked away from).
 const PICK_XP_PER_SWING: i64 = 12;
+/// Must be this close to an NPC to talk to it — tighter than gathering,
+/// since talking is a deliberate face-to-face action.
+const NPC_TALK_RANGE: i32 = 10;
 
 // --- Environmental vitals (player-attributes epic #83, #87) --------------------
 // The zone knows no terrain: "underwater" arrives from the gateway as an
@@ -288,6 +291,17 @@ fn build_board_status_json(b: &mmo::world::BuildBoard) -> Value {
     })
 }
 
+/// An authored NPC as a render entity (mining/abilities epic #123, #118) —
+/// same `status_update` shape every other zone-cached entity uses, so it
+/// renders through the client's ordinary spawn path with no special case.
+fn npc_status_json(n: &mmo::world::NpcSpawn) -> Value {
+    json!({
+        "type": "status_update",
+        "player_id": n.id,
+        "state": { "x": n.x, "y": n.y, "type": "npc", "name": n.name, "facing": [0, 0] },
+    })
+}
+
 fn clamp_world(x: i32, y: i32) -> (i32, i32) {
     (x.clamp(0, WORLD_SIZE - 1), y.clamp(0, WORLD_SIZE - 1))
 }
@@ -396,6 +410,9 @@ struct ZoneServer {
     /// pushed by the gateway — gates deposit/withdraw/craft to "near the
     /// specific structure", not just "on some plot" (#13).
     home_structures: Mutex<Vec<HomeStructureRef>>,
+    /// Authored NPCs in this zone's region (mining/abilities epic #123, #118) —
+    /// fixed, never despawn, no runtime state beyond the authored spawn itself.
+    npcs: Mutex<Vec<mmo::world::NpcSpawn>>,
 }
 
 impl ZoneServer {
@@ -416,6 +433,7 @@ impl ZoneServer {
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
             home_structures: Mutex::new(Vec::new()),
+            npcs: Mutex::new(Vec::new()),
         })
     }
 
@@ -482,8 +500,16 @@ impl ZoneServer {
         self.plots.lock().unwrap().iter().any(|c| c.rect().contains(px, py))
     }
 
-    /// Push the current state of every node and storage point to the gateway (which
-    /// broadcasts it), so a just-joined client renders them.
+    /// (Re)cache the authored NPCs inside this zone's current region.
+    fn spawn_npcs(&self) {
+        let r = *self.region.lock().unwrap();
+        let npcs = self.capital.npcs_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        *self.npcs.lock().unwrap() = npcs;
+    }
+
+    /// Push the current state of every node, storage point, build board, and
+    /// NPC to the gateway (which broadcasts it), so a just-joined client
+    /// renders them.
     fn send_all_nodes(&self) {
         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
             for n in self.nodes.lock().unwrap().values() {
@@ -494,6 +520,9 @@ impl ZoneServer {
             }
             for b in self.build_boards.lock().unwrap().iter() {
                 let _ = tx.send(Message::Text(build_board_status_json(b).to_string()));
+            }
+            for n in self.npcs.lock().unwrap().iter() {
+                let _ = tx.send(Message::Text(npc_status_json(n).to_string()));
             }
         }
     }
@@ -684,6 +713,30 @@ impl ZoneServer {
         }
     }
 
+    /// Validate proximity to `npc_id` (mining/abilities epic #123, #118) and,
+    /// if close enough, forward an internal `npc_interact` to the gateway —
+    /// the only party that knows inventory/equipment, which is what decides
+    /// what the NPC actually says (and whether it hands over a pickaxe).
+    /// Too far, or an unknown NPC/player: silent no-op, same convention as
+    /// every other proximity-gated action in this file.
+    fn apply_npc_talk(&self, pid: &str, npc_id: &str) {
+        let in_range = {
+            let entities = self.entities.lock().unwrap();
+            let npcs = self.npcs.lock().unwrap();
+            match (entities.get(pid), npcs.iter().find(|n| n.id == npc_id)) {
+                (Some(p), Some(n)) => dist2(p.x, p.y, n.x, n.y) <= (NPC_TALK_RANGE as i64).pow(2),
+                _ => false,
+            }
+        };
+        if in_range {
+            if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
+                let _ = tx.send(Message::Text(json!({
+                    "type": "npc_interact", "player_id": pid, "npc_id": npc_id,
+                }).to_string()));
+            }
+        }
+    }
+
     async fn handle_proxy(self: Arc<Self>, raw: TcpStream) {
         let ws = match tokio_tungstenite::accept_async(raw).await {
             Ok(ws) => ws,
@@ -747,6 +800,7 @@ impl ZoneServer {
                 self.spawn_storage_points();
                 self.spawn_build_boards();
                 self.spawn_plots();
+                self.spawn_npcs();
                 *self.home_structures.lock().unwrap() = Vec::new();
                 continue;
             }
@@ -915,6 +969,10 @@ impl ZoneServer {
                     let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let cooldown_ms = data.get("cooldown_ms").and_then(|v| v.as_i64()).unwrap_or(0);
                     self.apply_ability_swing(&player_id, &ability_id, &node_id, cooldown_ms);
+                }
+                "npc.talk" => {
+                    let npc_id = data.get("npc_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    self.apply_npc_talk(&player_id, &npc_id);
                 }
                 "store.deposit" | "store.withdraw" => {
                     // Validate the player is at a storage point; the gateway performs
@@ -1556,6 +1614,7 @@ impl ZoneServer {
         self.spawn_storage_points();
         self.spawn_build_boards();
         self.spawn_plots();
+        self.spawn_npcs();
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -2151,6 +2210,48 @@ mod tests {
         zone2.apply_ability_swing("p1", "pick", TREE, 1600);
         assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
         assert_eq!(zone2.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "wrong-target swing takes nothing");
+    }
+
+    // --- Mining/abilities epic #123, #118: quarry foreman NPC talk range --------
+
+    const FOREMAN: &str = "npc_quarry_foreman"; // authored at (8232, 13945)
+
+    /// Civic zone with its authored NPCs spawned and a player standing at the foreman.
+    fn civic_zone_at_foreman() -> Arc<ZoneServer> {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_npcs();
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(8232, 13945, PLAYER_MAX_HP),
+        );
+        zone
+    }
+
+    /// Standing close enough forwards an internal `npc_interact` — the
+    /// gateway decides what's actually said (and whether anything's handed
+    /// over); the zone only ever gates on proximity.
+    #[tokio::test]
+    async fn npc_talk_in_range_forwards_interact() {
+        let zone = civic_zone_at_foreman();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_npc_talk("p1", FOREMAN);
+        let packets = drain(&mut rx);
+        assert!(
+            packets.iter().any(|p| p.contains("\"npc_interact\"")
+                && p.contains(FOREMAN) && p.contains("\"p1\"")),
+            "expected a forwarded npc_interact: {packets:?}"
+        );
+    }
+
+    /// Too far away: silent no-op, same convention as every other
+    /// proximity-gated action in this file.
+    #[tokio::test]
+    async fn npc_talk_out_of_range_is_silent() {
+        let zone = civic_zone_at_foreman();
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 8500; // well past NPC_TALK_RANGE
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_npc_talk("p1", FOREMAN);
+        assert!(drain(&mut rx).is_empty(), "too far to talk");
     }
 
     #[tokio::test]

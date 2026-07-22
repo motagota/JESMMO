@@ -327,6 +327,35 @@ pub struct BuildBoard {
     pub y: i32,
 }
 
+/// An authored NPC: a fixed, always-present entity a player can talk to
+/// (mining/abilities epic #123, #118). Never moves, never despawns — unlike
+/// a resource node there's no runtime state to track, so the zone just
+/// spawns this directly with no cache-only wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NpcSpawn {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub district: &'static str,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// The Phase 1 NPC registry. Look up by id with [`npc`].
+pub fn npc_spawns() -> Vec<NpcSpawn> {
+    vec![
+        // The quarry foreman: stands just clear of the working face (which
+        // spans x 8210-8255, y 13900-13930) so he doesn't collide with the
+        // rock nodes themselves, but close enough that "walk up and talk"
+        // reads as part of the same site.
+        NpcSpawn { id: "npc_quarry_foreman", name: "Sten", district: "civic", x: 8232, y: 13945 },
+    ]
+}
+
+/// Look up an authored NPC by id.
+pub fn npc(id: &str) -> Option<NpcSpawn> {
+    npc_spawns().into_iter().find(|n| n.id == id)
+}
+
 /// Grid resolution the server samples the loaded terrain artifact at to
 /// build the `terrain.data` wire message — decoupled from the baked
 /// artifact's own internal tile/cell resolution (see [`loaded_terrain`]'s
@@ -410,6 +439,7 @@ pub struct Capital {
     pub resource_nodes: Vec<ResourceNodeSpawn>,
     pub storage_points: Vec<StoragePoint>,
     pub build_boards: Vec<BuildBoard>,
+    pub npcs: Vec<NpcSpawn>,
     /// Authoritative heights — loaded once from the baked artifact (issue
     /// #63), not generated in-process. See [`loaded_terrain`].
     pub terrain: std::sync::Arc<terrain_common::Terrain>,
@@ -474,6 +504,12 @@ impl Capital {
             .copied()
             .filter(|b| r.contains(b.x, b.y))
             .collect()
+    }
+
+    /// Authored NPCs whose position falls inside `r` — the set a zone owning
+    /// that region should spawn and gate `npc.talk` proximity against.
+    pub fn npcs_in(&self, r: Rect) -> Vec<NpcSpawn> {
+        self.npcs.iter().copied().filter(|n| r.contains(n.x, n.y)).collect()
     }
 }
 
@@ -640,6 +676,7 @@ pub fn capital() -> Capital {
         resource_nodes,
         storage_points,
         build_boards,
+        npcs: npc_spawns(),
         terrain,
     }
 }
