@@ -202,3 +202,14 @@ pub const S_ROAD_CANCELLED: &str = "road.cancelled"; // {order_id}
 // demolition's contributors, into town storage.
 pub const C_ROAD_DEMOLISH: &str = "road.demolish";
 pub const S_ROAD_DEMOLITION_PLANNED: &str = "road.demolition_planned"; // {order_id, demo_order_id}
+// {order_id, cell_index, required, progress, completed} -- pushed on a
+// build.contribute that lands on a road (progressive road building epic
+// #131, issue #133): a road's path is chopped into fixed-length cells at
+// plan time (see road_cell in persistence), each with its own cost, and a
+// contribution routes to the nearest INCOMPLETE cell within BOARD_RANGE of
+// the contributor -- no build-board fallback like every other order, you
+// build the stretch you're standing on. Fires alongside the ordinary
+// build.progress (still the order's pooled aggregate, unchanged shape, for
+// anything reading the total). The order as a whole still completes -- and
+// still fires build.completed -- once every cell is done, same as before.
+pub const S_ROAD_CELL_PROGRESS: &str = "road.cell_progress";

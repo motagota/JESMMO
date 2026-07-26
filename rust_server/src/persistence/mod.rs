@@ -689,6 +689,13 @@ pub struct CellContributeResult {
     /// done) — same shape as [`ContributeResult`]'s completion fields so the
     /// caller can reuse `announce_order_completion` unchanged.
     pub order_completed: bool,
+    /// The order's aggregate required cost (`item -> qty`) — for the
+    /// gateway's ordinary district-wide `build.progress` broadcast, which
+    /// keeps firing off the pooled total alongside the new per-cell one
+    /// (#133) so nothing reading the aggregate needs to change.
+    pub order_required: BTreeMap<String, i64>,
+    /// The order's aggregate progress after this contribution.
+    pub order_progress: BTreeMap<String, i64>,
     pub kind: String,
     pub district: String,
     pub contributors: Vec<(String, i64)>,
@@ -1984,6 +1991,8 @@ impl Db {
         result.progress = cell_progress;
         result.cell_completed = cell_completed;
         result.order_completed = order_completed;
+        result.order_required = order_required;
+        result.order_progress = order_progress;
         result.contributors = contributors;
         Ok(result)
     }

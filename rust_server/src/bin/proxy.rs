@@ -2347,6 +2347,26 @@ impl Proxy {
         // from the civic board). The gateway's live position cache (updated on every
         // status_update, same as the zone's tick) is fresh enough for this check.
         let Ok(Some(order)) = db.build_order_by_id(order_id).await else { return };
+
+        // Road plans (#131/#132/#133) route through per-cell contribution
+        // instead — unlike every other order, they're deliberately NOT
+        // contributable from a district's build board, only from the
+        // specific stretch of path you're standing at. `kind` distinguishes
+        // this from a demolition order (`demo_<id>`, which also carries
+        // `path_json` but never gets cells — see `create_demolition` — and
+        // keeps using the ordinary near-any-run proximity below). A road
+        // planned before #132 shipped has no cells at all — fall through to
+        // the ordinary pooled path below rather than silently refusing
+        // every contribution forever.
+        if order.kind.starts_with("road_") {
+            if let Ok(cells) = db.road_cells_for_order(order_id).await {
+                if !cells.is_empty() {
+                    self.apply_road_cell_contribute(&db, pid, &order, &cells, item_id, qty).await;
+                    return;
+                }
+            }
+        }
+
         let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
         let near_board = self
             .capital
@@ -2413,6 +2433,62 @@ impl Proxy {
         }
         self.announce_order_completion(
             &db, order_id, &res.kind, &res.district,
+            &res.contributors, res.placement.as_ref(), order.path_json.as_deref(),
+        )
+        .await;
+    }
+
+    /// The road half of `build.contribute` (#131/#132/#133): find the
+    /// nearest INCOMPLETE cell within `BOARD_RANGE` of the contributor and
+    /// route the deposit there. No board fallback — the whole point of
+    /// per-cell roads is that you build the stretch you're standing on, not
+    /// bank stone into an arbitrary point along the path from the civic
+    /// board.
+    async fn apply_road_cell_contribute(
+        &self,
+        db: &Db,
+        pid: &str,
+        order: &mmo::persistence::BuildOrder,
+        cells: &[mmo::persistence::RoadCell],
+        item_id: &str,
+        qty: i64,
+    ) {
+        let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else { return };
+        let nearest_cell = cells
+            .iter()
+            .filter(|c| c.completed_at.is_none())
+            .filter_map(|c| {
+                let d2 = point_segment_dist2(px, py, c.x0 as i32, c.y0 as i32, c.x1 as i32, c.y1 as i32);
+                (d2 <= (BOARD_RANGE as i64).pow(2)).then_some((c.cell_index, d2))
+            })
+            .min_by_key(|(_, d2)| *d2);
+        let Some((cell_index, _)) = nearest_cell else { return };
+
+        let res = match db.contribute_to_road_cell(pid, &order.id, cell_index, item_id, qty).await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if res.moved > 0 {
+            self.send_inventory(pid).await;
+            self.broadcast_to_district(&res.district, json!({
+                "type": "road.cell_progress", "order_id": order.id, "cell_index": cell_index,
+                "required": cost_json(&res.required), "progress": cost_json(&res.progress),
+                "completed": res.cell_completed,
+            }));
+            // The order's own pooled total still moves in lockstep (mirrored
+            // by `contribute_to_road_cell`) — broadcast it too so anything
+            // still reading the aggregate (the board list) keeps working
+            // unchanged, same message shape as an ordinary order's.
+            self.broadcast_to_district(&res.district, json!({
+                "type": "build.progress", "order_id": order.id,
+                "required": cost_json(&res.order_required), "progress": cost_json(&res.order_progress),
+            }));
+        }
+        if !res.order_completed {
+            return;
+        }
+        self.announce_order_completion(
+            db, &order.id, &res.kind, &res.district,
             &res.contributors, res.placement.as_ref(), order.path_json.as_deref(),
         )
         .await;
@@ -5940,6 +6016,27 @@ mod tests {
         (proxy, dbf, zone)
     }
 
+    /// Poll a road order's aggregate `progress_json` until it matches
+    /// `want` or 2 seconds pass. A fixed sleep isn't enough here: these
+    /// tests fire a burst of independent `build_contribute` sends without
+    /// waiting on each one's own response, and how long the proxy's actor
+    /// loop takes to actually work through that burst is load-dependent —
+    /// under the full suite's parallel test load a flat `sleep(300ms)`
+    /// occasionally lands before the last one lands (#133's road-cell
+    /// tests hit exactly this).
+    async fn poll_progress_json(db: &Db, order_id: &str, want: &str) {
+        for _ in 0..40 {
+            if db.build_order_by_id(order_id).await.unwrap().unwrap().progress_json == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "progress_json never reached {want} for {order_id}, got {:?}",
+            db.build_order_by_id(order_id).await.unwrap().map(|o| o.progress_json)
+        );
+    }
+
     /// Spawn a one-shot acceptor running `handle_client` for the next connection,
     /// and return a client websocket connected to it.
     async fn dial(proxy: &Arc<Proxy>) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
@@ -8769,15 +8866,20 @@ mod tests {
 
     /// A road order accepts contributions anywhere along its path — including
     /// a middle/far run well away from both the board and the first-run
-    /// placement — and rejects them away from the path entirely. Completing
-    /// the order broadcasts a structure that carries the full path (#96).
+    /// placement — and rejects them away from the path entirely. Since #133,
+    /// a contribution lands on the single nearest CELL, not the pooled
+    /// total, so finishing a road longer than one `BOARD_RANGE` reach takes
+    /// contributing from more than one spot — proven here by walking from
+    /// the far end back to the start. Completing the order broadcasts a
+    /// structure that carries the full path (#96).
     #[tokio::test]
     async fn road_contributions_work_along_the_path_and_completion_carries_it() {
         let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
         let mut editor_ws = dial_editor(&proxy, &db).await;
 
-        // 50m east then 100m south = 150m -> 37 stone (deliberately under the
-        // 50-item carry cap so one hauler can finish it in a single trip).
+        // 50m east then 100m south = 150m -> 37 stone across 30 5m cells —
+        // deliberately under the 50-item carry cap so one hauler can carry
+        // enough, but no single position reaches every cell.
         editor_ws
             .send(Message::Text(
                 json!({"type": "road.plan", "points": [[12800, 12800], [12850, 12800], [12850, 12900]]}).to_string(),
@@ -8817,7 +8919,9 @@ mod tests {
         assert_eq!(order.progress_json, "{}", "far from the whole path: contribution refused");
 
         // Near the SECOND run's far end (~90m from the placement segment,
-        // ~100m from the civic board): accepted.
+        // ~100m from the civic board): accepted, but lands on ONE cell —
+        // the order's aggregate moves by exactly this contribution, not the
+        // whole road's cost.
         proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
@@ -8825,16 +8929,42 @@ mod tests {
                 "order_id": order_id, "item_id": "stone", "qty": 1,
             }).to_string()))
             .unwrap();
+        let cell_msg = recv_until(&mut ws, "road.cell_progress").await;
+        assert!(cell_msg["cell_index"].as_i64().unwrap() >= 10, "lands in run 2 (cells 10..30), not run 1");
         let progress = recv_until(&mut ws, "build.progress").await;
-        assert_eq!(progress["progress"]["stone"].as_i64(), Some(1), "mid-path contribution accepted");
+        assert_eq!(progress["progress"]["stone"].as_i64(), Some(1), "one cell's worth moved, not the whole road");
 
-        // Pour in the rest: completion broadcasts a structure with the path.
-        zone.to_proxy
-            .send(Message::Text(json!({
-                "type": "build_contribute", "player_id": pid,
-                "order_id": order_id, "item_id": "stone", "qty": 36,
-            }).to_string()))
-            .unwrap();
+        // Keep feeding from the same spot: fills every cell reachable from
+        // here (the rest of run 2), but run 1's cells — far from this
+        // position — stay untouched, so the road isn't done yet.
+        for _ in 0..40 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": order_id, "item_id": "stone", "qty": 3,
+                }).to_string()))
+                .unwrap();
+        }
+        // Run 2 has 20 cells (10..30); one (28) was already filled above,
+        // 12 more cost 1 stone each and the last (29) absorbs the 8-stone
+        // remainder — 1 + 12 + 8 = 21 once the burst above has landed.
+        poll_progress_json(&db, &order_id, r#"{"stone":21}"#).await;
+        assert_eq!(
+            db.build_order_by_id(&order_id).await.unwrap().unwrap().state, "open",
+            "run 1's cells are still out of reach from the far end"
+        );
+
+        // Walk to the path's START: the untouched cells near run 1 are now
+        // in range, and finishing them completes the whole road.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100 });
+        for _ in 0..40 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": order_id, "item_id": "stone", "qty": 3,
+                }).to_string()))
+                .unwrap();
+        }
         recv_until(&mut ws, "build.completed").await;
         let structure = loop {
             let v = recv_until(&mut ws, "status_update").await;
@@ -8958,7 +9088,12 @@ mod tests {
         let err = recv_until(&mut editor_ws, "road.plan_error").await;
         assert!(err["message"].as_str().unwrap().contains("degenerate"));
 
-        // Contribute 10 of the 50 first — the move must carry it.
+        // Contribute 10 of the 50 first — the move must carry it. Since
+        // #133 a single contribution only lands on one ~5m cell (most of
+        // this road's 40 cells cost 1 stone each), so reaching 10 takes 10
+        // separate contributions — each one advances to whichever nearby
+        // cell is still incomplete, same as a player walking a few metres
+        // between drops in practice.
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "gather_yield", "player_id": pid,
@@ -8967,13 +9102,15 @@ mod tests {
             .unwrap();
         recv_until(&mut player_ws, "inv.update").await;
         proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100 });
-        zone.to_proxy
-            .send(Message::Text(json!({
-                "type": "build_contribute", "player_id": pid,
-                "order_id": order_id, "item_id": "stone", "qty": 10,
-            }).to_string()))
-            .unwrap();
-        recv_until(&mut player_ws, "build.progress").await;
+        for _ in 0..10 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": order_id, "item_id": "stone", "qty": 1,
+                }).to_string()))
+                .unwrap();
+        }
+        poll_progress_json(&db, &order_id, r#"{"stone":10}"#).await;
 
         // Replan to a 300m L: cost recomputes to 75, progress 10 kept.
         editor_ws
@@ -9077,13 +9214,18 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
+        // The 40m stub is only 8 cells, all within BOARD_RANGE of its
+        // midpoint (#131/#132/#133) — but each contribution still only
+        // lands on one cell at a time, so finishing it takes several.
         proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100 });
-        zone.to_proxy
-            .send(Message::Text(json!({
-                "type": "build_contribute", "player_id": pid,
-                "order_id": road_order, "item_id": "stone", "qty": 10,
-            }).to_string()))
-            .unwrap();
+        for _ in 0..10 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": road_order, "item_id": "stone", "qty": 3,
+                }).to_string()))
+                .unwrap();
+        }
         recv_until(&mut ws, "build.completed").await;
 
         // A cancel on the built road is refused; demolish posts the job.
@@ -9129,8 +9271,15 @@ mod tests {
             .unwrap();
 
         // Wire order: the refund lands (store.update) before the despawn.
-        let storage = recv_until(&mut ws, "store.update").await;
-        let items = storage["items"].as_array().unwrap();
+        // Login hydration also pushes an (empty) `store.update` on connect —
+        // loop past it rather than trusting the first one to be the refund.
+        let items = loop {
+            let storage = recv_until(&mut ws, "store.update").await;
+            let items = storage["items"].as_array().cloned().unwrap_or_default();
+            if items.iter().any(|it| it["item_id"] == "stone") {
+                break items;
+            }
+        };
         assert!(
             items.iter().any(|it| it["item_id"] == "stone" && it["qty"].as_i64() == Some(10)),
             "the full banked stone refunds to the demolisher's storage (got {items:?})"
@@ -9177,14 +9326,18 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
+        // Each contribution lands on one cell (#131/#132/#133), so reaching
+        // 12 stone takes 12 separate deposits from this spot.
         proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100 });
-        zone.to_proxy
-            .send(Message::Text(json!({
-                "type": "build_contribute", "player_id": pid,
-                "order_id": road_order, "item_id": "stone", "qty": 12,
-            }).to_string()))
-            .unwrap();
-        recv_until(&mut ws, "build.progress").await;
+        for _ in 0..12 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": road_order, "item_id": "stone", "qty": 1,
+                }).to_string()))
+                .unwrap();
+        }
+        poll_progress_json(&db, &road_order, r#"{"stone":12}"#).await;
 
         editor_ws
             .send(Message::Text(json!({"type": "road.demolish", "order_id": road_order}).to_string()))
@@ -9215,9 +9368,16 @@ mod tests {
                 "order_id": demo_id, "item_id": "tool_kit", "qty": 1,
             }).to_string()))
             .unwrap();
-        // Wire order: refund first, then the completion announcements.
-        let storage = recv_until(&mut ws, "store.update").await;
-        let items = storage["items"].as_array().unwrap();
+        // Wire order: refund first, then the completion announcements. Login
+        // hydration also pushes an (empty) `store.update` on connect — loop
+        // past it rather than trusting the first one to be the refund.
+        let items = loop {
+            let storage = recv_until(&mut ws, "store.update").await;
+            let items = storage["items"].as_array().cloned().unwrap_or_default();
+            if items.iter().any(|it| it["item_id"] == "stone") {
+                break items;
+            }
+        };
         assert!(
             items.iter().any(|it| it["item_id"] == "stone" && it["qty"].as_i64() == Some(12)),
             "a part-built plan refunds its contributed progress (got {items:?})"
@@ -9226,6 +9386,58 @@ mod tests {
         assert!(db.build_order_by_id(&road_order).await.unwrap().is_none());
 
         drop(editor_ws);
+        drop(ws);
+    }
+
+    /// A road order planned before #132 shipped (kind `road_*`, `path_json`
+    /// set, but never given any `road_cell` rows — exactly what a road
+    /// planned on an older build looks like) falls back to the ordinary
+    /// pooled `build.contribute` path instead of silently refusing every
+    /// contribution forever just because it predates per-cell tracking.
+    #[tokio::test]
+    async fn a_road_order_with_no_cells_falls_back_to_pooled_contribution() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let order = db
+            .insert_build_order(
+                "civic", "road_legacy", r#"{"stone":5}"#, "open", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "dirt_road".to_string(), x: 100, y: 100, x1: Some(110), y1: Some(100),
+                }),
+                Some("[[100,100],[110,100]]"),
+            )
+            .await
+            .unwrap();
+        assert!(db.road_cells_for_order(&order.id).await.unwrap().is_empty(), "no cells, as a pre-#132 road would have");
+
+        let email = format!("legacy_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Legacy"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 5, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 105, y: 100, hp: 100 });
+
+        // One pooled contribution of the whole 5 completes it outright —
+        // proving this landed on the legacy `db.contribute` path, not the
+        // per-cell one (which would have capped a single call far lower).
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order.id, "item_id": "stone", "qty": 5,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "build.completed").await;
+        assert_eq!(db.build_order_by_id(&order.id).await.unwrap().unwrap().state, "completed");
+
         drop(ws);
     }
 
