@@ -641,6 +641,67 @@ pub struct BuildPlacement {
     pub y1: Option<i64>,
 }
 
+/// One priced chunk of a road's path (progressive road building epic #131,
+/// issue #132): the input to [`Db::insert_road_cells`]/[`Db::replan_road_order`],
+/// computed by chopping the plan's polyline into fixed-length pieces and
+/// distributing the plan's total cost across them proportionally to each
+/// piece's length — see `cut_road_cells` in `proxy.rs`, which owns the
+/// pricing policy the same way it already owns `parse_road_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoadCellSpec {
+    pub x0: i64,
+    pub y0: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub required_json: String,
+}
+
+/// A persisted chunk of a road's path, with its own cost/progress
+/// (progressive road building epic #131, issue #132).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RoadCell {
+    pub order_id: String,
+    pub cell_index: i64,
+    pub x0: i64,
+    pub y0: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub required_json: String,
+    pub progress_json: String,
+    pub completed_at: Option<i64>,
+}
+
+/// The outcome of a [`Db::contribute_to_road_cell`] call: mirrors
+/// [`ContributeResult`], scoped to one cell plus whether that contribution
+/// finished the WHOLE road (every cell complete), in which case the caller
+/// runs the ordinary order-completion announcements same as `contribute`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellContributeResult {
+    /// Units actually moved from carried inventory into the cell.
+    pub moved: i64,
+    /// The cell's required cost (`item -> qty`).
+    pub required: BTreeMap<String, i64>,
+    /// The cell's progress after this contribution (`item -> qty`).
+    pub progress: BTreeMap<String, i64>,
+    /// Whether this contribution completed the CELL.
+    pub cell_completed: bool,
+    /// Whether this contribution completed the whole road order (every cell
+    /// done) — same shape as [`ContributeResult`]'s completion fields so the
+    /// caller can reuse `announce_order_completion` unchanged.
+    pub order_completed: bool,
+    /// The order's aggregate required cost (`item -> qty`) — for the
+    /// gateway's ordinary district-wide `build.progress` broadcast, which
+    /// keeps firing off the pooled total alongside the new per-cell one
+    /// (#133) so nothing reading the aggregate needs to change.
+    pub order_required: BTreeMap<String, i64>,
+    /// The order's aggregate progress after this contribution.
+    pub order_progress: BTreeMap<String, i64>,
+    pub kind: String,
+    pub district: String,
+    pub contributors: Vec<(String, i64)>,
+    pub placement: Option<BuildPlacement>,
+}
+
 /// The outcome of a [`Db::replan_road_order`] call (#104).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplanOutcome {
@@ -1765,6 +1826,177 @@ impl Db {
         })
     }
 
+    /// Persist a road plan's cells (#132), in path order starting at index 0.
+    /// Called right after `insert_build_order` for a fresh road plan — the
+    /// order's `required_json` is already the sum of every cell's cost (the
+    /// caller computed both from the same `cut_road_cells` split), so this
+    /// never needs to touch the order row itself.
+    pub async fn insert_road_cells(&self, order_id: &str, cells: &[RoadCellSpec]) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        for (i, c) in cells.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO road_cell (order_id, cell_index, x0, y0, x1, y1, required_json, progress_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, '{}')",
+            )
+            .bind(order_id)
+            .bind(i as i64)
+            .bind(c.x0)
+            .bind(c.y0)
+            .bind(c.x1)
+            .bind(c.y1)
+            .bind(&c.required_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A road order's cells, in path order (#132).
+    pub async fn road_cells_for_order(&self, order_id: &str) -> Result<Vec<RoadCell>, DbError> {
+        sqlx::query_as::<_, RoadCell>(
+            "SELECT * FROM road_cell WHERE order_id = ? ORDER BY cell_index",
+        )
+        .bind(order_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Contribute up to `qty` of `item_id` into ONE cell of a road order
+    /// (#132) — the cell-scoped sibling of [`Db::contribute`]. The caller
+    /// (the gateway, #133) resolves `cell_index` from the contributor's
+    /// position; this only trusts that it names an existing, unfinished
+    /// cell of an open road order. Keeps the order's own `progress_json`
+    /// mirrored in lockstep (same map, summed across cells) so every
+    /// existing consumer that reads the order's aggregate — the board list,
+    /// `settle_demolition`'s refund — keeps working unchanged.
+    pub async fn contribute_to_road_cell(
+        &self,
+        character_id: &str,
+        order_id: &str,
+        cell_index: i64,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<CellContributeResult, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(order) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
+            .bind(order_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(CellContributeResult::default());
+        };
+        let Some(cell) = sqlx::query_as::<_, RoadCell>(
+            "SELECT * FROM road_cell WHERE order_id = ? AND cell_index = ?",
+        )
+        .bind(order_id)
+        .bind(cell_index)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(CellContributeResult::default());
+        };
+
+        let cell_required = parse_cost(&cell.required_json);
+        let mut cell_progress = parse_cost(&cell.progress_json);
+        let mut result = CellContributeResult {
+            required: cell_required.clone(),
+            progress: cell_progress.clone(),
+            kind: order.kind.clone(),
+            district: order.district.clone(),
+            placement: order.placement(),
+            ..Default::default()
+        };
+
+        if order.state != "open" || cell.completed_at.is_some() || qty <= 0 {
+            tx.commit().await?;
+            return Ok(result);
+        }
+
+        let need = cell_required
+            .get(item_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(cell_progress.get(item_id).copied().unwrap_or(0))
+            .max(0);
+        let carried: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let moved = qty.min(need).min(carried.unwrap_or(0)).max(0);
+        if moved == 0 {
+            tx.commit().await?;
+            return Ok(result);
+        }
+
+        remove_inventory_in_tx(&mut tx, character_id, item_id, moved).await?;
+        *cell_progress.entry(item_id.to_string()).or_insert(0) += moved;
+        let cell_completed = cell_required
+            .iter()
+            .all(|(k, v)| cell_progress.get(k).copied().unwrap_or(0) >= *v);
+        sqlx::query(
+            "UPDATE road_cell SET progress_json = ?, completed_at = ? WHERE order_id = ? AND cell_index = ?",
+        )
+        .bind(dump_cost(&cell_progress))
+        .bind(cell_completed.then_some(now_secs()))
+        .bind(order_id)
+        .bind(cell_index)
+        .execute(&mut *tx)
+        .await?;
+
+        let mut order_progress = parse_cost(&order.progress_json);
+        *order_progress.entry(item_id.to_string()).or_insert(0) += moved;
+        sqlx::query("UPDATE build_order SET progress_json = ? WHERE id = ?")
+            .bind(dump_cost(&order_progress))
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO build_contribution (order_id, character_id, units) VALUES (?, ?, ?) \
+             ON CONFLICT(order_id, character_id) DO UPDATE SET units = units + excluded.units",
+        )
+        .bind(order_id)
+        .bind(character_id)
+        .bind(moved)
+        .execute(&mut *tx)
+        .await?;
+
+        let order_required = parse_cost(&order.required_json);
+        let order_completed = !order_required.is_empty()
+            && order_required
+                .iter()
+                .all(|(k, v)| order_progress.get(k).copied().unwrap_or(0) >= *v);
+        let mut contributors = Vec::new();
+        if order_completed {
+            sqlx::query("UPDATE build_order SET state = 'completed', completed_at = ? WHERE id = ?")
+                .bind(now_secs())
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            contributors = sqlx::query_as::<_, (String, i64)>(
+                "SELECT character_id, units FROM build_contribution WHERE order_id = ? ORDER BY character_id",
+            )
+            .bind(order_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        result.moved = moved;
+        result.progress = cell_progress;
+        result.cell_completed = cell_completed;
+        result.order_completed = order_completed;
+        result.order_required = order_required;
+        result.order_progress = order_progress;
+        result.contributors = contributors;
+        Ok(result)
+    }
+
     /// Unlock a `locked` build order (a tech-tree dependent) by flipping it to `open`.
     /// Idempotent: returns the now-open order, or `None` if there was no locked order
     /// of that `(district, kind)` (already open/completed, or absent).
@@ -2258,6 +2490,7 @@ impl Db {
         required_json: &str,
         path_json: &str,
         placement: &BuildPlacement,
+        cells: &[RoadCellSpec],
         now: i64,
     ) -> Result<ReplanOutcome, DbError> {
         let mut tx = self.pool.begin().await?;
@@ -2283,6 +2516,63 @@ impl Db {
             tx.commit().await?;
             return Ok(ReplanOutcome::default());
         }
+
+        // Re-cut the cells (#132). A new cell whose span exactly matches an
+        // OLD cell's span keeps that cell's progress/completion (capped to
+        // the new cost, in case the redistribution shrank it) — cells
+        // untouched by the edit (the common case: dragging one waypoint
+        // only changes the runs touching it) come out with identical spans
+        // and so keep their state for free; anything the edit actually
+        // reshaped starts fresh. Progress on a dropped cell isn't lost: the
+        // order's own `progress_json` (updated below, unchanged from
+        // before) still carries it, same as any other over-collected stone
+        // on a replan today.
+        let old_cells = sqlx::query_as::<_, RoadCell>(
+            "SELECT * FROM road_cell WHERE order_id = ? ORDER BY cell_index",
+        )
+        .bind(order_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM road_cell WHERE order_id = ?")
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?;
+        for (i, c) in cells.iter().enumerate() {
+            let carried = old_cells.iter().find(|o| {
+                o.x0 == c.x0 && o.y0 == c.y0 && o.x1 == c.x1 && o.y1 == c.y1
+            });
+            let new_required = parse_cost(&c.required_json);
+            let (progress_json, completed_at) = match carried {
+                Some(o) => {
+                    let mut p = parse_cost(&o.progress_json);
+                    for (k, v) in p.iter_mut() {
+                        if let Some(cap) = new_required.get(k) {
+                            *v = (*v).min(*cap);
+                        }
+                    }
+                    let done = !new_required.is_empty()
+                        && new_required.iter().all(|(k, v)| p.get(k).copied().unwrap_or(0) >= *v);
+                    (dump_cost(&p), if done { Some(now) } else { None })
+                }
+                None => ("{}".to_string(), None),
+            };
+            sqlx::query(
+                "INSERT INTO road_cell (order_id, cell_index, x0, y0, x1, y1, required_json, progress_json, completed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(order_id)
+            .bind(i as i64)
+            .bind(c.x0)
+            .bind(c.y0)
+            .bind(c.x1)
+            .bind(c.y1)
+            .bind(&c.required_json)
+            .bind(&progress_json)
+            .bind(completed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let order = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
             .bind(order_id)
             .fetch_one(&mut *tx)
@@ -2315,14 +2605,30 @@ impl Db {
     /// Returns whether the row was removed; `false` = wrong state/progress
     /// (the caller rejects with a pointer to demolition).
     pub async fn cancel_road_order(&self, order_id: &str) -> Result<bool, DbError> {
-        let res = sqlx::query(
-            "DELETE FROM build_order WHERE id = ? AND state = 'open' \
+        let mut tx = self.pool.begin().await?;
+        let eligible: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM build_order WHERE id = ? AND state = 'open' \
              AND path_json IS NOT NULL AND progress_json = '{}'",
         )
         .bind(order_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if eligible.is_none() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        // Children before parent — `road_cell.order_id` references
+        // `build_order(id)` and this DB enforces foreign keys.
+        sqlx::query("DELETE FROM road_cell WHERE order_id = ?")
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM build_order WHERE id = ?")
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Create a demolition order for a road (`road.demolish`, #106),
@@ -2428,6 +2734,10 @@ impl Db {
             parse_cost(&target.progress_json)
         };
         sqlx::query("DELETE FROM build_contribution WHERE order_id = ?")
+            .bind(&target.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM road_cell WHERE order_id = ?")
             .bind(&target.id)
             .execute(&mut *tx)
             .await?;
@@ -3001,6 +3311,150 @@ mod tests {
         assert_eq!(well.state, "completed");
         assert!(well.completed_at.is_some());
         assert_eq!(db.contribute(&a, &order.id, "stone", 1).await.unwrap().moved, 0);
+    }
+
+    /// Two 5m road cells (progressive road building epic #131, issue #132).
+    fn two_road_cells() -> Vec<RoadCellSpec> {
+        vec![
+            RoadCellSpec { x0: 100, y0: 100, x1: 105, y1: 100, required_json: r#"{"stone":2}"#.to_string() },
+            RoadCellSpec { x0: 105, y0: 100, x1: 110, y1: 100, required_json: r#"{"stone":2}"#.to_string() },
+        ]
+    }
+
+    #[tokio::test]
+    async fn road_cell_contribute_updates_the_cell_and_mirrors_into_the_order_aggregate() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "road_x", r#"{"stone":4}"#, "open", 0, None, 0, None, Some("[[100,100],[110,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&order.id, &two_road_cells()).await.unwrap();
+
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "stone", 10).await.unwrap();
+
+        // Partial contribution to cell 0: cell progress moves, cell isn't
+        // done yet, and the order's own aggregate mirrors the same amount.
+        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1).await.unwrap();
+        assert_eq!(r.moved, 1);
+        assert!(!r.cell_completed);
+        assert!(!r.order_completed);
+        let order_row = db.build_order_by_id(&order.id).await.unwrap().unwrap();
+        assert_eq!(order_row.progress_json, r#"{"stone":1}"#, "order aggregate mirrors the cell contribution");
+        let cells = db.road_cells_for_order(&order.id).await.unwrap();
+        assert_eq!(cells[0].progress_json, r#"{"stone":1}"#);
+        assert!(cells[0].completed_at.is_none());
+
+        // Finish cell 0: only THAT cell completes, not the whole road.
+        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1).await.unwrap();
+        assert!(r.cell_completed);
+        assert!(!r.order_completed);
+        let cells = db.road_cells_for_order(&order.id).await.unwrap();
+        assert!(cells[0].completed_at.is_some());
+        assert!(cells[1].completed_at.is_none());
+
+        // A contribution bounded past a completed cell's need moves nothing.
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 5).await.unwrap().moved, 0);
+
+        // Finish cell 1 too: the WHOLE order completes, contributors report,
+        // exactly like the pooled `contribute` path.
+        let r = db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 2).await.unwrap();
+        assert!(r.cell_completed);
+        assert!(r.order_completed, "every cell done completes the order");
+        assert_eq!(r.contributors, vec![(cid.clone(), 4)]);
+        let order_row = db.build_order_by_id(&order.id).await.unwrap().unwrap();
+        assert_eq!(order_row.state, "completed");
+        assert_eq!(order_row.progress_json, r#"{"stone":4}"#);
+
+        // Nothing more moves into a completed order.
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1).await.unwrap().moved, 0);
+    }
+
+    #[tokio::test]
+    async fn road_cell_contribute_is_a_noop_for_an_unknown_cell_or_order() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "road_x", r#"{"stone":2}"#, "open", 0, None, 0, None, Some("[[100,100],[105,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&order.id, &two_road_cells()[..1]).await.unwrap();
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "stone", 10).await.unwrap();
+
+        assert_eq!(db.contribute_to_road_cell(&cid, "no-such-order", 0, "stone", 1).await.unwrap().moved, 0);
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 9, "stone", 1).await.unwrap().moved, 0, "no cell at that index");
+    }
+
+    #[tokio::test]
+    async fn replan_road_order_preserves_progress_on_cells_whose_span_is_unchanged() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "road_x", r#"{"stone":4}"#, "open", 0, None, 0, None, Some("[[100,100],[110,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&order.id, &two_road_cells()).await.unwrap();
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "stone", 10).await.unwrap();
+        // Finish cell 0 only.
+        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2).await.unwrap();
+
+        // Replan: keep the first cell's span identical (100,100)-(105,100),
+        // extend the road further east so the SECOND cell's span changes.
+        let new_cells = vec![
+            RoadCellSpec { x0: 100, y0: 100, x1: 105, y1: 100, required_json: r#"{"stone":2}"#.to_string() },
+            RoadCellSpec { x0: 105, y0: 100, x1: 115, y1: 100, required_json: r#"{"stone":3}"#.to_string() },
+        ];
+        let placement = BuildPlacement { structure_kind: "dirt_road".to_string(), x: 100, y: 100, x1: Some(115), y1: Some(100) };
+        let outcome = db
+            .replan_road_order(&order.id, "civic", r#"{"stone":5}"#, "[[100,100],[115,100]]", &placement, &new_cells, 0)
+            .await
+            .unwrap();
+        assert!(outcome.applied);
+        assert!(!outcome.completed, "the recomputed 5-stone cost isn't covered by the kept 2");
+
+        let cells = db.road_cells_for_order(&order.id).await.unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].progress_json, r#"{"stone":2}"#, "unchanged span keeps its progress");
+        assert!(cells[0].completed_at.is_some(), "and stays completed");
+        assert_eq!(cells[1].progress_json, "{}", "the reshaped cell starts fresh");
+        assert!(cells[1].completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn settle_demolition_refunds_the_full_progress_including_a_part_finished_cell() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "road_x", r#"{"stone":4}"#, "open", 0, None, 0, None, Some("[[100,100],[110,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&order.id, &two_road_cells()).await.unwrap();
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "stone", 10).await.unwrap();
+        // Cell 0 fully done (2 stone), cell 1 only half done (1 of 2 stone)
+        // — the road as a whole is still open, not completed.
+        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2).await.unwrap();
+        db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1).await.unwrap();
+
+        db.create_demolition(&order.id, 0).await.unwrap().unwrap();
+        let (target, refund) = db.settle_demolition(&order.id).await.unwrap().unwrap();
+        assert_eq!(target.id, order.id);
+        assert_eq!(refund.get("stone"), Some(&3), "the partial cell's stone is refunded too, not lost");
+
+        assert!(db.road_cells_for_order(&order.id).await.unwrap().is_empty(), "cells are cleaned up with the order");
+        assert!(db.build_order_by_id(&order.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_road_order_removes_its_cells_too() {
+        let (db, _t) = TempDb::open().await;
+        let order = db
+            .insert_build_order("civic", "road_x", r#"{"stone":4}"#, "open", 0, None, 0, None, Some("[[100,100],[110,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&order.id, &two_road_cells()).await.unwrap();
+        assert!(db.cancel_road_order(&order.id).await.unwrap());
+        assert!(db.road_cells_for_order(&order.id).await.unwrap().is_empty());
+        assert!(db.build_order_by_id(&order.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

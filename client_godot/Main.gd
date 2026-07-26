@@ -160,7 +160,11 @@ func _process(_delta: float) -> void:
     _storage.show_panel(near_store)
     _inventory.set_forced_open(near_store)
     var near_board := _entities.nearest_build_board(_player.world_pos(), Protocol.BOARD_RANGE) != ""
-    _build.show_panel(near_board)
+    # Roads have no build-board fallback (#131/#133) — the only way to see
+    # (and pay into) what a specific stretch still needs is standing on it.
+    var near_cell := _world.nearest_incomplete_road_cell(_player.world_pos(), Protocol.BOARD_RANGE)
+    _build.set_road_cell(near_cell)
+    _build.show_panel(near_board or not near_cell.is_empty())
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
 
@@ -298,8 +302,14 @@ func _wire_signals() -> void:
     _net.build_list.connect(func(orders):
         _build.set_orders(orders)
         # Staked road plans (#95): every client renders open road orders'
-        # paths so players can see where stone is wanted.
-        _world.apply_road_plans(orders))
+        # paths so players can see where stone is wanted. Newly-seen open
+        # road plans (#134) need their cell geometry fetched once to seed
+        # the progressive pavement render and the nearest-cell readout.
+        for order_id in _world.apply_road_plans(orders):
+            _net.send_road_cells_request(order_id))
+    _net.road_cells.connect(func(order_id, cells): _world.set_road_cells(order_id, cells))
+    _net.road_cell_progress.connect(func(order_id, cell_index, required, progress, completed):
+        _world.set_road_cell_progress(order_id, cell_index, required, progress, completed))
     _net.build_progress.connect(func(order_id, required, progress): _build.update_progress(order_id, required, progress))
     _net.build_completed.connect(func(order_id, _structures):
         _build.mark_completed(order_id)
