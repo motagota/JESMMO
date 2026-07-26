@@ -275,15 +275,16 @@ struct ClientInfo {
 }
 
 /// The cached last-known state of an entity, as reported by its owning zone's
-/// `status_update`s — position/hp for recreating it elsewhere, plus an
-/// in-progress gather job (if any) so a split/merge/rolling-update doesn't
-/// silently drop it (#16). `gather` is `(node_id, progress)`.
+/// `status_update`s — position/hp for recreating it elsewhere on a
+/// split/merge/rolling-update (#16). Used to carry an in-progress gather
+/// job too, back when gathering was a channel a player could walk away
+/// from mid-yield; every resource is an instant ability swing now (#125),
+/// so there's nothing left to carry across a handoff.
 #[derive(Clone)]
 struct EntityCache {
     x: i32,
     y: i32,
     hp: i32,
-    gather: Option<(String, i32)>,
 }
 
 /// The outcome of the auth handshake: who this connection is and where to spawn.
@@ -317,10 +318,9 @@ struct Proxy {
     /// How often each client is pinged for liveness. A field (not just a const)
     /// so tests can drive the reaper on a short interval.
     ping_interval: Duration,
-    /// Last position+hp (and in-progress gather job, if any, #16) the proxy saw
-    /// for each entity (from status_updates), keyed by player_id. Used to
-    /// recreate entities at their real position — and resume gathering — in a
-    /// freshly-spawned zone instance during a split/merge/rolling update.
+    /// Last position+hp the proxy saw for each entity (from status_updates),
+    /// keyed by player_id. Used to recreate entities at their real position
+    /// in a freshly-spawned zone instance during a split/merge/rolling update.
     entity_state: Mutex<HashMap<String, EntityCache>>,
     /// Child processes the gateway spawned (the current instance per zone id),
     /// so a later update can reap the one it replaces.
@@ -872,13 +872,7 @@ impl Proxy {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                            // In-progress gather job, if the zone included one (#16) — so
-                            // a split/merge/rolling-update can resume it instead of
-                            // silently dropping it.
-                            let gather = st.get("gather_node").and_then(|v| v.as_str()).map(|node| {
-                                (node.to_string(), st.get("gather_progress").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
-                            });
-                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
+                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
                         }
                     }
                     // Stamp the owning zone and fan the update out to EVERY client,
@@ -943,12 +937,17 @@ impl Proxy {
                 Some("gather_yield") => {
                     // Internal: a zone yielded a gathered unit. Persist it and push
                     // the authoritative inventory/skill to the client (not forwarded).
+                    // `ability_id` (#128) is only present when this came from a real
+                    // ability swing (`apply_ability_swing`) — test fixtures and any
+                    // other internal caller that hands over starting items via this
+                    // same message never wear down a tool, by design.
                     if let Some(pid) = target_player.as_deref() {
                         let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
                         let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
                         let skill = data.get("skill").and_then(|v| v.as_str()).unwrap_or("gathering");
                         let xp = data.get("xp").and_then(|v| v.as_i64()).unwrap_or(0);
-                        self.apply_gather_yield(pid, item, qty, skill, xp).await;
+                        let ability_id = data.get("ability_id").and_then(|v| v.as_str()).map(str::to_string);
+                        self.apply_gather_yield(pid, item, qty, skill, xp, ability_id.as_deref()).await;
                     }
                 }
                 Some("store_op") => {
@@ -1083,19 +1082,13 @@ impl Proxy {
     /// authoritative position, and follow the player's client session (re-pointing
     /// `current_zone` and notifying it of the crossing). Shared by
     /// `handle_migrate_request` (a live region-boundary crossing) and
-    /// `handle_player_died` (a respawn, which may also cross zones). Carries
-    /// forward any in-progress gather job (#16) so the new zone can resume it.
+    /// `handle_player_died` (a respawn, which may also cross zones).
     fn relocate_player(&self, pid: &str, x: i32, y: i32, hp: i32, target: &str) {
         let target_tx = self.zones.lock().unwrap().get(target).map(|z| z.tx.clone());
         let Some(tx) = target_tx else { return };
-        let gather = self.entity_state.lock().unwrap().get(pid).and_then(|c| c.gather.clone());
-        let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-        if let Some((node_id, progress)) = &gather {
-            msg["gather_node"] = json!(node_id);
-            msg["gather_progress"] = json!(progress);
-        }
+        let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
         let _ = tx.send(Message::Text(msg.to_string()));
-        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
+        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
 
         // Follow the player's client session (every entity is a client).
         let mut clients = self.clients.lock().unwrap();
@@ -1437,19 +1430,14 @@ impl Proxy {
             return false;
         };
 
-        // 4. Recreate every entity in the new instance at its cached position,
-        //    resuming an in-progress gather job if it had one (#16).
+        // 4. Recreate every entity in the new instance at its cached position.
         for p in &players {
             let cached = self.entity_state.lock().unwrap().get(p).cloned();
-            let (x, y, hp, gather) = match cached {
-                Some(c) => (c.x, c.y, c.hp, c.gather),
-                None => (WORLD_SIZE / 2, WORLD_SIZE / 2, 100, None),
+            let (x, y, hp) = match cached {
+                Some(c) => (c.x, c.y, c.hp),
+                None => (WORLD_SIZE / 2, WORLD_SIZE / 2, 100),
             };
-            let mut msg = json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = &gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+            let msg = json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp});
             let _ = new_tx.send(Message::Text(msg.to_string()));
         }
 
@@ -1608,17 +1596,16 @@ impl Proxy {
             return false; // region too small to subdivide further
         }
 
-        // Players currently in this zone, with cached world positions (and any
-        // in-progress gather job, #16).
-        let players: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
+        // Players currently in this zone, with cached world positions.
+        let players: Vec<(String, i32, i32, i32)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == zone_id)
                 .map(|i| match state.get(&i.player_id).cloned() {
-                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
-                    None => (i.player_id.clone(), region.x0, region.y0, 100, None),
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp),
+                    None => (i.player_id.clone(), region.x0, region.y0, 100),
                 })
                 .collect()
         };
@@ -1689,18 +1676,14 @@ impl Proxy {
         // Migrate the players who now fall in the `give` half, at their exact
         // world position (seamless — no teleport).
         let mut moved = 0;
-        for (pid, x, y, hp, gather) in &players {
+        for (pid, x, y, hp) in &players {
             if !give.contains(*x, *y) {
                 continue;
             }
             let _ = old_tx.send(Message::Text(
                 json!({"type": "player_leave", "player_id": pid}).to_string(),
             ));
-            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+            let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
             let _ = new_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = new_id.clone();
@@ -1739,17 +1722,16 @@ impl Proxy {
         };
         let union = keep_region.union(&drop_region);
 
-        // Players to move out of the retiring zone, with their world positions
-        // (and any in-progress gather job, #16).
-        let movers: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
+        // Players to move out of the retiring zone, with their world positions.
+        let movers: Vec<(String, i32, i32, i32)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == drop_id)
                 .map(|i| match state.get(&i.player_id).cloned() {
-                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
-                    None => (i.player_id.clone(), union.x0, union.y0, 100, None),
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp),
+                    None => (i.player_id.clone(), union.x0, union.y0, 100),
                 })
                 .collect()
         };
@@ -1774,12 +1756,8 @@ impl Proxy {
         self.sync_home_structures_to_zone(keep_id, union).await;
 
         // Move the retiring zone's players into the survivor at their positions.
-        for (pid, x, y, hp, gather) in &movers {
-            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+        for (pid, x, y, hp) in &movers {
+            let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
             let _ = keep_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = keep_id.to_string();
@@ -2079,14 +2057,23 @@ impl Proxy {
     }
 
     /// Push a character's current inventory (with carry capacity) to its client as
-    /// `inv.update`.
+    /// `inv.update`. Every row carries its own `id` now (#128) — needed to equip or
+    /// repair a SPECIFIC tool instance once "the pickaxe" stops being unambiguous;
+    /// `durability`/`max_durability` ride along only for actual tool instances.
     async fn send_inventory(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         if let Ok(items) = db.inventory_for_character(pid).await {
             let used: i64 = items.iter().map(|it| it.qty).sum();
             let arr: Vec<Value> = items
                 .iter()
-                .map(|it| json!({"item_id": it.item_id, "qty": it.qty, "slot": it.slot}))
+                .map(|it| {
+                    let mut v = json!({"id": it.id, "item_id": it.item_id, "qty": it.qty, "slot": it.slot});
+                    if let Some(durability) = it.durability {
+                        v["durability"] = json!(durability);
+                        v["max_durability"] = json!(mmo::world::tool_max_durability(&it.item_id).unwrap_or(durability));
+                    }
+                    v
+                })
                 .collect();
             self.push_to_player(pid, json!({
                 "type": "inv.update", "player_id": pid, "items": arr,
@@ -2110,8 +2097,18 @@ impl Proxy {
     /// Perform a storage transfer reported by a zone (`store_op`) and push the
     /// updated inventory + storage to the client. The zone validated proximity; the
     /// gateway owns the durable, transactional move. No-op for guests / no DB.
+    ///
+    /// Tools are blocked from storage entirely (#128): the storehouse has no
+    /// concept of "which instance" (it only ever moves by item_id+qty), so
+    /// a worn tool deposited and withdrawn would silently come back at full
+    /// durability — durability laundering. Not solving "storage for
+    /// individually-tracked items" here; instance rows just aren't a fit
+    /// for a stack-based stash.
     async fn apply_store_op(&self, pid: &str, op: &str, item_id: &str, qty: i64) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
+        if mmo::world::tool_max_durability(item_id).is_some() {
+            return;
+        }
         let persistent = self
             .clients
             .lock()
@@ -3094,19 +3091,22 @@ impl Proxy {
         }
     }
 
-    // --- Equipment (mining/abilities epic #123) -----------------------------
+    // --- Equipment (mining/abilities epic #123; instanced in #128) ----------
 
     /// Push a character's tool slot + the abilities it grants to its client as
-    /// `equip.update`. This is the **only** place ability cooldowns are
-    /// computed for display — each `cooldown_ms` is already level-scaled via
-    /// [`mmo::world::ability_cooldown_ms`], so the hotbar always shows exactly
-    /// what the gateway will enforce on `ability.use` (#117).
+    /// `equip.update`, now including the live durability of the specific
+    /// instance worn (#128) so the HUD's "in hand" line can show wear
+    /// without opening Inventory. This is the **only** place ability
+    /// cooldowns are computed for display — each `cooldown_ms` is already
+    /// level-scaled via [`mmo::world::ability_cooldown_ms`], so the hotbar
+    /// always shows exactly what the gateway will enforce on `ability.use`
+    /// (#117).
     async fn send_equipment(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        let tool = db.equipped(pid, "tool").await.ok().flatten();
+        let equipped = db.equipped_tool(pid, "tool").await.ok().flatten();
         let mut abilities: Vec<Value> = Vec::new();
-        if let Some(item_id) = &tool {
-            for a in mmo::world::abilities_for_item(item_id) {
+        if let Some(tool) = &equipped {
+            for a in mmo::world::abilities_for_item(&tool.item_id) {
                 let level = match mmo::world::governing_skill(a.id) {
                     Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
                     None => 0,
@@ -3118,25 +3118,49 @@ impl Proxy {
             }
         }
         self.push_to_player(pid, json!({
-            "type": "equip.update", "player_id": pid, "tool": tool, "abilities": abilities,
+            "type": "equip.update", "player_id": pid,
+            "tool": equipped.as_ref().map(|t| t.item_id.clone()),
+            "durability": equipped.as_ref().map(|t| t.durability),
+            "max_durability": equipped.as_ref().map(|t| t.max_durability),
+            "abilities": abilities,
         }));
     }
 
-    /// Arm `item_id` in the slot it belongs to (mining/abilities epic #123).
-    /// An unrecognized/unequippable item id is silently ignored (a
-    /// well-behaved client only ever offers equippable items); not owning
-    /// one is the one case a legitimate client can hit — e.g. a stale
-    /// inventory view — so that gets an explicit `equip_error`.
-    async fn apply_equip(&self, pid: &str, item_id: &str) {
+    /// Arm a SPECIFIC owned tool instance (#128 — "the pickaxe" stopped
+    /// being well-defined once tools carry their own durability); the slot
+    /// is derived from the instance's own item. Not owning it (an unknown
+    /// instance id, or one belonging to someone else — e.g. a stale
+    /// inventory view) gets an explicit `equip_error`.
+    async fn apply_equip(&self, pid: &str, instance_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
-        let Some(slot) = mmo::world::equippable_slot(item_id) else { return };
-        match db.equip(pid, slot, item_id).await {
-            Ok(true) => self.send_equipment(pid).await,
-            Ok(false) => self.push_to_player(pid, json!({
+        match db.equip_instance(pid, instance_id).await {
+            Ok(Some(_)) => self.send_equipment(pid).await,
+            Ok(None) => self.push_to_player(pid, json!({
                 "type": "equip_error", "message": "you don't have one of those",
             })),
             Err(_) => {}
         }
+    }
+
+    /// Repair a specific owned tool instance at a crafting station (#128) —
+    /// same "confirm they own a crafting-kind structure on their own plot"
+    /// gate [`Db::apply_craft_make`] uses. Silent no-op on failure (no
+    /// station, unknown/unowned instance, nothing missing, can't afford it)
+    /// — mirrors crafting's existing failure posture.
+    async fn apply_repair(&self, pid: &str, instance_id: &str) {
+        let db = match &self.db { Some(d) => d.clone(), None => return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let Ok(structures) = db.structures_for_plot(&plot.id).await else { return };
+        if !structures.iter().any(|s| s.kind == "crafting") {
+            return;
+        }
+        let Ok(Some(outcome)) = db.repair_instance(pid, instance_id).await else { return };
+        self.send_inventory(pid).await;
+        self.send_equipment(pid).await; // durability may be the currently-equipped instance's
+        self.push_to_player(pid, json!({
+            "type": "repair.done", "instance_id": instance_id, "item_id": outcome.item_id,
+            "cost": Value::Object(outcome.cost.into_iter().map(|(k, v)| (k, json!(v))).collect()),
+        }));
     }
 
     /// Clear the tool slot.
@@ -3196,41 +3220,31 @@ impl Proxy {
         }));
     }
 
-    // --- NPCs (mining/abilities epic #123, #118) -----------------------------
+    // --- NPCs (mining/abilities epic #123, #118, generalized #126) -----------
 
-    /// Resolve a talk the zone already confirmed was in range: the quarry
-    /// foreman hands over a pickaxe the first time (and any time since —
-    /// it's a safety net, not a farm) a character has none at all, in
-    /// inventory or in hand; otherwise he just talks. Unknown NPC ids are a
-    /// silent no-op — only the foreman has dialogue today.
+    /// Resolve a talk the zone already confirmed was in range: fully
+    /// data-driven off the NPC's own authored `grants_item`/`lines_*` (#126)
+    /// — hands over that item the first time (and any time since — it's a
+    /// safety net, not a farm) a character has none at all, in inventory or
+    /// in hand; otherwise (or for an NPC with no `grants_item`) just talks.
+    /// Unknown NPC ids are a silent no-op.
     async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let Some(npc) = mmo::world::npc(npc_id) else { return };
-        if npc_id != "npc_quarry_foreman" {
-            return;
-        }
-        let owned = db.inventory_qty(pid, "pickaxe").await.unwrap_or(0);
-        let equipped = db.equipped(pid, "tool").await.ok().flatten();
-        let has_one = owned > 0 || equipped.as_deref() == Some("pickaxe");
         let mut granted = false;
-        if !has_one {
-            let added = db.add_to_inventory(pid, "pickaxe", 1).await.unwrap_or(0);
-            if added > 0 {
-                granted = true;
-                self.send_inventory(pid).await;
+        if let Some(item_id) = npc.grants_item {
+            let owned = db.inventory_qty(pid, item_id).await.unwrap_or(0);
+            let equipped = db.equipped(pid, "tool").await.ok().flatten();
+            let has_one = owned > 0 || equipped.as_deref() == Some(item_id);
+            if !has_one {
+                let added = db.add_to_inventory(pid, item_id, 1).await.unwrap_or(0);
+                if added > 0 {
+                    granted = true;
+                    self.send_inventory(pid).await;
+                }
             }
         }
-        let lines: Vec<&str> = if granted {
-            vec![
-                "No pick? Take mine, and mind the edge.",
-                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
-            ]
-        } else {
-            vec![
-                "Keep that pick on the rock, not the ground between swings.",
-                "Practice sharpens more than the edge — you'll swing faster with time.",
-            ]
-        };
+        let lines = if granted { npc.lines_granted } else { npc.lines_repeat };
         self.push_to_player(pid, json!({
             "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
             "lines": lines, "granted": granted,
@@ -4105,7 +4119,15 @@ impl Proxy {
     /// authoritative inventory + skill back to the client. The zone is authoritative
     /// for the *simulation* (range, depletion); the gateway owns the *durable* write,
     /// mirroring how character position is persisted. No-op for guests / no DB.
-    async fn apply_gather_yield(&self, pid: &str, item_id: &str, qty: i64, skill: &str, xp: i64) {
+    ///
+    /// `ability_id`, when present (#128), wears down whatever tool that
+    /// ability's swing used: normally -1 durability, a flat 15% chance of
+    /// -2 (a "rough" swing) — rolled here, not in persistence, since it's
+    /// gameplay tuning. Hitting 0 auto-unequips (the durable write does
+    /// that atomically); either way the client needs a fresh `equip.update`
+    /// afterward since its cooldown display or the armed tool itself may
+    /// have just changed.
+    async fn apply_gather_yield(&self, pid: &str, item_id: &str, qty: i64, skill: &str, xp: i64, ability_id: Option<&str>) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let persistent = self
             .clients
@@ -4123,6 +4145,18 @@ impl Proxy {
         self.send_inventory(pid).await;
         if let Ok(gain) = db.grant_skill_xp(pid, skill, xp).await {
             self.push_skill_gain(pid, &gain);
+        }
+        let is_tool_swing = ability_id.and_then(mmo::world::governing_tool).is_some();
+        if is_tool_swing {
+            let loss = if rand::random::<f64>() < 0.15 { 2 } else { 1 };
+            if let Ok(Some(_outcome)) = db.wear_equipped_tool(pid, "tool", loss).await {
+                // Re-push inventory unconditionally, not just on break — the
+                // Inventory panel shows per-instance durability on every row,
+                // which just went stale the moment this swing landed, same
+                // as the equip.update below (the HUD's in-hand line) always does.
+                self.send_inventory(pid).await;
+                self.send_equipment(pid).await; // live durability either way; cleared tool if it broke
+            }
         }
     }
 
@@ -4232,7 +4266,7 @@ impl Proxy {
                 if identity.persistent {
                     self.entity_state.lock().unwrap().insert(
                         player_id.clone(),
-                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp, gather: None },
+                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp },
                     );
                     let _ = zone.tx.send(Message::Text(
                         json!({"type": "spawn_entity", "player_id": player_id,
@@ -4324,17 +4358,25 @@ impl Proxy {
                         self.send_recipes(&player_id);
                         continue;
                     }
-                    // `equip`/`unequip` (mining/abilities epic #123): arming a
-                    // tool is pure inventory bookkeeping, no live position or
-                    // proximity involved — answer directly, same reasoning as
-                    // `craft.list`.
+                    // `equip`/`unequip` (mining/abilities epic #123, instanced in
+                    // #128): arming a tool is pure inventory bookkeeping, no live
+                    // position or proximity involved — answer directly, same
+                    // reasoning as `craft.list`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("equip") {
-                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        self.apply_equip(&player_id, &item_id).await;
+                        let instance_id = data.get("instance_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_equip(&player_id, &instance_id).await;
                         continue;
                     }
                     if data.get("type").and_then(|v| v.as_str()) == Some("unequip") {
                         self.apply_unequip(&player_id).await;
+                        continue;
+                    }
+                    // `repair` (#128): same "owns a crafting station on their own
+                    // plot" gate as `craft.make` — no live position/proximity
+                    // involved, answer directly.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("repair") {
+                        let instance_id = data.get("instance_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.apply_repair(&player_id, &instance_id).await;
                         continue;
                     }
                     // `ability.use` (mining/abilities epic #123, #117) needs the
@@ -5341,37 +5383,6 @@ mod tests {
         assert_eq!(note["zone"], "zone_b");
     }
 
-    /// #16 (migration safety): a player's in-progress gather job is carried
-    /// forward across a migration rather than silently dropped — the gateway
-    /// caches it from `status_update`s (extended to report it) and includes it
-    /// in the `spawn_entity` it sends to whichever zone the player lands in.
-    #[tokio::test]
-    async fn migrate_request_carries_an_in_progress_gather_job_forward() {
-        let p = test_proxy();
-        let _left = add_zone_region(&p, "zone_a", Region { x0: 0, y0: 0, x1: 600, y1: 1200 });
-        let mut right = add_zone_region(&p, "zone_b", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
-        let _client_rx = add_client(&p, "p1", "zone_a", 8);
-
-        // The gateway already cached p1's gather job from an earlier status_update
-        // (zone_a's tick loop now reports it — see `entity_status_json`).
-        p.entity_state.lock().unwrap().insert(
-            "p1".into(),
-            EntityCache { x: 640, y: 200, hp: 100, gather: Some(("node_suburbs_tree_0".to_string(), 7)) },
-        );
-
-        let msg = json!({"type": "migrate_request", "player_id": "p1", "from": "zone_a", "x": 650, "y": 200, "hp": 100});
-        p.handle_migrate_request(&msg);
-
-        let spawn = next_zone_text(&mut right).await;
-        assert_eq!(spawn["type"], "spawn_entity");
-        assert_eq!(spawn["gather_node"], "node_suburbs_tree_0");
-        assert_eq!(spawn["gather_progress"], 7);
-
-        // The cache carries it forward too (e.g. for a *second* migration in a row).
-        let cached = p.entity_state.lock().unwrap().get("p1").unwrap().gather.clone();
-        assert_eq!(cached, Some(("node_suburbs_tree_0".to_string(), 7)));
-    }
-
     #[tokio::test]
     async fn migrate_request_for_unowned_position_is_a_noop() {
         let p = test_proxy();
@@ -5439,7 +5450,7 @@ mod tests {
         let mut drop_rx = add_zone_region(&p, "drop", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
         let mut client_rx = add_client(&p, "p1", "drop", 8);
         // p1 is at a world position inside `drop`.
-        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100, gather: None });
+        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100 });
 
         p.merge_zones("keep", "drop").await;
 
@@ -5627,7 +5638,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             ch.id.clone(),
-            EntityCache { x: 4242, y: 1337, hp: 55, gather: None },
+            EntityCache { x: 4242, y: 1337, hp: 55 },
         );
 
         proxy.final_flush().await;
@@ -5653,7 +5664,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             "guest_1".to_string(),
-            EntityCache { x: 1, y: 2, hp: 100, gather: None },
+            EntityCache { x: 1, y: 2, hp: 100 },
         );
 
         // Should not panic, and should leave no character row behind.
@@ -6099,7 +6110,7 @@ mod tests {
         // Stand at the order's own location so the gateway's proximity gate passes.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: tcx, y: tcy - 40, hp: 100, gather: None },
+            EntityCache { x: tcx, y: tcy - 40, hp: 100 },
         );
 
         // Stock exactly the well's cost (wood 20 + stone 10), as gathering would.
@@ -6287,7 +6298,7 @@ mod tests {
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
         // Stand at the path's start point, nowhere near the civic board.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100 });
 
         zone.to_proxy.send(Message::Text(json!({
             "type": "gather_yield", "player_id": pid,
@@ -6658,11 +6669,12 @@ mod tests {
         drop(ws);
     }
 
-    /// Equip/unequip (mining/abilities epic #123, #116): arming a tool
-    /// requires actually owning it, grants the item's abilities on
-    /// `equip.update` with a cooldown already scaled by the governing skill's
-    /// level, and the armed tool survives a reconnect (it's durable, not
-    /// session state).
+    /// Equip/unequip (mining/abilities epic #123, #116; instanced in #128):
+    /// arming a tool requires actually owning that SPECIFIC instance,
+    /// grants the item's abilities on `equip.update` with a cooldown
+    /// already scaled by the governing skill's level plus the instance's
+    /// live durability, and the armed instance survives a reconnect (it's
+    /// durable, not session state).
     #[tokio::test]
     async fn equip_requires_ownership_grants_abilities_and_persists() {
         let (proxy, _dbf, zone) = proxy_with_db().await;
@@ -6676,8 +6688,8 @@ mod tests {
         .unwrap();
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
-        // No pickaxe yet: equipping is rejected, nothing persisted.
-        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+        // No pickaxe yet: equipping some made-up instance id is rejected.
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": "nonexistent"}).to_string()))
             .await
             .unwrap();
         let err = recv_until(&mut ws, "equip_error").await;
@@ -6688,25 +6700,38 @@ mod tests {
         // inventory AND skill pushes (not just the first) before the next
         // write — same idiom as the crafting test: firing straight into a
         // transaction that's still committing races SQLite into "database
-        // is locked" rather than actually reordering anything.
+        // is locked" rather than actually reordering anything. Capture the
+        // granted instance's own id (#128) — equipping now targets it
+        // specifically, since "the pickaxe" stops being unambiguous the
+        // moment you could own more than one.
         zone.to_proxy.send(Message::Text(json!({
             "type": "gather_yield", "player_id": pid,
             "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
         }).to_string())).unwrap();
-        let (mut saw_inv, mut saw_skill) = (false, false);
+        let (mut saw_inv, mut saw_skill, mut instance_id) = (false, false, String::new());
         while !(saw_inv && saw_skill) {
-            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
-                Some("inv.update") => saw_inv = true,
+            let frame = recv_frame(&mut ws).await.expect("expected the grant's pushes");
+            match frame["type"].as_str() {
+                Some("inv.update") => {
+                    saw_inv = true;
+                    let items = frame["items"].as_array().unwrap();
+                    let pick = items.iter().find(|i| i["item_id"] == "pickaxe").expect("granted pickaxe");
+                    assert_eq!(pick["durability"], 50, "fresh instance starts at max durability");
+                    assert_eq!(pick["max_durability"], 50);
+                    instance_id = pick["id"].as_str().unwrap().to_string();
+                }
                 Some("skill.update") => saw_skill = true,
                 _ => {}
             }
         }
 
-        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": instance_id}).to_string()))
             .await
             .unwrap();
         let update = recv_until(&mut ws, "equip.update").await;
         assert_eq!(update["tool"], "pickaxe");
+        assert_eq!(update["durability"], 50);
+        assert_eq!(update["max_durability"], 50);
         let abilities = update["abilities"].as_array().unwrap();
         assert_eq!(abilities.len(), 1);
         assert_eq!(abilities[0]["id"], "pick");
@@ -6720,7 +6745,7 @@ mod tests {
 
         // Re-arm, then reconnect: the tool is durable state, so login
         // hydration re-sends the same equip.update without re-equipping.
-        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": instance_id}).to_string()))
             .await
             .unwrap();
         recv_until(&mut ws, "equip.update").await;
@@ -6736,6 +6761,170 @@ mod tests {
         let rehydrated = recv_until(&mut ws2, "equip.update").await;
         assert_eq!(rehydrated["tool"], "pickaxe", "the armed tool survives a reconnect");
         drop(ws2);
+    }
+
+    /// A tool breaking (#128) auto-unequips through the FULL gateway path:
+    /// the zone's `gather_yield` (carrying `ability_id`, exactly as a real
+    /// swing sends it) drives `apply_gather_yield`'s wear-down, which pushes
+    /// both an `inv.update` showing the broken husk and an `equip.update`
+    /// with the ability gone. Wears it down directly against the shared DB
+    /// first (49 of 50) so the test doesn't need 50 real round trips — only
+    /// the LAST, breaking swing goes through the real wire.
+    #[tokio::test]
+    async fn a_tool_swing_wears_it_down_and_breaking_auto_unequips() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("wear_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Worn"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 0,
+        }).to_string())).unwrap();
+        let instance_id = loop {
+            let v = recv_frame(&mut ws).await.expect("expected the grant's inv.update");
+            if v["type"] == "inv.update" {
+                if let Some(pick) = v["items"].as_array().unwrap().iter().find(|i| i["item_id"] == "pickaxe") {
+                    break pick["id"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": instance_id}).to_string()))
+            .await
+            .unwrap();
+        // Login hydration may still have its own (tool: null) equip.update
+        // in flight — loop past it to the one this equip actually produced.
+        loop {
+            if recv_until(&mut ws, "equip.update").await["tool"] == "pickaxe" {
+                break;
+            }
+        }
+
+        // 49 direct wears (bypassing the wire — this is gateway-side plumbing,
+        // not re-proving the swing pipeline the earlier ability tests cover).
+        for _ in 0..49 {
+            db.wear_equipped_tool(&pid, "tool", 1).await.unwrap();
+        }
+        assert_eq!(db.equipped(&pid, "tool").await.unwrap().as_deref(), Some("pickaxe"), "not broken yet");
+
+        // The 50th, breaking swing — through the real internal message a
+        // zone's apply_ability_swing actually sends.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "stone", "qty": 1, "skill": "mining", "xp": 12, "ability_id": "pick",
+        }).to_string())).unwrap();
+
+        let (mut saw_husk, mut saw_unequip) = (false, false);
+        for _ in 0..40 {
+            if saw_husk && saw_unequip { break; }
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            match v["type"].as_str() {
+                Some("inv.update") => {
+                    if let Some(pick) = v["items"].as_array().unwrap().iter().find(|i| i["item_id"] == "pickaxe") {
+                        if pick["durability"] == 0 {
+                            saw_husk = true;
+                        }
+                    }
+                }
+                Some("equip.update") => {
+                    if v["tool"].is_null() {
+                        saw_unequip = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_husk, "expected an inv.update showing the pickaxe at 0 durability");
+        assert!(saw_unequip, "expected an equip.update with the tool cleared");
+        assert_eq!(db.equipped(&pid, "tool").await.unwrap(), None);
+        let items = db.inventory_for_character(&pid).await.unwrap();
+        assert!(items.iter().any(|i| i.id == instance_id && i.durability == Some(0)),
+            "the broken instance must still exist as a repairable husk");
+
+        drop(ws);
+    }
+
+    /// Repairing over the real wire, at an owned crafting station, restores
+    /// durability and consumes the (scaled) ingredient cost.
+    #[tokio::test]
+    async fn repair_wire_message_restores_durability_at_a_station() {
+        let (proxy, db, dbf, mut zone) = proxy_with_shared_db().await;
+        let db2 = Db::connect(dbf.url()).await.unwrap();
+        db2.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+        let mut ws = dial(&proxy).await;
+        let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Repairer").await;
+        let (px, py) = (bounds["x"].as_i64().unwrap() as i32 + 2, bounds["y"].as_i64().unwrap() as i32 + 2);
+        place_home_structure(&mut zone, &mut ws, &pid, "crafting", px, py).await;
+
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        let instance_id = db.inventory_for_character(&pid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap().id;
+        db.equip_instance(&pid, &instance_id).await.unwrap();
+        for _ in 0..38 {
+            db.wear_equipped_tool(&pid, "tool", 1).await.unwrap();
+        }
+        db.add_to_inventory(&pid, "wood", 2).await.unwrap();
+        db.add_to_inventory(&pid, "stone", 3).await.unwrap();
+        while recv_frame(&mut ws).await.is_some() {
+            // drain hydration/setup housekeeping — nothing here is asserted on.
+            if db.inventory_qty(&pid, "wood").await.unwrap() == 2 { break; }
+        }
+
+        ws.send(Message::Text(json!({"type": "repair", "instance_id": instance_id}).to_string()))
+            .await
+            .unwrap();
+        let done = recv_until(&mut ws, "repair.done").await;
+        assert_eq!(done["item_id"], "pickaxe");
+        assert_eq!(done["cost"]["wood"], 2);
+        assert_eq!(done["cost"]["stone"], 3);
+        assert_eq!(db.inventory_qty(&pid, "wood").await.unwrap(), 0);
+        assert_eq!(db.inventory_qty(&pid, "stone").await.unwrap(), 0);
+        let repaired = db.inventory_for_character(&pid).await.unwrap()
+            .into_iter().find(|i| i.id == instance_id).unwrap();
+        assert_eq!(repaired.durability, Some(50));
+
+        drop(ws);
+    }
+
+    /// Tools are blocked from storage entirely (#128) — a deposit attempt
+    /// (even one the zone would otherwise have approved on proximity)
+    /// leaves the instance exactly where it was.
+    #[tokio::test]
+    async fn store_deposit_rejects_tools() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("nolaunder_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "NoLaunder"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": pid,
+            "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 0,
+        }).to_string())).unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "store_op", "player_id": pid,
+            "op": "deposit", "item_id": "pickaxe", "qty": 1,
+        }).to_string())).unwrap();
+
+        // Nothing should move — no store.update/inv.update reflecting a
+        // deposit ever arrives; confirm directly against the DB instead of
+        // racing an absence over the wire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "still carried, not deposited");
+        assert!(db.storage_for_character(&pid).await.unwrap().is_empty(), "nothing reached storage");
+
+        drop(ws);
     }
 
     /// Read `from_proxy` values until one of type `ty` arrives, discarding
@@ -6803,15 +6992,24 @@ mod tests {
             "type": "gather_yield", "player_id": pid,
             "item_id": "pickaxe", "qty": 1, "skill": "mining", "xp": 2500,
         }).to_string())).unwrap();
-        let (mut saw_inv, mut saw_skill) = (false, false);
+        let (mut saw_inv, mut saw_skill, mut instance_id) = (false, false, String::new());
         while !(saw_inv && saw_skill) {
-            match recv_frame(&mut ws).await.expect("expected the grant's pushes")["type"].as_str() {
-                Some("inv.update") => saw_inv = true,
+            let frame = recv_frame(&mut ws).await.expect("expected the grant's pushes");
+            match frame["type"].as_str() {
+                // Login hydration may still push its own (empty) inv.update
+                // around this point — only the one that actually carries the
+                // pickaxe counts.
+                Some("inv.update") => {
+                    if let Some(pick) = frame["items"].as_array().unwrap().iter().find(|i| i["item_id"] == "pickaxe") {
+                        saw_inv = true;
+                        instance_id = pick["id"].as_str().unwrap().to_string();
+                    }
+                }
                 Some("skill.update") => saw_skill = true,
                 _ => {}
             }
         }
-        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": instance_id}).to_string()))
             .await
             .unwrap();
         recv_until(&mut ws, "equip.update").await;
@@ -6884,7 +7082,12 @@ mod tests {
         // Equipping is a pointer, not a move (#116) — the pickaxe stays
         // counted in the bag too. A third talk still grants nothing either
         // way, whether the "owned" or the "equipped" half of the check fires.
-        ws.send(Message::Text(json!({"type": "equip", "item_id": "pickaxe"}).to_string()))
+        // The shared DB handle gives the granted instance's id directly —
+        // simpler than threading it through the inv.update the grant
+        // already pushed (#128: equip now targets a specific instance).
+        let instance_id = db.inventory_for_character(&pid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap().id;
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": instance_id}).to_string()))
             .await
             .unwrap();
         // Login hydration also pushes an `equip.update` (tool: null) — it
@@ -6906,6 +7109,71 @@ mod tests {
         assert_eq!(equipped_talk["granted"], false, "an equipped pick still counts as owned");
         assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "still no second grant");
 
+        drop(ws);
+    }
+
+    /// The logging foreman (#126) grants exactly like Sten does — same rule,
+    /// different NPC/item, proving `apply_npc_interact`'s generalization off
+    /// `NpcSpawn.grants_item` actually works for a second NPC, not just the
+    /// one it was extracted from.
+    #[tokio::test]
+    async fn npc_interact_grants_an_axe_from_the_logging_foreman_only_while_none() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("lf_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Lumberjack"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        let dialogue = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(dialogue["name"], "Elke");
+        assert_eq!(dialogue["granted"], true);
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        let again = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(again["granted"], false);
+        assert_ne!(again["lines"], dialogue["lines"], "a returning visitor hears different lines");
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1, "no second grant");
+
+        drop(ws);
+    }
+
+    /// Each NPC's grant is scoped to its OWN item (#126) — talking to one
+    /// never satisfies the other, and talking to both grants both.
+    #[tokio::test]
+    async fn npc_grants_are_scoped_to_each_npcs_own_item() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("both_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "BothTools"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Talking to Sten first must not pre-empt Elke's axe grant, or vice versa.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        assert_eq!(recv_until(&mut ws, "npc.dialogue").await["granted"], true);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        assert_eq!(recv_until(&mut ws, "npc.dialogue").await["granted"], true, "owning a pick must not block the axe grant");
+
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1);
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1);
         drop(ws);
     }
 
@@ -7121,7 +7389,7 @@ mod tests {
         proxy.clients.lock().unwrap().get_mut(&pid1).unwrap().current_zone = "z_suburbs".to_string();
         proxy.entity_state.lock().unwrap().insert(
             pid1.clone(),
-            EntityCache { x: 5000, y: 3000, hp: 100, gather: None },
+            EntityCache { x: 5000, y: 3000, hp: 100 },
         );
 
         ws1.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -7190,7 +7458,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 5200, y: 3000, hp: 100, gather: None },
+            EntityCache { x: 5200, y: 3000, hp: 100 },
         );
 
         ws.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -7237,7 +7505,7 @@ mod tests {
         // crossed into the Suburbs.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 12800, y: 12800, hp: 100, gather: None },
+            EntityCache { x: 12800, y: 12800, hp: 100 },
         );
 
         ws.send(Message::Text(
@@ -8170,7 +8438,7 @@ mod tests {
             }
         }
         let (dx, dy) = wet.expect("the v3 bake has open water (~10% of the world is masked)");
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "open water at ({dx},{dy}) must submerge even over the flat 0m NoData fill");
@@ -8199,7 +8467,7 @@ mod tests {
         })
         .await
         .unwrap();
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
@@ -8383,7 +8651,7 @@ mod tests {
         recv_until(&mut ws, "inv.update").await;
 
         // Far from the board, far from run 1, far from every run: rejected.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8396,7 +8664,7 @@ mod tests {
 
         // Near the SECOND run's far end (~90m from the placement segment,
         // ~100m from the civic board): accepted.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8460,7 +8728,7 @@ mod tests {
 
         // Walk (cache-wise) into the suburbs: the board follows the player,
         // not the zone's region centre.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100 });
         ws.send(Message::Text(json!({"type": "build.list"}).to_string())).await.unwrap();
         let board = recv_until(&mut ws, "build.list").await;
         let kinds: Vec<&str> = board["orders"].as_array().unwrap().iter().filter_map(|o| o["kind"].as_str()).collect();
@@ -8544,7 +8812,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut player_ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8655,7 +8923,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8755,7 +9023,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8840,7 +9108,7 @@ mod tests {
         assert_eq!(flags["poison_sources"], 0);
 
         // In the grove: exactly the two in-radius trees count.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["poison_sources"], 2, "two trees in radius, the third is just outside");

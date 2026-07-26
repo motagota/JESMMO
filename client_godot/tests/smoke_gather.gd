@@ -1,17 +1,19 @@
-## Headless end-to-end gather + deposit test against a running gateway + zone.
-## Registers a character (spawns at the town centre), walks to the authored civic
-## tree, gathers wood, walks to the town storehouse, deposits, and asserts the
-## storehouse holds the wood.
+## Headless end-to-end resource-to-storage test against a running gateway +
+## zone (rewritten in #127 — bare-hands gathering was retired in #125; every
+## resource is ability-swing-gated now). Registers a character, walks to the
+## logging camp foreman, talks (grants an axe), equips it, walks to a real
+## camp tree, swings Chop until 2 wood are banked, walks to the town
+## storehouse, deposits, and asserts the storehouse holds the wood.
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_gather.gd
 extends SceneTree
 
 var _net
 var _t := 0.0
-var _phase := "auth" # auth -> to_tree -> gather -> wait_wood -> to_store -> deposit -> wait_store
-var _moves := 0
+var _phase := "auth" # auth -> to_elke -> talk -> equip -> to_tree -> chop -> to_store -> deposit -> wait_store
+var _axe_instance_id := ""
 var _wood_qty := 0
 var _stored_wood := 0
-var _resources := {} # id -> true, resource nodes the client actually received
+var _chop_cooldown_at := 0.0
 
 func _initialize() -> void:
 	randomize()
@@ -22,16 +24,25 @@ func _initialize() -> void:
 		_net.register(email, "pw12", "Gatherer"))
 	_net.welcome.connect(func(d):
 		print("SMOKE: welcome ", d.get("player_id"))
-		_phase = "to_tree")
-	# Track resource nodes the server actually pushes to us — a registered player
-	# spawns via spawn_entity, so this verifies that path sends the nodes too.
-	_net.status_update.connect(func(id, _zone, state):
-		if String(state.get("type", "")) == "resource":
-			_resources[id] = true)
+		_phase = "to_elke")
+	_net.npc_dialogue.connect(func(_npc_id, npc_name, _lines, granted):
+		if _phase == "talk":
+			print("SMOKE: talked to ", npc_name, " granted=", granted)
+			_phase = "equip")
+	_net.equip_update.connect(func(tool, _durability, _max_durability, _abilities):
+		if _phase == "equip" and tool == "axe":
+			print("SMOKE: axe equipped")
+			_phase = "to_tree")
 	_net.inv_update.connect(func(items, _used, _capacity):
 		for it in items:
-			if String(it.get("item_id", "")) == "wood":
-				_wood_qty = int(it.get("qty", 0)))
+			var item_id := String(it.get("item_id", ""))
+			if item_id == "wood":
+				_wood_qty = int(it.get("qty", 0))
+			elif item_id == "axe" and _axe_instance_id == "":
+				# The granted instance's own id (#128) — equip now targets a
+				# specific tool, since "the axe" stops being unambiguous the
+				# moment you could own more than one.
+				_axe_instance_id = String(it.get("id", "")))
 	_net.store_update.connect(func(items):
 		for it in items:
 			if String(it.get("item_id", "")) == "wood":
@@ -48,33 +59,40 @@ func _process(delta: float) -> bool:
 		quit(1)
 		return true
 	match _phase:
+		"to_elke":
+			# Town centre (12800,12800) -> the logging foreman (14300,11400).
+			_net.send_move(14300 - 12800, 11400 - 12800)
+			_phase = "talk_wait"
+		"talk_wait":
+			if _t > 3.0:
+				_net.send_npc_talk("npc_logging_foreman")
+				_phase = "talk"
+		# "talk" advances to "equip" via npc_dialogue above.
+		"equip":
+			if _axe_instance_id != "":
+				_net.send_equip(_axe_instance_id)
+			# advances to "to_tree" via equip_update above once tool == "axe"
 		"to_tree":
-			# Town centre (600,600) -> civic tree at (540,540): step NW into range.
-			if _moves < 8:
-				_net.send_move(-10, -10)
-				_moves += 1
-			else:
-				_moves = 0
-				_phase = "gather"
-		"gather":
-			# The node we walked to must have been pushed to us; if a logged-in
-			# player receives no resources, fail loudly rather than time out.
-			if not _resources.has("node_civic_tree_0"):
-				push_error("SMOKE_NO_RESOURCES logged-in player received no resource nodes (seen=%d)" % _resources.size())
-				quit(1)
-				return true
-			_net.send_gather_start("node_civic_tree_0")
-			_phase = "wait_wood"
-		"wait_wood":
+			# Elke (14300,11400) -> the nearest camp tree (14280,11380).
+			_net.send_move(14280 - 14300, 11380 - 11400)
+			_phase = "chop_wait"
+		"chop_wait":
+			if _t > 4.5:
+				_chop_cooldown_at = 0.0
+				_phase = "chop"
+		"chop":
 			if _wood_qty >= 2:
-				print("SMOKE: gathered wood x", _wood_qty)
+				print("SMOKE: chopped wood x", _wood_qty)
 				_phase = "to_store"
+			elif _t >= _chop_cooldown_at:
+				_net.send_ability_use("chop", "node_logging_tree_0")
+				_chop_cooldown_at = _t + 2.1 # base cooldown at woodcutting Lv0 + slack
 		"to_store":
-			# Tree (520,520) -> storehouse at (630,610): step SE into range.
-			if _moves < 14:
-				_net.send_move(10, 8)
-				_moves += 1
-			else:
+			# Tree (14280,11380) -> the town storehouse (12830,12810).
+			_net.send_move(12830 - 14280, 12810 - 11380)
+			_phase = "store_wait"
+		"store_wait":
+			if _t > 4.5:
 				_phase = "deposit"
 		"deposit":
 			_net.send_store_deposit("wood", _wood_qty)

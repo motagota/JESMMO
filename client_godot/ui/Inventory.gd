@@ -7,10 +7,16 @@ class_name InventoryPanel
 extends CanvasLayer
 
 signal do_withdraw(item_id: String, qty: int)
-## Right-clicked an equippable item (mining/abilities epic #123, #119) —
-## Main sends `equip`. Unequipping happens from the HUD's "in hand" line,
-## not here (there's nothing armed to right-click once it's already worn).
-signal do_equip(item_id: String)
+## Right-clicked an equippable item (mining/abilities epic #123, #119;
+## carries the specific instance id since #128 — tools are individually
+## durability-tracked, so "equip the pickaxe" is ambiguous once you own
+## more than one). Main sends `equip`. Unequipping happens from the HUD's
+## "in hand" line, not here (there's nothing armed to right-click once
+## it's already worn).
+signal do_equip(instance_id: String)
+## Clicked a damaged tool instance's "Repair" button (#128). Main sends
+## `repair`; the server gates it on an owned crafting station.
+signal do_repair(instance_id: String)
 
 const COLS := 5
 
@@ -84,13 +90,34 @@ func _rebuild() -> void:
 		var it: Dictionary = it_v
 		var item_id := String(it.get("item_id", "?"))
 		var qty := int(it.get("qty", 0))
+		var instance_id := String(it.get("id", ""))
+		var is_tool := it.has("durability")
+		var durability := int(it.get("durability", 0))
+		var max_durability := int(it.get("max_durability", 0))
+
 		var slot := PanelContainer.new()
 		slot.custom_minimum_size = Vector2(54, 54)
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 2)
+		slot.add_child(col)
+
 		var di := DraggableItem.new(item_id, qty, "inventory")
-		di.text = "%s\nx%d" % [item_id, qty]
+		# A tool instance (#128): qty is always 1, so its durability is the
+		# informative number, not the count.
+		di.text = "%s\n(%d/%d)" % [item_id, durability, max_durability] if is_tool else "%s\nx%d" % [item_id, qty]
 		di.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		if Protocol.is_equippable(item_id):
 			di.tooltip_text = "Drag to move  |  Right-click to equip"
-			di.right_clicked.connect(func(id): do_equip.emit(id))
-		slot.add_child(di)
+			di.right_clicked.connect(func(_id): do_equip.emit(instance_id))
+		col.add_child(di)
+
+		if is_tool and durability < max_durability:
+			var repair_btn := Button.new()
+			repair_btn.text = "Repair"
+			repair_btn.add_theme_font_size_override("font_size", 10)
+			repair_btn.focus_mode = Control.FOCUS_NONE
+			repair_btn.tooltip_text = "Repair at a crafting station"
+			repair_btn.pressed.connect(func(): do_repair.emit(instance_id))
+			col.add_child(repair_btn)
+
 		_grid.add_child(slot)

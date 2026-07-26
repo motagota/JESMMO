@@ -1,8 +1,7 @@
 ## Heads-up display: connection/zone/position, the gathered inventory, a one-line
-## skills glance, a transient gather-progress line, floating "+N item" feedback, and
-## a level-up banner. Built in code; driven by `Main`. The full skills breakdown
-## (progress bars) lives in the dedicated `SkillsPanel` (K); this keeps a compact
-## at-a-glance readout.
+## skills glance, floating "+N item" feedback, and a level-up banner. Built in
+## code; driven by `Main`. The full skills breakdown (progress bars) lives in
+## the dedicated `SkillsPanel` (K); this keeps a compact at-a-glance readout.
 class_name Hud
 extends CanvasLayer
 
@@ -14,7 +13,6 @@ signal unequip_pressed
 var _status: Label
 var _inv: Label
 var _skill: Label
-var _gather: Label
 var _build_hint: Label
 var _rent_hint: Label
 var _tool: Button
@@ -27,10 +25,10 @@ var zone := "—"
 var pos := Vector2.ZERO
 var _home := Vector2.ZERO
 var _has_home := false
-## What pressing E does right now — "gather" by default; Main switches this
-## to "talk" whenever an NPC is the nearer of the two (mining/abilities
-## epic #123, #121).
-var _interact_verb := "gather"
+## What pressing E does right now — "talk" when an NPC is in range, "" (no
+## hint shown) otherwise. Gathering has no bare-hands E interaction at all
+## anymore (#127) — it's entirely hotbar-driven (Pick/Chop).
+var _interact_verb := ""
 
 ## skill_id -> {level, xp}, so each skill renders on the one line independently.
 var _skills: Dictionary = {}
@@ -49,9 +47,7 @@ func _ready() -> void:
 	_inv = _line(box)
 	_inv.text = "inventory: (empty)"
 	_skill = _line(box)
-	_skill.text = "gathering: Lv 0    [K] skills"
-	_gather = _line(box)
-	_gather.modulate = Color(0.8, 1.0, 0.6)
+	_skill.text = "[K] skills"
 	_build_hint = _line(box)
 	_build_hint.modulate = Color(0.85, 0.7, 1.0)
 	_build_hint.text = "[B] build"
@@ -136,8 +132,9 @@ func _refresh_status() -> void:
 		var home_part := ""
 		if _has_home:
 			home_part = "   |   home: %s %dm" % [_compass(_home - pos), int(round(pos.distance_to(_home)))]
-		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s   |   [E] %s" % [
-			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part, _interact_verb]
+		var interact_part := "   |   [E] %s" % _interact_verb if _interact_verb != "" else ""
+		_status.text = "%s   |   zone: %s   |   pos: (%d, %d)%s%s" % [
+			conn, zone, int(round(pos.x)), int(round(pos.y)), home_part, interact_part]
 
 ## A rough compass heading from the player toward `delta` (world units).
 func _compass(delta: Vector2) -> String:
@@ -164,18 +161,25 @@ func set_inventory(items: Array, used: int, capacity: int) -> void:
 	var parts := PackedStringArray()
 	for it_v in items:
 		var it: Dictionary = it_v
-		parts.append("%s x%d" % [String(it.get("item_id", "?")), int(it.get("qty", 0))])
+		var item_id := String(it.get("item_id", "?"))
+		if it.has("durability"):
+			# A tool instance (#128) — qty is always 1, so durability is the
+			# informative number, not the count.
+			parts.append("%s (%d/%d)" % [item_id, int(it["durability"]), int(it.get("max_durability", 0))])
+		else:
+			parts.append("%s x%d" % [item_id, int(it.get("qty", 0))])
 	_inv.text = "inventory: " + ", ".join(parts) + cap
 
 ## The armed tool, or "" for nothing equipped (mining/abilities epic #123,
-## #119). A blank in-hand line while empty means the click target only
-## exists once there's something to unequip.
-func set_tool(item_id: String) -> void:
+## #119), plus its live durability (#128). A blank in-hand line while empty
+## means the click target only exists once there's something to unequip.
+func set_tool(item_id: String, durability: int, max_durability: int) -> void:
 	if item_id == "":
 		_tool.text = ""
 		_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	else:
-		_tool.text = "In hand: %s %s   (click to unequip)" % [Protocol.item_icon(item_id), item_id]
+		_tool.text = "In hand: %s %s (%d/%d)   (click to unequip)" % [
+			Protocol.item_icon(item_id), item_id, durability, max_durability]
 		_tool.mouse_filter = Control.MOUSE_FILTER_STOP
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
@@ -188,12 +192,6 @@ func set_skill(skill_id: String, xp: int, level: int) -> void:
 		parts.append("%s: Lv %d  (%d xp)" % [sid, int(s["level"]), int(s["xp"])])
 	parts.append("[K] skills")
 	_skill.text = "  |  ".join(parts)
-
-func set_gather_progress(pct: int) -> void:
-	if pct <= 0 or pct >= 100:
-		_gather.text = ""
-	else:
-		_gather.text = "gathering… %d%%" % pct
 
 ## Build/place mode hint (#12): `active` shows the current kind/rotation and the
 ## controls; inactive clears the line.
@@ -217,7 +215,6 @@ func set_rent_hint(state: String, due_at: int) -> void:
 	_rent_hint.text = "rent: %s (%s)   [P] plot & rent" % [state.capitalize(), when]
 
 func flash_gain(item_id: String, qty: int) -> void:
-	_gather.text = ""
 	_gain.text = "+%d %s" % [qty, item_id]
 	_gain.modulate.a = 1.0
 	if _gain_tween and _gain_tween.is_valid():

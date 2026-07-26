@@ -1,15 +1,18 @@
 ## Live Milton Road / quarry loop test (#99) against a running gateway with
 ## the content seeded (scripts/seed_milton_road.py + seed_poison_pen.py):
-## registers a fresh account, mines one stone at the Mt Coot-tha quarry face
-## (authored contract: node_quarry_rock_0 at (8210, 13900)), self-locates
-## the quarry-spur road order from the civic board (path start (8485,14250)),
-## contributes the stone from the face, and asserts build.progress moves.
-## Deliberately does NOT complete any order — the inaugural build belongs to
-## players — so the test is rerunnable (each run advances the community
-## build by one stone).
+## registers a fresh account, talks to the quarry foreman Sten (grants a
+## pickaxe), equips it, swings Pick once at the Mt Coot-tha quarry face
+## (authored contract: node_quarry_rock_0 at (8210, 13900)) — rewritten in
+## #127, mining is ability-swing-gated, not bare-hands channel gathering —
+## self-locates the quarry-spur road order from the civic board (path start
+## (8485,14250)), contributes the stone from the face, and asserts
+## build.progress moves. Deliberately does NOT complete any order — the
+## inaugural build belongs to players — so the test is rerunnable (each run
+## advances the community build by one stone).
 ## Run: Godot --headless --path client_godot -s res://tests/smoke_milton_road.gd
 extends SceneTree
 
+const FOREMAN := Vector2i(8232, 13945) # Sten's authored spot
 const FACE := Vector2i(8210, 13900) # node_quarry_rock_0's authored spot
 const SPUR_START := Vector2i(8485, 14250) # the quarry spur plan's first point
 
@@ -21,6 +24,8 @@ var _pos := Vector2.ZERO
 var _stone := 0
 var _spur_id := ""
 var _board_poll := 0.0
+var _chop_cooldown_at := 0.0
+var _pickaxe_instance_id := ""
 
 func _fail(message: String) -> void:
 	print("SMOKE_FAIL: %s" % message)
@@ -37,20 +42,36 @@ func _initialize() -> void:
 			return
 		_pos = Vector2(float(state.get("x", 0)), float(state.get("y", 0)))
 		if _phase == "auth":
-			_phase = "travel"
-			_net.send_move(FACE.x - int(_pos.x), FACE.y - int(_pos.y))
-		elif _phase == "travel" and _pos.distance_to(Vector2(FACE)) < 5.0:
-			# Only start mining once the position has settled at the face —
-			# the teleport may cross a zone split, and a gather.start sent
-			# before the handoff lands in the OLD zone and is dropped.
-			_phase = "mining"
-			_net.send_gather_start("node_quarry_rock_0")
-			print("SMOKE: at the Mt Coot-tha face — mining"))
-	_net.gather_result.connect(func(item_id, qty):
-		if item_id == "stone":
+			_phase = "to_foreman"
+			_net.send_move(FOREMAN.x - int(_pos.x), FOREMAN.y - int(_pos.y))
+		elif _phase == "to_foreman" and _pos.distance_to(Vector2(FOREMAN)) < 5.0:
+			# Only talk once the position has settled — the teleport may cross
+			# a zone split, and a message sent before the handoff lands in the
+			# OLD zone and is dropped.
+			_phase = "talk_wait"
+			_t = 0.0)
+	_net.npc_dialogue.connect(func(_npc_id, npc_name, _lines, _granted):
+		if _phase == "talk":
+			print("SMOKE: talked to %s" % npc_name)
+			_phase = "equip")
+	_net.inv_update.connect(func(items, _used, _capacity):
+		if _pickaxe_instance_id != "":
+			return
+		for it in items:
+			if String(it.get("item_id", "")) == "pickaxe":
+				# The granted instance's own id (#128) — equip now targets a
+				# specific tool, since "the pickaxe" stops being unambiguous
+				# the moment you could own more than one.
+				_pickaxe_instance_id = String(it.get("id", "")))
+	_net.equip_update.connect(func(tool, _durability, _max_durability, _abilities):
+		if _phase == "equip" and tool == "pickaxe":
+			print("SMOKE: pickaxe equipped")
+			_phase = "to_face"
+			_net.send_move(FACE.x - int(_pos.x), FACE.y - int(_pos.y)))
+	_net.ability_result.connect(func(id, ok, _cooldown_ms, _reason, item_id, qty):
+		if id == "pick" and ok and item_id == "stone":
 			_stone += qty
 			if _phase == "mining" and _stone >= 1:
-				_net.send_gather_stop()
 				_phase = "find_spur"
 				_board_poll = 0.0
 				print("SMOKE: mined %d stone" % _stone))
@@ -79,12 +100,31 @@ func _initialize() -> void:
 
 func _process(delta: float) -> bool:
 	_t += delta
-	if _phase == "find_spur":
-		_board_poll -= delta
-		if _board_poll <= 0.0:
-			_board_poll = 1.0
-			_net.send_build_list()
-	if _t > 40.0:
+	match _phase:
+		"talk_wait":
+			if _t > 3.0:
+				_net.send_npc_talk("npc_quarry_foreman")
+				_phase = "talk"
+		"equip":
+			if _pickaxe_instance_id != "":
+				_net.send_equip(_pickaxe_instance_id)
+			# advances to "to_face" via equip_update above once tool == "pickaxe"
+		"to_face":
+			if _pos.distance_to(Vector2(FACE)) < 5.0:
+				_phase = "mining"
+				_chop_cooldown_at = 0.0
+		"mining":
+			if _t >= _chop_cooldown_at:
+				_net.send_ability_use("pick", "node_quarry_rock_0")
+				_chop_cooldown_at = _t + 2.1 # base cooldown at mining Lv0 + slack
+		"find_spur":
+			_board_poll -= delta
+			if _board_poll <= 0.0:
+				_board_poll = 1.0
+				_net.send_build_list()
+		_:
+			pass
+	if _t > 45.0:
 		_fail("SMOKE_TIMEOUT phase=%s stone=%d spur=%s" % [_phase, _stone, _spur_id])
 		return true
 	return false

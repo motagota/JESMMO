@@ -175,6 +175,9 @@ pub fn items() -> Vec<Item> {
         // slot puts the Pick ability on the hotbar. stack_size 1 — it's worn,
         // not stacked, though nothing stops carrying spares unequipped.
         Item { id: "pickaxe", name: "Pickaxe", stack_size: 1, category: "tool" },
+        // Woodcutting (#122 backlog, #125): same single tool-in-hand slot as
+        // the pickaxe — equipping one replaces the other.
+        Item { id: "axe", name: "Axe", stack_size: 1, category: "tool" },
     ]
 }
 
@@ -207,6 +210,10 @@ pub fn recipes() -> Vec<Recipe> {
             id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 2), ("stone", 3)],
             output_item: "pickaxe", output_qty: 1,
         },
+        Recipe {
+            id: "axe", name: "Axe", inputs: &[("wood", 2), ("stone", 1)],
+            output_item: "axe", output_qty: 1,
+        },
     ]
 }
 
@@ -226,7 +233,7 @@ pub fn recipe(id: &str) -> Option<Recipe> {
 /// item isn't equippable at all (most items — wood, stone, plank, ...).
 pub fn equippable_slot(item_id: &str) -> Option<&'static str> {
     match item_id {
-        "pickaxe" => Some("tool"),
+        "pickaxe" | "axe" => Some("tool"),
         _ => None,
     }
 }
@@ -245,14 +252,19 @@ pub struct Ability {
 pub fn abilities_for_item(item_id: &str) -> &'static [Ability] {
     match item_id {
         "pickaxe" => &[Ability { id: "pick", name: "Pick" }],
+        "axe" => &[Ability { id: "chop", name: "Chop" }],
         _ => &[],
     }
 }
 
-/// The skill whose level scales an ability's cooldown, if any.
+/// The skill whose level scales an ability's cooldown, if any. Woodcutting
+/// (#122 backlog, #125) is a dedicated skill, not a reuse of the old
+/// channel-gathering "gathering" skill — same one-skill-per-ability pattern
+/// mining already set.
 pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
     match ability_id {
         "pick" => Some("mining"),
+        "chop" => Some("woodcutting"),
         _ => None,
     }
 }
@@ -262,21 +274,85 @@ pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
 pub fn ability_target_item(ability_id: &str) -> Option<&'static str> {
     match ability_id {
         "pick" => Some("stone"),
+        "chop" => Some("wood"),
         _ => None,
     }
 }
 
 /// An ability's swing/use cooldown (ms) at a given level of its governing
 /// skill (0 if ungoverned or the wielder hasn't trained it). Each ability
-/// hardcodes its own curve for now — there's exactly one — but this is the
-/// single place both the gateway (enforcement) and `equip.update` (display)
-/// compute it, so they can never disagree.
+/// hardcodes its own curve — Chop mirrors Pick's for now, a starting point
+/// for the balance-pass backlog item, not a claim they must stay identical
+/// forever — but this is the single place both the gateway (enforcement)
+/// and `equip.update` (display) compute it, so they can never disagree.
 pub fn ability_cooldown_ms(ability_id: &str, skill_level: i64) -> i64 {
     match ability_id {
         // 2000ms at level 0, -80ms per level, floors at 1200ms (~level 10+).
-        "pick" => (2000 - 80 * skill_level).max(1200),
+        "pick" | "chop" => (2000 - 80 * skill_level).max(1200),
         _ => 1000,
     }
+}
+
+/// Mining-skill xp per successful swing per ability (mining/abilities epic
+/// #123; generalized in #125 when Chop joined Pick — a per-ability table
+/// rather than one hardcoded constant in the zone). Same rate for both:
+/// a swing is a swing, instant rather than the old multi-tick channel's
+/// per-unit yield (which paid out at 10/unit).
+pub fn ability_xp_per_swing(ability_id: &str) -> i64 {
+    match ability_id {
+        "pick" | "chop" => 12,
+        _ => 0,
+    }
+}
+
+// --- Tool durability & repair (mining/abilities epic #123 backlog, #128) ------
+
+/// Max durability (swings before it breaks) for an equippable tool, or
+/// `None` for anything that isn't one — also doubles as "is this item
+/// instanced rather than stacked" (see `persistence::add_inventory_in_tx`).
+/// A placeholder number for now; #129's balance pass owns the real curve.
+pub fn tool_max_durability(item_id: &str) -> Option<i64> {
+    match item_id {
+        "pickaxe" | "axe" => Some(50),
+        _ => None,
+    }
+}
+
+/// The tool item an ability wears down on a successful swing — the inverse
+/// of [`abilities_for_item`]. `None` for an ability with no tool of its own
+/// (shouldn't happen for a harvesting ability today, but keeps the mapping
+/// honest for whatever comes next).
+pub fn governing_tool(ability_id: &str) -> Option<&'static str> {
+    match ability_id {
+        "pick" => Some("pickaxe"),
+        "chop" => Some("axe"),
+        _ => None,
+    }
+}
+
+/// Repair cost for a tool missing `missing` of its `max` durability:
+/// `ceil(missing / 10)` "repair units" out of `ceil(max / 10)` total units,
+/// applied proportionally to each of the tool's craft-recipe ingredients
+/// (minimum 1 of each so a nearly-full repair is never free). `None` if
+/// `item_id` has no matching recipe (shouldn't happen for a real tool) or
+/// nothing is actually missing.
+pub fn repair_cost(item_id: &str, missing: i64, max: i64) -> Option<Vec<(&'static str, i64)>> {
+    if missing <= 0 || max <= 0 {
+        return None;
+    }
+    let recipe = recipes().into_iter().find(|r| r.output_item == item_id)?;
+    let total_units = (max + 9) / 10; // ceil(max / 10), >= 1 since max > 0
+    let repair_units = ((missing + 9) / 10).min(total_units); // ceil(missing / 10), capped
+    Some(
+        recipe
+            .inputs
+            .iter()
+            .map(|(ingredient, full_qty)| {
+                let cost = ((full_qty * repair_units) + total_units - 1) / total_units; // ceil
+                (*ingredient, cost.max(1))
+            })
+            .collect(),
+    )
 }
 
 /// Fixed footprint (world units) for a home structure kind, used both by
@@ -331,6 +407,11 @@ pub struct BuildBoard {
 /// (mining/abilities epic #123, #118). Never moves, never despawns — unlike
 /// a resource node there's no runtime state to track, so the zone just
 /// spawns this directly with no cache-only wrapper.
+///
+/// `grants_item`/`lines_granted`/`lines_repeat` (#126) make every NPC's
+/// "safety net, not a farm" hand-out fully data-driven — `apply_npc_interact`
+/// in proxy.rs reads these instead of hardcoding a specific NPC id/item, so
+/// a third NPC later needs zero gateway changes, just a new entry here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NpcSpawn {
     pub id: &'static str,
@@ -338,6 +419,14 @@ pub struct NpcSpawn {
     pub district: &'static str,
     pub x: i32,
     pub y: i32,
+    /// The item this NPC hands over the first time (and any time since —
+    /// it's a safety net, not a farm) a talker has none at all, owned or
+    /// equipped. `None` for an NPC that only ever talks.
+    pub grants_item: Option<&'static str>,
+    /// Dialogue when a talk actually granted something.
+    pub lines_granted: &'static [&'static str],
+    /// Dialogue on any other talk (already has one, or nothing to grant).
+    pub lines_repeat: &'static [&'static str],
 }
 
 /// The Phase 1 NPC registry. Look up by id with [`npc`].
@@ -347,7 +436,34 @@ pub fn npc_spawns() -> Vec<NpcSpawn> {
         // spans x 8210-8255, y 13900-13930) so he doesn't collide with the
         // rock nodes themselves, but close enough that "walk up and talk"
         // reads as part of the same site.
-        NpcSpawn { id: "npc_quarry_foreman", name: "Sten", district: "civic", x: 8232, y: 13945 },
+        NpcSpawn {
+            id: "npc_quarry_foreman", name: "Sten", district: "civic", x: 8232, y: 13945,
+            grants_item: Some("pickaxe"),
+            lines_granted: &[
+                "No pick? Take mine, and mind the edge.",
+                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
+            ],
+            lines_repeat: &[
+                "Keep that pick on the rock, not the ground between swings.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ],
+        },
+        // The logging camp foreman: a small starter grove a short walk NE of
+        // the town centre (#126) — distinct site and direction from the
+        // quarry, so a fresh character has two nearby, unmissable bootstrap
+        // loops instead of one.
+        NpcSpawn {
+            id: "npc_logging_foreman", name: "Elke", district: "civic", x: 14300, y: 11400,
+            grants_item: Some("axe"),
+            lines_granted: &[
+                "No axe? Take this one, and watch your footing on the roots.",
+                "Arm it, stand by a trunk, and swing — [1] once it's in your hand.",
+            ],
+            lines_repeat: &[
+                "Let the axe do the work — don't force the swing.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ],
+        },
     ]
 }
 
@@ -649,6 +765,18 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_quarry_rock_5", district: "civic", item_id: "stone", x: 8225, y: 13930, qty: 25 },
         ResourceNodeSpawn { id: "node_quarry_rock_6", district: "civic", item_id: "stone", x: 8240, y: 13925, qty: 25 },
         ResourceNodeSpawn { id: "node_quarry_rock_7", district: "civic", item_id: "stone", x: 8255, y: 13930, qty: 25 },
+        // The logging camp (#126): a starter grove clustered around the
+        // logging foreman, mirroring the quarry's rich-node treatment —
+        // 6 nodes at 4x an ordinary field tree's qty, so hauling/crafting
+        // here isn't gated on the same handful of scattered singles near
+        // spawn. Probed dry (h ~2.5–5.2m, well above sea level) before
+        // authoring.
+        ResourceNodeSpawn { id: "node_logging_tree_0", district: "civic", item_id: "wood", x: 14280, y: 11380, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_1", district: "civic", item_id: "wood", x: 14320, y: 11385, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_2", district: "civic", item_id: "wood", x: 14340, y: 11410, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_3", district: "civic", item_id: "wood", x: 14320, y: 11435, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_4", district: "civic", item_id: "wood", x: 14280, y: 11430, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_5", district: "civic", item_id: "wood", x: 14260, y: 11405, qty: 20 },
     ];
 
     // A public town storehouse beside the town centre (the M2 stash). Per-plot
@@ -1083,6 +1211,37 @@ mod tests {
             let r = cell.rect();
             assert!(suburbs.contains(r.x0, r.y0) && suburbs.contains(r.x1 - 1, r.y1 - 1));
         }
+    }
+
+    // --- Tool durability & repair (mining/abilities epic #123 backlog, #128) ------
+
+    #[test]
+    fn repair_cost_scales_with_missing_durability_and_floors_at_one() {
+        // Pickaxe: 2 wood + 3 stone, max 50 -> 5 total units (ceil(50/10)).
+        assert_eq!(repair_cost("pickaxe", 0, 50), None, "nothing missing -> nothing to repair");
+        // Missing 10 -> 1 unit/5 -> wood ceil(2/5)=1, stone ceil(3/5)=1.
+        assert_eq!(repair_cost("pickaxe", 10, 50), Some(vec![("wood", 1), ("stone", 1)]));
+        // Missing 38 -> 4 units/5 -> wood ceil(8/5)=2, stone ceil(12/5)=3.
+        assert_eq!(repair_cost("pickaxe", 38, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Fully broken -> the full recipe (never less than crafting fresh).
+        assert_eq!(repair_cost("pickaxe", 50, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Missing far more than max (shouldn't happen, but must not go
+        // negative/overflow) clamps to the same as fully broken.
+        assert_eq!(repair_cost("pickaxe", 999, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Not a real tool/recipe -> None, not a panic.
+        assert_eq!(repair_cost("wood", 5, 50), None);
+    }
+
+    #[test]
+    fn tool_registries_agree_with_each_other() {
+        for item_id in ["pickaxe", "axe"] {
+            assert!(tool_max_durability(item_id).is_some(), "{item_id} should have a durability cap");
+            let abilities = abilities_for_item(item_id);
+            assert_eq!(abilities.len(), 1, "{item_id} should grant exactly one ability");
+            assert_eq!(governing_tool(abilities[0].id), Some(item_id), "governing_tool must invert abilities_for_item for {item_id}");
+        }
+        assert_eq!(tool_max_durability("wood"), None);
+        assert_eq!(governing_tool("nonexistent"), None);
     }
 }
 
