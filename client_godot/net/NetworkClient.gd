@@ -74,6 +74,12 @@ signal road_planned(order_id: String)
 signal road_plan_error(message: String)
 signal road_cancelled(order_id: String)
 signal road_demolition_planned(order_id: String, demo_order_id: String)
+## Progressive road building (#131, issue #134): a road's full cell list
+## (answering road.cells_request), and a live per-cell update as one
+## contribution lands (road.cell_progress) — see Protocol.gd's doc for the
+## exact shapes.
+signal road_cells(order_id: String, cells: Array)
+signal road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool)
 signal home_respawn_set(bed_id: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -269,6 +275,15 @@ func _handle_text(text: String) -> void:
             road_demolition_planned.emit(
                 String(msg.get("order_id", "")),
                 String(msg.get("demo_order_id", "")))
+        Protocol.S_ROAD_CELLS:
+            road_cells.emit(String(msg.get("order_id", "")), msg.get("cells", []))
+        Protocol.S_ROAD_CELL_PROGRESS:
+            road_cell_progress.emit(
+                String(msg.get("order_id", "")),
+                int(msg.get("cell_index", -1)),
+                msg.get("required", {}),
+                msg.get("progress", {}),
+                bool(msg.get("completed", false)))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -446,6 +461,12 @@ func send_road_cancel(order_id: String) -> void:
 ## Post a demolition order for a built/part-built road (#106, editor only).
 func send_road_demolish(order_id: String) -> void:
     _send({"type": Protocol.C_ROAD_DEMOLISH, "order_id": order_id})
+
+## Ask for a road order's full cell list (#134) — no role restriction, a
+## stateless read like terrain/object list requests. Answered with
+## `road_cells`.
+func send_road_cells_request(order_id: String) -> void:
+    _send({"type": Protocol.C_ROAD_CELLS_REQUEST, "order_id": order_id})
 
 ## Craft a recipe (validated server-side: owns a crafting station, has ingredients).
 func send_craft_make(recipe_id: String) -> void:

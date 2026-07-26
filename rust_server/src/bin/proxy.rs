@@ -2438,6 +2438,31 @@ impl Proxy {
         .await;
     }
 
+    /// Answer `road.cells_request` (#134) with a road order's full cell list
+    /// — geometry, per-cell cost/progress, and completion — a stateless DB
+    /// read like `terrain.list`/`object.list`, no proximity or role gate.
+    /// The client uses this to seed its progressive pavement render and its
+    /// nearest-cell contribution readout for an open road plan the moment it
+    /// first sees one on the board, then keeps it current live via
+    /// `road.cell_progress`. A bad/unknown order id just answers empty.
+    async fn send_road_cells(&self, pid: &str, order_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let cells = db.road_cells_for_order(order_id).await.unwrap_or_default();
+        let arr: Vec<Value> = cells
+            .iter()
+            .map(|c| {
+                json!({
+                    "cell_index": c.cell_index,
+                    "x0": c.x0, "y0": c.y0, "x1": c.x1, "y1": c.y1,
+                    "required": serde_json::from_str::<Value>(&c.required_json).unwrap_or(json!({})),
+                    "progress": serde_json::from_str::<Value>(&c.progress_json).unwrap_or(json!({})),
+                    "completed": c.completed_at.is_some(),
+                })
+            })
+            .collect();
+        self.push_to_player(pid, json!({"type": "road.cells", "order_id": order_id, "cells": arr}));
+    }
+
     /// The road half of `build.contribute` (#131/#132/#133): find the
     /// nearest INCOMPLETE cell within `BOARD_RANGE` of the contributor and
     /// route the deposit there. No board fallback — the whole point of
@@ -4633,6 +4658,13 @@ impl Proxy {
                     // as `terrain.edit_op` and `mayor.build_create`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("road.plan") {
                         self.apply_road_plan(&player_id, data).await;
+                        continue;
+                    }
+                    // `road.cells_request` (#134) is a stateless read, same
+                    // reasoning as `terrain.list`/`object.list`.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("road.cells_request") {
+                        let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        self.send_road_cells(&player_id, &order_id).await;
                         continue;
                     }
                     // `home.set_respawn` only needs DB ownership checking (is this bed
@@ -9438,6 +9470,76 @@ mod tests {
         recv_until(&mut ws, "build.completed").await;
         assert_eq!(db.build_order_by_id(&order.id).await.unwrap().unwrap().state, "completed");
 
+        drop(ws);
+    }
+
+    /// `road.cells_request` (#134) answers with a road's full cell geometry
+    /// and state, in path order — what the client seeds its progressive
+    /// render and nearest-cell contribution readout from.
+    #[tokio::test]
+    async fn road_cells_request_answers_with_geometry_and_state() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        // A 10m stub: 2 cells.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.plan", "points": [[700, 700], [710, 700]]}).to_string()))
+            .await
+            .unwrap();
+        let order_id = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+
+        editor_ws.send(Message::Text(json!({"type": "road.cells_request", "order_id": order_id}).to_string()))
+            .await
+            .unwrap();
+        let resp = recv_until(&mut editor_ws, "road.cells").await;
+        assert_eq!(resp["order_id"].as_str().unwrap(), order_id);
+        let cells = resp["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 2, "10m / 5m cells");
+        assert_eq!((cells[0]["x0"].as_i64(), cells[0]["y0"].as_i64()), (Some(700), Some(700)));
+        assert_eq!((cells[1]["x1"].as_i64(), cells[1]["y1"].as_i64()), (Some(710), Some(700)));
+        assert!(!cells[0]["completed"].as_bool().unwrap());
+        assert_eq!(cells[0]["progress"], json!({}));
+
+        // Finish cell 0 for real, then re-request: the answer reflects it live.
+        let email = format!("cellreq_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "CellReq"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 5, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 700, y: 700, hp: 100 });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": order_id, "item_id": "stone", "qty": 5,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "road.cell_progress").await;
+
+        editor_ws.send(Message::Text(json!({"type": "road.cells_request", "order_id": order_id}).to_string()))
+            .await
+            .unwrap();
+        let resp = recv_until(&mut editor_ws, "road.cells").await;
+        let cells = resp["cells"].as_array().unwrap();
+        assert!(cells[0]["completed"].as_bool().unwrap(), "cell 0 reflects its real completion");
+
+        // Unknown order id: an empty answer, not a hang or error.
+        editor_ws.send(Message::Text(json!({"type": "road.cells_request", "order_id": "no-such"}).to_string()))
+            .await
+            .unwrap();
+        let resp = recv_until(&mut editor_ws, "road.cells").await;
+        assert!(resp["cells"].as_array().unwrap().is_empty());
+
+        drop(editor_ws);
         drop(ws);
     }
 

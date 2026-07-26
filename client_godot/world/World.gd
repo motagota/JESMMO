@@ -119,6 +119,15 @@ const _DEMO_STAKE_COLOR := Color(0.95, 0.12, 0.10)
 ## for the demolish tool's picking (#107): order_id -> {"path": [Vector2..]}.
 ## Data only — the built ribbon renders via the structure entity.
 var _completed_road_orders: Dictionary = {}
+## Progressive per-cell road building (#131, issue #134): an OPEN road's
+## cells, seeded once from `road.cells` and kept current by
+## `road.cell_progress` deltas — order_id -> {"cells": [{x0,y0,x1,y1,
+## required,progress,completed}, ...], "nodes": [MeshInstance3D, ...]}.
+## `cells` is the FULL list (including incomplete ones — the nearest-cell
+## contribution readout needs their position/cost too); `nodes` only covers
+## the currently rendered (completed) subset, real pavement laid in
+## alongside the stakes rather than waiting for the whole road to finish.
+var _road_cells: Dictionary = {}
 ## What the plot markers were last drawn from, so they can be redrawn against
 ## fresh terrain heights (see `refresh_plot_markers`).
 var _home_bounds: Dictionary = {}
@@ -164,6 +173,8 @@ func _process(delta: float) -> void:
         rec["nodes"] = _build_road_path(rec["path"])
     for id in _road_plans:
         _restake_plan(id)
+    for id in _road_cells:
+        _render_road_cells(id)
 
 ## Rebuild the district name labels from a `partition` message; lazily build
 ## the static ground/roads once the world size and the terrain heightmap are
@@ -525,12 +536,16 @@ func _build_road_ribbon(a: Vector2, b: Vector2) -> MeshInstance3D:
 ## Staked road plans (#95): rebuild the whole set from a `build.list` push.
 ## Replace-not-merge — the board is authoritative, so a plan that finished
 ## (or a stale render from before a reconnect) simply isn't re-staked.
-func apply_road_plans(orders: Array) -> void:
+## Returns the order_ids of open road plans (#134) not yet in `_road_cells`
+## — newly seen this call — so the caller (Main) can fetch their cells;
+## World has no network access of its own.
+func apply_road_plans(orders: Array) -> Array:
     for id in _road_plans.keys():
         for n in _road_plans[id]["nodes"]:
             n.queue_free()
     _road_plans.clear()
     _completed_road_orders.clear()
+    var open_road_ids := {}
     for o_v in orders:
         var o: Dictionary = o_v
         var raw: Array = o.get("path", [])
@@ -548,11 +563,24 @@ func apply_road_plans(orders: Array) -> void:
             _road_plans[String(o.get("order_id", ""))] = {
                 "path": path, "nodes": [], "kind": kind, "progress_total": progress_total,
             }
+            if kind.begins_with("road_"):
+                open_road_ids[String(o.get("order_id", ""))] = true
         elif state == "completed" and kind.begins_with("road_"):
             # Built roads, for the demolish tool's picking (#107).
             _completed_road_orders[String(o.get("order_id", ""))] = {"path": path}
     for id in _road_plans:
         _restake_plan(id)
+    # Progressive cells (#134): a road that's no longer an open plan (built,
+    # replanned to a new id, cancelled, or under demolition) drops its
+    # partial-pavement render — the built ribbon or nothing takes over.
+    var missing: Array = []
+    for id in _road_cells.keys():
+        if not open_road_ids.has(id):
+            remove_road_cells(id)
+    for id in open_road_ids:
+        if not _road_cells.has(id):
+            missing.append(id)
+    return missing
 
 ## A built road was demolished (#107): its structure entity despawned —
 ## un-render the ribbons. No-op for non-road despawns.
@@ -563,13 +591,102 @@ func remove_dirt_road(id: String) -> void:
         n.queue_free()
     _dirt_roads.erase(id)
 
-## An order completed (#96 renders the built road) — drop its stakes.
+## An order completed (#96 renders the built road) — drop its stakes and any
+## progressive-cell pavement (#134); the full built ribbon takes over.
 func remove_road_plan(order_id: String) -> void:
-    if not _road_plans.has(order_id):
+    if _road_plans.has(order_id):
+        for n in _road_plans[order_id]["nodes"]:
+            n.queue_free()
+        _road_plans.erase(order_id)
+    remove_road_cells(order_id)
+
+## Seed/replace a road order's full cell list (#134, `road.cells`) and render
+## whichever cells are already complete. Safe to call again for the same
+## order (e.g. a reconnect) — rebuilds from scratch rather than merging.
+func set_road_cells(order_id: String, cells: Array) -> void:
+    if _road_cells.has(order_id):
+        for n in _road_cells[order_id]["nodes"]:
+            n.queue_free()
+    var parsed: Array = []
+    for c_v in cells:
+        var c: Dictionary = c_v
+        parsed.append({
+            "x0": float(c.get("x0", 0)), "y0": float(c.get("y0", 0)),
+            "x1": float(c.get("x1", 0)), "y1": float(c.get("y1", 0)),
+            "required": c.get("required", {}), "progress": c.get("progress", {}),
+            "completed": bool(c.get("completed", false)),
+        })
+    _road_cells[order_id] = {"cells": parsed, "nodes": []}
+    _render_road_cells(order_id)
+
+## One cell's state changed live (#134, `road.cell_progress`) — update it and
+## redraw if its completion (and so its pavement) actually changed. No-op if
+## the order's base cell list (`set_road_cells`) hasn't arrived yet; the
+## follow-up `road.cells` request Main issues on first sight will catch it up.
+func set_road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool) -> void:
+    if not _road_cells.has(order_id):
         return
-    for n in _road_plans[order_id]["nodes"]:
+    var cells: Array = _road_cells[order_id]["cells"]
+    if cell_index < 0 or cell_index >= cells.size():
+        return
+    var c: Dictionary = cells[cell_index]
+    var changed: bool = bool(c["completed"]) != completed
+    c["required"] = required
+    c["progress"] = progress
+    c["completed"] = completed
+    if changed:
+        _render_road_cells(order_id)
+
+## An order left the board entirely (replanned/cancelled/demolished/built) —
+## drop its cached cells and any rendered pavement.
+func remove_road_cells(order_id: String) -> void:
+    if not _road_cells.has(order_id):
+        return
+    for n in _road_cells[order_id]["nodes"]:
         n.queue_free()
-    _road_plans.erase(order_id)
+    _road_cells.erase(order_id)
+
+## Redraw the real-pavement ribbons for an order's currently-completed
+## cells. Each cell renders as its own straight chord (matching the server's
+## own straight-chord cost geometry, #132) — close enough at 5m that the
+## faceting against the smooth spline is invisible, and robust to cells
+## completing in any order (out-of-path-order building leaves no gap lie).
+func _render_road_cells(order_id: String) -> void:
+    var rec: Dictionary = _road_cells[order_id]
+    for n in rec["nodes"]:
+        n.queue_free()
+    var nodes: Array = []
+    for c_v in rec["cells"]:
+        var c: Dictionary = c_v
+        if bool(c["completed"]):
+            nodes.append(_build_road_ribbon(Vector2(c["x0"], c["y0"]), Vector2(c["x1"], c["y1"])))
+    rec["nodes"] = nodes
+
+## The nearest incomplete road cell to `from` within `max_dist`, across every
+## open road plan the client currently knows about — what the "you're
+## standing on a cell that needs N stone" contribution readout (#134) is
+## driven from. `{}` if nothing's in range. Mirrors `EntityManager`'s
+## nearest_* pattern, just over locally-cached road geometry rather than the
+## entity roster (roads aren't entities).
+func nearest_incomplete_road_cell(from: Vector2, max_dist: float) -> Dictionary:
+    var best: Dictionary = {}
+    var best_d2 := max_dist * max_dist
+    for order_id in _road_cells:
+        var cells: Array = _road_cells[order_id]["cells"]
+        for i in range(cells.size()):
+            var c: Dictionary = cells[i]
+            if bool(c["completed"]):
+                continue
+            var p := Geometry2D.get_closest_point_to_segment(
+                from, Vector2(c["x0"], c["y0"]), Vector2(c["x1"], c["y1"]))
+            var d2 := from.distance_squared_to(p)
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = {
+                    "order_id": order_id, "cell_index": i,
+                    "required": c["required"], "progress": c["progress"],
+                }
+    return best
 
 func _restake_plan(order_id: String) -> void:
     var rec: Dictionary = _road_plans[order_id]

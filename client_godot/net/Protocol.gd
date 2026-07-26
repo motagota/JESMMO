@@ -196,6 +196,17 @@ const S_ROAD_DEMOLITION_PLANNED := "road.demolition_planned" # {order_id, demo_o
 ## number is authoritative.
 const ROAD_STONE_PER_M_DEN := 4
 const ROAD_MIN_STONE := 5
+## Progressive road building (#131, issue #134): a road pays cell by cell —
+## `road.cells_request {order_id}` asks for a road's full cell geometry +
+## state (once per road, to seed the client), answered with `road.cells
+## {order_id, cells: [{cell_index, x0, y0, x1, y1, required, progress,
+## completed}]}`; `road.cell_progress {order_id, cell_index, required,
+## progress, completed}` keeps it current live, pushed alongside the
+## ordinary `S_BUILD_PROGRESS` (still the road's pooled aggregate,
+## unchanged) whenever a contribution lands on a cell.
+const C_ROAD_CELLS_REQUEST := "road.cells_request"
+const S_ROAD_CELLS := "road.cells"
+const S_ROAD_CELL_PROGRESS := "road.cell_progress"
 
 # --- gameplay: rent — ticker, pay/auto-pay, lapse -> reclaim (M4 #14) ---------
 const S_RENT_STATUS := "rent.status"

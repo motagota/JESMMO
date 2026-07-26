@@ -17,6 +17,13 @@ var _orders: Array = []
 var _inventory: Array = []
 ## skill_id -> level, for greying orders above the player's current skill.
 var _skill_levels: Dictionary = {}
+## The nearest incomplete road cell (#131/#134), if the player is standing
+## near one — `{order_id, cell_index, required, progress}`, or `{}` when
+## none is in range. Roads have no build-board fallback, so this is the
+## ONLY way to see (and pay into) what a specific stretch of road still
+## needs; unlike the ordinary orders above, it's driven by local proximity
+## to road geometry, not "near a board".
+var _road_cell: Dictionary = {}
 
 func _ready() -> void:
 	layer = 8
@@ -73,6 +80,15 @@ func mark_completed(order_id: String) -> void:
 			break
 	_rebuild()
 
+## The nearest incomplete road cell right now (#134), or `{}` for none —
+## Main recomputes this every frame from local road geometry (roads aren't
+## proximity-gated by a board, so this can't ride the ordinary order list).
+func set_road_cell(cell: Dictionary) -> void:
+	if _road_cell == cell:
+		return
+	_road_cell = cell
+	_rebuild()
+
 func show_panel(show: bool) -> void:
 	visible = show
 
@@ -88,11 +104,13 @@ func _rebuild() -> void:
 		return
 	for c in _list.get_children():
 		c.queue_free()
+	_rebuild_road_cell()
 	if _orders.is_empty():
-		var empty := Label.new()
-		empty.text = "(no active orders)"
-		empty.modulate = Color(0.6, 0.6, 0.6)
-		_list.add_child(empty)
+		if _road_cell.is_empty():
+			var empty := Label.new()
+			empty.text = "(no active orders)"
+			empty.modulate = Color(0.6, 0.6, 0.6)
+			_list.add_child(empty)
 		return
 	for o_v in _orders:
 		var o: Dictionary = o_v
@@ -145,3 +163,37 @@ func _rebuild() -> void:
 				btn.pressed.connect(func(): do_contribute.emit(order_id, item, carried))
 				row.add_child(btn)
 			_list.add_child(row)
+
+## The road-cell section (#134): what's shown for standing on an incomplete
+## stretch of an in-progress road — no skill gate (roads aren't skill-gated
+## today), no board proximity needed. Emits the SAME `do_contribute` signal
+## as an ordinary order row; the server resolves which cell a contribution
+## actually lands on from the player's live position (#133), so this is
+## purely a readout, not a targeting mechanism.
+func _rebuild_road_cell() -> void:
+	if _road_cell.is_empty():
+		return
+	var head := Label.new()
+	head.add_theme_font_size_override("font_size", 13)
+	head.text = "🚧 Road (this spot)"
+	head.modulate = Color(1.0, 0.85, 0.4)
+	_list.add_child(head)
+	var order_id := String(_road_cell.get("order_id", ""))
+	var required: Dictionary = _road_cell.get("required", {})
+	var progress: Dictionary = _road_cell.get("progress", {})
+	for item_v in required.keys():
+		var item := String(item_v)
+		var need := int(required.get(item, 0))
+		var have := int(progress.get(item, 0))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.text = "  %s  %d/%d" % [item, have, need]
+		lbl.custom_minimum_size = Vector2(150, 0)
+		row.add_child(lbl)
+		var carried := _carried(item)
+		if have < need and carried > 0:
+			var btn := Button.new()
+			btn.text = "Contribute %d" % carried
+			btn.pressed.connect(func(): do_contribute.emit(order_id, item, carried))
+			row.add_child(btn)
+		_list.add_child(row)

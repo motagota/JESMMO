@@ -213,3 +213,13 @@ pub const S_ROAD_DEMOLITION_PLANNED: &str = "road.demolition_planned"; // {order
 // anything reading the total). The order as a whole still completes -- and
 // still fires build.completed -- once every cell is done, same as before.
 pub const S_ROAD_CELL_PROGRESS: &str = "road.cell_progress";
+// {order_id} -- ask for a road order's full cell list (progressive road
+// building epic #131, issue #134): a stateless read, same as
+// terrain.list/object.list. Answered with road.cells.
+pub const C_ROAD_CELLS_REQUEST: &str = "road.cells_request";
+// {order_id, cells: [{cell_index, x0, y0, x1, y1, required, progress,
+// completed}]} -- a road order's full cell geometry + state, in path order.
+// The client seeds its progressive pavement render and nearest-cell
+// contribution readout from this once per road, then keeps it current via
+// road.cell_progress deltas.
+pub const S_ROAD_CELLS: &str = "road.cells";
