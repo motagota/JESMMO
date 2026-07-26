@@ -357,6 +357,11 @@ pub struct BuildBoard {
 /// (mining/abilities epic #123, #118). Never moves, never despawns — unlike
 /// a resource node there's no runtime state to track, so the zone just
 /// spawns this directly with no cache-only wrapper.
+///
+/// `grants_item`/`lines_granted`/`lines_repeat` (#126) make every NPC's
+/// "safety net, not a farm" hand-out fully data-driven — `apply_npc_interact`
+/// in proxy.rs reads these instead of hardcoding a specific NPC id/item, so
+/// a third NPC later needs zero gateway changes, just a new entry here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NpcSpawn {
     pub id: &'static str,
@@ -364,6 +369,14 @@ pub struct NpcSpawn {
     pub district: &'static str,
     pub x: i32,
     pub y: i32,
+    /// The item this NPC hands over the first time (and any time since —
+    /// it's a safety net, not a farm) a talker has none at all, owned or
+    /// equipped. `None` for an NPC that only ever talks.
+    pub grants_item: Option<&'static str>,
+    /// Dialogue when a talk actually granted something.
+    pub lines_granted: &'static [&'static str],
+    /// Dialogue on any other talk (already has one, or nothing to grant).
+    pub lines_repeat: &'static [&'static str],
 }
 
 /// The Phase 1 NPC registry. Look up by id with [`npc`].
@@ -373,7 +386,34 @@ pub fn npc_spawns() -> Vec<NpcSpawn> {
         // spans x 8210-8255, y 13900-13930) so he doesn't collide with the
         // rock nodes themselves, but close enough that "walk up and talk"
         // reads as part of the same site.
-        NpcSpawn { id: "npc_quarry_foreman", name: "Sten", district: "civic", x: 8232, y: 13945 },
+        NpcSpawn {
+            id: "npc_quarry_foreman", name: "Sten", district: "civic", x: 8232, y: 13945,
+            grants_item: Some("pickaxe"),
+            lines_granted: &[
+                "No pick? Take mine, and mind the edge.",
+                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
+            ],
+            lines_repeat: &[
+                "Keep that pick on the rock, not the ground between swings.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ],
+        },
+        // The logging camp foreman: a small starter grove a short walk NE of
+        // the town centre (#126) — distinct site and direction from the
+        // quarry, so a fresh character has two nearby, unmissable bootstrap
+        // loops instead of one.
+        NpcSpawn {
+            id: "npc_logging_foreman", name: "Elke", district: "civic", x: 14300, y: 11400,
+            grants_item: Some("axe"),
+            lines_granted: &[
+                "No axe? Take this one, and watch your footing on the roots.",
+                "Arm it, stand by a trunk, and swing — [1] once it's in your hand.",
+            ],
+            lines_repeat: &[
+                "Let the axe do the work — don't force the swing.",
+                "Practice sharpens more than the edge — you'll swing faster with time.",
+            ],
+        },
     ]
 }
 
@@ -675,6 +715,18 @@ pub fn capital() -> Capital {
         ResourceNodeSpawn { id: "node_quarry_rock_5", district: "civic", item_id: "stone", x: 8225, y: 13930, qty: 25 },
         ResourceNodeSpawn { id: "node_quarry_rock_6", district: "civic", item_id: "stone", x: 8240, y: 13925, qty: 25 },
         ResourceNodeSpawn { id: "node_quarry_rock_7", district: "civic", item_id: "stone", x: 8255, y: 13930, qty: 25 },
+        // The logging camp (#126): a starter grove clustered around the
+        // logging foreman, mirroring the quarry's rich-node treatment —
+        // 6 nodes at 4x an ordinary field tree's qty, so hauling/crafting
+        // here isn't gated on the same handful of scattered singles near
+        // spawn. Probed dry (h ~2.5–5.2m, well above sea level) before
+        // authoring.
+        ResourceNodeSpawn { id: "node_logging_tree_0", district: "civic", item_id: "wood", x: 14280, y: 11380, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_1", district: "civic", item_id: "wood", x: 14320, y: 11385, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_2", district: "civic", item_id: "wood", x: 14340, y: 11410, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_3", district: "civic", item_id: "wood", x: 14320, y: 11435, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_4", district: "civic", item_id: "wood", x: 14280, y: 11430, qty: 20 },
+        ResourceNodeSpawn { id: "node_logging_tree_5", district: "civic", item_id: "wood", x: 14260, y: 11405, qty: 20 },
     ];
 
     // A public town storehouse beside the town centre (the M2 stash). Per-plot

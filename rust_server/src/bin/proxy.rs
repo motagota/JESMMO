@@ -3169,41 +3169,31 @@ impl Proxy {
         }));
     }
 
-    // --- NPCs (mining/abilities epic #123, #118) -----------------------------
+    // --- NPCs (mining/abilities epic #123, #118, generalized #126) -----------
 
-    /// Resolve a talk the zone already confirmed was in range: the quarry
-    /// foreman hands over a pickaxe the first time (and any time since —
-    /// it's a safety net, not a farm) a character has none at all, in
-    /// inventory or in hand; otherwise he just talks. Unknown NPC ids are a
-    /// silent no-op — only the foreman has dialogue today.
+    /// Resolve a talk the zone already confirmed was in range: fully
+    /// data-driven off the NPC's own authored `grants_item`/`lines_*` (#126)
+    /// — hands over that item the first time (and any time since — it's a
+    /// safety net, not a farm) a character has none at all, in inventory or
+    /// in hand; otherwise (or for an NPC with no `grants_item`) just talks.
+    /// Unknown NPC ids are a silent no-op.
     async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let Some(npc) = mmo::world::npc(npc_id) else { return };
-        if npc_id != "npc_quarry_foreman" {
-            return;
-        }
-        let owned = db.inventory_qty(pid, "pickaxe").await.unwrap_or(0);
-        let equipped = db.equipped(pid, "tool").await.ok().flatten();
-        let has_one = owned > 0 || equipped.as_deref() == Some("pickaxe");
         let mut granted = false;
-        if !has_one {
-            let added = db.add_to_inventory(pid, "pickaxe", 1).await.unwrap_or(0);
-            if added > 0 {
-                granted = true;
-                self.send_inventory(pid).await;
+        if let Some(item_id) = npc.grants_item {
+            let owned = db.inventory_qty(pid, item_id).await.unwrap_or(0);
+            let equipped = db.equipped(pid, "tool").await.ok().flatten();
+            let has_one = owned > 0 || equipped.as_deref() == Some(item_id);
+            if !has_one {
+                let added = db.add_to_inventory(pid, item_id, 1).await.unwrap_or(0);
+                if added > 0 {
+                    granted = true;
+                    self.send_inventory(pid).await;
+                }
             }
         }
-        let lines: Vec<&str> = if granted {
-            vec![
-                "No pick? Take mine, and mind the edge.",
-                "Arm it, stand at the face, and swing — [1] once it's in your hand.",
-            ]
-        } else {
-            vec![
-                "Keep that pick on the rock, not the ground between swings.",
-                "Practice sharpens more than the edge — you'll swing faster with time.",
-            ]
-        };
+        let lines = if granted { npc.lines_granted } else { npc.lines_repeat };
         self.push_to_player(pid, json!({
             "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
             "lines": lines, "granted": granted,
@@ -6848,6 +6838,71 @@ mod tests {
         assert_eq!(equipped_talk["granted"], false, "an equipped pick still counts as owned");
         assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "still no second grant");
 
+        drop(ws);
+    }
+
+    /// The logging foreman (#126) grants exactly like Sten does — same rule,
+    /// different NPC/item, proving `apply_npc_interact`'s generalization off
+    /// `NpcSpawn.grants_item` actually works for a second NPC, not just the
+    /// one it was extracted from.
+    #[tokio::test]
+    async fn npc_interact_grants_an_axe_from_the_logging_foreman_only_while_none() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("lf_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Lumberjack"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        let dialogue = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(dialogue["name"], "Elke");
+        assert_eq!(dialogue["granted"], true);
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        let again = recv_until(&mut ws, "npc.dialogue").await;
+        assert_eq!(again["granted"], false);
+        assert_ne!(again["lines"], dialogue["lines"], "a returning visitor hears different lines");
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1, "no second grant");
+
+        drop(ws);
+    }
+
+    /// Each NPC's grant is scoped to its OWN item (#126) — talking to one
+    /// never satisfies the other, and talking to both grants both.
+    #[tokio::test]
+    async fn npc_grants_are_scoped_to_each_npcs_own_item() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("both_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "BothTools"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Talking to Sten first must not pre-empt Elke's axe grant, or vice versa.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_quarry_foreman",
+        }).to_string())).unwrap();
+        assert_eq!(recv_until(&mut ws, "npc.dialogue").await["granted"], true);
+
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+        }).to_string())).unwrap();
+        assert_eq!(recv_until(&mut ws, "npc.dialogue").await["granted"], true, "owning a pick must not block the axe grant");
+
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1);
+        assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1);
         drop(ws);
     }
 

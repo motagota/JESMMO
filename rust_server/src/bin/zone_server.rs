@@ -2070,6 +2070,43 @@ mod tests {
         assert!(drain(&mut rx).is_empty(), "too far to talk");
     }
 
+    /// The logging camp's starter grove spawns alongside the quarry in the
+    /// civic district (#126) — same authored-spawn mechanism as every other
+    /// resource cluster, just a second site.
+    #[tokio::test]
+    async fn logging_camp_nodes_spawn_in_civic() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_nodes();
+        let nodes = zone.nodes.lock().unwrap();
+        for i in 0..6 {
+            let id = format!("node_logging_tree_{i}");
+            let n = nodes.get(&id).unwrap_or_else(|| panic!("expected {id} to spawn"));
+            assert_eq!(n.item_id, "wood");
+            assert!(n.qty > 0);
+        }
+    }
+
+    /// The logging foreman (#126) talks through the exact same generic
+    /// proximity gate as the quarry foreman — proving `apply_npc_talk`
+    /// never hardcoded which NPC it's gating, only distance.
+    #[tokio::test]
+    async fn logging_foreman_talk_in_range_forwards_interact() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_npcs();
+        zone.entities.lock().unwrap().insert(
+            "p1".to_string(),
+            Entity::player(14300, 11400, PLAYER_MAX_HP),
+        );
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_npc_talk("p1", "npc_logging_foreman");
+        let packets = drain(&mut rx);
+        assert!(
+            packets.iter().any(|p| p.contains("\"npc_interact\"")
+                && p.contains("npc_logging_foreman") && p.contains("\"p1\"")),
+            "expected a forwarded npc_interact: {packets:?}"
+        );
+    }
+
     #[tokio::test]
     async fn build_board_spawns_in_civic() {
         // Proximity gating for build.contribute now lives at the gateway (it knows
