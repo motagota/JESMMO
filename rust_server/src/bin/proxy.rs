@@ -275,15 +275,16 @@ struct ClientInfo {
 }
 
 /// The cached last-known state of an entity, as reported by its owning zone's
-/// `status_update`s — position/hp for recreating it elsewhere, plus an
-/// in-progress gather job (if any) so a split/merge/rolling-update doesn't
-/// silently drop it (#16). `gather` is `(node_id, progress)`.
+/// `status_update`s — position/hp for recreating it elsewhere on a
+/// split/merge/rolling-update (#16). Used to carry an in-progress gather
+/// job too, back when gathering was a channel a player could walk away
+/// from mid-yield; every resource is an instant ability swing now (#125),
+/// so there's nothing left to carry across a handoff.
 #[derive(Clone)]
 struct EntityCache {
     x: i32,
     y: i32,
     hp: i32,
-    gather: Option<(String, i32)>,
 }
 
 /// The outcome of the auth handshake: who this connection is and where to spawn.
@@ -317,10 +318,9 @@ struct Proxy {
     /// How often each client is pinged for liveness. A field (not just a const)
     /// so tests can drive the reaper on a short interval.
     ping_interval: Duration,
-    /// Last position+hp (and in-progress gather job, if any, #16) the proxy saw
-    /// for each entity (from status_updates), keyed by player_id. Used to
-    /// recreate entities at their real position — and resume gathering — in a
-    /// freshly-spawned zone instance during a split/merge/rolling update.
+    /// Last position+hp the proxy saw for each entity (from status_updates),
+    /// keyed by player_id. Used to recreate entities at their real position
+    /// in a freshly-spawned zone instance during a split/merge/rolling update.
     entity_state: Mutex<HashMap<String, EntityCache>>,
     /// Child processes the gateway spawned (the current instance per zone id),
     /// so a later update can reap the one it replaces.
@@ -872,13 +872,7 @@ impl Proxy {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                            // In-progress gather job, if the zone included one (#16) — so
-                            // a split/merge/rolling-update can resume it instead of
-                            // silently dropping it.
-                            let gather = st.get("gather_node").and_then(|v| v.as_str()).map(|node| {
-                                (node.to_string(), st.get("gather_progress").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
-                            });
-                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
+                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
                         }
                     }
                     // Stamp the owning zone and fan the update out to EVERY client,
@@ -1083,19 +1077,13 @@ impl Proxy {
     /// authoritative position, and follow the player's client session (re-pointing
     /// `current_zone` and notifying it of the crossing). Shared by
     /// `handle_migrate_request` (a live region-boundary crossing) and
-    /// `handle_player_died` (a respawn, which may also cross zones). Carries
-    /// forward any in-progress gather job (#16) so the new zone can resume it.
+    /// `handle_player_died` (a respawn, which may also cross zones).
     fn relocate_player(&self, pid: &str, x: i32, y: i32, hp: i32, target: &str) {
         let target_tx = self.zones.lock().unwrap().get(target).map(|z| z.tx.clone());
         let Some(tx) = target_tx else { return };
-        let gather = self.entity_state.lock().unwrap().get(pid).and_then(|c| c.gather.clone());
-        let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-        if let Some((node_id, progress)) = &gather {
-            msg["gather_node"] = json!(node_id);
-            msg["gather_progress"] = json!(progress);
-        }
+        let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
         let _ = tx.send(Message::Text(msg.to_string()));
-        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, gather });
+        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
 
         // Follow the player's client session (every entity is a client).
         let mut clients = self.clients.lock().unwrap();
@@ -1437,19 +1425,14 @@ impl Proxy {
             return false;
         };
 
-        // 4. Recreate every entity in the new instance at its cached position,
-        //    resuming an in-progress gather job if it had one (#16).
+        // 4. Recreate every entity in the new instance at its cached position.
         for p in &players {
             let cached = self.entity_state.lock().unwrap().get(p).cloned();
-            let (x, y, hp, gather) = match cached {
-                Some(c) => (c.x, c.y, c.hp, c.gather),
-                None => (WORLD_SIZE / 2, WORLD_SIZE / 2, 100, None),
+            let (x, y, hp) = match cached {
+                Some(c) => (c.x, c.y, c.hp),
+                None => (WORLD_SIZE / 2, WORLD_SIZE / 2, 100),
             };
-            let mut msg = json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = &gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+            let msg = json!({"type": "spawn_entity", "player_id": p, "x": x, "y": y, "hp": hp});
             let _ = new_tx.send(Message::Text(msg.to_string()));
         }
 
@@ -1608,17 +1591,16 @@ impl Proxy {
             return false; // region too small to subdivide further
         }
 
-        // Players currently in this zone, with cached world positions (and any
-        // in-progress gather job, #16).
-        let players: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
+        // Players currently in this zone, with cached world positions.
+        let players: Vec<(String, i32, i32, i32)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == zone_id)
                 .map(|i| match state.get(&i.player_id).cloned() {
-                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
-                    None => (i.player_id.clone(), region.x0, region.y0, 100, None),
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp),
+                    None => (i.player_id.clone(), region.x0, region.y0, 100),
                 })
                 .collect()
         };
@@ -1689,18 +1671,14 @@ impl Proxy {
         // Migrate the players who now fall in the `give` half, at their exact
         // world position (seamless — no teleport).
         let mut moved = 0;
-        for (pid, x, y, hp, gather) in &players {
+        for (pid, x, y, hp) in &players {
             if !give.contains(*x, *y) {
                 continue;
             }
             let _ = old_tx.send(Message::Text(
                 json!({"type": "player_leave", "player_id": pid}).to_string(),
             ));
-            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+            let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
             let _ = new_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = new_id.clone();
@@ -1739,17 +1717,16 @@ impl Proxy {
         };
         let union = keep_region.union(&drop_region);
 
-        // Players to move out of the retiring zone, with their world positions
-        // (and any in-progress gather job, #16).
-        let movers: Vec<(String, i32, i32, i32, Option<(String, i32)>)> = {
+        // Players to move out of the retiring zone, with their world positions.
+        let movers: Vec<(String, i32, i32, i32)> = {
             let clients = self.clients.lock().unwrap();
             let state = self.entity_state.lock().unwrap();
             clients
                 .values()
                 .filter(|i| i.current_zone == drop_id)
                 .map(|i| match state.get(&i.player_id).cloned() {
-                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp, c.gather),
-                    None => (i.player_id.clone(), union.x0, union.y0, 100, None),
+                    Some(c) => (i.player_id.clone(), c.x, c.y, c.hp),
+                    None => (i.player_id.clone(), union.x0, union.y0, 100),
                 })
                 .collect()
         };
@@ -1774,12 +1751,8 @@ impl Proxy {
         self.sync_home_structures_to_zone(keep_id, union).await;
 
         // Move the retiring zone's players into the survivor at their positions.
-        for (pid, x, y, hp, gather) in &movers {
-            let mut msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
-            if let Some((node_id, progress)) = gather {
-                msg["gather_node"] = json!(node_id);
-                msg["gather_progress"] = json!(progress);
-            }
+        for (pid, x, y, hp) in &movers {
+            let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
             let _ = keep_tx.send(Message::Text(msg.to_string()));
             if let Some(info) = self.clients.lock().unwrap().get_mut(pid) {
                 info.current_zone = keep_id.to_string();
@@ -4232,7 +4205,7 @@ impl Proxy {
                 if identity.persistent {
                     self.entity_state.lock().unwrap().insert(
                         player_id.clone(),
-                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp, gather: None },
+                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp },
                     );
                     let _ = zone.tx.send(Message::Text(
                         json!({"type": "spawn_entity", "player_id": player_id,
@@ -5341,37 +5314,6 @@ mod tests {
         assert_eq!(note["zone"], "zone_b");
     }
 
-    /// #16 (migration safety): a player's in-progress gather job is carried
-    /// forward across a migration rather than silently dropped — the gateway
-    /// caches it from `status_update`s (extended to report it) and includes it
-    /// in the `spawn_entity` it sends to whichever zone the player lands in.
-    #[tokio::test]
-    async fn migrate_request_carries_an_in_progress_gather_job_forward() {
-        let p = test_proxy();
-        let _left = add_zone_region(&p, "zone_a", Region { x0: 0, y0: 0, x1: 600, y1: 1200 });
-        let mut right = add_zone_region(&p, "zone_b", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
-        let _client_rx = add_client(&p, "p1", "zone_a", 8);
-
-        // The gateway already cached p1's gather job from an earlier status_update
-        // (zone_a's tick loop now reports it — see `entity_status_json`).
-        p.entity_state.lock().unwrap().insert(
-            "p1".into(),
-            EntityCache { x: 640, y: 200, hp: 100, gather: Some(("node_suburbs_tree_0".to_string(), 7)) },
-        );
-
-        let msg = json!({"type": "migrate_request", "player_id": "p1", "from": "zone_a", "x": 650, "y": 200, "hp": 100});
-        p.handle_migrate_request(&msg);
-
-        let spawn = next_zone_text(&mut right).await;
-        assert_eq!(spawn["type"], "spawn_entity");
-        assert_eq!(spawn["gather_node"], "node_suburbs_tree_0");
-        assert_eq!(spawn["gather_progress"], 7);
-
-        // The cache carries it forward too (e.g. for a *second* migration in a row).
-        let cached = p.entity_state.lock().unwrap().get("p1").unwrap().gather.clone();
-        assert_eq!(cached, Some(("node_suburbs_tree_0".to_string(), 7)));
-    }
-
     #[tokio::test]
     async fn migrate_request_for_unowned_position_is_a_noop() {
         let p = test_proxy();
@@ -5439,7 +5381,7 @@ mod tests {
         let mut drop_rx = add_zone_region(&p, "drop", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
         let mut client_rx = add_client(&p, "p1", "drop", 8);
         // p1 is at a world position inside `drop`.
-        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100, gather: None });
+        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100 });
 
         p.merge_zones("keep", "drop").await;
 
@@ -5627,7 +5569,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             ch.id.clone(),
-            EntityCache { x: 4242, y: 1337, hp: 55, gather: None },
+            EntityCache { x: 4242, y: 1337, hp: 55 },
         );
 
         proxy.final_flush().await;
@@ -5653,7 +5595,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             "guest_1".to_string(),
-            EntityCache { x: 1, y: 2, hp: 100, gather: None },
+            EntityCache { x: 1, y: 2, hp: 100 },
         );
 
         // Should not panic, and should leave no character row behind.
@@ -6099,7 +6041,7 @@ mod tests {
         // Stand at the order's own location so the gateway's proximity gate passes.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: tcx, y: tcy - 40, hp: 100, gather: None },
+            EntityCache { x: tcx, y: tcy - 40, hp: 100 },
         );
 
         // Stock exactly the well's cost (wood 20 + stone 10), as gathering would.
@@ -6287,7 +6229,7 @@ mod tests {
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
         // Stand at the path's start point, nowhere near the civic board.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100 });
 
         zone.to_proxy.send(Message::Text(json!({
             "type": "gather_yield", "player_id": pid,
@@ -7121,7 +7063,7 @@ mod tests {
         proxy.clients.lock().unwrap().get_mut(&pid1).unwrap().current_zone = "z_suburbs".to_string();
         proxy.entity_state.lock().unwrap().insert(
             pid1.clone(),
-            EntityCache { x: 5000, y: 3000, hp: 100, gather: None },
+            EntityCache { x: 5000, y: 3000, hp: 100 },
         );
 
         ws1.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -7190,7 +7132,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 5200, y: 3000, hp: 100, gather: None },
+            EntityCache { x: 5200, y: 3000, hp: 100 },
         );
 
         ws.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -7237,7 +7179,7 @@ mod tests {
         // crossed into the Suburbs.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 12800, y: 12800, hp: 100, gather: None },
+            EntityCache { x: 12800, y: 12800, hp: 100 },
         );
 
         ws.send(Message::Text(
@@ -8170,7 +8112,7 @@ mod tests {
             }
         }
         let (dx, dy) = wet.expect("the v3 bake has open water (~10% of the world is masked)");
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "open water at ({dx},{dy}) must submerge even over the flat 0m NoData fill");
@@ -8199,7 +8141,7 @@ mod tests {
         })
         .await
         .unwrap();
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
@@ -8383,7 +8325,7 @@ mod tests {
         recv_until(&mut ws, "inv.update").await;
 
         // Far from the board, far from run 1, far from every run: rejected.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8396,7 +8338,7 @@ mod tests {
 
         // Near the SECOND run's far end (~90m from the placement segment,
         // ~100m from the civic board): accepted.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8460,7 +8402,7 @@ mod tests {
 
         // Walk (cache-wise) into the suburbs: the board follows the player,
         // not the zone's region centre.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100 });
         ws.send(Message::Text(json!({"type": "build.list"}).to_string())).await.unwrap();
         let board = recv_until(&mut ws, "build.list").await;
         let kinds: Vec<&str> = board["orders"].as_array().unwrap().iter().filter_map(|o| o["kind"].as_str()).collect();
@@ -8544,7 +8486,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut player_ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8655,7 +8597,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8755,7 +8697,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100 });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -8840,7 +8782,7 @@ mod tests {
         assert_eq!(flags["poison_sources"], 0);
 
         // In the grove: exactly the two in-radius trees count.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100, gather: None });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100 });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["poison_sources"], 2, "two trees in radius, the third is just outside");

@@ -53,26 +53,16 @@ const CAPTURE_MOB_THRESHOLD: usize = 2; // capture only progresses at/below this
 const CAPTURE_RATE: f32 = 1.0; // bar units/tick while capturing (~5s to take a zone)
 const CAPTURE_DECAY: f32 = 0.5; // bar units/tick lost when a capture stalls
 
-// --- Resource gathering -------------------------------------------------------
-const GATHER_RANGE: i32 = 50; // must be within this of a node to gather it
-/// Gathering is a channel: stepping more than this from where you started
-/// interrupts it (#114). The generous GATHER_RANGE stays as the start/
-/// targeting radius and a backstop only.
-const GATHER_MOVE_BREAK_M: i32 = 3;
-const GATHER_PERIOD: i32 = 20; // ticks per yielded unit (~1s); a 5-qty node ~5s
-const GATHER_XP: i64 = 10; // gathering-skill xp per unit
+// --- Resource nodes -------------------------------------------------------
 const NODE_RESPAWN_TICKS: i32 = 200; // a depleted node refills after ~10s
 
-// --- Abilities (mining/abilities epic #123, #117) ------------------------------
-/// A swing must be this close to its target node — tighter than bare-hands
-/// GATHER_RANGE, since a swing is a deliberate melee-ish action, not "stand
-/// near and channel".
-const PICK_RANGE: i32 = 8;
-/// Mining-skill xp per successful swing (gathering's per-unit XP is 10; a
-/// swing is slightly more valuable since it's instant, not a multi-tick
-/// channel that can be walked away from).
-const PICK_XP_PER_SWING: i64 = 12;
-/// Must be this close to an NPC to talk to it — tighter than gathering,
+// --- Abilities (mining/abilities epic #123, #117; generalized in #125) --------
+/// A swing must be this close to its target node — a deliberate melee-ish
+/// action, not the old channel's "stand near and wait". Shared by every
+/// harvesting ability (Pick, Chop, ...), not pick-specific despite the name
+/// history — kept generic on purpose since #125 added a second ability.
+const SWING_RANGE: i32 = 8;
+/// Must be this close to an NPC to talk to it — tighter than a swing,
 /// since talking is a deliberate face-to-face action.
 const NPC_TALK_RANGE: i32 = 10;
 
@@ -253,16 +243,6 @@ struct HomeStructureRef {
     y: i32,
 }
 
-/// An in-progress gather: which node a player is working and how far along the
-/// current unit they are.
-struct GatherJob {
-    node_id: String,
-    progress: i32,
-    /// Where the player stood when the channel started/resumed (#114):
-    /// moving more than GATHER_MOVE_BREAK_M from here interrupts it.
-    anchor: (i32, i32),
-}
-
 fn node_status_json(n: &ResourceNode) -> Value {
     json!({
         "type": "status_update",
@@ -347,10 +327,7 @@ fn in_melee_arc(px: i32, py: i32, fx: i32, fy: i32, mx: i32, my: i32) -> bool {
     (vx * fx as f64 + vy * fy as f64) / (d * fl) >= MELEE_ARC_COS
 }
 
-/// `gathering` is the entity's current `GatherJob`, if any — included so the
-/// gateway's migration cache can resume it on a split/merge/rolling-update
-/// rather than silently dropping it (#16).
-fn entity_status_json(id: &str, e: &Entity, gathering: Option<&GatherJob>) -> Value {
+fn entity_status_json(id: &str, e: &Entity) -> Value {
     let mut state = json!({
         "x": e.x, "y": e.y, "hp": e.hp, "max_hp": e.max_hp,
         "type": e.kind.as_str(),
@@ -366,10 +343,6 @@ fn entity_status_json(id: &str, e: &Entity, gathering: Option<&GatherJob>) -> Va
         state["poison_buildup"] = json!(e.poison_buildup);
         state["max_poison"] = json!(POISON_PROC_AT);
         state["poisoned"] = json!(e.poisoned);
-    }
-    if let Some(job) = gathering {
-        state["gather_node"] = json!(job.node_id);
-        state["gather_progress"] = json!(job.progress);
     }
     json!({
         "type": "status_update",
@@ -396,8 +369,6 @@ struct ZoneServer {
     /// Gatherable resource nodes in this zone's region (cache-only runtime state),
     /// keyed by node id.
     nodes: Mutex<HashMap<String, ResourceNode>>,
-    /// In-progress gather jobs, keyed by player id.
-    gathering: Mutex<HashMap<String, GatherJob>>,
     /// Authored storage access points in this zone's region (deposit/withdraw spots).
     storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
     /// Authored build-order boards in this zone's region (contribution spots).
@@ -428,7 +399,6 @@ impl ZoneServer {
             mob_counter: Mutex::new(0),
             capital: mmo::world::capital(),
             nodes: Mutex::new(HashMap::new()),
-            gathering: Mutex::new(HashMap::new()),
             storage_points: Mutex::new(Vec::new()),
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
@@ -608,45 +578,15 @@ impl ZoneServer {
         }
     }
 
-    /// Begin gathering a node: validate it exists, is in range, and has
-    /// stock; the per-unit yield is resolved authoritatively in the tick.
-    /// Solid rock (mining/abilities epic #123) refuses bare hands outright,
-    /// with a hint pointing at the fix — the pick ability, not this channel.
-    fn apply_gather_start(&self, pid: &str, node_id: &str) {
-        let (ok, is_rock) = {
-            let entities = self.entities.lock().unwrap();
-            let nodes = self.nodes.lock().unwrap();
-            match (entities.get(pid), nodes.get(node_id)) {
-                (Some(p), Some(n)) => (
-                    n.qty > 0 && dist2(p.x, p.y, n.x, n.y) <= (GATHER_RANGE as i64).pow(2),
-                    n.item_id == "stone",
-                ),
-                _ => (false, false),
-            }
-        };
-        if is_rock {
-            if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
-                let _ = tx.send(Message::Text(json!({
-                    "type": "gather.error", "player_id": pid,
-                    "message": "Solid rock — you need a pick. The quarry foreman can help.",
-                }).to_string()));
-            }
-            return;
-        }
-        if ok {
-            let anchor = self.entities.lock().unwrap().get(pid).map(|p| (p.x, p.y)).unwrap_or((0, 0));
-            self.gathering.lock().unwrap().insert(
-                pid.to_string(),
-                GatherJob { node_id: node_id.to_string(), progress: 0, anchor },
-            );
-        }
-    }
-
     /// Push an ability's client-facing outcome. `ok=false` carries a
     /// `reason` the hotbar can toast (#119, #117); `cooldown_ms` rides
     /// along either way so the client's sweep always matches the gateway's
-    /// ledger, which already started it before this was even called.
-    fn send_ability_result(&self, pid: &str, ability_id: &str, ok: bool, reason: &str, cooldown_ms: i64) {
+    /// ledger, which already started it before this was even called. A
+    /// success also carries what was actually swung out of the node
+    /// (`item_id`/`qty`, #125) so the client can flash an ordinary "+N"
+    /// gain notice — a gap the old channel's now-deleted `gather.result`
+    /// used to cover and ability swings never did.
+    fn send_ability_result(&self, pid: &str, ability_id: &str, ok: bool, reason: &str, cooldown_ms: i64, yield_item: Option<(&str, i64)>) {
         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
             let mut v = json!({
                 "type": "ability.result", "player_id": pid,
@@ -655,18 +595,22 @@ impl ZoneServer {
             if !ok {
                 v["reason"] = json!(reason);
             }
+            if let Some((item_id, qty)) = yield_item {
+                v["item_id"] = json!(item_id);
+                v["qty"] = json!(qty);
+            }
             let _ = tx.send(Message::Text(v.to_string()));
         }
     }
 
     /// Resolve a gateway-approved ability swing against this zone's live
-    /// state (mining/abilities epic #123, #117): the gateway already
-    /// checked the wielder's tool and cooldown; range, stock, and whether
-    /// the node is even the right kind for this ability are the zone's
-    /// call, since it alone knows live positions and node state. A
-    /// successful swing yields exactly like a gather tick would — the
-    /// internal `gather_yield` reuses the same gateway persistence path —
-    /// but instantly, with no channel.
+    /// state (mining/abilities epic #123, #117; generalized to any
+    /// harvesting ability in #125): the gateway already checked the
+    /// wielder's tool and cooldown; range, stock, and whether the node is
+    /// even the right kind for this ability are the zone's call, since it
+    /// alone knows live positions and node state. A successful swing
+    /// yields through the same internal `gather_yield` persistence path
+    /// every ability already shares — instantly, with no channel.
     fn apply_ability_swing(&self, pid: &str, ability_id: &str, node_id: &str, cooldown_ms: i64) {
         let Some(target_item) = mmo::world::ability_target_item(ability_id) else { return };
         let outcome = {
@@ -675,7 +619,7 @@ impl ZoneServer {
             let Some(p) = entities.get(pid) else { return };
             match nodes.get_mut(node_id) {
                 Some(node) if node.item_id == target_item && node.qty > 0 => {
-                    if dist2(p.x, p.y, node.x, node.y) > (PICK_RANGE as i64).pow(2) {
+                    if dist2(p.x, p.y, node.x, node.y) > (SWING_RANGE as i64).pow(2) {
                         Err("out_of_range")
                     } else {
                         node.qty -= 1;
@@ -691,12 +635,13 @@ impl ZoneServer {
         };
         match outcome {
             Ok((item_id, depleted)) => {
-                self.send_ability_result(pid, ability_id, true, "", cooldown_ms);
+                let xp = mmo::world::ability_xp_per_swing(ability_id);
+                self.send_ability_result(pid, ability_id, true, "", cooldown_ms, Some((&item_id, 1)));
                 if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
                     let skill = mmo::world::governing_skill(ability_id).unwrap_or("mining");
                     let _ = tx.send(Message::Text(json!({
                         "type": "gather_yield", "player_id": pid,
-                        "item_id": item_id, "qty": 1, "skill": skill, "xp": PICK_XP_PER_SWING,
+                        "item_id": item_id, "qty": 1, "skill": skill, "xp": xp,
                     }).to_string()));
                     let touch = if depleted {
                         json!({"type": "despawn", "player_id": node_id})
@@ -709,7 +654,7 @@ impl ZoneServer {
                     let _ = tx.send(Message::Text(touch.to_string()));
                 }
             }
-            Err(reason) => self.send_ability_result(pid, ability_id, false, reason, cooldown_ms),
+            Err(reason) => self.send_ability_result(pid, ability_id, false, reason, cooldown_ms, None),
         }
     }
 
@@ -910,18 +855,6 @@ impl ZoneServer {
                     let (x, y) = clamp_world(x, y);
                     self.entities.lock().unwrap().insert(player_id.clone(), Entity::player(x, y, hp));
                     println!("[Zone {}] Received player {player_id} at ({x}, {y})", self.zone_id);
-                    // Resume an in-progress gather job carried over from a migration
-                    // (#16) — only if the node actually exists here (it might not, if
-                    // the split/merge moved the player away from it).
-                    if let Some(node_id) = data.get("gather_node").and_then(|v| v.as_str()) {
-                        let progress = data.get("gather_progress").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                        if self.nodes.lock().unwrap().contains_key(node_id) {
-                            self.gathering.lock().unwrap().insert(
-                                player_id.clone(),
-                                GatherJob { node_id: node_id.to_string(), progress, anchor: (x, y) },
-                            );
-                        }
-                    }
                     self.send_status_update(&player_id).await;
                     // Persistent players spawn this way (not via player_join), so they
                     // must also be sent the gatherable nodes, storage points, and build
@@ -952,13 +885,6 @@ impl ZoneServer {
                             e.swinging = true;
                         }
                     }
-                }
-                "gather.start" => {
-                    let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    self.apply_gather_start(&player_id, &node_id);
-                }
-                "gather.stop" => {
-                    self.gathering.lock().unwrap().remove(&player_id);
                 }
                 "ability_swing" => {
                     // Internal: the gateway already confirmed the tool and the
@@ -1376,88 +1302,20 @@ impl ZoneServer {
                 }
 
                 // --- 6. Build outbound entity packets while holding the lock.
-                // `gathering` locked after `entities` (consistent order, matching
-                // step 7 below) so each packet can include an in-progress gather
-                // job — the gateway caches it to resume on migration (#16).
-                let gathering = self.gathering.lock().unwrap();
                 for id in &changed {
                     if let Some(e) = entities.get(id) {
-                        packets.push(entity_status_json(id, e, gathering.get(id)).to_string());
+                        packets.push(entity_status_json(id, e).to_string());
                     }
                 }
-            } // entities (and gathering) lock released here
+            } // entities lock released here
 
-            // --- 7. Resource gathering + node respawn. ---
-            // Locks taken after `entities` (consistent order) to avoid deadlock.
+            // --- 7. Node respawn (the old channel-gathering per-tick yield
+            // loop that used to live here was removed in #125 — every
+            // resource is ability-swing-gated now, and a swing is instant,
+            // resolved synchronously in `apply_ability_swing`, not ticked).
             {
-                let entities = self.entities.lock().unwrap();
                 let mut nodes = self.nodes.lock().unwrap();
-                let mut gathering = self.gathering.lock().unwrap();
-                let mut finished: Vec<String> = Vec::new();
                 let mut touched: HashSet<String> = HashSet::new();
-
-                for (pid, job) in gathering.iter_mut() {
-                    // Player and node must exist, be in range, and the node have stock.
-                    let (px, py) = match entities.get(pid) {
-                        Some(p) => (p.x, p.y),
-                        None => { finished.push(pid.clone()); continue; }
-                    };
-                    let (nx, ny, has_stock) = match nodes.get(&job.node_id) {
-                        Some(n) => (n.x, n.y, n.qty > 0),
-                        None => { finished.push(pid.clone()); continue; }
-                    };
-                    // Gathering is a channel — walking away interrupts it
-                    // (#114). The anchor check is the real gate; the node
-                    // range stays as a backstop.
-                    let moved = dist2(px, py, job.anchor.0, job.anchor.1)
-                        > (GATHER_MOVE_BREAK_M as i64).pow(2);
-                    if moved || !has_stock || dist2(px, py, nx, ny) > (GATHER_RANGE as i64).pow(2) {
-                        // Tell the client the channel broke — without this
-                        // the HUD's "gathering…" line froze at its last pct
-                        // forever (#114, user report).
-                        packets.push(json!({
-                            "type": "gather.progress", "player_id": pid,
-                            "node_id": job.node_id, "pct": 0,
-                        }).to_string());
-                        finished.push(pid.clone());
-                        continue;
-                    }
-
-                    job.progress += 1;
-                    let pct = (job.progress * 100 / GATHER_PERIOD).min(100);
-                    packets.push(json!({
-                        "type": "gather.progress", "player_id": pid,
-                        "node_id": job.node_id, "pct": pct,
-                    }).to_string());
-
-                    if job.progress >= GATHER_PERIOD {
-                        job.progress = 0;
-                        let node = nodes.get_mut(&job.node_id).unwrap();
-                        node.qty -= 1;
-                        let item = node.item_id.clone();
-                        touched.insert(node.id.clone());
-                        // Client-facing yield feedback.
-                        packets.push(json!({
-                            "type": "gather.result", "player_id": pid,
-                            "item_id": item, "qty": 1,
-                        }).to_string());
-                        // Internal: the gateway persists inventory + xp and pushes
-                        // the authoritative inv.update / skill.update to the client.
-                        packets.push(json!({
-                            "type": "gather_yield", "player_id": pid,
-                            "item_id": item, "qty": 1, "skill": "gathering", "xp": GATHER_XP,
-                        }).to_string());
-                        if node.qty <= 0 {
-                            node.respawn_timer = NODE_RESPAWN_TICKS;
-                            finished.push(pid.clone()); // stop gathering a depleted node
-                        }
-                    }
-                }
-                for pid in finished {
-                    gathering.remove(&pid);
-                }
-
-                // Respawn depleted nodes on their timer.
                 for node in nodes.values_mut() {
                     if node.qty <= 0 && node.respawn_timer > 0 {
                         node.respawn_timer -= 1;
@@ -1467,15 +1325,9 @@ impl ZoneServer {
                         }
                     }
                 }
-
-                // Emit node state: a live node -> status_update; a depleted one -> despawn.
                 for id in &touched {
                     if let Some(n) = nodes.get(id) {
-                        if n.qty > 0 {
-                            packets.push(node_status_json(n).to_string());
-                        } else {
-                            packets.push(json!({"type": "despawn", "player_id": n.id}).to_string());
-                        }
+                        packets.push(node_status_json(n).to_string());
                     }
                 }
             }
@@ -1586,9 +1438,8 @@ impl ZoneServer {
         };
         let packet = {
             let entities = self.entities.lock().unwrap();
-            let gathering = self.gathering.lock().unwrap();
             match entities.get(player_id) {
-                Some(e) => entity_status_json(player_id, e, gathering.get(player_id)),
+                Some(e) => entity_status_json(player_id, e),
                 None => return,
             }
         };
@@ -1863,43 +1714,6 @@ mod tests {
         assert!(zone.entities.lock().unwrap().get("p1").unwrap().submerged);
     }
 
-    // --- #114: gathering interrupts when you walk away ---------------------------
-
-    /// Moving more than GATHER_MOVE_BREAK_M from where the channel started
-    /// cancels it — and the cancellation pushes a pct=0 progress so the HUD
-    /// clears (it used to freeze at the last value forever).
-    #[tokio::test]
-    async fn walking_away_interrupts_gathering_and_clears_the_hud() {
-        let zone = civic_zone_on_tree();
-        zone.gathering.lock().unwrap().insert(
-            "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 3, anchor: (12740, 12740) },
-        );
-        // Step 6m away (still WELL inside the 50m node range).
-        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12746;
-        let packets = drive(zone.clone(), 2).await;
-
-        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "the channel must break on movement");
-        assert!(
-            packets.iter().any(|p| p.contains("\"gather.progress\"") && p.contains("\"pct\":0")),
-            "the cancellation must push pct=0 so the HUD clears"
-        );
-    }
-
-    /// Standing at the anchor keeps the channel running (progress advances).
-    #[tokio::test]
-    async fn standing_still_keeps_gathering() {
-        let zone = civic_zone_on_tree();
-        zone.gathering.lock().unwrap().insert(
-            "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
-        );
-        drive(zone.clone(), 3).await;
-        let gathering = zone.gathering.lock().unwrap();
-        let job = gathering.get("p1").expect("still gathering");
-        assert!(job.progress > 0, "progress should advance while standing at the anchor");
-    }
-
     // --- #88: poison buildup, proc, DoT -----------------------------------------
 
     /// Standing among poison trees builds up, procs at the threshold, and the
@@ -2056,94 +1870,7 @@ mod tests {
         out
     }
 
-    fn count(packets: &[String], needle: &str) -> usize {
-        packets.iter().filter(|p| p.contains(needle)).count()
-    }
-
-    #[tokio::test]
-    async fn gather_yields_item_and_xp_then_continues() {
-        let zone = civic_zone_on_tree();
-        zone.gathering.lock().unwrap().insert(
-            "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
-        );
-        // One GATHER_PERIOD plus slack -> exactly one unit yielded.
-        let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
-
-        assert!(count(&packets, "\"gather.progress\"") > 0, "no progress packets");
-        assert_eq!(count(&packets, "\"gather.result\""), 1, "expected one yield");
-        assert!(packets.iter().any(|p| p.contains("\"gather_yield\"")
-            && p.contains("\"skill\":\"gathering\"") && p.contains("\"xp\":10")),
-            "missing internal gather_yield with xp");
-        // Node decremented but still alive; the job continues.
-        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 4);
-        assert_eq!(count(&packets, "\"despawn\""), 0, "a live node should not despawn");
-        assert!(zone.gathering.lock().unwrap().contains_key("p1"), "job should continue");
-    }
-
-    #[tokio::test]
-    async fn gather_depletes_node_then_despawns_and_schedules_respawn() {
-        let zone = civic_zone_on_tree();
-        zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 1; // one unit left
-        zone.gathering.lock().unwrap().insert(
-            "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
-        );
-        let packets = drive(zone.clone(), (GATHER_PERIOD as u32) + 4).await;
-
-        assert_eq!(count(&packets, "\"gather.result\""), 1);
-        assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(TREE)),
-            "depleted node should despawn");
-        let nodes = zone.nodes.lock().unwrap();
-        let n = nodes.get(TREE).unwrap();
-        assert_eq!(n.qty, 0);
-        assert!(n.respawn_timer > 0, "respawn should be scheduled");
-        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job ends on depletion");
-    }
-
-    #[tokio::test]
-    async fn gather_out_of_range_is_cancelled() {
-        let zone = civic_zone_on_tree();
-        // Move the player far from the tree (still in-region, but out of gather range).
-        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 13000;
-        zone.gathering.lock().unwrap().insert(
-            "p1".to_string(),
-            GatherJob { node_id: TREE.to_string(), progress: 0, anchor: (12740, 12740) },
-        );
-        let packets = drive(zone.clone(), 6).await;
-
-        assert_eq!(count(&packets, "\"gather.result\""), 0, "no yield out of range");
-        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "job cancelled");
-        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node untouched");
-    }
-
-    // --- Mining/abilities epic #123, #117: pick swings & pick-only rock ---------
-
-    /// Bare hands refuse solid rock outright — no channel starts, and the
-    /// client gets a hint pointing at the fix (the pick) instead of silence.
-    #[tokio::test]
-    async fn gather_start_on_rock_is_refused_with_a_hint() {
-        let zone = civic_zone_on_rock();
-        let mut rx = wire_proxy_tx(&zone);
-        zone.apply_gather_start("p1", ROCK);
-
-        assert!(!zone.gathering.lock().unwrap().contains_key("p1"), "no channel should start on rock");
-        let packets = drain(&mut rx);
-        let err = packets.iter().find(|p| p.contains("\"gather.error\"")).expect("expected a gather.error");
-        assert!(err.contains("pick"), "the hint should mention the fix: {err}");
-    }
-
-    /// Trees are unaffected by the pick-only rule — bare-hands gathering on
-    /// wood still starts a channel exactly as before.
-    #[tokio::test]
-    async fn gather_start_on_a_tree_is_unaffected() {
-        let zone = civic_zone_on_tree();
-        let mut rx = wire_proxy_tx(&zone);
-        zone.apply_gather_start("p1", TREE);
-
-        assert!(zone.gathering.lock().unwrap().contains_key("p1"), "bare hands still work on wood");
-        assert!(drain(&mut rx).iter().all(|p| !p.contains("\"gather.error\"")));
-    }
+    // --- Mining/abilities epic #123, #117/#125: ability swings -----------------
 
     /// A swing in range of a stocked rock yields exactly one stone, mining
     /// XP, an `ability.result` success, and an updated node status — no
@@ -2210,6 +1937,95 @@ mod tests {
         zone2.apply_ability_swing("p1", "pick", TREE, 1600);
         assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
         assert_eq!(zone2.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "wrong-target swing takes nothing");
+    }
+
+    /// A successful swing's `ability.result` carries what was actually
+    /// taken (#125) — the client flashes it as an ordinary "+N" gain notice,
+    /// closing a gap where ability swings never showed one (only the old
+    /// channel's now-deleted `gather.result` did).
+    #[tokio::test]
+    async fn ability_result_carries_the_yield_for_the_client_flash() {
+        let zone = civic_zone_on_rock();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
+            && p.contains("\"item_id\":\"stone\"") && p.contains("\"qty\":1")),
+            "expected the yield on the successful ability.result: {packets:?}");
+
+        // A rejection carries no item_id/qty — nothing was taken.
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12900; // out of range
+        let mut rx2 = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        let packets2 = drain(&mut rx2);
+        assert!(packets2.iter().any(|p| p.contains("\"ok\":false") && !p.contains("\"item_id\"")),
+            "a rejected swing must not carry an item_id: {packets2:?}");
+    }
+
+    /// Chop mirrors Pick exactly (#125) — the same `apply_ability_swing` is
+    /// generic over `ability_target_item`/`governing_skill`, so a swing
+    /// against a tree yields wood and woodcutting xp instead of stone and
+    /// mining xp, with identical range/depletion/wrong-target behaviour.
+    #[tokio::test]
+    async fn chop_swing_yields_wood_and_woodcutting_xp() {
+        let zone = civic_zone_on_tree();
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
+            && p.contains("\"item_id\":\"wood\"") && p.contains("\"qty\":1")),
+            "expected a successful ability.result: {packets:?}");
+        assert!(packets.iter().any(|p| p.contains("\"gather_yield\"") && p.contains("\"item_id\":\"wood\"")
+            && p.contains("\"skill\":\"woodcutting\"") && p.contains("\"xp\":12")),
+            "missing the internal gather_yield with woodcutting xp: {packets:?}");
+        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 4, "one wood taken");
+    }
+
+    #[tokio::test]
+    async fn chop_swing_depletes_node_then_despawns_and_schedules_respawn() {
+        let zone = civic_zone_on_tree();
+        zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 1;
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(TREE)));
+        let nodes = zone.nodes.lock().unwrap();
+        let n = nodes.get(TREE).unwrap();
+        assert_eq!(n.qty, 0);
+        assert!(n.respawn_timer > 0, "respawn should be scheduled");
+    }
+
+    #[tokio::test]
+    async fn chop_swing_out_of_range_is_rejected() {
+        let zone = civic_zone_on_tree();
+        zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12850; // well past SWING_RANGE
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+
+        let packets = drain(&mut rx);
+        assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":false")
+            && p.contains("\"reason\":\"out_of_range\"")));
+        assert!(packets.iter().all(|p| !p.contains("\"gather_yield\"")));
+        assert_eq!(zone.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "node untouched");
+    }
+
+    /// Chop only targets wood — a rock is the wrong node kind for it, same
+    /// as a tree is the wrong kind for Pick.
+    #[tokio::test]
+    async fn chop_swing_on_an_exhausted_or_wrong_node_is_rejected() {
+        let zone = civic_zone_on_tree();
+        zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 0;
+        let mut rx = wire_proxy_tx(&zone);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+        assert!(drain(&mut rx).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
+
+        let zone2 = civic_zone_on_rock();
+        let mut rx2 = wire_proxy_tx(&zone2);
+        zone2.apply_ability_swing("p1", "chop", ROCK, 1600);
+        assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
+        assert_eq!(zone2.nodes.lock().unwrap().get(ROCK).unwrap().qty, 5, "wrong-target swing takes nothing");
     }
 
     // --- Mining/abilities epic #123, #118: quarry foreman NPC talk range --------

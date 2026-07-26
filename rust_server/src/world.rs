@@ -175,6 +175,9 @@ pub fn items() -> Vec<Item> {
         // slot puts the Pick ability on the hotbar. stack_size 1 — it's worn,
         // not stacked, though nothing stops carrying spares unequipped.
         Item { id: "pickaxe", name: "Pickaxe", stack_size: 1, category: "tool" },
+        // Woodcutting (#122 backlog, #125): same single tool-in-hand slot as
+        // the pickaxe — equipping one replaces the other.
+        Item { id: "axe", name: "Axe", stack_size: 1, category: "tool" },
     ]
 }
 
@@ -207,6 +210,10 @@ pub fn recipes() -> Vec<Recipe> {
             id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 2), ("stone", 3)],
             output_item: "pickaxe", output_qty: 1,
         },
+        Recipe {
+            id: "axe", name: "Axe", inputs: &[("wood", 2), ("stone", 1)],
+            output_item: "axe", output_qty: 1,
+        },
     ]
 }
 
@@ -226,7 +233,7 @@ pub fn recipe(id: &str) -> Option<Recipe> {
 /// item isn't equippable at all (most items — wood, stone, plank, ...).
 pub fn equippable_slot(item_id: &str) -> Option<&'static str> {
     match item_id {
-        "pickaxe" => Some("tool"),
+        "pickaxe" | "axe" => Some("tool"),
         _ => None,
     }
 }
@@ -245,14 +252,19 @@ pub struct Ability {
 pub fn abilities_for_item(item_id: &str) -> &'static [Ability] {
     match item_id {
         "pickaxe" => &[Ability { id: "pick", name: "Pick" }],
+        "axe" => &[Ability { id: "chop", name: "Chop" }],
         _ => &[],
     }
 }
 
-/// The skill whose level scales an ability's cooldown, if any.
+/// The skill whose level scales an ability's cooldown, if any. Woodcutting
+/// (#122 backlog, #125) is a dedicated skill, not a reuse of the old
+/// channel-gathering "gathering" skill — same one-skill-per-ability pattern
+/// mining already set.
 pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
     match ability_id {
         "pick" => Some("mining"),
+        "chop" => Some("woodcutting"),
         _ => None,
     }
 }
@@ -262,20 +274,34 @@ pub fn governing_skill(ability_id: &str) -> Option<&'static str> {
 pub fn ability_target_item(ability_id: &str) -> Option<&'static str> {
     match ability_id {
         "pick" => Some("stone"),
+        "chop" => Some("wood"),
         _ => None,
     }
 }
 
 /// An ability's swing/use cooldown (ms) at a given level of its governing
 /// skill (0 if ungoverned or the wielder hasn't trained it). Each ability
-/// hardcodes its own curve for now — there's exactly one — but this is the
-/// single place both the gateway (enforcement) and `equip.update` (display)
-/// compute it, so they can never disagree.
+/// hardcodes its own curve — Chop mirrors Pick's for now, a starting point
+/// for the balance-pass backlog item, not a claim they must stay identical
+/// forever — but this is the single place both the gateway (enforcement)
+/// and `equip.update` (display) compute it, so they can never disagree.
 pub fn ability_cooldown_ms(ability_id: &str, skill_level: i64) -> i64 {
     match ability_id {
         // 2000ms at level 0, -80ms per level, floors at 1200ms (~level 10+).
-        "pick" => (2000 - 80 * skill_level).max(1200),
+        "pick" | "chop" => (2000 - 80 * skill_level).max(1200),
         _ => 1000,
+    }
+}
+
+/// Mining-skill xp per successful swing per ability (mining/abilities epic
+/// #123; generalized in #125 when Chop joined Pick — a per-ability table
+/// rather than one hardcoded constant in the zone). Same rate for both:
+/// a swing is a swing, instant rather than the old multi-tick channel's
+/// per-unit yield (which paid out at 10/unit).
+pub fn ability_xp_per_swing(ability_id: &str) -> i64 {
+    match ability_id {
+        "pick" | "chop" => 12,
+        _ => 0,
     }
 }
 
