@@ -25,6 +25,7 @@ var _stone := 0
 var _spur_id := ""
 var _board_poll := 0.0
 var _chop_cooldown_at := 0.0
+var _pickaxe_instance_id := ""
 
 func _fail(message: String) -> void:
 	print("SMOKE_FAIL: %s" % message)
@@ -53,7 +54,16 @@ func _initialize() -> void:
 		if _phase == "talk":
 			print("SMOKE: talked to %s" % npc_name)
 			_phase = "equip")
-	_net.equip_update.connect(func(tool, _abilities):
+	_net.inv_update.connect(func(items, _used, _capacity):
+		if _pickaxe_instance_id != "":
+			return
+		for it in items:
+			if String(it.get("item_id", "")) == "pickaxe":
+				# The granted instance's own id (#128) — equip now targets a
+				# specific tool, since "the pickaxe" stops being unambiguous
+				# the moment you could own more than one.
+				_pickaxe_instance_id = String(it.get("id", "")))
+	_net.equip_update.connect(func(tool, _durability, _max_durability, _abilities):
 		if _phase == "equip" and tool == "pickaxe":
 			print("SMOKE: pickaxe equipped")
 			_phase = "to_face"
@@ -96,7 +106,8 @@ func _process(delta: float) -> bool:
 				_net.send_npc_talk("npc_quarry_foreman")
 				_phase = "talk"
 		"equip":
-			_net.send_equip("pickaxe")
+			if _pickaxe_instance_id != "":
+				_net.send_equip(_pickaxe_instance_id)
 			# advances to "to_face" via equip_update above once tool == "pickaxe"
 		"to_face":
 			if _pos.distance_to(Vector2(FACE)) < 5.0:

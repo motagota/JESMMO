@@ -161,18 +161,25 @@ func set_inventory(items: Array, used: int, capacity: int) -> void:
 	var parts := PackedStringArray()
 	for it_v in items:
 		var it: Dictionary = it_v
-		parts.append("%s x%d" % [String(it.get("item_id", "?")), int(it.get("qty", 0))])
+		var item_id := String(it.get("item_id", "?"))
+		if it.has("durability"):
+			# A tool instance (#128) — qty is always 1, so durability is the
+			# informative number, not the count.
+			parts.append("%s (%d/%d)" % [item_id, int(it["durability"]), int(it.get("max_durability", 0))])
+		else:
+			parts.append("%s x%d" % [item_id, int(it.get("qty", 0))])
 	_inv.text = "inventory: " + ", ".join(parts) + cap
 
 ## The armed tool, or "" for nothing equipped (mining/abilities epic #123,
-## #119). A blank in-hand line while empty means the click target only
-## exists once there's something to unequip.
-func set_tool(item_id: String) -> void:
+## #119), plus its live durability (#128). A blank in-hand line while empty
+## means the click target only exists once there's something to unequip.
+func set_tool(item_id: String, durability: int, max_durability: int) -> void:
 	if item_id == "":
 		_tool.text = ""
 		_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	else:
-		_tool.text = "In hand: %s %s   (click to unequip)" % [Protocol.item_icon(item_id), item_id]
+		_tool.text = "In hand: %s %s (%d/%d)   (click to unequip)" % [
+			Protocol.item_icon(item_id), item_id, durability, max_durability]
 		_tool.mouse_filter = Control.MOUSE_FILTER_STOP
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:

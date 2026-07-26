@@ -33,9 +33,12 @@ signal craft_recipes(recipes: Array)
 signal craft_made(recipe_id: String, item_id: String, qty: int)
 ## Equipment (mining/abilities epic #123, #119): the tool slot changed (or
 ## login hydration is reporting its current state) — `tool` is "" when
-## nothing's armed. `abilities` mirrors the server's `equip.update` shape.
-signal equip_update(tool: String, abilities: Array)
+## nothing's armed, in which case `durability`/`max_durability` are 0.
+## `abilities` mirrors the server's `equip.update` shape.
+signal equip_update(tool: String, durability: int, max_durability: int, abilities: Array)
 signal equip_error(message: String)
+## A repair (#128) went through — `cost` is `{item_id: qty, ...}` consumed.
+signal repair_done(instance_id: String, item_id: String, cost: Dictionary)
 ## One ability use's outcome. `reason` is only meaningful when `ok` is
 ## false ("no_tool" | "cooldown" | "out_of_range" | "exhausted");
 ## `item_id`/`qty` only when `ok` is true (#125/#127) — what the swing
@@ -285,13 +288,25 @@ func _handle_text(text: String) -> void:
         Protocol.S_MAYOR_BUILD_ERROR:
             mayor_build_error.emit(String(msg.get("message", "that build order was rejected")))
         Protocol.S_EQUIP_UPDATE:
-            # `tool` rides as JSON null (not just absent) when nothing's
-            # equipped — Dictionary.get's default only covers a missing key,
-            # so a present-but-null value must be handled explicitly.
+            # `tool`/`durability`/`max_durability` ride as JSON null (not
+            # just absent) when nothing's equipped — Dictionary.get's
+            # default only covers a missing key, so present-but-null values
+            # must be handled explicitly.
             var tool_v: Variant = msg.get("tool")
-            equip_update.emit(String(tool_v) if tool_v != null else "", msg.get("abilities", []))
+            var durability_v: Variant = msg.get("durability")
+            var max_durability_v: Variant = msg.get("max_durability")
+            equip_update.emit(
+                String(tool_v) if tool_v != null else "",
+                int(durability_v) if durability_v != null else 0,
+                int(max_durability_v) if max_durability_v != null else 0,
+                msg.get("abilities", []))
         Protocol.S_EQUIP_ERROR:
             equip_error.emit(String(msg.get("message", "couldn't equip that")))
+        Protocol.S_REPAIR_DONE:
+            repair_done.emit(
+                String(msg.get("instance_id", "")),
+                String(msg.get("item_id", "")),
+                msg.get("cost", {}))
         Protocol.S_ABILITY_RESULT:
             ability_result.emit(
                 String(msg.get("id", "")),
@@ -436,10 +451,11 @@ func send_road_demolish(order_id: String) -> void:
 func send_craft_make(recipe_id: String) -> void:
     _send({"type": Protocol.C_CRAFT_MAKE, "recipe_id": recipe_id})
 
-## Arm an owned item in the tool slot (mining/abilities epic #123, #119).
-## Answered with `equip.update` on success, `equip_error` if not owned.
-func send_equip(item_id: String) -> void:
-    _send({"type": Protocol.C_EQUIP, "item_id": item_id})
+## Arm a SPECIFIC owned tool instance (#128 — "the pickaxe" stopped being
+## well-defined once tools carry their own durability). Answered with
+## `equip.update` on success, `equip_error` if not owned.
+func send_equip(instance_id: String) -> void:
+    _send({"type": Protocol.C_EQUIP, "instance_id": instance_id})
 
 ## Clear the tool slot.
 func send_unequip() -> void:
@@ -449,6 +465,12 @@ func send_unequip() -> void:
 ## the tool grants it, its cooldown has elapsed, the node's in range/stocked).
 func send_ability_use(ability_id: String, node_id: String) -> void:
     _send({"type": Protocol.C_ABILITY_USE, "id": ability_id, "node_id": node_id})
+
+## Repair a specific owned tool instance at an owned crafting station
+## (#128) — validated server-side; silent no-op on failure, same posture
+## as `send_craft_make`.
+func send_repair(instance_id: String) -> void:
+    _send({"type": Protocol.C_REPAIR, "instance_id": instance_id})
 
 ## Talk to an NPC (validated server-side by proximity). Answered with
 ## `npc.dialogue` (mining/abilities epic #123, #121).

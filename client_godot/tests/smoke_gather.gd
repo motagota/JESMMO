@@ -10,6 +10,7 @@ extends SceneTree
 var _net
 var _t := 0.0
 var _phase := "auth" # auth -> to_elke -> talk -> equip -> to_tree -> chop -> to_store -> deposit -> wait_store
+var _axe_instance_id := ""
 var _wood_qty := 0
 var _stored_wood := 0
 var _chop_cooldown_at := 0.0
@@ -28,14 +29,20 @@ func _initialize() -> void:
 		if _phase == "talk":
 			print("SMOKE: talked to ", npc_name, " granted=", granted)
 			_phase = "equip")
-	_net.equip_update.connect(func(tool, _abilities):
+	_net.equip_update.connect(func(tool, _durability, _max_durability, _abilities):
 		if _phase == "equip" and tool == "axe":
 			print("SMOKE: axe equipped")
 			_phase = "to_tree")
 	_net.inv_update.connect(func(items, _used, _capacity):
 		for it in items:
-			if String(it.get("item_id", "")) == "wood":
-				_wood_qty = int(it.get("qty", 0)))
+			var item_id := String(it.get("item_id", ""))
+			if item_id == "wood":
+				_wood_qty = int(it.get("qty", 0))
+			elif item_id == "axe" and _axe_instance_id == "":
+				# The granted instance's own id (#128) — equip now targets a
+				# specific tool, since "the axe" stops being unambiguous the
+				# moment you could own more than one.
+				_axe_instance_id = String(it.get("id", "")))
 	_net.store_update.connect(func(items):
 		for it in items:
 			if String(it.get("item_id", "")) == "wood":
@@ -62,7 +69,8 @@ func _process(delta: float) -> bool:
 				_phase = "talk"
 		# "talk" advances to "equip" via npc_dialogue above.
 		"equip":
-			_net.send_equip("axe")
+			if _axe_instance_id != "":
+				_net.send_equip(_axe_instance_id)
 			# advances to "to_tree" via equip_update above once tool == "axe"
 		"to_tree":
 			# Elke (14300,11400) -> the nearest camp tree (14280,11380).

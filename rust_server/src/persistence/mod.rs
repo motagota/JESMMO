@@ -17,6 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
 
 use crate::util::now_secs;
+use crate::world;
 
 /// All persistence errors surface as `sqlx::Error`; callers that need friendlier
 /// semantics (e.g. "email already taken") check before writing.
@@ -82,7 +83,24 @@ fn dump_cost(cost: &BTreeMap<String, i64>) -> String {
     serde_json::to_string(cost).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Add `qty` of `item_id` to a character's carried inventory. Tools (#128)
+/// are instanced, not stacked — each unit becomes its own fresh-durability
+/// row and `qty` here just means "how many separate tools to create" (in
+/// practice always 1: every current tool source — craft, NPC grant — hands
+/// over exactly one at a time). Ordinary items keep merging onto a single
+/// stack row like always.
 async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
+    if let Some(max) = world::tool_max_durability(item_id) {
+        for _ in 0..qty {
+            sqlx::query(
+                "INSERT INTO inventory_item (id, character_id, item_id, qty, slot, durability) \
+                 VALUES (?, ?, ?, 1, NULL, ?)",
+            )
+            .bind(Uuid::new_v4().to_string()).bind(character_id).bind(item_id).bind(max)
+            .execute(&mut **tx).await?;
+        }
+        return Ok(());
+    }
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT id FROM inventory_item WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT 1",
     )
@@ -101,7 +119,25 @@ async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str,
     Ok(())
 }
 
+/// Remove up to `qty` of `item_id` from carried inventory. For a tool
+/// (#128) this deletes whichever OWNED INSTANCES come first (arbitrary,
+/// oldest-first) until `qty` units are gone — fine for the one caller that
+/// can reach a tool here (`deposit`, which #128 blocks for tools entirely
+/// at the gateway, precisely because "which instance" isn't a meaningful
+/// question for a stash slot) — kept generic rather than special-cased so
+/// it can't silently corrupt state if that guard is ever bypassed.
 async fn remove_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<i64, DbError> {
+    if world::tool_max_durability(item_id).is_some() {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM inventory_item WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT ?",
+        )
+        .bind(character_id).bind(item_id).bind(qty)
+        .fetch_all(&mut **tx).await?;
+        for id in &ids {
+            sqlx::query("DELETE FROM inventory_item WHERE id = ?").bind(id).execute(&mut **tx).await?;
+        }
+        return Ok(ids.len() as i64);
+    }
     let cur: Option<i64> = sqlx::query_scalar(
         "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
     )
@@ -436,7 +472,9 @@ pub struct SkillGain {
     pub leveled_up: bool,
 }
 
-/// A carried inventory item (finite slots).
+/// A carried inventory item (finite slots). `durability` is `None` for an
+/// ordinary stackable item and `Some(0..=max)` for a tool instance (#128) —
+/// a tool row's `qty` is always 1, since instances never stack.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct InventoryItem {
     pub id: String,
@@ -444,6 +482,35 @@ pub struct InventoryItem {
     pub item_id: String,
     pub qty: i64,
     pub slot: Option<i64>,
+    pub durability: Option<i64>,
+}
+
+/// The tool currently armed in a slot, with its instance identity and live
+/// durability (#128) — everything `apply_ability_use`'s wear-down and
+/// `equip.update`'s display need in one lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquippedTool {
+    pub instance_id: String,
+    pub item_id: String,
+    pub durability: i64,
+    pub max_durability: i64,
+}
+
+/// The result of spending durability on an equipped tool (#128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WearOutcome {
+    pub remaining: i64,
+    /// `true` when this swing broke it — the equipment row was cleared
+    /// (auto-unequip), leaving the instance in inventory at 0 durability.
+    pub broke: bool,
+}
+
+/// The result of a successful repair (#128) — what it cost, so the gateway
+/// can report it back and knows what to re-push (inventory changed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairOutcome {
+    pub item_id: String,
+    pub cost: Vec<(String, i64)>,
 }
 
 /// A safe home-stash item (large, unslotted; stacks per item).
@@ -834,7 +901,7 @@ impl Db {
         character_id: &str,
     ) -> Result<Vec<InventoryItem>, DbError> {
         sqlx::query_as::<_, InventoryItem>(
-            "SELECT id, character_id, item_id, qty, slot FROM inventory_item \
+            "SELECT id, character_id, item_id, qty, slot, durability FROM inventory_item \
              WHERE character_id = ? ORDER BY item_id",
         )
         .bind(character_id)
@@ -1347,37 +1414,51 @@ impl Db {
         Ok(true)
     }
 
-    // --- Equipment (mining/abilities epic #123) ---------------------------
+    // --- Equipment (mining/abilities epic #123; instanced in #128) --------
 
-    /// Arm `item_id` into `slot`, atomically checked against carried
-    /// inventory (equipping doesn't consume or move the item — it's a
-    /// pointer, same shape as [`Db::set_respawn_structure`] — so re-arming a
-    /// different item just overwrites the row). Returns `false` without
-    /// writing anything if the character doesn't actually carry one.
-    pub async fn equip(&self, character_id: &str, slot: &str, item_id: &str) -> Result<bool, DbError> {
+    /// Arm a SPECIFIC owned instance — once tools carry their own durability
+    /// (#128), "equip the pickaxe" is ambiguous the moment you own more
+    /// than one, so the caller identifies exactly which row (whichever the
+    /// player clicked); the slot it belongs in is derived from the
+    /// instance's own item, same as the old item-id-based `equip` did.
+    /// Returns `(slot, item_id)` on success; `None` if the instance doesn't
+    /// exist, isn't owned by this character, or isn't equippable at all.
+    pub async fn equip_instance(
+        &self,
+        character_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<(&'static str, String)>, DbError> {
         let mut tx = self.pool.begin().await?;
-        let have: Option<i64> = sqlx::query_scalar(
-            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT item_id, character_id FROM inventory_item WHERE id = ?",
         )
-        .bind(character_id)
-        .bind(item_id)
-        .fetch_one(&mut *tx)
+        .bind(instance_id)
+        .fetch_optional(&mut *tx)
         .await?;
-        if have.unwrap_or(0) <= 0 {
+        let Some((item_id, owner)) = row else {
             tx.commit().await?;
-            return Ok(false);
+            return Ok(None);
+        };
+        let Some(slot) = world::equippable_slot(&item_id) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        if owner != character_id {
+            tx.commit().await?;
+            return Ok(None);
         }
         sqlx::query(
-            "INSERT INTO equipment (character_id, slot, item_id) VALUES (?, ?, ?) \
-             ON CONFLICT(character_id, slot) DO UPDATE SET item_id = excluded.item_id",
+            "INSERT INTO equipment (character_id, slot, item_id, instance_id) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(character_id, slot) DO UPDATE SET item_id = excluded.item_id, instance_id = excluded.instance_id",
         )
         .bind(character_id)
         .bind(slot)
-        .bind(item_id)
+        .bind(&item_id)
+        .bind(instance_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(Some((slot, item_id)))
     }
 
     /// Clear whatever's armed in `slot`. A no-op (not an error) if nothing was.
@@ -1390,13 +1471,146 @@ impl Db {
         Ok(())
     }
 
-    /// What's currently armed in `slot`, if anything.
+    /// What's currently armed in `slot`, if anything — just the item id
+    /// (cheap; used wherever only "which kind of tool" matters, not its
+    /// wear). See [`Db::equipped_tool`] for the full instance + durability.
     pub async fn equipped(&self, character_id: &str, slot: &str) -> Result<Option<String>, DbError> {
         sqlx::query_scalar("SELECT item_id FROM equipment WHERE character_id = ? AND slot = ?")
             .bind(character_id)
             .bind(slot)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    /// The full equipped tool in `slot` — instance id, item id, and live
+    /// durability (#128) — for wear-down on a swing and for `equip.update`'s
+    /// display. `None` if nothing's equipped (including a just-broken tool,
+    /// which auto-unequips — see [`Db::wear_equipped_tool`]).
+    pub async fn equipped_tool(&self, character_id: &str, slot: &str) -> Result<Option<EquippedTool>, DbError> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT e.instance_id, i.item_id, i.durability FROM equipment e \
+             JOIN inventory_item i ON i.id = e.instance_id \
+             WHERE e.character_id = ? AND e.slot = ? AND e.instance_id IS NOT NULL",
+        )
+        .bind(character_id)
+        .bind(slot)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(instance_id, item_id, durability)| {
+            let max = world::tool_max_durability(&item_id).unwrap_or(durability);
+            EquippedTool { instance_id, item_id, durability, max_durability: max }
+        }))
+    }
+
+    /// Spend durability on whatever's equipped in `slot` after a successful
+    /// swing (#128) — `loss` is the already-rolled amount (1 normally, 2 on
+    /// a "rough" swing; the roll itself lives at the call site, since it's
+    /// gameplay tuning, not a persistence concern). Clamped at 0; hitting 0
+    /// auto-unequips (clears the equipment row) but leaves the instance in
+    /// inventory as a repairable, durability-0 husk. `None` if nothing was
+    /// actually equipped (a race with an unequip/reconnect — the caller
+    /// already checked before the swing, so this should be rare).
+    pub async fn wear_equipped_tool(
+        &self,
+        character_id: &str,
+        slot: &str,
+        loss: i64,
+    ) -> Result<Option<WearOutcome>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT e.instance_id, i.durability FROM equipment e \
+             JOIN inventory_item i ON i.id = e.instance_id \
+             WHERE e.character_id = ? AND e.slot = ? AND e.instance_id IS NOT NULL",
+        )
+        .bind(character_id)
+        .bind(slot)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((instance_id, durability)) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let remaining = (durability - loss).max(0);
+        sqlx::query("UPDATE inventory_item SET durability = ? WHERE id = ?")
+            .bind(remaining)
+            .bind(&instance_id)
+            .execute(&mut *tx)
+            .await?;
+        let broke = remaining <= 0;
+        if broke {
+            sqlx::query("DELETE FROM equipment WHERE character_id = ? AND slot = ?")
+                .bind(character_id)
+                .bind(slot)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(WearOutcome { remaining, broke }))
+    }
+
+    /// Repair a specific owned tool instance (#128) to full durability, at a
+    /// cost that scales with how worn it is ([`world::repair_cost`]) —
+    /// consumed atomically alongside the durability restore, same
+    /// check-then-spend shape as [`Db::craft`]. Works whether the instance
+    /// is currently equipped or just sitting in the bag (a broken tool is
+    /// always the latter, having auto-unequipped on the swing that broke
+    /// it). Returns `None` if the instance doesn't exist, isn't owned by
+    /// this character, isn't actually a tool, isn't missing any durability,
+    /// or the character can't afford the repair.
+    pub async fn repair_instance(
+        &self,
+        character_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<RepairOutcome>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT item_id, character_id, durability FROM inventory_item WHERE id = ?",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((item_id, owner, durability)) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let Some(max) = world::tool_max_durability(&item_id) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        if owner != character_id {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let Some(cost) = world::repair_cost(&item_id, max - durability, max) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        for (ingredient, qty) in &cost {
+            let have: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+            )
+            .bind(character_id)
+            .bind(*ingredient)
+            .fetch_one(&mut *tx)
+            .await?;
+            if have.unwrap_or(0) < *qty {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+        for (ingredient, qty) in &cost {
+            remove_inventory_in_tx(&mut tx, character_id, ingredient, *qty).await?;
+        }
+        sqlx::query("UPDATE inventory_item SET durability = ? WHERE id = ?")
+            .bind(max)
+            .bind(instance_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(RepairOutcome {
+            item_id,
+            cost: cost.into_iter().map(|(i, q)| (i.to_string(), q)).collect(),
+        }))
     }
 
     /// Total carried quantity of one item (0 if none) — a cheap point
@@ -2933,5 +3147,133 @@ mod tests {
             !db.delete_world_object("no-such-id").await.unwrap(),
             "a losing racer's delete must report false (it must not broadcast)"
         );
+    }
+
+    // --- Tool durability & instancing (mining/abilities epic #123 backlog, #128) --
+
+    /// Tools never stack — granting two pickaxes creates two separate
+    /// fresh-durability rows, not one row at qty 2. Ordinary items are
+    /// untouched (still merge onto one stack row).
+    #[tokio::test]
+    async fn tools_are_instanced_not_stacked_on_grant() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        db.add_to_inventory(&cid, "wood", 3).await.unwrap();
+        db.add_to_inventory(&cid, "wood", 2).await.unwrap();
+
+        let items = db.inventory_for_character(&cid).await.unwrap();
+        let picks: Vec<_> = items.iter().filter(|i| i.item_id == "pickaxe").collect();
+        assert_eq!(picks.len(), 2, "two grants -> two separate instance rows");
+        assert!(picks.iter().all(|p| p.qty == 1 && p.durability == Some(50)), "each a fresh instance: {picks:?}");
+        assert_ne!(picks[0].id, picks[1].id, "distinct instance ids");
+
+        let wood: Vec<_> = items.iter().filter(|i| i.item_id == "wood").collect();
+        assert_eq!(wood.len(), 1, "ordinary items still merge onto one stack row");
+        assert_eq!(wood[0].qty, 5);
+        assert_eq!(wood[0].durability, None, "not a tool -> no durability tracked");
+    }
+
+    /// Equipping targets a specific instance: wrong owner, unknown id, and a
+    /// non-equippable item are all rejected; a legitimate equip returns the
+    /// derived slot and item, and is reflected by `equipped`/`equipped_tool`.
+    #[tokio::test]
+    async fn equip_instance_validates_ownership_and_equippability() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        let stranger = a_character(&db).await;
+        db.add_to_inventory(&owner, "pickaxe", 1).await.unwrap();
+        db.add_to_inventory(&owner, "wood", 1).await.unwrap();
+        let items = db.inventory_for_character(&owner).await.unwrap();
+        let pick_id = &items.iter().find(|i| i.item_id == "pickaxe").unwrap().id;
+        let wood_id = &items.iter().find(|i| i.item_id == "wood").unwrap().id;
+
+        assert_eq!(db.equip_instance(&owner, "no-such-id").await.unwrap(), None, "unknown instance");
+        assert_eq!(db.equip_instance(&stranger, pick_id).await.unwrap(), None, "not the owner");
+        assert_eq!(db.equip_instance(&owner, wood_id).await.unwrap(), None, "not equippable at all");
+
+        let ok = db.equip_instance(&owner, pick_id).await.unwrap();
+        assert_eq!(ok, Some(("tool", "pickaxe".to_string())));
+        assert_eq!(db.equipped(&owner, "tool").await.unwrap().as_deref(), Some("pickaxe"));
+        let tool = db.equipped_tool(&owner, "tool").await.unwrap().unwrap();
+        assert_eq!(tool.instance_id, *pick_id);
+        assert_eq!(tool.durability, 50);
+        assert_eq!(tool.max_durability, 50);
+    }
+
+    /// A swing spends durability on whichever instance is equipped; hitting
+    /// 0 auto-unequips (the slot clears) but the instance survives in
+    /// inventory as a repairable, durability-0 husk — not deleted.
+    #[tokio::test]
+    async fn wear_equipped_tool_clamps_at_zero_and_auto_unequips_on_break() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        let instance_id = db.inventory_for_character(&cid).await.unwrap()[0].id.clone();
+        db.equip_instance(&cid, &instance_id).await.unwrap();
+
+        let outcome = db.wear_equipped_tool(&cid, "tool", 1).await.unwrap().unwrap();
+        assert_eq!((outcome.remaining, outcome.broke), (49, false));
+        assert_eq!(db.equipped(&cid, "tool").await.unwrap().as_deref(), Some("pickaxe"), "still equipped");
+
+        // Drive it to the brink, then break it with a loss bigger than what's left.
+        for _ in 0..48 {
+            db.wear_equipped_tool(&cid, "tool", 1).await.unwrap();
+        }
+        let broke = db.wear_equipped_tool(&cid, "tool", 5).await.unwrap().unwrap();
+        assert_eq!((broke.remaining, broke.broke), (0, true), "clamped at 0, not negative");
+        assert_eq!(db.equipped(&cid, "tool").await.unwrap(), None, "auto-unequipped");
+
+        let items = db.inventory_for_character(&cid).await.unwrap();
+        let husk = items.iter().find(|i| i.id == instance_id).expect("the broken instance must still exist");
+        assert_eq!(husk.durability, Some(0), "a repairable husk, not deleted");
+
+        // Nothing equipped: wearing it down again is a no-op, not an error.
+        assert_eq!(db.wear_equipped_tool(&cid, "tool", 1).await.unwrap(), None);
+    }
+
+    /// Repair cost scales with missing durability (world::repair_cost's
+    /// formula) and is actually consumed; repairing something not missing
+    /// any durability, or that can't be afforded, does nothing.
+    #[tokio::test]
+    async fn repair_instance_costs_scale_and_restore_to_full() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        let instance_id = db.inventory_for_character(&cid).await.unwrap()[0].id.clone();
+
+        // Fully healthy: nothing to repair.
+        assert_eq!(db.repair_instance(&cid, &instance_id).await.unwrap(), None);
+
+        // Wear it to 12/50 (missing 38) — repair_cost(pickaxe, 38, 50) with
+        // the pickaxe recipe (2 wood + 3 stone): total_units=5, repair_units=4
+        // -> wood ceil(2*4/5)=2, stone ceil(3*4/5)=3.
+        db.equip_instance(&cid, &instance_id).await.unwrap();
+        for _ in 0..38 {
+            db.wear_equipped_tool(&cid, "tool", 1).await.unwrap();
+        }
+
+        // Can't afford it yet.
+        assert_eq!(db.repair_instance(&cid, &instance_id).await.unwrap(), None, "no ingredients at all");
+
+        db.add_to_inventory(&cid, "wood", 2).await.unwrap();
+        db.add_to_inventory(&cid, "stone", 3).await.unwrap();
+        let outcome = db.repair_instance(&cid, &instance_id).await.unwrap().expect("affordable now");
+        assert_eq!(outcome.item_id, "pickaxe");
+        assert_eq!(
+            outcome.cost.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+            [("wood".to_string(), 2), ("stone".to_string(), 3)].into_iter().collect(),
+        );
+        assert_eq!(db.inventory_qty(&cid, "wood").await.unwrap(), 0, "ingredients consumed");
+        assert_eq!(db.inventory_qty(&cid, "stone").await.unwrap(), 0);
+        let repaired = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.id == instance_id).unwrap();
+        assert_eq!(repaired.durability, Some(50), "restored to full");
+
+        // A stranger can't repair someone else's instance.
+        let stranger = a_character(&db).await;
+        db.wear_equipped_tool(&cid, "tool", 10).await.unwrap();
+        assert_eq!(db.repair_instance(&stranger, &instance_id).await.unwrap(), None);
     }
 }

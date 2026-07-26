@@ -642,6 +642,10 @@ impl ZoneServer {
                     let _ = tx.send(Message::Text(json!({
                         "type": "gather_yield", "player_id": pid,
                         "item_id": item_id, "qty": 1, "skill": skill, "xp": xp,
+                        // Tells the gateway which ability swung — it wears down
+                        // whatever tool governs it (#128). Only ever present for
+                        // a real swing; nothing else emits gather_yield anymore.
+                        "ability_id": ability_id,
                     }).to_string()));
                     let touch = if depleted {
                         json!({"type": "despawn", "player_id": node_id})
@@ -1885,8 +1889,9 @@ mod tests {
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
             && p.contains("\"cooldown_ms\":1600")), "expected a successful ability.result: {packets:?}");
         assert!(packets.iter().any(|p| p.contains("\"gather_yield\"") && p.contains("\"item_id\":\"stone\"")
-            && p.contains("\"skill\":\"mining\"") && p.contains("\"xp\":12")),
-            "missing the internal gather_yield with mining xp: {packets:?}");
+            && p.contains("\"skill\":\"mining\"") && p.contains("\"xp\":12")
+            && p.contains("\"ability_id\":\"pick\"")),
+            "missing the internal gather_yield with mining xp and ability_id (#128 needs it to wear the tool): {packets:?}");
         assert_eq!(zone.nodes.lock().unwrap().get(ROCK).unwrap().qty, 4, "one stone taken");
     }
 

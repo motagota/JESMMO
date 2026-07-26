@@ -305,6 +305,56 @@ pub fn ability_xp_per_swing(ability_id: &str) -> i64 {
     }
 }
 
+// --- Tool durability & repair (mining/abilities epic #123 backlog, #128) ------
+
+/// Max durability (swings before it breaks) for an equippable tool, or
+/// `None` for anything that isn't one — also doubles as "is this item
+/// instanced rather than stacked" (see `persistence::add_inventory_in_tx`).
+/// A placeholder number for now; #129's balance pass owns the real curve.
+pub fn tool_max_durability(item_id: &str) -> Option<i64> {
+    match item_id {
+        "pickaxe" | "axe" => Some(50),
+        _ => None,
+    }
+}
+
+/// The tool item an ability wears down on a successful swing — the inverse
+/// of [`abilities_for_item`]. `None` for an ability with no tool of its own
+/// (shouldn't happen for a harvesting ability today, but keeps the mapping
+/// honest for whatever comes next).
+pub fn governing_tool(ability_id: &str) -> Option<&'static str> {
+    match ability_id {
+        "pick" => Some("pickaxe"),
+        "chop" => Some("axe"),
+        _ => None,
+    }
+}
+
+/// Repair cost for a tool missing `missing` of its `max` durability:
+/// `ceil(missing / 10)` "repair units" out of `ceil(max / 10)` total units,
+/// applied proportionally to each of the tool's craft-recipe ingredients
+/// (minimum 1 of each so a nearly-full repair is never free). `None` if
+/// `item_id` has no matching recipe (shouldn't happen for a real tool) or
+/// nothing is actually missing.
+pub fn repair_cost(item_id: &str, missing: i64, max: i64) -> Option<Vec<(&'static str, i64)>> {
+    if missing <= 0 || max <= 0 {
+        return None;
+    }
+    let recipe = recipes().into_iter().find(|r| r.output_item == item_id)?;
+    let total_units = (max + 9) / 10; // ceil(max / 10), >= 1 since max > 0
+    let repair_units = ((missing + 9) / 10).min(total_units); // ceil(missing / 10), capped
+    Some(
+        recipe
+            .inputs
+            .iter()
+            .map(|(ingredient, full_qty)| {
+                let cost = ((full_qty * repair_units) + total_units - 1) / total_units; // ceil
+                (*ingredient, cost.max(1))
+            })
+            .collect(),
+    )
+}
+
 /// Fixed footprint (world units) for a home structure kind, used both by
 /// placement validation (bounds/overlap) and the client's ghost preview. `None`
 /// for anything that isn't a placeable home structure (#12).
@@ -1161,6 +1211,37 @@ mod tests {
             let r = cell.rect();
             assert!(suburbs.contains(r.x0, r.y0) && suburbs.contains(r.x1 - 1, r.y1 - 1));
         }
+    }
+
+    // --- Tool durability & repair (mining/abilities epic #123 backlog, #128) ------
+
+    #[test]
+    fn repair_cost_scales_with_missing_durability_and_floors_at_one() {
+        // Pickaxe: 2 wood + 3 stone, max 50 -> 5 total units (ceil(50/10)).
+        assert_eq!(repair_cost("pickaxe", 0, 50), None, "nothing missing -> nothing to repair");
+        // Missing 10 -> 1 unit/5 -> wood ceil(2/5)=1, stone ceil(3/5)=1.
+        assert_eq!(repair_cost("pickaxe", 10, 50), Some(vec![("wood", 1), ("stone", 1)]));
+        // Missing 38 -> 4 units/5 -> wood ceil(8/5)=2, stone ceil(12/5)=3.
+        assert_eq!(repair_cost("pickaxe", 38, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Fully broken -> the full recipe (never less than crafting fresh).
+        assert_eq!(repair_cost("pickaxe", 50, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Missing far more than max (shouldn't happen, but must not go
+        // negative/overflow) clamps to the same as fully broken.
+        assert_eq!(repair_cost("pickaxe", 999, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Not a real tool/recipe -> None, not a panic.
+        assert_eq!(repair_cost("wood", 5, 50), None);
+    }
+
+    #[test]
+    fn tool_registries_agree_with_each_other() {
+        for item_id in ["pickaxe", "axe"] {
+            assert!(tool_max_durability(item_id).is_some(), "{item_id} should have a durability cap");
+            let abilities = abilities_for_item(item_id);
+            assert_eq!(abilities.len(), 1, "{item_id} should grant exactly one ability");
+            assert_eq!(governing_tool(abilities[0].id), Some(item_id), "governing_tool must invert abilities_for_item for {item_id}");
+        }
+        assert_eq!(tool_max_durability("wood"), None);
+        assert_eq!(governing_tool("nonexistent"), None);
     }
 }
 

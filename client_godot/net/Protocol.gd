@@ -71,17 +71,28 @@ const C_CRAFT_MAKE := "craft.make"
 const S_CRAFT_MADE := "craft.made"
 
 # --- gameplay: equipment & abilities (mining/abilities epic #123, #119) -------
-## Arming/clearing the tool slot. Answered with `equip.update` on success
-## (and pushed unprompted on login hydration); an unowned item comes back as
+## Arming/clearing the tool slot. `instance_id` (#128) identifies exactly
+## WHICH owned tool to arm — items are individually durability-tracked, so
+## "equip the pickaxe" stops being well-defined the moment you own more than
+## one. Answered with `equip.update` on success (and pushed unprompted on
+## login hydration); an unowned/unrecognized instance comes back as
 ## `equip_error`.
-const C_EQUIP := "equip" # {item_id}
+const C_EQUIP := "equip" # {instance_id}
 const C_UNEQUIP := "unequip"
-const S_EQUIP_UPDATE := "equip.update" # {tool, abilities: [{id, name, cooldown_ms}]}
+const S_EQUIP_UPDATE := "equip.update" # {tool, durability, max_durability, abilities: [{id, name, cooldown_ms}]}
 const S_EQUIP_ERROR := "equip_error" # {message}
-## One ability use (a Pick swing today). `cooldown_ms` on the result is
+## One ability use (Pick/Chop today). `cooldown_ms` on the result is
 ## already level-scaled server-side — the hotbar just renders it.
 const C_ABILITY_USE := "ability.use" # {id, node_id}
 const S_ABILITY_RESULT := "ability.result" # {id, ok, cooldown_ms, reason?, item_id?, qty?}
+
+# --- gameplay: tool durability & repair (mining/abilities epic #123 backlog, #128) --
+## Repair a specific owned (usually broken/worn) tool instance at an owned
+## crafting station — cost scales with how much durability is missing.
+## Silent no-op server-side on failure (no station, can't afford it, nothing
+## missing) — same posture as `craft.make`.
+const C_REPAIR := "repair" # {instance_id}
+const S_REPAIR_DONE := "repair.done" # {instance_id, item_id, cost: {item_id: qty, ...}}
 ## Must be this close to a node to swing at it (mirrors the server's
 ## zone_server.rs PICK_RANGE).
 const PICK_RANGE := 8.0

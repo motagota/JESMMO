@@ -18,6 +18,7 @@ var _well_id := ""
 var _well_wood_progress := -1
 var _saw_board := false
 var _chop_cooldown_at := 0.0
+var _axe_instance_id := ""
 
 func _initialize() -> void:
 	randomize()
@@ -47,14 +48,17 @@ func _initialize() -> void:
 		if _phase == "talk":
 			print("SMOKE: talked to ", npc_name, " granted=", granted)
 			_phase = "equip")
-	_net.equip_update.connect(func(tool, _abilities):
+	_net.equip_update.connect(func(tool, _durability, _max_durability, _abilities):
 		if _phase == "equip" and tool == "axe":
 			print("SMOKE: axe equipped")
 			_phase = "to_tree")
 	_net.inv_update.connect(func(items, _used, _capacity):
 		for it in items:
-			if String(it.get("item_id", "")) == "wood":
-				_wood_qty = int(it.get("qty", 0)))
+			var item_id := String(it.get("item_id", ""))
+			if item_id == "wood":
+				_wood_qty = int(it.get("qty", 0))
+			elif item_id == "axe" and _axe_instance_id == "":
+				_axe_instance_id = String(it.get("id", "")))
 	_net.connect_to("ws://127.0.0.1:8766")
 
 func _process(delta: float) -> bool:
@@ -82,7 +86,8 @@ func _process(delta: float) -> bool:
 				_phase = "talk"
 		# "talk" advances to "equip" via npc_dialogue above.
 		"equip":
-			_net.send_equip("axe")
+			if _axe_instance_id != "":
+				_net.send_equip(_axe_instance_id)
 			# advances to "to_tree" via equip_update above once tool == "axe"
 		"to_tree":
 			# Elke (14300,11400) -> the nearest camp tree (14280,11380).

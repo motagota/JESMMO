@@ -336,9 +336,9 @@ func _wire_signals() -> void:
     _rent.do_pay.connect(func(plot_id): _net.send_rent_pay(plot_id))
     _rent.do_set_autopay.connect(func(plot_id, enabled): _net.send_rent_set_autopay(plot_id, enabled))
 
-    # Equipment & abilities (mining/abilities epic #123, #119).
-    _net.equip_update.connect(func(tool, abilities):
-        _hud.set_tool(tool)
+    # Equipment & abilities (mining/abilities epic #123, #119; durability #128).
+    _net.equip_update.connect(func(tool, durability, max_durability, abilities):
+        _hud.set_tool(tool, durability, max_durability)
         _hotbar.set_abilities(abilities))
     _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
     _net.ability_result.connect(func(id, ok, cooldown_ms, reason, item_id, qty):
@@ -347,7 +347,9 @@ func _wire_signals() -> void:
             _hud.flash_gain(item_id, qty)
         else:
             _hud.flash_announce(_ability_fail_text(reason)))
-    _inventory.do_equip.connect(func(item_id): _net.send_equip(item_id))
+    _inventory.do_equip.connect(func(instance_id): _net.send_equip(instance_id))
+    _inventory.do_repair.connect(func(instance_id): _net.send_repair(instance_id))
+    _net.repair_done.connect(func(_instance_id, item_id, _cost): _hud.flash_announce("Repaired your %s" % item_id))
     _hud.unequip_pressed.connect(func(): _net.send_unequip())
     _hotbar.use_pressed.connect(_on_hotbar_use)
     _net.npc_dialogue.connect(func(_npc_id, npc_name, lines, granted):
