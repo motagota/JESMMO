@@ -87,6 +87,10 @@ const ROAD_MAX_LENGTH_M: i64 = 4_000;
 /// Points cap: each point past the first is a
 /// corner; a real road plan has a handful, not hundreds.
 const ROAD_MAX_POINTS: usize = 64;
+/// Progressive road building (#131, issue #132): a plan's path is chopped
+/// into chunks this long (by arc length) at plan/replan time, each priced
+/// and built independently — see `cut_road_cells`.
+const ROAD_CELL_LEN_M: f64 = 5.0;
 
 /// Environmental tick cadence (#87): how often every connected player's
 /// environment flags (submerged; poison sources, #88) are recomputed and
@@ -403,6 +407,90 @@ fn build_order_json(o: &mmo::persistence::BuildOrder) -> Value {
 /// An `item -> qty` cost map as a JSON object (for `build.progress`).
 fn cost_json(cost: &std::collections::BTreeMap<String, i64>) -> Value {
     Value::Object(cost.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
+}
+
+/// Chop a validated road path into `ROAD_CELL_LEN_M` chunks by arc length
+/// (progressive road building epic #131, issue #132) and price each chunk
+/// as a share of `total_stone` proportional to its own length, remainder
+/// folded into the last cell so the parts always sum to exactly
+/// `total_stone`. Pricing the WHOLE road first and only then splitting it —
+/// rather than re-applying `ROAD_MIN_STONE` per cell — keeps a road's total
+/// cost identical to the pre-#131 pooled model; flooring per 5m cell
+/// instead would have made a 50m road roughly 4x pricier for no reason
+/// (10 cells x a 5-stone floor vs. today's ~12-stone total).
+///
+/// A cell may cross an original waypoint corner — the cut runs on arc
+/// length, not on the plan's turns — so a cell's `(x0,y0)-(x1,y1)` is a
+/// straight chord approximating that stretch, good enough for the
+/// proximity check #133 does against it (every other proximity gate in
+/// this file already tolerates the same corner-cutting approximation).
+fn cut_road_cells(points: &[(i64, i64)], total_stone: i64) -> Vec<mmo::persistence::RoadCellSpec> {
+    struct Cut { x: f64, y: f64, len: f64 }
+    let mut cuts = vec![Cut { x: points[0].0 as f64, y: points[0].1 as f64, len: 0.0 }];
+    let mut carried = 0.0f64;
+    let mut total_len = 0.0f64;
+    for w in points.windows(2) {
+        let (x0, y0) = (w[0].0 as f64, w[0].1 as f64);
+        let (x1, y1) = (w[1].0 as f64, w[1].1 as f64);
+        let seg_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+        if seg_len <= 0.0 {
+            continue;
+        }
+        let (dx, dy) = ((x1 - x0) / seg_len, (y1 - y0) / seg_len);
+        let mut walked = 0.0f64;
+        while carried + (seg_len - walked) >= ROAD_CELL_LEN_M {
+            walked += ROAD_CELL_LEN_M - carried;
+            carried = 0.0;
+            total_len += ROAD_CELL_LEN_M;
+            cuts.push(Cut { x: x0 + dx * walked, y: y0 + dy * walked, len: total_len });
+        }
+        carried += seg_len - walked;
+        total_len += seg_len - walked;
+    }
+    let last = points[points.len() - 1];
+    if cuts.last().is_some_and(|c| (c.x.round() as i64, c.y.round() as i64) != last) {
+        cuts.push(Cut { x: last.0 as f64, y: last.1 as f64, len: total_len });
+    }
+
+    let mut cells = Vec::with_capacity(cuts.len().saturating_sub(1));
+    let mut spent = 0i64;
+    for w in cuts.windows(2) {
+        let cell_len = w[1].len - w[0].len;
+        let share = if total_len > 0.0 {
+            ((total_stone as f64) * cell_len / total_len).round() as i64
+        } else {
+            0
+        };
+        spent += share;
+        cells.push(mmo::persistence::RoadCellSpec {
+            x0: w[0].x.round() as i64,
+            y0: w[0].y.round() as i64,
+            x1: w[1].x.round() as i64,
+            y1: w[1].y.round() as i64,
+            required_json: json!({ "stone": share.max(0) }).to_string(),
+        });
+    }
+    // Fold the rounding remainder into the last cell so the parts always
+    // sum to exactly `total_stone`; defensively floor at 1 so a cell never
+    // prices at (or below) zero, which would trivially auto-complete it.
+    if let Some(last_cell) = cells.last_mut() {
+        let remainder = total_stone - spent;
+        let current = last_cell.required_json.as_str();
+        let bumped = (parse_road_cell_stone(current) + remainder).max(1);
+        last_cell.required_json = json!({ "stone": bumped }).to_string();
+    }
+    cells
+}
+
+/// Pull the `stone` field back out of a `required_json` blob built by
+/// [`cut_road_cells`] itself — a tiny local helper rather than pulling in
+/// `persistence`'s `parse_cost` for one field, since this stays entirely
+/// inside `cut_road_cells`'s own bookkeeping.
+fn parse_road_cell_stone(required_json: &str) -> i64 {
+    serde_json::from_str::<Value>(required_json)
+        .ok()
+        .and_then(|v| v.get("stone").and_then(|s| s.as_i64()))
+        .unwrap_or(0)
 }
 
 /// Render one district-roster row (DB ownership + authored world-space bounds)
@@ -2598,6 +2686,10 @@ impl Proxy {
             .await
         {
             Ok(order) => {
+                let cells = cut_road_cells(&points, stone);
+                if let Err(e) = db.insert_road_cells(&order.id, &cells).await {
+                    eprintln!("[Proxy] road.plan: persisting cells failed: {e}");
+                }
                 self.push_to_player(pid, json!({"type": "road.planned", "order_id": order.id}));
                 self.broadcast_build_list(&district).await;
             }
@@ -2676,8 +2768,9 @@ impl Proxy {
             x1: Some(points[1].0),
             y1: Some(points[1].1),
         };
+        let cells = cut_road_cells(&points, stone);
         match db
-            .replan_road_order(&order_id, &district, &required_json, &path_json, &placement, now_secs())
+            .replan_road_order(&order_id, &district, &required_json, &path_json, &placement, &cells, now_secs())
             .await
         {
             Ok(outcome) if outcome.applied => {
@@ -5413,6 +5506,67 @@ mod tests {
         assert_eq!(wide.split().0.x1, 400);
         let tall = Region { x0: 0, y0: 0, x1: 200, y1: 800 };
         assert_eq!(tall.split().0.y1, 400);
+    }
+
+    #[test]
+    fn cut_road_cells_splits_evenly_and_prices_cells_summing_to_the_total() {
+        // 100m east then 200m south = 300m, an exact multiple of the 5m
+        // cell length, at 75 stone total (matches
+        // `road_plan_creates_a_length_costed_order_with_the_full_path`).
+        let points = vec![(12800, 12800), (12900, 12800), (12900, 13000)];
+        let cells = cut_road_cells(&points, 75);
+        assert_eq!(cells.len(), 60, "300m / 5m cells");
+        assert_eq!(cells[0].x0, 12800);
+        assert_eq!(cells[0].y0, 12800);
+        assert_eq!(cells[0].x1, 12805);
+        assert_eq!(cells[0].y1, 12800);
+        let last = cells.last().unwrap();
+        assert_eq!((last.x1, last.y1), (12900, 13000), "last cell ends exactly on the path's end");
+        let total: i64 = cells.iter().map(|c| parse_road_cell_stone(&c.required_json)).sum();
+        assert_eq!(total, 75, "cell costs sum to exactly the road's total, no rounding drift");
+        assert!(cells.iter().all(|c| parse_road_cell_stone(&c.required_json) >= 1), "no cell prices at zero");
+    }
+
+    #[test]
+    fn cut_road_cells_handles_a_sub_cell_stub_as_one_whole_cell() {
+        // A 4m stub is shorter than one 5m cell — the whole stub is cell 0,
+        // pricing the ROAD_MIN_STONE floor (matches
+        // `road_plan_validates_geometry_and_floors_the_cost`'s stub case).
+        let points = vec![(12800, 12800), (12804, 12800)];
+        let cells = cut_road_cells(&points, ROAD_MIN_STONE);
+        assert_eq!(cells.len(), 1);
+        assert_eq!((cells[0].x0, cells[0].y0, cells[0].x1, cells[0].y1), (12800, 12800, 12804, 12800));
+        assert_eq!(parse_road_cell_stone(&cells[0].required_json), ROAD_MIN_STONE);
+    }
+
+    #[test]
+    fn cut_road_cells_folds_the_remainder_length_into_a_short_last_cell() {
+        // 12m: two full 5m cells plus a 2m remainder cell, still summing to
+        // exactly the road's total cost.
+        let points = vec![(12800, 12800), (12812, 12800)];
+        let cells = cut_road_cells(&points, 5);
+        assert_eq!(cells.len(), 3);
+        assert_eq!((cells[2].x0, cells[2].x1), (12810, 12812), "the short remainder cell is 2m");
+        let total: i64 = cells.iter().map(|c| parse_road_cell_stone(&c.required_json)).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn cut_road_cells_crosses_a_corner_with_a_straight_chord() {
+        // 3m east then 5m south = 8m total, so the 5m cut lands 2m into the
+        // second leg — the first cell (0-5m) straddles the corner and
+        // becomes a diagonal chord between its own endpoints, not the
+        // kinked L the original path took.
+        let points = vec![(12800, 12800), (12803, 12800), (12803, 12805)];
+        let cells = cut_road_cells(&points, 5);
+        assert_eq!(cells.len(), 2);
+        assert_eq!((cells[0].x0, cells[0].y0), (12800, 12800));
+        assert_eq!((cells[0].x1, cells[0].y1), (12803, 12802), "chord ends 2m into the second leg");
+        assert_ne!(cells[0].x0, cells[0].x1, "a corner-straddling cell isn't axis-aligned like either original run");
+        assert_ne!(cells[0].y0, cells[0].y1);
+        assert_eq!((cells[1].x1, cells[1].y1), (12803, 12805), "second cell ends exactly on the path's end");
+        let total: i64 = cells.iter().map(|c| parse_road_cell_stone(&c.required_json)).sum();
+        assert_eq!(total, 5, "cell costs still sum to the road's total across a corner");
     }
 
     #[test]
