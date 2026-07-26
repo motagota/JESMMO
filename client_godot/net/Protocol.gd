@@ -30,11 +30,11 @@ const C_GUEST := "guest"
 const C_MOVE := "move"
 const C_ATTACK := "attack"
 
-# --- gameplay: gathering / inventory / skills / storage (M2) ------------------
-const C_GATHER_START := "gather.start"
-const C_GATHER_STOP := "gather.stop"
-const S_GATHER_PROGRESS := "gather.progress"
-const S_GATHER_RESULT := "gather.result"
+# --- gameplay: inventory / skills / storage (M2) -------------------------------
+# Bare-hands resource gathering (gather.start/stop/progress/result) was
+# retired in #125/#127 — every resource is ability-swing-gated now (Pick/
+# Chop on the hotbar). `gather_yield` (internal, not a client-facing type
+# here) is the one piece of the old plumbing that's still shared infra.
 const S_INV_UPDATE := "inv.update"
 const S_SKILL_UPDATE := "skill.update"
 const S_SKILL_LEVELUP := "skill.levelup"
@@ -81,7 +81,7 @@ const S_EQUIP_ERROR := "equip_error" # {message}
 ## One ability use (a Pick swing today). `cooldown_ms` on the result is
 ## already level-scaled server-side — the hotbar just renders it.
 const C_ABILITY_USE := "ability.use" # {id, node_id}
-const S_ABILITY_RESULT := "ability.result" # {id, ok, cooldown_ms, reason?}
+const S_ABILITY_RESULT := "ability.result" # {id, ok, cooldown_ms, reason?, item_id?, qty?}
 ## Must be this close to a node to swing at it (mirrors the server's
 ## zone_server.rs PICK_RANGE).
 const PICK_RANGE := 8.0
@@ -220,8 +220,6 @@ const STRUCTURE_FOOTPRINT := {
 ## World-unit grid step the placement ghost snaps to.
 const PLACE_GRID := 10
 
-## Must be within this many world units of a node to gather it (mirrors the server).
-const GATHER_RANGE := 50.0
 ## Must be within this of a storage point to deposit/withdraw (mirrors the server).
 const STORAGE_RANGE := 60.0
 ## Must be within this of a build board to contribute (mirrors the server).

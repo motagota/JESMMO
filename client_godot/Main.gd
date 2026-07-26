@@ -164,16 +164,11 @@ func _process(_delta: float) -> void:
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
 
-    # NPCs win the E-key prompt over gathering exactly when one's actually
-    # nearer (mining/abilities epic #123, #121) — not merely "in range too";
-    # NPC_TALK_RANGE is already far tighter than GATHER_RANGE, but a rock
-    # could still sit closer than an NPC even with both in range.
+    # E purely talks to the nearest NPC in range (#127) — bare-hands resource
+    # interaction doesn't exist anymore, every resource is ability-swing-gated
+    # (Pick/Chop on the hotbar). No hint at all when nothing's in range.
     var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
-    var gather_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
-    var npc_wins := npc_id != "" and (gather_id == "" or
-        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
-            <= _player.world_pos().distance_to(_entities.wpos_of(gather_id)))
-    _hud.set_interact_verb("talk" if npc_wins else "gather")
+    _hud.set_interact_verb("talk" if npc_id != "" else "")
 
     # Auto-fire (mining/abilities epic #123, #120): re-attempt every
     # auto-armed, ready slot each frame — a no-target miss is silent
@@ -291,8 +286,6 @@ func _wire_signals() -> void:
     # Death gets a proper overlay (#89) instead of the old connection-label
     # hack; the respawn's status stream restores the vitals bars underneath.
     _net.you_died.connect(func(): _vitals.show_death())
-    _net.gather_progress.connect(func(_node_id, pct): _hud.set_gather_progress(pct))
-    _net.gather_result.connect(func(item_id, qty): _hud.flash_gain(item_id, qty))
     _net.inv_update.connect(func(items, used, capacity):
         _hud.set_inventory(items, used, capacity)
         _storage.set_inventory(items)
@@ -348,9 +341,11 @@ func _wire_signals() -> void:
         _hud.set_tool(tool)
         _hotbar.set_abilities(abilities))
     _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
-    _net.ability_result.connect(func(id, ok, cooldown_ms, reason):
+    _net.ability_result.connect(func(id, ok, cooldown_ms, reason, item_id, qty):
         _hotbar.on_ability_result(id, ok, cooldown_ms)
-        if not ok:
+        if ok:
+            _hud.flash_gain(item_id, qty)
+        else:
             _hud.flash_announce(_ability_fail_text(reason)))
     _inventory.do_equip.connect(func(item_id): _net.send_equip(item_id))
     _hud.unequip_pressed.connect(func(): _net.send_unequip())
@@ -551,25 +546,18 @@ func _check_district_crossing(wx: float, wy: float) -> void:
     _transition.begin(d)
     _net.send_district_enter(from_district, d)
 
-## E was pressed (mining/abilities epic #123, #121): closes an open dialogue
-## first (E doubles as its close key — this must swallow the press, not
-## re-open a fresh talk on the same keystroke); otherwise talks to the
-## nearest NPC if it's the nearer of the two interactions, else gathers the
-## nearest in-range resource node. Mirrors the `_hud.set_interact_verb`
-## priority computed every frame in `_process`.
+## E was pressed (mining/abilities epic #123, #121; simplified in #127):
+## closes an open dialogue first (E doubles as its close key — this must
+## swallow the press, not re-open a fresh talk on the same keystroke);
+## otherwise talks to the nearest in-range NPC. Nothing else — gathering is
+## entirely hotbar-driven now (Pick/Chop), so E has no other job.
 func _on_interact_pressed() -> void:
     if _npc_dialogue.visible:
         _npc_dialogue.close()
         return
     var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
-    var node_id := _entities.nearest_resource(_player.world_pos(), Protocol.GATHER_RANGE)
-    var npc_wins := npc_id != "" and (node_id == "" or
-        _player.world_pos().distance_to(_entities.wpos_of(npc_id))
-            <= _player.world_pos().distance_to(_entities.wpos_of(node_id)))
-    if npc_wins:
+    if npc_id != "":
         _net.send_npc_talk(npc_id)
-    elif node_id != "":
-        _net.send_gather_start(node_id)
 
 ## Resolve a hotbar press to a target node and send `ability.use` (mining/
 ## abilities epic #123, #119/#120). For a non-harvesting ability (none exist

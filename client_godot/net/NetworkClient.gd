@@ -18,8 +18,6 @@ signal status_update(id: String, zone: String, state: Dictionary)
 signal despawn(id: String)
 signal zone_migration(zone: String)
 signal you_died
-signal gather_progress(node_id: String, pct: int)
-signal gather_result(item_id: String, qty: int)
 signal inv_update(items: Array, used: int, capacity: int)
 signal skill_update(skill_id: String, xp: int, level: int)
 signal skill_levelup(skill_id: String, level: int)
@@ -38,9 +36,11 @@ signal craft_made(recipe_id: String, item_id: String, qty: int)
 ## nothing's armed. `abilities` mirrors the server's `equip.update` shape.
 signal equip_update(tool: String, abilities: Array)
 signal equip_error(message: String)
-## One ability use's outcome. `reason` is only meaningful when `ok` is false
-## ("no_tool" | "cooldown" | "out_of_range" | "exhausted").
-signal ability_result(id: String, ok: bool, cooldown_ms: int, reason: String)
+## One ability use's outcome. `reason` is only meaningful when `ok` is
+## false ("no_tool" | "cooldown" | "out_of_range" | "exhausted");
+## `item_id`/`qty` only when `ok` is true (#125/#127) — what the swing
+## actually took, so the client can flash an ordinary "+N" gain notice.
+signal ability_result(id: String, ok: bool, cooldown_ms: int, reason: String, item_id: String, qty: int)
 ## An NPC's reply to `npc.talk` (mining/abilities epic #123, #121).
 signal npc_dialogue(npc_id: String, npc_name: String, lines: Array, granted: bool)
 signal terrain_data(resolution: int, world_size: float, heights: PackedFloat32Array)
@@ -140,10 +140,6 @@ func _handle_text(text: String) -> void:
             zone_migration.emit(String(msg.get("zone", "")))
         Protocol.S_YOU_DIED:
             you_died.emit()
-        Protocol.S_GATHER_PROGRESS:
-            gather_progress.emit(String(msg.get("node_id", "")), int(msg.get("pct", 0)))
-        Protocol.S_GATHER_RESULT:
-            gather_result.emit(String(msg.get("item_id", "")), int(msg.get("qty", 0)))
         Protocol.S_INV_UPDATE:
             inv_update.emit(
                 msg.get("items", []),
@@ -301,7 +297,9 @@ func _handle_text(text: String) -> void:
                 String(msg.get("id", "")),
                 bool(msg.get("ok", false)),
                 int(msg.get("cooldown_ms", 0)),
-                String(msg.get("reason", "")))
+                String(msg.get("reason", "")),
+                String(msg.get("item_id", "")),
+                int(msg.get("qty", 0)))
         Protocol.S_NPC_DIALOGUE:
             npc_dialogue.emit(
                 String(msg.get("npc_id", "")),
@@ -339,13 +337,6 @@ func send_move(dx: int, dy: int) -> void:
 ## Flag a melee swing in a facing direction.
 func send_attack(dx: int, dy: int) -> void:
     _send({"type": Protocol.C_ATTACK, "dx": dx, "dy": dy})
-
-## Begin gathering a resource node.
-func send_gather_start(node_id: String) -> void:
-    _send({"type": Protocol.C_GATHER_START, "node_id": node_id})
-
-func send_gather_stop() -> void:
-    _send({"type": Protocol.C_GATHER_STOP})
 
 ## Deposit / withdraw items at a storage point (validated server-side by proximity).
 func send_store_deposit(item_id: String, qty: int) -> void:
