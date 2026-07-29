@@ -364,8 +364,8 @@ func _wire_signals() -> void:
     _net.market_orders.connect(func(_mid, orders): _market.set_orders(orders))
     _net.market_trade.connect(func(_mid, item_id, unit_price, qty):
         _market.note_trade(item_id, unit_price, qty))
-    _market.do_sell.connect(func(item_id, price, qty): _net.send_market_sell(item_id, price, qty))
-    _market.do_buy.connect(func(item_id, price, qty): _net.send_market_buy(item_id, price, qty))
+    _market.do_sell.connect(func(item_id, price, qty, hours): _net.send_market_sell(item_id, price, qty, hours))
+    _market.do_buy.connect(func(item_id, price, qty, hours): _net.send_market_buy(item_id, price, qty, hours))
     _market.do_cancel.connect(func(order_id): _net.send_market_cancel(order_id))
     _market.do_watch.connect(func(item_id): _net.send_market_book_request(item_id))
     _net.rent_status.connect(_on_rent_status)

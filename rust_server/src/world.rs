@@ -244,6 +244,25 @@ pub const PRICE_TICK_GOLD: i64 = 1;
 /// one above the cap is a mis-click or an attempt to wedge the book.
 pub const MIN_ORDER_QTY: i64 = 1;
 pub const MAX_ORDER_QTY: i64 = 10_000;
+/// How long a resting order may sit before the sweep releases its escrow
+/// (#140). A resting order holds goods or gold hostage, so "forever" isn't an
+/// option; these are the durations a client may ask for, in hours.
+pub const ORDER_DURATIONS_HOURS: &[i64] = &[12, 24, 72, 168];
+pub const DEFAULT_ORDER_HOURS: i64 = 24;
+/// Resting orders one player may hold at one market (#140). Caps the cost of
+/// rebuilding a book on boot, and stops one player papering a book with
+/// hundreds of tiny orders.
+pub const MAX_OPEN_ORDERS_PER_MARKET: i64 = 40;
+
+/// Clamp a requested order duration to one the server actually offers,
+/// falling back to the default for anything unrecognised.
+pub fn order_duration_hours(requested: i64) -> i64 {
+    if ORDER_DURATIONS_HOURS.contains(&requested) {
+        requested
+    } else {
+        DEFAULT_ORDER_HOURS
+    }
+}
 
 /// Why an order was refused, as a stable code for the wire (#139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +270,8 @@ pub enum OrderReject {
     NotACommodity,
     BadPrice,
     BadQty,
+    TooManyOrders,
+    RateLimited,
 }
 
 impl OrderReject {
@@ -259,6 +280,8 @@ impl OrderReject {
             OrderReject::NotACommodity => "not_a_commodity",
             OrderReject::BadPrice => "bad_price",
             OrderReject::BadQty => "bad_qty",
+            OrderReject::TooManyOrders => "too_many_orders",
+            OrderReject::RateLimited => "rate_limited",
         }
     }
 
@@ -267,6 +290,8 @@ impl OrderReject {
             OrderReject::NotACommodity => "that item is sold on the listing board, not the book",
             OrderReject::BadPrice => "price must be a positive whole number of gold",
             OrderReject::BadQty => "order size is out of bounds",
+            OrderReject::TooManyOrders => "you have too many orders resting at this market",
+            OrderReject::RateLimited => "slow down — too many market commands",
         }
     }
 }

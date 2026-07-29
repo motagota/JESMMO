@@ -258,6 +258,11 @@ const S_MARKET_TRADE := "market.trade"
 const PRICE_TICK_GOLD := 1
 const MIN_ORDER_QTY := 1
 const MAX_ORDER_QTY := 10000
+## How long a resting order may hold its escrow before the server's sweep
+## releases it (#140). The server clamps anything it doesn't offer to the
+## default, so this list is a convenience, not a trust boundary.
+const ORDER_DURATIONS_HOURS := [12, 24, 72, 168]
+const DEFAULT_ORDER_HOURS := 24
 ## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
 ## the panel; the server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0

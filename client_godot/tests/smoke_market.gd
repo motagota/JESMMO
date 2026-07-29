@@ -165,16 +165,24 @@ func _process(_delta: float) -> bool:
 	# server re-validates and re-bounds all of it.
 	var sold := []
 	var bought := []
-	_market.do_sell.connect(func(i, p, q): sold.append([i, p, q]))
-	_market.do_buy.connect(func(i, p, q): bought.append([i, p, q]))
+	_market.do_sell.connect(func(i, p, q, h): sold.append([i, p, q, h]))
+	_market.do_buy.connect(func(i, p, q, h): bought.append([i, p, q, h]))
 	_market._price_field.value = 11
 	_market._qty_field.value = 7
 	_press("Sell")
 	_press("Buy")
-	if sold != [["wood", 11, 7]]:
+	if sold != [["wood", 11, 7, Protocol.DEFAULT_ORDER_HOURS]]:
 		_fail("Sell emitted %s" % [sold]); return true
-	if bought != [["wood", 11, 7]]:
+	if bought != [["wood", 11, 7, Protocol.DEFAULT_ORDER_HOURS]]:
 		_fail("Buy emitted %s" % [bought]); return true
+
+	# A resting order holds escrow, so it carries a duration (#140) — picking
+	# a different one must actually travel with the command.
+	sold.clear()
+	_market._duration_field.select(0) # the shortest offered
+	_press("Sell")
+	if sold.is_empty() or sold[0][3] != Protocol.ORDER_DURATIONS_HOURS[0]:
+		_fail("the chosen duration should ride the order, got %s" % [sold]); return true
 
 	# Switching commodity clears the old depth and asks for the new book,
 	# so one book's levels can never be read as another's.

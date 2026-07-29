@@ -528,13 +528,15 @@ func send_warehouse_withdraw(item_id: String, qty: int) -> void:
 
 ## Order book (#139). `command_id` is client-generated and deduped server-side,
 ## so a resend after a dropped connection can't place or buy twice.
-func send_market_sell(item_id: String, unit_price: int, qty: int) -> void:
+func send_market_sell(item_id: String, unit_price: int, qty: int, duration_hours: int) -> void:
     _send({"type": Protocol.C_MARKET_SELL, "command_id": _command_id(),
-        "item_id": item_id, "unit_price": unit_price, "qty": qty})
+        "item_id": item_id, "unit_price": unit_price, "qty": qty,
+        "duration_hours": duration_hours})
 
-func send_market_buy(item_id: String, unit_price: int, qty: int) -> void:
+func send_market_buy(item_id: String, unit_price: int, qty: int, duration_hours: int) -> void:
     _send({"type": Protocol.C_MARKET_BUY, "command_id": _command_id(),
-        "item_id": item_id, "unit_price": unit_price, "qty": qty})
+        "item_id": item_id, "unit_price": unit_price, "qty": qty,
+        "duration_hours": duration_hours})
 
 func send_market_cancel(order_id: String) -> void:
     _send({"type": Protocol.C_MARKET_CANCEL, "command_id": _command_id(), "order_id": order_id})

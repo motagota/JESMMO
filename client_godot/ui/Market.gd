@@ -19,8 +19,8 @@ signal do_deposit(item_id: String, qty: int)
 signal do_withdraw(item_id: String, qty: int)
 ## Order book (#139): rest a sell, cross the book with a buy, cancel your own,
 ## or switch which commodity's depth you're looking at.
-signal do_sell(item_id: String, unit_price: int, qty: int)
-signal do_buy(item_id: String, unit_price: int, qty: int)
+signal do_sell(item_id: String, unit_price: int, qty: int, duration_hours: int)
+signal do_buy(item_id: String, unit_price: int, qty: int, duration_hours: int)
 signal do_cancel(order_id: String)
 signal do_watch(item_id: String)
 
@@ -54,6 +54,7 @@ var _last_trade := ""
 const TRADABLE := ["wood", "stone", "plank", "tool_kit"]
 var _price_field: SpinBox
 var _qty_field: SpinBox
+var _duration_field: OptionButton
 
 func _ready() -> void:
 	layer = 8
@@ -277,16 +278,29 @@ func _rebuild_book() -> void:
 	_qty_field.max_value = Protocol.MAX_ORDER_QTY
 	_qty_field.value = 1
 	form.add_child(_qty_field)
+	# How long the remainder may rest before the server releases its escrow
+	# (#140) — a resting order holds goods or gold, so it can't sit forever.
+	var for_lbl := Label.new()
+	for_lbl.text = "for"
+	form.add_child(for_lbl)
+	_duration_field = OptionButton.new()
+	_duration_field.focus_mode = Control.FOCUS_NONE
+	for i in range(Protocol.ORDER_DURATIONS_HOURS.size()):
+		var h: int = Protocol.ORDER_DURATIONS_HOURS[i]
+		_duration_field.add_item("%dh" % h if h < 24 else "%dd" % (h / 24), h)
+		if h == Protocol.DEFAULT_ORDER_HOURS:
+			_duration_field.select(i)
+	form.add_child(_duration_field)
 	_body.add_child(form)
 
 	var actions := HBoxContainer.new()
 	var sell_btn := Button.new()
 	sell_btn.text = "Sell"
-	sell_btn.pressed.connect(func(): do_sell.emit(_watching, int(_price_field.value), int(_qty_field.value)))
+	sell_btn.pressed.connect(func(): do_sell.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
 	actions.add_child(sell_btn)
 	var buy_btn := Button.new()
 	buy_btn.text = "Buy"
-	buy_btn.pressed.connect(func(): do_buy.emit(_watching, int(_price_field.value), int(_qty_field.value)))
+	buy_btn.pressed.connect(func(): do_buy.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
 	actions.add_child(buy_btn)
 	_body.add_child(actions)
 	var hint := Label.new()
@@ -294,7 +308,7 @@ func _rebuild_book() -> void:
 	hint.modulate = Color(0.6, 0.6, 0.65)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.custom_minimum_size = Vector2(380, 0)
-	hint.text = "Selling escrows from your warehouse here. Buying fills instantly at the seller's price — bid above the ask and you keep the difference."
+	hint.text = "Either side fills against the book first, then rests for whatever's left. A sell escrows goods from your warehouse here; a buy escrows gold. You always trade at the RESTING order's price, so crossing the spread keeps you the difference."
 	_body.add_child(hint)
 
 	# Your own resting orders — the one place ownership IS shown, because
@@ -325,6 +339,12 @@ func _rebuild_book() -> void:
 		cancel.pressed.connect(func(): do_cancel.emit(order_id))
 		row.add_child(cancel)
 		_body.add_child(row)
+
+## The selected rest duration, in hours.
+func _duration() -> int:
+	if _duration_field == null or _duration_field.selected < 0:
+		return Protocol.DEFAULT_ORDER_HOURS
+	return _duration_field.get_item_id(_duration_field.selected)
 
 ## Which commodity's book is on screen — Main seeds its depth on market.open.
 func watching() -> String:
