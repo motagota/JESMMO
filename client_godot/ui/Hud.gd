@@ -12,6 +12,7 @@ signal unequip_pressed
 
 var _status: Label
 var _inv: Label
+var _gold: Label
 var _skill: Label
 var _build_hint: Label
 var _rent_hint: Label
@@ -46,6 +47,12 @@ func _ready() -> void:
 	_status = _line(box)
 	_inv = _line(box)
 	_inv.text = "inventory: (empty)"
+	# Purse (#145). Gold used to change only at rent time and was visible only
+	# in the rent panel; build wages make it move during ordinary play, so it
+	# needs a permanent readout. Seeded from the first `rent.status`/`gold.update`.
+	_gold = _line(box)
+	_gold.modulate = Color(1.0, 0.85, 0.2)
+	_gold.text = "gold: —"
 	_skill = _line(box)
 	_skill.text = "[K] skills"
 	_build_hint = _line(box)
@@ -111,6 +118,13 @@ func set_zone(text: String) -> void:
 func set_pos(wx: float, wy: float) -> void:
 	pos = Vector2(wx, wy)
 	_refresh_status()
+
+## The purse readout (#145). Fed by `gold.update` (build wages) and by the
+## `gold` that already rides `rent.status`, so it's correct from login rather
+## than only after the first time you earn something.
+func set_gold(gold: int) -> void:
+	if _gold:
+		_gold.text = "gold: %d" % gold
 
 ## Switch the E-key hint between "gather" and "talk" (mining/abilities epic
 ## #123, #121) — Main recomputes this every frame from whichever's nearer,

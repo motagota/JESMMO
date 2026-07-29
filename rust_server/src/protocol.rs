@@ -161,6 +161,15 @@ pub const S_RENT_WARNING: &str = "rent.warning"; // {plot_id, due_at}
 pub const S_RENT_RECLAIMED: &str = "rent.reclaimed"; // {plot_id, moved_to_storage}
 pub const C_RENT_SET_AUTOPAY: &str = "rent.set_autopay"; // {plot_id, enabled} -- opt-in; off by default
 
+// --- gold.* (build wages, #145) -------------------------------------------------
+// {gold, delta, reason} -- the character's authoritative gold balance after it
+// changed, plus what moved and why. Until #145 gold only ever changed at rent
+// time, so `rent.status`'s own `gold` field was enough; build wages make the
+// balance move during ordinary play, and a player earning money they can't see
+// is a bug in feel if not in code. `delta` is signed (positive for wages);
+// `reason` is a short tag ("build_wages") for client feedback and telemetry.
+pub const S_GOLD_UPDATE: &str = "gold.update";
+
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control
