@@ -81,6 +81,10 @@ signal road_demolition_planned(order_id: String, demo_order_id: String)
 signal road_cells(order_id: String, cells: Array)
 signal road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool)
 signal home_respawn_set(bed_id: String)
+## The character's gold balance changed (#145) — `delta` is signed, `reason`
+## is a short tag ("build_wages"). Until wages existed gold only moved at rent
+## time and rode `rent_status`; it now moves during ordinary play.
+signal gold_update(gold: int, delta: int, reason: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -284,6 +288,11 @@ func _handle_text(text: String) -> void:
                 msg.get("required", {}),
                 msg.get("progress", {}),
                 bool(msg.get("completed", false)))
+        Protocol.S_GOLD_UPDATE:
+            gold_update.emit(
+                int(msg.get("gold", 0)),
+                int(msg.get("delta", 0)),
+                String(msg.get("reason", "")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:

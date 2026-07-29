@@ -92,6 +92,18 @@ const ROAD_MAX_POINTS: usize = 64;
 /// and built independently — see `cut_road_cells`.
 const ROAD_CELL_LEN_M: f64 = 5.0;
 
+/// Build wages (#145): gold the city pays per UNIT actually contributed to a
+/// city build order — the game's first gold faucet. Before this, gold was
+/// minted once at character creation (500, migration 0006) and only ever
+/// drained by rent, so every purse trended to zero.
+///
+/// Deliberately tied to commissioned work: gold enters the economy only as
+/// fast as the city posts build orders, which makes whoever plans them the
+/// de facto central bank. For scale at 1/unit: a town well (30 units) pays
+/// 30, a 300m road (75 stone) pays 75, against `RENT_COST_GOLD` of 50.
+/// A real balance pass owns the number (see #129); this is a starting point.
+const BUILD_WAGE_GOLD_PER_UNIT: i64 = 1;
+
 /// Environmental tick cadence (#87): how often every connected player's
 /// environment flags (submerged; poison sources, #88) are recomputed and
 /// pushed to their owning zone. The push is unconditional each tick, not
@@ -2326,6 +2338,36 @@ impl Proxy {
         }
     }
 
+    /// The wage rate a given order kind pays per contributed unit (#145).
+    ///
+    /// Demolition orders (`demo_*`, #106) pay **nothing**. Tearing a road down
+    /// is labour too, but demolition refunds the stone while wages already paid
+    /// aren't clawed back — so paying for teardown *as well as* rebuild would
+    /// make the place → earn → demolish → replace loop profitable in both
+    /// directions instead of one. The loop is knowingly left open (it needs an
+    /// editor to post the demolition, so players can't reach it), but it
+    /// shouldn't be subsidised twice. Revisit before roads ever become
+    /// player-demolishable.
+    fn wage_for(&self, kind: &str) -> i64 {
+        if kind.starts_with("demo_") { 0 } else { BUILD_WAGE_GOLD_PER_UNIT }
+    }
+
+    /// Announce wages that were already credited inside the contribution's own
+    /// transaction (#145): push the new balance and log the payout. The log line
+    /// is the only visibility into faucet rate, and doubles as the alarm for the
+    /// demolish → rebuild loop described on `wage_for`.
+    async fn pay_wages(&self, pid: &str, order_id: &str, units: i64, wages: i64) {
+        if wages <= 0 {
+            return;
+        }
+        let Some(db) = self.db.clone() else { return };
+        let balance = db.character_gold(pid).await.unwrap_or(0);
+        println!("[Proxy] WAGES: {pid} +{wages}g for {units} unit(s) on {order_id} (balance {balance})");
+        self.push_to_player(pid, json!({
+            "type": "gold.update", "gold": balance, "delta": wages, "reason": "build_wages",
+        }));
+    }
+
     /// Apply a `build_contribute` reported by a zone (which validated board proximity):
     /// the durable transactional contribution, then push the freed inventory + broadcast
     /// progress; on completion, pay lump-sum building XP, spawn the structure, and unlock
@@ -2408,7 +2450,7 @@ impl Proxy {
             return;
         }
 
-        let res = match db.contribute(pid, order_id, item_id, qty).await {
+        let res = match db.contribute(pid, order_id, item_id, qty, self.wage_for(&order.kind)).await {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -2416,6 +2458,7 @@ impl Proxy {
             // Contributed items left the player's carry — refresh it, then tell the
             // district how the order's progress advanced.
             self.send_inventory(pid).await;
+            self.pay_wages(pid, order_id, res.moved, res.wages).await;
             self.broadcast_to_district(&res.district, json!({
                 "type": "build.progress", "order_id": order_id,
                 "required": cost_json(&res.required), "progress": cost_json(&res.progress),
@@ -2489,12 +2532,16 @@ impl Proxy {
             .min_by_key(|(_, d2)| *d2);
         let Some((cell_index, _)) = nearest_cell else { return };
 
-        let res = match db.contribute_to_road_cell(pid, &order.id, cell_index, item_id, qty).await {
+        let res = match db
+            .contribute_to_road_cell(pid, &order.id, cell_index, item_id, qty, self.wage_for(&order.kind))
+            .await
+        {
             Ok(r) => r,
             Err(_) => return,
         };
         if res.moved > 0 {
             self.send_inventory(pid).await;
+            self.pay_wages(pid, &order.id, res.moved, res.wages).await;
             self.broadcast_to_district(&res.district, json!({
                 "type": "road.cell_progress", "order_id": order.id, "cell_index": cell_index,
                 "required": cost_json(&res.required), "progress": cost_json(&res.progress),
@@ -9470,6 +9517,105 @@ mod tests {
         recv_until(&mut ws, "build.completed").await;
         assert_eq!(db.build_order_by_id(&order.id).await.unwrap().unwrap().state, "completed");
 
+        drop(ws);
+    }
+
+    /// Build wages (#145): an ordinary contribution pays the city's rate and
+    /// pushes the new balance, while a DEMOLITION contribution pays nothing —
+    /// demolition refunds the stone without clawing wages back, so paying for
+    /// teardown as well as rebuild would subsidise the place → earn →
+    /// demolish → replace loop in both directions.
+    #[tokio::test]
+    async fn build_wages_pay_for_building_but_never_for_demolition() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let mut editor_ws = dial_editor(&proxy, &db).await;
+
+        let email = format!("wager_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Wager"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let start = db.character_gold(&pid).await.unwrap();
+
+        // Build a 40m road stub for real, on site.
+        editor_ws
+            .send(Message::Text(json!({"type": "road.plan", "points": [[13800, 12600], [13840, 12600]]}).to_string()))
+            .await
+            .unwrap();
+        let road = recv_until(&mut editor_ws, "road.planned").await["order_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 10, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13820, y: 12600, hp: 100 });
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": road, "item_id": "stone", "qty": 3,
+            }).to_string()))
+            .unwrap();
+
+        // The wage push carries the authoritative balance and the delta.
+        let paid = recv_until(&mut ws, "gold.update").await;
+        let delta = paid["delta"].as_i64().unwrap();
+        assert!(delta > 0, "building pays");
+        assert_eq!(paid["reason"].as_str().unwrap(), "build_wages");
+        assert_eq!(paid["gold"].as_i64().unwrap(), start + delta, "balance is authoritative, not client-computed");
+        assert_eq!(db.character_gold(&pid).await.unwrap(), start + delta);
+
+        // Finish the road, then post a demolition on it.
+        for _ in 0..10 {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": road, "item_id": "stone", "qty": 3,
+                }).to_string()))
+                .unwrap();
+        }
+        recv_until(&mut ws, "build.completed").await;
+        let earned_building = db.character_gold(&pid).await.unwrap();
+        assert!(earned_building > start, "the whole road paid wages");
+
+        editor_ws
+            .send(Message::Text(json!({"type": "road.demolish", "order_id": road}).to_string()))
+            .await
+            .unwrap();
+        let demo_id = recv_until(&mut editor_ws, "road.demolition_planned").await["demo_order_id"]
+            .as_str().unwrap().to_string();
+
+        // Working the demolition pays NOTHING, even though it's a real
+        // contribution that really completes the order.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "tool_kit", "qty": 1, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "build_contribute", "player_id": pid,
+                "order_id": demo_id, "item_id": "tool_kit", "qty": 1,
+            }).to_string()))
+            .unwrap();
+        loop {
+            let v = recv_until(&mut ws, "despawn").await;
+            if v["player_id"].as_str().unwrap().starts_with("structure_road_") {
+                break;
+            }
+        }
+        assert_eq!(
+            db.character_gold(&pid).await.unwrap(), earned_building,
+            "demolition labour earns no wages"
+        );
+
+        drop(editor_ws);
         drop(ws);
     }
 

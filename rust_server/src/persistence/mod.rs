@@ -157,6 +157,24 @@ async fn remove_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &s
     Ok(take)
 }
 
+/// Mint `amount` gold into a character's purse, inside a caller-owned
+/// transaction (build wages, #145 — the game's first gold faucet). Kept as an
+/// in-tx helper on purpose: wages MUST commit together with the contribution
+/// that earned them, or a crash between the two either loses the wage or pays
+/// it twice on retry. `amount <= 0` is a no-op, so callers can pass a wage of
+/// zero (demolition orders) without branching.
+async fn grant_gold_in_tx(tx: &mut Tx<'_>, character_id: &str, amount: i64) -> Result<(), DbError> {
+    if amount <= 0 {
+        return Ok(());
+    }
+    sqlx::query("UPDATE character SET gold = gold + ? WHERE id = ?")
+        .bind(amount)
+        .bind(character_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn add_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT id FROM storage_item WHERE character_id = ? AND item_id = ? LIMIT 1",
@@ -627,6 +645,9 @@ pub struct ContributeResult {
     /// The completed order's own placement, if it carried one (copied from the row so
     /// the gateway can spawn the structure without a second query).
     pub placement: Option<BuildPlacement>,
+    /// Gold paid to the contributor for this contribution (#145), already credited
+    /// in the same transaction. `moved * wage_per_unit`; 0 for an unpaid order.
+    pub wages: i64,
 }
 
 /// Where a build order's structure appears on completion, and what kind it is.
@@ -700,6 +721,9 @@ pub struct CellContributeResult {
     pub district: String,
     pub contributors: Vec<(String, i64)>,
     pub placement: Option<BuildPlacement>,
+    /// Gold paid to the contributor for this contribution (#145), already credited
+    /// in the same transaction. `moved * wage_per_unit`.
+    pub wages: i64,
 }
 
 /// The outcome of a [`Db::replan_road_order`] call (#104).
@@ -1877,6 +1901,7 @@ impl Db {
         cell_index: i64,
         item_id: &str,
         qty: i64,
+        wage_per_unit: i64,
     ) -> Result<CellContributeResult, DbError> {
         let mut tx = self.pool.begin().await?;
         let Some(order) = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
@@ -1965,6 +1990,9 @@ impl Db {
         .bind(moved)
         .execute(&mut *tx)
         .await?;
+        // Wages (#145), in this same transaction — see `grant_gold_in_tx`.
+        result.wages = moved * wage_per_unit.max(0);
+        grant_gold_in_tx(&mut tx, character_id, result.wages).await?;
 
         let order_required = parse_cost(&order.required_json);
         let order_completed = !order_required.is_empty()
@@ -2032,12 +2060,19 @@ impl Db {
     /// the order doesn't require move nothing. Records the per-character contribution
     /// (for lump-sum building XP on completion). When the last required item is met the
     /// order flips to `completed` and its contributors are returned.
+    ///
+    /// `wage_per_unit` (#145) is paid into the contributor's purse **in this same
+    /// transaction**, on the units that actually moved — never on the qty offered,
+    /// which is routinely larger. The caller owns the policy: it passes 0 for orders
+    /// that shouldn't pay (demolitions), so the rate const stays in `proxy.rs` with
+    /// every other tuning value.
     pub async fn contribute(
         &self,
         character_id: &str,
         order_id: &str,
         item_id: &str,
         qty: i64,
+        wage_per_unit: i64,
     ) -> Result<ContributeResult, DbError> {
         let mut tx = self.pool.begin().await?;
         let order = sqlx::query_as::<_, BuildOrder>("SELECT * FROM build_order WHERE id = ?")
@@ -2060,6 +2095,7 @@ impl Db {
             completed: false,
             contributors: Vec::new(),
             placement: order.placement(),
+            wages: 0,
         };
 
         // Only open orders accept contributions; locked/completed ones are a no-op
@@ -2121,6 +2157,9 @@ impl Db {
             .bind(moved)
             .execute(&mut *tx)
             .await?;
+            // Wages (#145), in this same transaction — see `grant_gold_in_tx`.
+            result.wages = moved * wage_per_unit.max(0);
+            grant_gold_in_tx(&mut tx, character_id, result.wages).await?;
         }
 
         // Completion: every required item met (an order with no requirements never
@@ -3287,17 +3326,17 @@ mod tests {
         db.add_to_inventory(&b, "stone", 20).await.unwrap();
 
         // A contributes wood: bounded by the order's need (20), not the 30 carried.
-        let r = db.contribute(&a, &order.id, "wood", 30).await.unwrap();
+        let r = db.contribute(&a, &order.id, "wood", 30, 0).await.unwrap();
         assert_eq!(r.moved, 20, "capped at the wood requirement");
         assert!(!r.completed, "stone still outstanding");
         assert_eq!(r.progress.get("wood"), Some(&20));
         assert_eq!(db.inventory_total(&a).await.unwrap(), 10, "unspent wood stays carried");
 
         // Wood is already met: a further wood contribution moves nothing.
-        assert_eq!(db.contribute(&b, &order.id, "wood", 5).await.unwrap().moved, 0);
+        assert_eq!(db.contribute(&b, &order.id, "wood", 5, 0).await.unwrap().moved, 0);
 
         // B finishes the stone (bounded to the 10 needed) → completes the order.
-        let done = db.contribute(&b, &order.id, "stone", 20).await.unwrap();
+        let done = db.contribute(&b, &order.id, "stone", 20, 0).await.unwrap();
         assert_eq!(done.moved, 10);
         assert!(done.completed, "the last required item completes the order");
         // Both contributors are reported, keyed for XP, with their total units.
@@ -3310,7 +3349,77 @@ mod tests {
         let well = after.iter().find(|o| o.id == order.id).unwrap();
         assert_eq!(well.state, "completed");
         assert!(well.completed_at.is_some());
-        assert_eq!(db.contribute(&a, &order.id, "stone", 1).await.unwrap().moved, 0);
+        assert_eq!(db.contribute(&a, &order.id, "stone", 1, 0).await.unwrap().moved, 0);
+    }
+
+    /// Build wages (#145) are paid on the units that actually MOVED, in the
+    /// same transaction as the contribution, through both contribute paths —
+    /// and a wage of 0 (demolition orders) mints nothing.
+    #[tokio::test]
+    async fn build_wages_pay_on_moved_units_through_both_contribute_paths() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let start = db.character_gold(&cid).await.unwrap();
+        assert_eq!(start, 500, "the migration's starting balance");
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+        db.add_to_inventory(&cid, "stone", 30).await.unwrap();
+
+        // Pooled path. The order needs 20 wood; offer 30. Wages must follow
+        // the 20 that MOVED, not the 30 offered — the two differ constantly,
+        // since contributions are bounded by remaining need and carried stock.
+        let well = db
+            .insert_build_order("civic", "town_well", r#"{"wood":20,"stone":10}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+        let r = db.contribute(&cid, &well.id, "wood", 30, 3).await.unwrap();
+        assert_eq!(r.moved, 20, "bounded by the order's need");
+        assert_eq!(r.wages, 60, "3 gold x the 20 units that moved, not the 30 offered");
+        assert_eq!(db.character_gold(&cid).await.unwrap(), start + 60, "credited in the same tx");
+
+        // Per-cell road path pays on the same rule.
+        let road = db
+            .insert_build_order("civic", "road_x", r#"{"stone":4}"#, "open", 0, None, 0, None, Some("[[100,100],[110,100]]"))
+            .await
+            .unwrap();
+        db.insert_road_cells(&road.id, &two_road_cells()).await.unwrap();
+        let r = db.contribute_to_road_cell(&cid, &road.id, 0, "stone", 5, 3).await.unwrap();
+        assert_eq!(r.moved, 2, "bounded by the cell's own cost");
+        assert_eq!(r.wages, 6);
+        assert_eq!(db.character_gold(&cid).await.unwrap(), start + 66);
+
+        // A zero wage (what the gateway passes for `demo_*` orders) mints
+        // nothing, even though the contribution itself still lands.
+        let before = db.character_gold(&cid).await.unwrap();
+        let r = db.contribute_to_road_cell(&cid, &road.id, 1, "stone", 2, 0).await.unwrap();
+        assert_eq!(r.moved, 2, "the contribution still happens");
+        assert_eq!(r.wages, 0);
+        assert_eq!(db.character_gold(&cid).await.unwrap(), before, "no gold minted at a zero rate");
+    }
+
+    /// A contribution that moves nothing pays nothing — the guard that stops
+    /// a spam-click on a filled order from minting gold for free.
+    #[tokio::test]
+    async fn build_wages_pay_nothing_when_no_units_move() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let start = db.character_gold(&cid).await.unwrap();
+        let order = db
+            .insert_build_order("civic", "town_well", r#"{"wood":5}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+
+        // Carrying nothing: nothing moves, nothing is paid.
+        let r = db.contribute(&cid, &order.id, "wood", 5, 10).await.unwrap();
+        assert_eq!((r.moved, r.wages), (0, 0));
+        assert_eq!(db.character_gold(&cid).await.unwrap(), start);
+
+        // Fill it, then contribute again into an already-met requirement.
+        db.add_to_inventory(&cid, "wood", 10).await.unwrap();
+        assert_eq!(db.contribute(&cid, &order.id, "wood", 5, 10).await.unwrap().wages, 50);
+        let paid = db.character_gold(&cid).await.unwrap();
+        let r = db.contribute(&cid, &order.id, "wood", 5, 10).await.unwrap();
+        assert_eq!((r.moved, r.wages), (0, 0), "a completed order pays no more wages");
+        assert_eq!(db.character_gold(&cid).await.unwrap(), paid, "no free gold from re-contributing");
     }
 
     /// Two 5m road cells (progressive road building epic #131, issue #132).
@@ -3335,7 +3444,7 @@ mod tests {
 
         // Partial contribution to cell 0: cell progress moves, cell isn't
         // done yet, and the order's own aggregate mirrors the same amount.
-        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1).await.unwrap();
+        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1, 0).await.unwrap();
         assert_eq!(r.moved, 1);
         assert!(!r.cell_completed);
         assert!(!r.order_completed);
@@ -3346,7 +3455,7 @@ mod tests {
         assert!(cells[0].completed_at.is_none());
 
         // Finish cell 0: only THAT cell completes, not the whole road.
-        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1).await.unwrap();
+        let r = db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 1, 0).await.unwrap();
         assert!(r.cell_completed);
         assert!(!r.order_completed);
         let cells = db.road_cells_for_order(&order.id).await.unwrap();
@@ -3354,11 +3463,11 @@ mod tests {
         assert!(cells[1].completed_at.is_none());
 
         // A contribution bounded past a completed cell's need moves nothing.
-        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 5).await.unwrap().moved, 0);
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 5, 0).await.unwrap().moved, 0);
 
         // Finish cell 1 too: the WHOLE order completes, contributors report,
         // exactly like the pooled `contribute` path.
-        let r = db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 2).await.unwrap();
+        let r = db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 2, 0).await.unwrap();
         assert!(r.cell_completed);
         assert!(r.order_completed, "every cell done completes the order");
         assert_eq!(r.contributors, vec![(cid.clone(), 4)]);
@@ -3367,7 +3476,7 @@ mod tests {
         assert_eq!(order_row.progress_json, r#"{"stone":4}"#);
 
         // Nothing more moves into a completed order.
-        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1).await.unwrap().moved, 0);
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1, 0).await.unwrap().moved, 0);
     }
 
     #[tokio::test]
@@ -3381,8 +3490,8 @@ mod tests {
         let cid = a_character(&db).await;
         db.add_to_inventory(&cid, "stone", 10).await.unwrap();
 
-        assert_eq!(db.contribute_to_road_cell(&cid, "no-such-order", 0, "stone", 1).await.unwrap().moved, 0);
-        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 9, "stone", 1).await.unwrap().moved, 0, "no cell at that index");
+        assert_eq!(db.contribute_to_road_cell(&cid, "no-such-order", 0, "stone", 1, 0).await.unwrap().moved, 0);
+        assert_eq!(db.contribute_to_road_cell(&cid, &order.id, 9, "stone", 1, 0).await.unwrap().moved, 0, "no cell at that index");
     }
 
     #[tokio::test]
@@ -3396,7 +3505,7 @@ mod tests {
         let cid = a_character(&db).await;
         db.add_to_inventory(&cid, "stone", 10).await.unwrap();
         // Finish cell 0 only.
-        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2).await.unwrap();
+        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2, 0).await.unwrap();
 
         // Replan: keep the first cell's span identical (100,100)-(105,100),
         // extend the road further east so the SECOND cell's span changes.
@@ -3432,8 +3541,8 @@ mod tests {
         db.add_to_inventory(&cid, "stone", 10).await.unwrap();
         // Cell 0 fully done (2 stone), cell 1 only half done (1 of 2 stone)
         // — the road as a whole is still open, not completed.
-        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2).await.unwrap();
-        db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1).await.unwrap();
+        db.contribute_to_road_cell(&cid, &order.id, 0, "stone", 2, 0).await.unwrap();
+        db.contribute_to_road_cell(&cid, &order.id, 1, "stone", 1, 0).await.unwrap();
 
         db.create_demolition(&order.id, 0).await.unwrap().unwrap();
         let (target, refund) = db.settle_demolition(&order.id).await.unwrap().unwrap();
@@ -3474,7 +3583,7 @@ mod tests {
             .unwrap();
         let cid = a_character(&db).await;
         db.add_to_inventory(&cid, "wood", 40).await.unwrap();
-        assert_eq!(db.contribute(&cid, &locked.id, "wood", 40).await.unwrap().moved, 0,
+        assert_eq!(db.contribute(&cid, &locked.id, "wood", 40, 0).await.unwrap().moved, 0,
             "a locked order accepts nothing");
     }
 
@@ -3491,7 +3600,7 @@ mod tests {
 
         // Below the threshold (Building 0): the gate rejects, nothing moves, the wood
         // stays carried, and the order does not complete.
-        let r = db.contribute(&cid, &order.id, "wood", 30).await.unwrap();
+        let r = db.contribute(&cid, &order.id, "wood", 30, 0).await.unwrap();
         assert_eq!(r.moved, 0, "greyed order accepts nothing below its skill threshold");
         assert!(!r.completed);
         assert_eq!(db.inventory_total(&cid).await.unwrap(), 30, "wood untouched");
@@ -3499,7 +3608,7 @@ mod tests {
         // Reach Building 1, then the same contribution succeeds and completes it.
         db.grant_skill_xp(&cid, "building", 100).await.unwrap();
         assert_eq!(db.skill_level(&cid, "building").await.unwrap(), 1);
-        let r = db.contribute(&cid, &order.id, "wood", 30).await.unwrap();
+        let r = db.contribute(&cid, &order.id, "wood", 30, 0).await.unwrap();
         assert_eq!(r.moved, 30, "the threshold un-greys the order");
         assert!(r.completed);
     }

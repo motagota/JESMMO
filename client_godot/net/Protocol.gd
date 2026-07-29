@@ -215,6 +215,13 @@ const S_RENT_WARNING := "rent.warning"
 const S_RENT_RECLAIMED := "rent.reclaimed"
 const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 
+# --- gameplay: gold balance (build wages, #145) -------------------------------
+## `{gold, delta, reason}` — the authoritative balance after it changed, what
+## moved, and why. Until #145 gold only ever changed at rent time, so
+## `rent.status`'s own `gold` field was the only source; build wages make it
+## move during ordinary play, so the HUD tracks this instead.
+const S_GOLD_UPDATE := "gold.update"
+
 # --- gameplay: mayor-commissioned city build orders (e.g. dirt paths) --------
 ## Restricted server-side to the account with `role == "mayor"` (see `welcome`'s
 ## `role` field); rejected with `S_MAYOR_BUILD_ERROR` for everyone else.

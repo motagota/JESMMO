@@ -320,6 +320,13 @@ func _wire_signals() -> void:
     _net.craft_recipes.connect(func(recipes): _craft.set_recipes(recipes))
     _net.craft_made.connect(func(_recipe_id, item_id, qty): _hud.flash_gain(item_id, qty))
     _net.home_respawn_set.connect(func(_bed_id): _hud.flash_announce("Respawn point set!"))
+    # Build wages (#145): the balance readout tracks every change, and an
+    # earned delta flashes like any other gain so the faucet is felt, not
+    # just tallied.
+    _net.gold_update.connect(func(gold, delta, _reason):
+        _hud.set_gold(gold)
+        if delta > 0:
+            _hud.flash_gain("gold", delta))
     _net.rent_status.connect(_on_rent_status)
     _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))
@@ -537,6 +544,7 @@ func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _t
 ## change) to both the HUD's compact hint and the toggleable rent panel (#14).
 func _on_rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int) -> void:
     _hud.set_rent_hint(state, due_at)
+    _hud.set_gold(gold) # seeds the purse readout at login, before any wage lands
     _rent.set_status(plot_id, due_at, paid_through, state, auto_pay, gold)
 
 ## The client already knows every zone's district from `partition`, so it
