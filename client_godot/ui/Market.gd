@@ -14,6 +14,10 @@
 class_name MarketPanel
 extends CanvasLayer
 
+## Move goods between carried inventory and this market's warehouse (#138).
+signal do_deposit(item_id: String, qty: int)
+signal do_withdraw(item_id: String, qty: int)
+
 ## The section the player is looking at. Kept as an explicit enum rather than
 ## tab indices so the later issues can add their own without renumbering.
 enum Section { COMMODITIES, LISTINGS, WAREHOUSE }
@@ -24,6 +28,13 @@ var _tabs: HBoxContainer
 var _section: Section = Section.COMMODITIES
 var _market_id := ""
 var _gold := 0
+## The warehouse at THIS market (#138) — rows as the server sent them, plus
+## slot usage. Locked rows are shown but never offered a Withdraw button.
+var _warehouse: Array = []
+var _used_slots := 0
+var _total_slots := 0
+## Carried inventory, so the warehouse section can offer Deposit per item.
+var _inventory: Array = []
 
 func _ready() -> void:
 	layer = 8
@@ -90,6 +101,19 @@ func set_section(s: Section) -> void:
 	_section = s
 	_rebuild()
 
+## Your warehouse at this market (#138), straight from `warehouse.state`.
+func set_warehouse(items: Array, used: int, slots: int) -> void:
+	_warehouse = items
+	_used_slots = used
+	_total_slots = slots
+	_rebuild()
+
+## Carried inventory, so the warehouse section knows what you could deposit.
+func set_inventory(items: Array) -> void:
+	_inventory = items
+	if _section == Section.WAREHOUSE:
+		_rebuild()
+
 func _rebuild() -> void:
 	if not _body:
 		return
@@ -123,5 +147,73 @@ func _rebuild() -> void:
 		Section.LISTINGS:
 			todo.text = "Listing board — unique items (tools carry their own durability) at a fixed ask."
 		Section.WAREHOUSE:
-			todo.text = "Your stock held at this market. Goods are local: you collect where you bought."
+			_rebuild_warehouse()
+			return
 	_body.add_child(todo)
+
+## The warehouse section (#138): what you're holding here, and what you could
+## put in. Locked rows render greyed with no Withdraw — they're escrowed
+## against an open sell order, and a player looking at goods they can't take
+## needs to see why rather than just find the button missing.
+func _rebuild_warehouse() -> void:
+	var head := Label.new()
+	head.add_theme_font_size_override("font_size", 12)
+	head.modulate = Color(0.8, 0.85, 0.95)
+	head.text = "Held here — %d/%d slots" % [_used_slots, _total_slots]
+	_body.add_child(head)
+
+	if _warehouse.is_empty():
+		var empty := Label.new()
+		empty.modulate = Color(0.6, 0.6, 0.6)
+		empty.text = "  (nothing stored here yet)"
+		_body.add_child(empty)
+	for it_v in _warehouse:
+		var it: Dictionary = it_v
+		var item_id := String(it.get("item_id", ""))
+		var locked := String(it.get("state", "available")) == "locked"
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(210, 0)
+		if it.has("durability"):
+			lbl.text = "  %s  (%d/%d)" % [item_id, int(it.get("durability", 0)), int(it.get("max_durability", 0))]
+		else:
+			lbl.text = "  %s  x%d" % [item_id, int(it.get("qty", 0))]
+		if locked:
+			lbl.text += "   🔒 on sale"
+			lbl.modulate = Color(0.6, 0.6, 0.65)
+		row.add_child(lbl)
+		if not locked:
+			var qty := int(it.get("qty", 0))
+			var btn := Button.new()
+			btn.text = "Withdraw"
+			btn.pressed.connect(func(): do_withdraw.emit(item_id, qty))
+			row.add_child(btn)
+		_body.add_child(row)
+
+	var carry_head := Label.new()
+	carry_head.add_theme_font_size_override("font_size", 12)
+	carry_head.modulate = Color(0.8, 0.85, 0.95)
+	carry_head.text = "Carried — deposit to trade"
+	_body.add_child(carry_head)
+	if _inventory.is_empty():
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (carrying nothing)"
+		_body.add_child(none)
+	for it_v in _inventory:
+		var it: Dictionary = it_v
+		var item_id := String(it.get("item_id", ""))
+		var qty := int(it.get("qty", 0))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(210, 0)
+		if it.has("durability"):
+			lbl.text = "  %s  (%d/%d)" % [item_id, int(it.get("durability", 0)), int(it.get("max_durability", 0))]
+		else:
+			lbl.text = "  %s  x%d" % [item_id, qty]
+		row.add_child(lbl)
+		var btn := Button.new()
+		btn.text = "Deposit"
+		btn.pressed.connect(func(): do_deposit.emit(item_id, qty))
+		row.add_child(btn)
+		_body.add_child(row)

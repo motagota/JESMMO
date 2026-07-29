@@ -98,6 +98,12 @@ const ROAD_CELL_LEN_M: f64 = 5.0;
 /// out of range is refused, not just hidden.
 const MARKET_RANGE: i32 = 60;
 
+/// Warehouse capacity per player per market (#138), counted in SLOTS: one row
+/// is one slot, so a stack of 90 planks costs the same as a stack of 2, and
+/// each tool instance costs its own. Generous on purpose — the warehouse is
+/// working stock for trading, and a cramped one just means tedious trips.
+const WAREHOUSE_SLOTS: i64 = 60;
+
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
 /// minted once at character creation (500, migration 0006) and only ever
@@ -2380,14 +2386,90 @@ impl Proxy {
     async fn apply_market_open(&self, pid: &str) {
         let Some(db) = self.db.clone() else { return };
         match self.market_at(&db, pid).await {
-            Some((market_id, x, y)) => self.push_to_player(pid, json!({
-                "type": "market.opened", "market_id": market_id, "x": x, "y": y,
-            })),
+            Some((market_id, x, y)) => {
+                self.push_to_player(pid, json!({
+                    "type": "market.opened", "market_id": market_id, "x": x, "y": y,
+                }));
+                // Hydrate what you're holding here, so the panel is useful the
+                // moment it opens rather than after a round trip (#138).
+                self.send_warehouse(pid, &market_id).await;
+            }
             None => self.push_to_player(pid, json!({
                 "type": "market.error", "code": "out_of_range",
                 "detail": "stand at a built market to trade",
             })),
         }
+    }
+
+    /// Push this player's warehouse at `market_id` (#138). `available` and
+    /// `locked` travel as distinct rows, not a merged total: locked stock is
+    /// escrowed against an open order and can't be withdrawn, and a player
+    /// staring at goods they can't take needs to see WHY.
+    async fn send_warehouse(&self, pid: &str, market_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(rows) = db.warehouse_for_character(market_id, pid).await else { return };
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut v = json!({
+                    "id": r.id, "item_id": r.item_id, "qty": r.qty, "state": r.state,
+                });
+                if let Some(d) = r.durability {
+                    v["durability"] = json!(d);
+                    if let Some(max) = mmo::world::tool_max_durability(&r.item_id) {
+                        v["max_durability"] = json!(max);
+                    }
+                }
+                v
+            })
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "warehouse.state", "market_id": market_id,
+            "items": items, "used": rows.len(), "slots": WAREHOUSE_SLOTS,
+        }));
+    }
+
+    /// Apply `warehouse.deposit` / `warehouse.withdraw` (#138). Both are gated
+    /// through `market_at` — the same server-side range check `market.open`
+    /// established (#137) — so a client can't stock a market it isn't standing
+    /// at. Guests have no durable inventory, so they're a no-op.
+    async fn apply_warehouse_op(&self, pid: &str, op: &str, item_id: &str, qty: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": "out_of_range",
+                "detail": "stand at a built market to use its warehouse",
+            }));
+            return;
+        };
+        let moved = match op {
+            "deposit" => db.warehouse_deposit(&market_id, pid, item_id, qty, WAREHOUSE_SLOTS).await,
+            "withdraw" => db.warehouse_withdraw(&market_id, pid, item_id, qty).await,
+            _ => Ok(0),
+        };
+        match moved {
+            Ok(0) if op == "deposit" => self.push_to_player(pid, json!({
+                "type": "market.error", "code": "warehouse_full",
+                "detail": "no room in your warehouse here",
+            })),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[Proxy] warehouse.{op}: {e}");
+                return;
+            }
+        }
+        self.send_inventory(pid).await;
+        self.send_warehouse(pid, &market_id).await;
     }
 
     /// The wage rate a given order kind pays per contributed unit (#145).
@@ -4765,6 +4847,19 @@ impl Proxy {
                     // zone — same as `build_contribute`'s own proximity gate.
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
                         self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // `warehouse.*` (#138) share market.open's range gate.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("warehouse."))
+                        .filter(|op| *op == "deposit" || *op == "withdraw")
+                    {
+                        let op = op.to_string();
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_warehouse_op(&player_id, &op, &item_id, qty).await;
                         continue;
                     }
                     // `road.cells_request` (#134) is a stateless read, same
@@ -9648,6 +9743,107 @@ mod tests {
         assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
 
         drop(ws);
+    }
+
+    /// The warehouse over the wire (#138): gated by the same server-side range
+    /// check as `market.open`, hydrated on open, and pushed after every move.
+    #[tokio::test]
+    async fn warehouse_deposit_and_withdraw_are_range_gated_and_push_state() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        // A built market to trade at, without hauling 80 units in a test.
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12900, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let email = format!("stocker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Stocker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 30, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        // Out of range: refused, and nothing moves.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12000, y: 12800, hp: 100 });
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 10}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
+        assert!(db.warehouse_for_character(&market.id, &pid).await.unwrap().is_empty());
+
+        // Step up to the market: opening hydrates the (empty) warehouse.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12900, y: 12800, hp: 100 });
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let state = recv_until(&mut ws, "warehouse.state").await;
+        assert_eq!(state["market_id"].as_str().unwrap(), market.id);
+        assert!(state["items"].as_array().unwrap().is_empty());
+        assert_eq!(state["slots"].as_i64().unwrap(), WAREHOUSE_SLOTS);
+
+        // Deposit: state comes back with the stock, and carry drops.
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let state = loop {
+            let v = recv_until(&mut ws, "warehouse.state").await;
+            if !v["items"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let items = state["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item_id"].as_str().unwrap(), "wood");
+        assert_eq!(items[0]["qty"].as_i64().unwrap(), 20);
+        assert_eq!(items[0]["state"].as_str().unwrap(), "available");
+        assert_eq!(state["used"].as_i64().unwrap(), 1);
+
+        // Withdraw it back.
+        ws.send(Message::Text(
+            json!({"type": "warehouse.withdraw", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let v = recv_until(&mut ws, "warehouse.state").await;
+            if v["items"].as_array().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            qty_of_inventory(&db, &pid, "wood").await, 30,
+            "everything came back to carry"
+        );
+
+        drop(ws);
+    }
+
+    async fn qty_of_inventory(db: &Db, pid: &str, item: &str) -> i64 {
+        db.inventory_for_character(pid)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|i| i.item_id == item)
+            .map(|i| i.qty)
+            .sum()
     }
 
     /// Build wages (#145): an ordinary contribution pays the city's rate and

@@ -782,6 +782,21 @@ impl BuildOrder {
     }
 }
 
+/// One row of a player's warehouse at one market (market epic #136, #138).
+/// `state` is `available` or `locked` (locked = escrowed against an open sell
+/// order, #139). `durability` mirrors `InventoryItem`'s: `None` for an
+/// ordinary stackable, `Some` for a single tool instance.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WarehouseItem {
+    pub id: String,
+    pub market_id: String,
+    pub character_id: String,
+    pub item_id: String,
+    pub qty: i64,
+    pub state: String,
+    pub durability: Option<i64>,
+}
+
 /// A gatherable resource node.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ResourceNode {
@@ -979,6 +994,302 @@ impl Db {
         }
         tx.commit().await?;
         Ok(moved)
+    }
+
+    // --- Market warehouse (market epic #136, issue #138) -------------------
+
+    /// Everything this character holds at this market, available and locked
+    /// alike, oldest first so the client's list is stable across refreshes.
+    pub async fn warehouse_for_character(
+        &self,
+        market_id: &str,
+        character_id: &str,
+    ) -> Result<Vec<WarehouseItem>, DbError> {
+        sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+             ORDER BY item_id, id",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Move up to `qty` of `item_id` from carried inventory into this market's
+    /// warehouse, in one transaction. Returns the amount moved (0 if nothing
+    /// could be).
+    ///
+    /// **Capacity is in SLOTS, not units** (`slots`, from the caller's const):
+    /// one row is one slot, so a stack of 90 planks costs the same slot as a
+    /// stack of 2, and every tool instance costs its own. A deposit that would
+    /// need a NEW row when already at capacity is refused **outright** — never
+    /// partially applied — since a half-landed deposit is exactly the kind of
+    /// thing players report as lost goods. Topping up an existing stack is
+    /// always allowed, because it consumes no additional slot.
+    ///
+    /// Tools (#128) move as instances: the `inventory_item` row's own id and
+    /// durability are carried over unchanged, so the thing in the warehouse is
+    /// the same worn pickaxe you put in, not a fresh one.
+    pub async fn warehouse_deposit(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+        slots: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let used_slots: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM market_warehouse_item WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let moved = if world::tool_max_durability(item_id).is_some() {
+            // Instanced: each tool needs its own slot, so only take as many as
+            // there is room for — and none at all if there's no room.
+            let room = (slots - used_slots).max(0);
+            let take = qty.min(room);
+            if take == 0 {
+                tx.commit().await?;
+                return Ok(0);
+            }
+            let rows = sqlx::query_as::<_, InventoryItem>(
+                "SELECT id, character_id, item_id, qty, slot, durability FROM inventory_item \
+                 WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT ?",
+            )
+            .bind(character_id)
+            .bind(item_id)
+            .bind(take)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in &rows {
+                // Depositing the tool you're holding takes it out of your hand
+                // rather than refusing — same courtesy as #128's break, and
+                // required anyway: `equipment.instance_id` references the
+                // inventory row we're about to delete.
+                sqlx::query("DELETE FROM equipment WHERE character_id = ? AND instance_id = ?")
+                    .bind(character_id)
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM inventory_item WHERE id = ?")
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO market_warehouse_item \
+                     (id, market_id, character_id, item_id, qty, state, durability) \
+                     VALUES (?, ?, ?, ?, 1, 'available', ?)",
+                )
+                .bind(&r.id) // same id in = same instance out
+                .bind(market_id)
+                .bind(character_id)
+                .bind(item_id)
+                .bind(r.durability)
+                .execute(&mut *tx)
+                .await?;
+            }
+            rows.len() as i64
+        } else {
+            // Stackable: merges into this market's existing available stack if
+            // there is one, otherwise needs a free slot.
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+                 AND item_id = ? AND state = 'available' LIMIT 1",
+            )
+            .bind(market_id)
+            .bind(character_id)
+            .bind(item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing.is_none() && used_slots >= slots {
+                tx.commit().await?;
+                return Ok(0); // no room, and nothing to merge into
+            }
+            let moved = remove_inventory_in_tx(&mut tx, character_id, item_id, qty).await?;
+            if moved > 0 {
+                match existing {
+                    Some(id) => {
+                        sqlx::query("UPDATE market_warehouse_item SET qty = qty + ? WHERE id = ?")
+                            .bind(moved)
+                            .bind(&id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO market_warehouse_item \
+                             (id, market_id, character_id, item_id, qty, state, durability) \
+                             VALUES (?, ?, ?, ?, ?, 'available', NULL)",
+                        )
+                        .bind(Uuid::new_v4().to_string())
+                        .bind(market_id)
+                        .bind(character_id)
+                        .bind(item_id)
+                        .bind(moved)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+            moved
+        };
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Move up to `qty` of `item_id` from this market's warehouse back into
+    /// carried inventory. Draws from **`available` rows only** — locked stock
+    /// is escrowed against an open order and is not the player's to take back
+    /// until they cancel it. Also bounded by remaining carry capacity, exactly
+    /// like [`Db::withdraw`] from home storage.
+    pub async fn warehouse_withdraw(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let carried: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        if room <= 0 {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let rows = sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+             AND item_id = ? AND state = 'available' ORDER BY id",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut moved = 0i64;
+        for r in &rows {
+            let want = qty.min(room) - moved;
+            if want <= 0 {
+                break;
+            }
+            if r.durability.is_some() {
+                // A tool instance: all or nothing, and it goes back to carried
+                // inventory as the SAME row id, keeping its wear.
+                sqlx::query("DELETE FROM market_warehouse_item WHERE id = ?")
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO inventory_item (id, character_id, item_id, qty, slot, durability) \
+                     VALUES (?, ?, ?, 1, NULL, ?)",
+                )
+                .bind(&r.id)
+                .bind(character_id)
+                .bind(item_id)
+                .bind(r.durability)
+                .execute(&mut *tx)
+                .await?;
+                moved += 1;
+            } else {
+                let take = want.min(r.qty);
+                if take <= 0 {
+                    continue;
+                }
+                if take == r.qty {
+                    sqlx::query("DELETE FROM market_warehouse_item WHERE id = ?")
+                        .bind(&r.id)
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    sqlx::query("UPDATE market_warehouse_item SET qty = qty - ? WHERE id = ?")
+                        .bind(take)
+                        .bind(&r.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                add_inventory_in_tx(&mut tx, character_id, item_id, take).await?;
+                moved += take;
+            }
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Move `qty` of an item from `available` to `locked` in this market's
+    /// warehouse — escrow against an open sell order (#139 will call this;
+    /// #138 ships it so the state actually means something and can be tested).
+    /// Returns the amount locked, bounded by what's available.
+    pub async fn warehouse_lock(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+             AND item_id = ? AND state = 'available' ORDER BY id",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut locked = 0i64;
+        for r in &rows {
+            let want = qty - locked;
+            if want <= 0 {
+                break;
+            }
+            if r.durability.is_some() || r.qty <= want {
+                // Whole row moves across — a tool instance is indivisible.
+                sqlx::query("UPDATE market_warehouse_item SET state = 'locked' WHERE id = ?")
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                locked += r.qty;
+            } else {
+                // Split the stack: part stays available, part becomes escrow.
+                sqlx::query("UPDATE market_warehouse_item SET qty = qty - ? WHERE id = ?")
+                    .bind(want)
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO market_warehouse_item \
+                     (id, market_id, character_id, item_id, qty, state, durability) \
+                     VALUES (?, ?, ?, ?, ?, 'locked', NULL)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(market_id)
+                .bind(character_id)
+                .bind(item_id)
+                .bind(want)
+                .execute(&mut *tx)
+                .await?;
+                locked += want;
+            }
+        }
+        tx.commit().await?;
+        Ok(locked)
     }
 
     pub async fn inventory_for_character(
@@ -3358,6 +3669,161 @@ mod tests {
         assert_eq!(well.state, "completed");
         assert!(well.completed_at.is_some());
         assert_eq!(db.contribute(&a, &order.id, "stone", 1, 0).await.unwrap().moved, 0);
+    }
+
+    /// A market to warehouse against — the warehouse is keyed by a completed
+    /// market order's id, so tests need a real order row to reference.
+    async fn a_market(db: &Db) -> String {
+        db.insert_build_order("civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0, None, None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn warehouse_deposit_and_withdraw_round_trip_and_respect_carry_capacity() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+
+        // Deposit moves carried -> available.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 20, 60).await.unwrap(), 20);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1, "one stack, one slot");
+        assert_eq!((held[0].qty, held[0].state.as_str()), (20, "available"));
+        assert_eq!(qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood"), 10);
+
+        // A second deposit of the same item merges into the existing stack
+        // rather than eating another slot.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 10, 60).await.unwrap(), 10);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!((held.len(), held[0].qty), (1, 30));
+
+        // Withdraw is bounded by remaining carry capacity (MAX_CARRY = 50).
+        db.add_to_inventory(&cid, "stone", 45).await.unwrap();
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 30).await.unwrap(), 5, "only 5 carry slots left");
+        assert_eq!(db.warehouse_for_character(&m, &cid).await.unwrap()[0].qty, 25);
+
+        // Depositing an item you don't carry moves nothing.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "plank", 5, 60).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn warehouse_locked_stock_is_not_withdrawable() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+        db.warehouse_deposit(&m, &cid, "wood", 30, 60).await.unwrap();
+
+        // Lock 10 against a (future) sell order: the stack splits.
+        assert_eq!(db.warehouse_lock(&m, &cid, "wood", 10).await.unwrap(), 10);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        let available: i64 = held.iter().filter(|r| r.state == "available").map(|r| r.qty).sum();
+        let locked: i64 = held.iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
+        assert_eq!((available, locked), (20, 10));
+
+        // Withdrawing "everything" only takes the available part — escrowed
+        // stock isn't the player's to take back until the order is cancelled.
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 999).await.unwrap(), 20);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!((held[0].qty, held[0].state.as_str()), (10, "locked"));
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 10).await.unwrap(), 0, "locked stays put");
+    }
+
+    #[tokio::test]
+    async fn warehouse_capacity_is_slots_and_a_full_warehouse_refuses_outright() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        // Two slots only. Fill both with different items.
+        db.add_to_inventory(&cid, "wood", 5).await.unwrap();
+        db.add_to_inventory(&cid, "stone", 5).await.unwrap();
+        db.add_to_inventory(&cid, "plank", 5).await.unwrap();
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 5, 2).await.unwrap(), 5);
+        assert_eq!(db.warehouse_deposit(&m, &cid, "stone", 5, 2).await.unwrap(), 5);
+
+        // A third distinct item needs a third slot: refused OUTRIGHT, with
+        // nothing moved — a half-landed deposit is what players report as
+        // lost goods.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "plank", 5, 2).await.unwrap(), 0);
+        assert_eq!(qty_of(&db.inventory_for_character(&cid).await.unwrap(), "plank"), 5, "nothing taken");
+        assert_eq!(db.warehouse_for_character(&m, &cid).await.unwrap().len(), 2);
+
+        // Topping up an item already stored consumes no new slot, so it's
+        // still allowed at capacity.
+        db.add_to_inventory(&cid, "wood", 5).await.unwrap();
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 5, 2).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn warehousing_a_tool_preserves_the_instance_and_its_wear() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        let inv = db.inventory_for_character(&cid).await.unwrap();
+        let pick = inv.iter().find(|i| i.item_id == "pickaxe").unwrap().clone();
+        assert_eq!(pick.durability, Some(50));
+
+        // Wear it, so "the same instance" is actually falsifiable.
+        db.equip_instance(&cid, &pick.id).await.unwrap();
+        db.wear_equipped_tool(&cid, "tool", 7).await.unwrap();
+        let worn = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        assert_eq!(worn.durability, Some(43));
+
+        // Deposit: same row id, same wear, one slot.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "pickaxe", 1, 60).await.unwrap(), 1);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, worn.id, "the SAME instance, not a fresh tool");
+        assert_eq!((held[0].durability, held[0].qty), (Some(43), 1));
+        assert!(db.inventory_for_character(&cid).await.unwrap().iter().all(|i| i.item_id != "pickaxe"));
+        // Stowing the tool you're holding takes it out of your hand, rather
+        // than refusing the deposit or leaving a dangling equipment row.
+        assert!(db.equipped_tool(&cid, "tool").await.unwrap().is_none(), "deposited tool is unequipped");
+
+        // Withdraw: still the same instance, still worn.
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "pickaxe", 1).await.unwrap(), 1);
+        let back = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        assert_eq!((back.id, back.durability), (worn.id, Some(43)));
+        assert!(db.warehouse_for_character(&m, &cid).await.unwrap().is_empty());
+    }
+
+    /// The epic's headline invariant, first installment (#136 §12): across a
+    /// stream of deposits, withdrawals and locks, an item is conserved —
+    /// `carried + available + locked` never changes. Duplication kills
+    /// economies, so this is the test that matters most here.
+    #[tokio::test]
+    async fn warehouse_conserves_goods_across_a_random_command_stream() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        const TOTAL: i64 = 40;
+        db.add_to_inventory(&cid, "wood", TOTAL).await.unwrap();
+
+        // Deterministic pseudo-random stream, so a failure is reproducible.
+        let mut seed: u64 = 0x5eed;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as i64
+        };
+        for step in 0..60 {
+            let qty = next() % 13; // includes 0 and over-asks
+            match next() % 3 {
+                0 => { db.warehouse_deposit(&m, &cid, "wood", qty, 60).await.unwrap(); }
+                1 => { db.warehouse_withdraw(&m, &cid, "wood", qty).await.unwrap(); }
+                _ => { db.warehouse_lock(&m, &cid, "wood", qty).await.unwrap(); }
+            }
+            let carried = qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood");
+            let held: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
+                .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+            assert_eq!(carried + held, TOTAL, "wood conserved at step {step}");
+        }
     }
 
     /// Build wages (#145) are paid on the units that actually MOVED, in the

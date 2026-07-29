@@ -80,28 +80,90 @@ func _process(_delta: float) -> bool:
 	if not _body_text().contains("Order book"):
 		_fail("commodities is the default section, got: %s" % _body_text()); return true
 	_market.set_section(MarketPanel.Section.WAREHOUSE)
-	if not _body_text().contains("collect where you bought"):
-		_fail("warehouse section didn't render, got: %s" % _body_text()); return true
+	if not _body_text().contains("nothing stored here yet"):
+		_fail("warehouse section didn't render empty, got: %s" % _body_text()); return true
 	_market.set_section(MarketPanel.Section.LISTINGS)
 	if not _body_text().contains("durability"):
 		_fail("listings section didn't render, got: %s" % _body_text()); return true
 
+	# --- warehouse section (#138) ---------------------------------------------
+	_market.set_section(MarketPanel.Section.WAREHOUSE)
+	_market.set_inventory([
+		{"item_id": "wood", "qty": 12},
+		{"item_id": "pickaxe", "qty": 1, "durability": 43, "max_durability": 50},
+	])
+	_market.set_warehouse([
+		{"id": "a", "item_id": "stone", "qty": 20, "state": "available"},
+		{"id": "b", "item_id": "stone", "qty": 5, "state": "locked"},
+		{"id": "c", "item_id": "axe", "qty": 1, "state": "available", "durability": 31, "max_durability": 50},
+	], 3, 60)
+	var w := _body_text()
+	if not w.contains("3/60 slots"):
+		_fail("slot usage should render, got: %s" % w); return true
+	if not w.contains("stone  x20") or not w.contains("stone  x5"):
+		_fail("available and locked stock should BOTH be listed, got: %s" % w); return true
+	if not w.contains("🔒 on sale"):
+		_fail("locked stock must say why it's untouchable, got: %s" % w); return true
+	if not w.contains("axe  (31/50)"):
+		_fail("a warehoused tool should show its own wear, got: %s" % w); return true
+	if not w.contains("pickaxe  (43/50)"):
+		_fail("carried tools should be depositable with their wear shown, got: %s" % w); return true
+
+	# Only the AVAILABLE rows get a Withdraw button — locked stock is escrowed
+	# and offering the button would be a lie.
+	var withdraws := _buttons("Withdraw")
+	if withdraws != 2:
+		_fail("expected 2 Withdraw buttons (available stone + axe), got %d" % withdraws); return true
+	if _buttons("Deposit") != 2:
+		_fail("expected a Deposit button per carried item, got %d" % _buttons("Deposit")); return true
+
+	# The deposit signal carries what the server needs; the server re-bounds it.
+	var deposited := []
+	_market.do_deposit.connect(func(item_id, qty): deposited.append([item_id, qty]))
+	for row in _market._body.get_children():
+		if row is HBoxContainer and not row.is_queued_for_deletion():
+			for c in row.get_children():
+				if c is Button and c.text == "Deposit":
+					c.pressed.emit()
+					break
+	if deposited.is_empty():
+		_fail("Deposit should emit do_deposit"); return true
+	if deposited[0][0] != "wood" or deposited[0][1] != 12:
+		_fail("deposit emitted the wrong payload: %s" % [deposited[0]]); return true
+
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.
+	_market.set_section(MarketPanel.Section.COMMODITIES)
 	_market.set_market("")
 	if not _body_text().contains("not trading"):
 		_fail("walking away should clear the trading state"); return true
 
-	print("SMOKE_OK: built markets are found by structure_kind (and nothing else is), and the panel gates on the server's ack, not on standing nearby")
+	print("SMOKE_OK: built markets are found by structure_kind (and nothing else is), the panel gates on the server's ack rather than proximity, and the warehouse shows locked stock as unwithdrawable with tools keeping their own wear")
 	quit(0)
 	return true
 
-## The panel's current text. Children replaced by a rebuild are `queue_free`d,
-## which is DEFERRED — they're still children until the next frame — so a
-## same-frame read must skip them or it sees the previous section too.
-func _body_text() -> String:
+## Count visible buttons with the given label across the panel body.
+func _buttons(label: String) -> int:
+	var n := 0
+	for row in _market._body.get_children():
+		if row.is_queued_for_deletion():
+			continue
+		for c in row.get_children():
+			if c is Button and c.text == label:
+				n += 1
+	return n
+
+## The panel's current text. Recurses, since item rows are Labels nested in an
+## HBoxContainer alongside their button. Children replaced by a rebuild are
+## `queue_free`d, which is DEFERRED — they're still children until the next
+## frame — so a same-frame read must skip them or it sees the old section too.
+func _body_text(node: Node = null) -> String:
 	var out := ""
-	for c in _market._body.get_children():
-		if c is Label and not c.is_queued_for_deletion():
+	for c in (node if node != null else _market._body).get_children():
+		if c.is_queued_for_deletion():
+			continue
+		if c is Label:
 			out += c.text + " | "
+		elif c.get_child_count() > 0:
+			out += _body_text(c)
 	return out

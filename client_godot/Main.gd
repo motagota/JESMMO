@@ -315,6 +315,7 @@ func _wire_signals() -> void:
         _storage.set_inventory(items)
         _inventory.set_inventory(items, used, capacity)
         _build.set_inventory(items)
+        _market.set_inventory(items)
         _craft.set_inventory(items))
     _net.skill_update.connect(_on_skill_update)
     _net.skill_levelup.connect(func(skill_id, level): _hud.flash_levelup(skill_id, level))
@@ -351,6 +352,11 @@ func _wire_signals() -> void:
     # Market (#137): the server confirmed we're at a real one and may trade.
     _net.market_opened.connect(func(market_id, _x, _y): _market.set_market(market_id))
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
+    # Warehouse (#138): custody of goods held at this market.
+    _net.warehouse_state.connect(func(_market_id, items, used, slots):
+        _market.set_warehouse(items, used, slots))
+    _market.do_deposit.connect(func(item_id, qty): _net.send_warehouse_deposit(item_id, qty))
+    _market.do_withdraw.connect(func(item_id, qty): _net.send_warehouse_withdraw(item_id, qty))
     _net.rent_status.connect(_on_rent_status)
     _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))

@@ -183,8 +183,25 @@ pub const C_MARKET_OPEN: &str = "market.open";
 // from day one, since per-market state is the point of the design even though
 // only the capital's market exists in v1.
 pub const S_MARKET_OPENED: &str = "market.opened";
-// {code, detail} -- a market command was refused ("out_of_range", ...).
+// {code, detail} -- a market command was refused ("out_of_range",
+// "warehouse_full", ...).
 pub const S_MARKET_ERROR: &str = "market.error";
+// {item_id, qty} -- move goods between carried inventory and your warehouse AT
+// the market you're standing at (#138). Both share market.open's server-side
+// range gate. Custody is the point: goods are local, so you deposit stock to
+// sell it and collect purchases where you bought them; nothing teleports
+// between markets. Tools move as INSTANCES, keeping their own durability and
+// row id (#128), which is what lets the listing board sell a specific worn one.
+pub const C_WAREHOUSE_DEPOSIT: &str = "warehouse.deposit";
+pub const C_WAREHOUSE_WITHDRAW: &str = "warehouse.withdraw";
+// {market_id, items: [{id, item_id, qty, state, durability?, max_durability?}],
+// used, slots} -- your full warehouse at one market, pushed on market.open and
+// after every deposit/withdraw. `state` is "available" | "locked"; locked stock
+// is escrowed against an open sell order (#139) and can't be withdrawn, and
+// travels as its own row rather than being merged into the available total so
+// the client can show WHY it isn't takeable. Capacity is counted in SLOTS
+// (rows), not units.
+pub const S_WAREHOUSE_STATE: &str = "warehouse.state";
 
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}

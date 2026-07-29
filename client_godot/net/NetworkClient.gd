@@ -84,6 +84,9 @@ signal road_cell_progress(order_id: String, cell_index: int, required: Dictionar
 ## command was refused (out of range, no market built yet).
 signal market_opened(market_id: String, x: int, y: int)
 signal market_error(code: String, detail: String)
+## Your warehouse at one market (#138): every row, available and locked alike,
+## plus slot usage. Pushed on `market.open` and after every deposit/withdraw.
+signal warehouse_state(market_id: String, items: Array, used: int, slots: int)
 signal home_respawn_set(bed_id: String)
 ## The character's gold balance changed (#145) — `delta` is signed, `reason`
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
@@ -301,6 +304,12 @@ func _handle_text(text: String) -> void:
             market_error.emit(
                 String(msg.get("code", "")),
                 String(msg.get("detail", "market command refused")))
+        Protocol.S_WAREHOUSE_STATE:
+            warehouse_state.emit(
+                String(msg.get("market_id", "")),
+                msg.get("items", []),
+                int(msg.get("used", 0)),
+                int(msg.get("slots", 0)))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),
@@ -488,6 +497,15 @@ func send_road_demolish(order_id: String) -> void:
 ## server resolves and range-checks it from your live position.
 func send_market_open() -> void:
     _send({"type": Protocol.C_MARKET_OPEN})
+
+## Move goods between carried inventory and your warehouse at the market
+## you're standing at (#138). Same range gate as `market.open`; the server
+## bounds both by what's actually there, carry capacity, and slot capacity.
+func send_warehouse_deposit(item_id: String, qty: int) -> void:
+    _send({"type": Protocol.C_WAREHOUSE_DEPOSIT, "item_id": item_id, "qty": qty})
+
+func send_warehouse_withdraw(item_id: String, qty: int) -> void:
+    _send({"type": Protocol.C_WAREHOUSE_WITHDRAW, "item_id": item_id, "qty": qty})
 
 ## Ask for a road order's full cell list (#134) — no role restriction, a
 ## stateless read like terrain/object list requests. Answered with

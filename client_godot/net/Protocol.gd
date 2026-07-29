@@ -225,6 +225,16 @@ const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 const C_MARKET_OPEN := "market.open"
 const S_MARKET_OPENED := "market.opened"
 const S_MARKET_ERROR := "market.error"
+## Warehouse (#138) — custody of goods held AT a market. `warehouse.deposit` /
+## `warehouse.withdraw {item_id, qty}` share `market.open`'s server-side range
+## gate; `warehouse.state {market_id, items, used, slots}` is pushed on open
+## and after every move. Each item is `{id, item_id, qty, state,
+## durability?, max_durability?}` with `state` "available" | "locked" —
+## locked stock is escrowed against an open sell order and can't be
+## withdrawn. Capacity is in SLOTS (rows), not units.
+const C_WAREHOUSE_DEPOSIT := "warehouse.deposit"
+const C_WAREHOUSE_WITHDRAW := "warehouse.withdraw"
+const S_WAREHOUSE_STATE := "warehouse.state"
 ## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
 ## the panel; the server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0
