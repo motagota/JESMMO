@@ -2391,8 +2391,10 @@ impl Proxy {
                     "type": "market.opened", "market_id": market_id, "x": x, "y": y,
                 }));
                 // Hydrate what you're holding here, so the panel is useful the
-                // moment it opens rather than after a round trip (#138).
+                // moment it opens rather than after a round trip (#138), plus
+                // your own resting orders (#139).
                 self.send_warehouse(pid, &market_id).await;
+                self.send_own_orders(pid, &market_id).await;
             }
             None => self.push_to_player(pid, json!({
                 "type": "market.error", "code": "out_of_range",
@@ -2470,6 +2472,186 @@ impl Proxy {
         }
         self.send_inventory(pid).await;
         self.send_warehouse(pid, &market_id).await;
+    }
+
+    /// A commodity's aggregated book as a wire message (#139). Levels only —
+    /// individual order ownership is never broadcast, which keeps the message
+    /// small and stops players reading each other's positions.
+    async fn book_json(&self, market_id: &str, item_id: &str) -> Option<Value> {
+        let db = self.db.clone()?;
+        let asks = db.book_for(market_id, item_id, "sell").await.ok()?;
+        let bids = db.book_for(market_id, item_id, "buy").await.ok()?;
+        let level = |l: &mmo::persistence::BookLevel| json!({"price": l.unit_price, "qty": l.qty});
+        Some(json!({
+            "type": "market.book", "market_id": market_id, "item_id": item_id,
+            "asks": asks.iter().map(level).collect::<Vec<_>>(),
+            "bids": bids.iter().map(level).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Answer one player's `market.book_request`.
+    async fn send_book(&self, pid: &str, market_id: &str, item_id: &str) {
+        if let Some(v) = self.book_json(market_id, item_id).await {
+            self.push_to_player(pid, v);
+        }
+    }
+
+    /// Push the changed book to everyone in the district. Deliberately not a
+    /// subscription model yet: markets are per-district and depth messages are
+    /// small, so broadcasting on change keeps every onlooker's book live with
+    /// no extra machinery. If traffic ever matters, the design doc's
+    /// `MarketSubscribe` is the upgrade path.
+    async fn broadcast_book(&self, district: &str, market_id: &str, item_id: &str) {
+        if let Some(v) = self.book_json(market_id, item_id).await {
+            self.broadcast_to_district(district, v);
+        }
+    }
+
+    /// Push this player's own resting orders at a market (#139).
+    async fn send_own_orders(&self, pid: &str, market_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(orders) = db.open_orders_for_character(market_id, pid).await else { return };
+        let arr: Vec<Value> = orders
+            .iter()
+            .map(|o| json!({
+                "order_id": o.id, "side": o.side, "item_id": o.item_id,
+                "unit_price": o.unit_price, "qty_total": o.qty_total,
+                "qty_remaining": o.qty_remaining,
+            }))
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "market.orders", "market_id": market_id, "orders": arr,
+        }));
+    }
+
+    /// Apply `market.sell` / `market.buy` / `market.cancel` (#139). All three
+    /// share `market.open`'s server-side range gate, and all three refuse with
+    /// a typed `market.error` rather than a silent no-op, so a client can tell
+    /// "rejected" from "nothing matched".
+    async fn apply_market_order(&self, pid: &str, op: &str, data: &Value) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let reject = |code: &str, detail: &str| {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": code, "detail": detail,
+            }));
+        };
+        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+            reject("out_of_range", "stand at a built market to trade");
+            return;
+        };
+        let district = self
+            .entity_state
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|c| (c.x, c.y))
+            .and_then(|(x, y)| self.capital.district_at(x, y).map(|d| d.id.to_string()))
+            .unwrap_or_default();
+        let command_id = data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
+        let now = now_secs();
+
+        if op == "cancel" {
+            let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+            match db.cancel_order(pid, order_id).await {
+                Ok(Some(o)) => {
+                    self.send_warehouse(pid, &market_id).await;
+                    self.send_own_orders(pid, &market_id).await;
+                    self.broadcast_book(&district, &market_id, &o.item_id).await;
+                }
+                Ok(None) => reject("no_such_order", "that order isn't yours, or is already gone"),
+                Err(e) => eprintln!("[Proxy] market.cancel: {e}"),
+            }
+            return;
+        }
+
+        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let unit_price = data.get("unit_price").and_then(|v| v.as_i64()).unwrap_or(0);
+        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Err(r) = mmo::world::validate_order(&item_id, unit_price, qty) {
+            reject(r.code(), r.detail());
+            return;
+        }
+
+        match op {
+            "sell" => {
+                match db
+                    .place_sell_order(&market_id, pid, &item_id, unit_price, qty, command_id, now)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        self.send_warehouse(pid, &market_id).await;
+                        self.send_own_orders(pid, &market_id).await;
+                        self.broadcast_book(&district, &market_id, &item_id).await;
+                    }
+                    Ok(None) => reject(
+                        "no_stock",
+                        "deposit that item into this market's warehouse before selling it",
+                    ),
+                    Err(e) => eprintln!("[Proxy] market.sell: {e}"),
+                }
+            }
+            "buy" => {
+                match db
+                    .buy_immediate(
+                        &market_id, pid, &item_id, unit_price, qty, WAREHOUSE_SLOTS, command_id, now,
+                    )
+                    .await
+                {
+                    Ok(out) if out.filled == 0 => reject(
+                        "no_fill",
+                        "nothing on the book at or below that price",
+                    ),
+                    Ok(out) => {
+                        // The buyer's gold and stock both moved.
+                        self.push_gold(pid, -out.spent, "market_buy").await;
+                        self.send_warehouse(pid, &market_id).await;
+                        // Each seller learns their order shrank, gets paid, and
+                        // sees their own escrow drop. Proceeds are summed per
+                        // seller across their fills so the delta is a real
+                        // "+N gold" they can be shown, not a bare balance.
+                        let mut proceeds: std::collections::BTreeMap<&str, i64> = Default::default();
+                        for t in &out.fills {
+                            *proceeds.entry(t.seller_id.as_str()).or_insert(0) += t.unit_price * t.qty;
+                        }
+                        for (seller_id, earned) in proceeds {
+                            self.push_gold(seller_id, earned, "market_sale").await;
+                            self.send_warehouse(seller_id, &market_id).await;
+                            self.send_own_orders(seller_id, &market_id).await;
+                        }
+                        for t in &out.fills {
+                            self.broadcast_to_district(&district, json!({
+                                "type": "market.trade", "market_id": market_id,
+                                "item_id": t.item_id, "unit_price": t.unit_price, "qty": t.qty,
+                            }));
+                        }
+                        self.broadcast_book(&district, &market_id, &item_id).await;
+                    }
+                    Err(e) => eprintln!("[Proxy] market.buy: {e}"),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Push a player's authoritative gold balance (#145's `gold.update`), used
+    /// wherever gold moves for a reason other than wages. `delta` is
+    /// informational; the balance is read back from the DB either way.
+    async fn push_gold(&self, pid: &str, delta: i64, reason: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let balance = db.character_gold(pid).await.unwrap_or(0);
+        self.push_to_player(pid, json!({
+            "type": "gold.update", "gold": balance, "delta": delta, "reason": reason,
+        }));
     }
 
     /// The wage rate a given order kind pays per contributed unit (#145).
@@ -4847,6 +5029,30 @@ impl Proxy {
                     // zone — same as `build_contribute`'s own proximity gate.
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
                         self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // `market.book_request` (#139): a stateless read of one
+                    // commodity's depth, so the client can look at a book
+                    // without waiting for someone else's trade to push one.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.book_request") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if let Some(db) = self.db.clone() {
+                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                                self.send_book(&player_id, &market_id, &item_id).await;
+                            }
+                        }
+                        continue;
+                    }
+                    // `market.sell` / `market.buy` / `market.cancel` (#139)
+                    // share market.open's range gate.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("market."))
+                        .filter(|op| matches!(*op, "sell" | "buy" | "cancel"))
+                    {
+                        let op = op.to_string();
+                        self.apply_market_order(&player_id, &op, &data).await;
                         continue;
                     }
                     // `warehouse.*` (#138) share market.open's range gate.
@@ -9844,6 +10050,117 @@ mod tests {
             .filter(|i| i.item_id == item)
             .map(|i| i.qty)
             .sum()
+    }
+
+    /// The trading loop over the wire (#139): stock a warehouse, rest a sell,
+    /// have someone else cross it, and check both sides are paid and told.
+    #[tokio::test]
+    async fn market_sell_and_buy_execute_over_the_wire_at_the_resting_price() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12900, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Two traders, both standing at the market.
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("s_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "Seller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("b_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "Buyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+        for who in [&sid, &bid_] {
+            proxy.entity_state.lock().unwrap().insert(who.clone(), EntityCache { x: 12900, y: 12800, hp: 100 });
+        }
+
+        // Seller mines wood and banks it at the market.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        recv_until(&mut seller, "inv.update").await;
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        )).await.unwrap();
+        recv_until(&mut seller, "warehouse.state").await;
+
+        // A tool can never go on the book — it belongs to the listing board.
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "c0", "item_id": "pickaxe", "unit_price": 5, "qty": 1,
+        }).to_string())).await.unwrap();
+        let err = recv_until(&mut seller, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "not_a_commodity");
+
+        // Rest a sell at 8.
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "c1", "item_id": "wood", "unit_price": 8, "qty": 20,
+        }).to_string())).await.unwrap();
+        let orders = recv_until(&mut seller, "market.orders").await;
+        let mine = orders["orders"].as_array().unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["unit_price"].as_i64().unwrap(), 8);
+        let order_id = mine[0]["order_id"].as_str().unwrap().to_string();
+
+        // The buyer sees the depth, aggregated by level and with no ownership.
+        buyer.send(Message::Text(
+            json!({"type": "market.book_request", "item_id": "wood"}).to_string(),
+        )).await.unwrap();
+        let book = recv_until(&mut buyer, "market.book").await;
+        assert_eq!(book["asks"], json!([{"price": 8, "qty": 20}]));
+        assert!(book.to_string().find(&sid).is_none(), "depth must not leak who is selling");
+
+        // Bid 12 for 5: pays the resting 8, not the 12 bid.
+        let buyer_gold = db.character_gold(&bid_).await.unwrap();
+        let seller_gold = db.character_gold(&sid).await.unwrap();
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
+        }).to_string())).await.unwrap();
+        let tick = recv_until(&mut buyer, "market.trade").await;
+        assert_eq!((tick["unit_price"].as_i64(), tick["qty"].as_i64()), (Some(8), Some(5)));
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "5 x the resting 8");
+        assert_eq!(db.character_gold(&sid).await.unwrap(), seller_gold + 40, "seller paid immediately");
+
+        // Goods landed in the BUYER's warehouse at this market.
+        let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+        assert_eq!(held, 5);
+
+        // A resend of the same command_id doesn't buy again.
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
+        }).to_string())).await.unwrap();
+        let err = recv_until(&mut buyer, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "no_fill", "deduped, so nothing filled");
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "charged exactly once");
+
+        // Cancelling returns the unsold escrow to available.
+        seller.send(Message::Text(json!({
+            "type": "market.cancel", "command_id": "c3", "order_id": order_id,
+        }).to_string())).await.unwrap();
+        let state = loop {
+            let v = recv_until(&mut seller, "warehouse.state").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["state"] == "available") {
+                break v;
+            }
+        };
+        let avail: i64 = state["items"].as_array().unwrap().iter()
+            .filter(|i| i["state"] == "available").map(|i| i["qty"].as_i64().unwrap()).sum();
+        assert_eq!(avail, 15, "20 offered - 5 sold = 15 back");
+
+        drop(seller);
+        drop(buyer);
     }
 
     /// Build wages (#145): an ordinary contribution pays the city's rate and

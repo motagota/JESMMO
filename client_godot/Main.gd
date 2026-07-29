@@ -350,13 +350,24 @@ func _wire_signals() -> void:
         if delta > 0:
             _hud.flash_gain("gold", delta))
     # Market (#137): the server confirmed we're at a real one and may trade.
-    _net.market_opened.connect(func(market_id, _x, _y): _market.set_market(market_id))
+    _net.market_opened.connect(func(market_id, _x, _y):
+        _market.set_market(market_id)
+        _net.send_market_book_request(_market.watching())) # seed the depth we're looking at
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
     # Warehouse (#138): custody of goods held at this market.
     _net.warehouse_state.connect(func(_market_id, items, used, slots):
         _market.set_warehouse(items, used, slots))
     _market.do_deposit.connect(func(item_id, qty): _net.send_warehouse_deposit(item_id, qty))
     _market.do_withdraw.connect(func(item_id, qty): _net.send_warehouse_withdraw(item_id, qty))
+    # Order book (#139).
+    _net.market_book.connect(func(_mid, item_id, asks, bids): _market.set_book(item_id, asks, bids))
+    _net.market_orders.connect(func(_mid, orders): _market.set_orders(orders))
+    _net.market_trade.connect(func(_mid, item_id, unit_price, qty):
+        _market.note_trade(item_id, unit_price, qty))
+    _market.do_sell.connect(func(item_id, price, qty): _net.send_market_sell(item_id, price, qty))
+    _market.do_buy.connect(func(item_id, price, qty): _net.send_market_buy(item_id, price, qty))
+    _market.do_cancel.connect(func(order_id): _net.send_market_cancel(order_id))
+    _market.do_watch.connect(func(item_id): _net.send_market_book_request(item_id))
     _net.rent_status.connect(_on_rent_status)
     _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))

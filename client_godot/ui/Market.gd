@@ -17,6 +17,12 @@ extends CanvasLayer
 ## Move goods between carried inventory and this market's warehouse (#138).
 signal do_deposit(item_id: String, qty: int)
 signal do_withdraw(item_id: String, qty: int)
+## Order book (#139): rest a sell, cross the book with a buy, cancel your own,
+## or switch which commodity's depth you're looking at.
+signal do_sell(item_id: String, unit_price: int, qty: int)
+signal do_buy(item_id: String, unit_price: int, qty: int)
+signal do_cancel(order_id: String)
+signal do_watch(item_id: String)
 
 ## The section the player is looking at. Kept as an explicit enum rather than
 ## tab indices so the later issues can add their own without renumbering.
@@ -35,6 +41,19 @@ var _used_slots := 0
 var _total_slots := 0
 ## Carried inventory, so the warehouse section can offer Deposit per item.
 var _inventory: Array = []
+## Order book state (#139): which commodity we're watching, its aggregated
+## depth, our own resting orders, and the last few ticks.
+var _watching := "wood"
+var _asks: Array = []
+var _bids: Array = []
+var _orders: Array = []
+var _last_trade := ""
+## The commodities a v1 book can hold — the stackable items. Tools are
+## excluded by the server too (they go to the listing board, #142); listing
+## them here would just be an invitation to a rejection.
+const TRADABLE := ["wood", "stone", "plank", "tool_kit"]
+var _price_field: SpinBox
+var _qty_field: SpinBox
 
 func _ready() -> void:
 	layer = 8
@@ -101,6 +120,28 @@ func set_section(s: Section) -> void:
 	_section = s
 	_rebuild()
 
+## One commodity's aggregated depth (#139), from `market.book`. Ignored if
+## it's not the book we're looking at.
+func set_book(item_id: String, asks: Array, bids: Array) -> void:
+	if item_id != _watching:
+		return
+	_asks = asks
+	_bids = bids
+	if _section == Section.COMMODITIES:
+		_rebuild()
+
+## Your own resting orders at this market (#139).
+func set_orders(orders: Array) -> void:
+	_orders = orders
+	if _section == Section.COMMODITIES:
+		_rebuild()
+
+## The ticker (#139) — the last fill, so a trader can see the market move.
+func note_trade(item_id: String, unit_price: int, qty: int) -> void:
+	_last_trade = "last: %d x %s @ %dg" % [qty, item_id, unit_price]
+	if _section == Section.COMMODITIES:
+		_rebuild()
+
 ## Your warehouse at this market (#138), straight from `warehouse.state`.
 func set_warehouse(items: Array, used: int, slots: int) -> void:
 	_warehouse = items
@@ -143,13 +184,160 @@ func _rebuild() -> void:
 	todo.custom_minimum_size = Vector2(380, 0)
 	match _section:
 		Section.COMMODITIES:
-			todo.text = "Order book — buy and sell stackable goods at a price. Coming with the matching engine."
+			_rebuild_book()
+			return
 		Section.LISTINGS:
 			todo.text = "Listing board — unique items (tools carry their own durability) at a fixed ask."
 		Section.WAREHOUSE:
 			_rebuild_warehouse()
 			return
 	_body.add_child(todo)
+
+## The commodities section (#139): which good you're watching, its depth, the
+## ticker, your own resting orders, and the place-order controls.
+##
+## Depth is deliberately anonymous — the server aggregates by price level and
+## never says who is behind a level, so this can't show it either.
+func _rebuild_book() -> void:
+	var picker := HBoxContainer.new()
+	for item in TRADABLE:
+		var b := Button.new()
+		b.text = item
+		b.focus_mode = Control.FOCUS_NONE
+		b.modulate = Color(1, 1, 1) if item == _watching else Color(0.6, 0.6, 0.65)
+		b.pressed.connect(func(): _watch(item))
+		picker.add_child(b)
+	_body.add_child(picker)
+
+	var best_ask := 0
+	if not _asks.is_empty():
+		best_ask = int((_asks[0] as Dictionary).get("price", 0))
+	var spread := Label.new()
+	spread.add_theme_font_size_override("font_size", 12)
+	var bid_txt := "—" if _bids.is_empty() else str(int((_bids[0] as Dictionary).get("price", 0)))
+	var ask_txt := "—" if _asks.is_empty() else str(best_ask)
+	spread.text = "%s — best bid %s / best ask %s" % [_watching, bid_txt, ask_txt]
+	_body.add_child(spread)
+	if _last_trade != "":
+		var tick := Label.new()
+		tick.add_theme_font_size_override("font_size", 11)
+		tick.modulate = Color(0.6, 0.9, 0.6)
+		tick.text = "  " + _last_trade
+		_body.add_child(tick)
+
+	var asks_head := Label.new()
+	asks_head.add_theme_font_size_override("font_size", 11)
+	asks_head.modulate = Color(0.95, 0.7, 0.7)
+	asks_head.text = "asks (for sale)"
+	_body.add_child(asks_head)
+	if _asks.is_empty():
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (nothing for sale)"
+		_body.add_child(none)
+	for lvl_v in _asks:
+		var lvl: Dictionary = lvl_v
+		var l := Label.new()
+		l.text = "  %d @ %dg" % [int(lvl.get("qty", 0)), int(lvl.get("price", 0))]
+		_body.add_child(l)
+
+	var bids_head := Label.new()
+	bids_head.add_theme_font_size_override("font_size", 11)
+	bids_head.modulate = Color(0.7, 0.9, 0.7)
+	bids_head.text = "bids (wanted)"
+	_body.add_child(bids_head)
+	if _bids.is_empty():
+		var none_b := Label.new()
+		none_b.modulate = Color(0.6, 0.6, 0.6)
+		none_b.text = "  (no buy orders yet)"
+		_body.add_child(none_b)
+	for lvl_v in _bids:
+		var lvl: Dictionary = lvl_v
+		var l := Label.new()
+		l.text = "  %d @ %dg" % [int(lvl.get("qty", 0)), int(lvl.get("price", 0))]
+		_body.add_child(l)
+
+	# Place-order controls. The server re-validates everything; these bounds
+	# just stop obviously-doomed commands leaving the client.
+	var form := HBoxContainer.new()
+	var price_lbl := Label.new()
+	price_lbl.text = "price"
+	form.add_child(price_lbl)
+	_price_field = SpinBox.new()
+	_price_field.min_value = Protocol.PRICE_TICK_GOLD
+	_price_field.max_value = 100000
+	_price_field.step = Protocol.PRICE_TICK_GOLD
+	_price_field.value = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+	form.add_child(_price_field)
+	var qty_lbl := Label.new()
+	qty_lbl.text = "qty"
+	form.add_child(qty_lbl)
+	_qty_field = SpinBox.new()
+	_qty_field.min_value = Protocol.MIN_ORDER_QTY
+	_qty_field.max_value = Protocol.MAX_ORDER_QTY
+	_qty_field.value = 1
+	form.add_child(_qty_field)
+	_body.add_child(form)
+
+	var actions := HBoxContainer.new()
+	var sell_btn := Button.new()
+	sell_btn.text = "Sell"
+	sell_btn.pressed.connect(func(): do_sell.emit(_watching, int(_price_field.value), int(_qty_field.value)))
+	actions.add_child(sell_btn)
+	var buy_btn := Button.new()
+	buy_btn.text = "Buy"
+	buy_btn.pressed.connect(func(): do_buy.emit(_watching, int(_price_field.value), int(_qty_field.value)))
+	actions.add_child(buy_btn)
+	_body.add_child(actions)
+	var hint := Label.new()
+	hint.add_theme_font_size_override("font_size", 10)
+	hint.modulate = Color(0.6, 0.6, 0.65)
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.custom_minimum_size = Vector2(380, 0)
+	hint.text = "Selling escrows from your warehouse here. Buying fills instantly at the seller's price — bid above the ask and you keep the difference."
+	_body.add_child(hint)
+
+	# Your own resting orders — the one place ownership IS shown, because
+	# it's yours.
+	var mine_head := Label.new()
+	mine_head.add_theme_font_size_override("font_size", 11)
+	mine_head.modulate = Color(0.8, 0.85, 0.95)
+	mine_head.text = "your orders"
+	_body.add_child(mine_head)
+	if _orders.is_empty():
+		var none_o := Label.new()
+		none_o.modulate = Color(0.6, 0.6, 0.6)
+		none_o.text = "  (none resting)"
+		_body.add_child(none_o)
+	for o_v in _orders:
+		var o: Dictionary = o_v
+		var order_id := String(o.get("order_id", ""))
+		var row := HBoxContainer.new()
+		var l := Label.new()
+		l.custom_minimum_size = Vector2(230, 0)
+		l.text = "  %s %d/%d %s @ %dg" % [
+			String(o.get("side", "")), int(o.get("qty_remaining", 0)),
+			int(o.get("qty_total", 0)), String(o.get("item_id", "")),
+			int(o.get("unit_price", 0))]
+		row.add_child(l)
+		var cancel := Button.new()
+		cancel.text = "Cancel"
+		cancel.pressed.connect(func(): do_cancel.emit(order_id))
+		row.add_child(cancel)
+		_body.add_child(row)
+
+## Which commodity's book is on screen — Main seeds its depth on market.open.
+func watching() -> String:
+	return _watching
+
+func _watch(item_id: String) -> void:
+	if _watching == item_id:
+		return
+	_watching = item_id
+	_asks = []
+	_bids = []
+	do_watch.emit(item_id)
+	_rebuild()
 
 ## The warehouse section (#138): what you're holding here, and what you could
 ## put in. Locked rows render greyed with no Withdraw — they're escrowed

@@ -77,7 +77,7 @@ func _process(_delta: float) -> bool:
 	_market.set_market("order-abc")
 	if _body_text().contains("not trading"):
 		_fail("should be trading after market.opened"); return true
-	if not _body_text().contains("Order book"):
+	if not _body_text().contains("asks (for sale)"):
 		_fail("commodities is the default section, got: %s" % _body_text()); return true
 	_market.set_section(MarketPanel.Section.WAREHOUSE)
 	if not _body_text().contains("nothing stored here yet"):
@@ -131,27 +131,94 @@ func _process(_delta: float) -> bool:
 	if deposited[0][0] != "wood" or deposited[0][1] != 12:
 		_fail("deposit emitted the wrong payload: %s" % [deposited[0]]); return true
 
+	# --- order book (#139) ----------------------------------------------------
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	_market.set_book("wood", [{"price": 8, "qty": 20}, {"price": 9, "qty": 5}], [{"price": 6, "qty": 3}])
+	var bk := _body_text()
+	if not bk.contains("best bid 6") or not bk.contains("best ask 8"):
+		_fail("spread should read from the top of each side, got: %s" % bk); return true
+	if not bk.contains("20 @ 8g") or not bk.contains("5 @ 9g") or not bk.contains("3 @ 6g"):
+		_fail("every price level should render, got: %s" % bk); return true
+
+	# Depth for a DIFFERENT commodity must be ignored — a stale push for
+	# something we're not looking at would otherwise corrupt the view.
+	_market.set_book("stone", [{"price": 99, "qty": 99}], [])
+	if _body_text().contains("99 @ 99g"):
+		_fail("depth for an unwatched item leaked into the view"); return true
+
+	# The ticker shows the last fill.
+	_market.note_trade("wood", 8, 5)
+	if not _body_text().contains("last: 5 x wood @ 8g"):
+		_fail("ticker didn't render, got: %s" % _body_text()); return true
+
+	# Your own resting orders are the one place ownership IS shown, with a
+	# Cancel each.
+	_market.set_orders([
+		{"order_id": "o1", "side": "sell", "item_id": "wood", "unit_price": 9, "qty_total": 10, "qty_remaining": 4},
+	])
+	if not _body_text().contains("sell 4/10 wood @ 9g"):
+		_fail("own orders should render with fill progress, got: %s" % _body_text()); return true
+	if _buttons("Cancel") != 1:
+		_fail("expected one Cancel button, got %d" % _buttons("Cancel")); return true
+
+	# Sell/Buy emit the watched commodity with the form's price and qty; the
+	# server re-validates and re-bounds all of it.
+	var sold := []
+	var bought := []
+	_market.do_sell.connect(func(i, p, q): sold.append([i, p, q]))
+	_market.do_buy.connect(func(i, p, q): bought.append([i, p, q]))
+	_market._price_field.value = 11
+	_market._qty_field.value = 7
+	_press("Sell")
+	_press("Buy")
+	if sold != [["wood", 11, 7]]:
+		_fail("Sell emitted %s" % [sold]); return true
+	if bought != [["wood", 11, 7]]:
+		_fail("Buy emitted %s" % [bought]); return true
+
+	# Switching commodity clears the old depth and asks for the new book,
+	# so one book's levels can never be read as another's.
+	var watched := []
+	_market.do_watch.connect(func(i): watched.append(i))
+	_market._watch("stone")
+	if watched != ["stone"]:
+		_fail("switching should request the new book, got %s" % [watched]); return true
+	if _body_text().contains("20 @ 8g"):
+		_fail("old depth survived a commodity switch"); return true
+
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.
-	_market.set_section(MarketPanel.Section.COMMODITIES)
 	_market.set_market("")
 	if not _body_text().contains("not trading"):
 		_fail("walking away should clear the trading state"); return true
 
-	print("SMOKE_OK: built markets are found by structure_kind (and nothing else is), the panel gates on the server's ack rather than proximity, and the warehouse shows locked stock as unwithdrawable with tools keeping their own wear")
+	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable with tools keeping their wear; book renders anonymous depth, ignores other commodities' pushes, and place/cancel emit correctly")
 	quit(0)
 	return true
 
-## Count visible buttons with the given label across the panel body.
-func _buttons(label: String) -> int:
+## Count visible buttons with the given label anywhere in the panel body.
+func _buttons(label: String, node: Node = null) -> int:
 	var n := 0
-	for row in _market._body.get_children():
-		if row.is_queued_for_deletion():
+	for c in (node if node != null else _market._body).get_children():
+		if c.is_queued_for_deletion():
 			continue
-		for c in row.get_children():
-			if c is Button and c.text == label:
-				n += 1
+		if c is Button and c.text == label:
+			n += 1
+		elif c.get_child_count() > 0:
+			n += _buttons(label, c)
 	return n
+
+## Press the first visible button with the given label.
+func _press(label: String, node: Node = null) -> bool:
+	for c in (node if node != null else _market._body).get_children():
+		if c.is_queued_for_deletion():
+			continue
+		if c is Button and c.text == label:
+			c.pressed.emit()
+			return true
+		elif c.get_child_count() > 0 and _press(label, c):
+			return true
+	return false
 
 ## The panel's current text. Recurses, since item rows are Labels nested in an
 ## HBoxContainer alongside their button. Children replaced by a rebuild are

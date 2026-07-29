@@ -222,6 +222,71 @@ pub fn recipe(id: &str) -> Option<Recipe> {
     recipes().into_iter().find(|r| r.id == id)
 }
 
+// --- Market (epic #136, issue #139) -----------------------------------------
+
+/// Whether an item can be traded as a **commodity** — a fungible good with an
+/// order book, keyed by `item_id` alone.
+///
+/// `stack_size` already draws exactly the line the market needs: anything that
+/// stacks is interchangeable unit-for-unit, and anything that doesn't carries
+/// per-instance state (a tool's durability, #128) that makes "the price of a
+/// pickaxe" meaningless. Unique items are sold individually on the listing
+/// board (#142) instead, so this is also the check that keeps them off the book.
+pub fn is_commodity(item_id: &str) -> bool {
+    items().into_iter().any(|i| i.id == item_id && i.stack_size > 1)
+}
+
+/// Order prices are whole gold, and must be a multiple of this. A tick keeps
+/// the book's price levels countable (and its depth broadcasts small) instead
+/// of letting a thousand orders sit one copper apart.
+pub const PRICE_TICK_GOLD: i64 = 1;
+/// Bounds on a single order's size — an order below the floor is noise, and
+/// one above the cap is a mis-click or an attempt to wedge the book.
+pub const MIN_ORDER_QTY: i64 = 1;
+pub const MAX_ORDER_QTY: i64 = 10_000;
+
+/// Why an order was refused, as a stable code for the wire (#139).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderReject {
+    NotACommodity,
+    BadPrice,
+    BadQty,
+}
+
+impl OrderReject {
+    pub fn code(self) -> &'static str {
+        match self {
+            OrderReject::NotACommodity => "not_a_commodity",
+            OrderReject::BadPrice => "bad_price",
+            OrderReject::BadQty => "bad_qty",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            OrderReject::NotACommodity => "that item is sold on the listing board, not the book",
+            OrderReject::BadPrice => "price must be a positive whole number of gold",
+            OrderReject::BadQty => "order size is out of bounds",
+        }
+    }
+}
+
+/// Shared validation for every order placement (#139): the commodity gate, the
+/// price tick, and the size bounds. One place, so a sell and a buy can never
+/// disagree about what's tradable.
+pub fn validate_order(item_id: &str, unit_price: i64, qty: i64) -> Result<(), OrderReject> {
+    if !is_commodity(item_id) {
+        return Err(OrderReject::NotACommodity);
+    }
+    if unit_price <= 0 || unit_price % PRICE_TICK_GOLD != 0 {
+        return Err(OrderReject::BadPrice);
+    }
+    if !(MIN_ORDER_QTY..=MAX_ORDER_QTY).contains(&qty) {
+        return Err(OrderReject::BadQty);
+    }
+    Ok(())
+}
+
 // --- Equipment & abilities (mining/abilities epic #123) ---------------------
 //
 // A tiny slice of a bigger future system: one equipment slot ("tool") and one

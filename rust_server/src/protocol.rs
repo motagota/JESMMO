@@ -203,6 +203,41 @@ pub const C_WAREHOUSE_WITHDRAW: &str = "warehouse.withdraw";
 // (rows), not units.
 pub const S_WAREHOUSE_STATE: &str = "warehouse.state";
 
+// --- market order book (issue #139) ---------------------------------------------
+// All three share market.open's server-side range gate and carry a
+// client-generated `command_id`, deduped server-side so a reconnect-and-resend
+// can't place or buy twice. The commodity key is `item_id` ALONE (no quality
+// system exists); only stackable items are commodities, and tools go to the
+// listing board (#142) instead.
+//
+// {command_id, item_id, unit_price, qty} -- rest a SELL order. Escrows the
+// goods out of your warehouse at this market (available -> locked) and rests
+// the order for exactly what could be escrowed, never a promise you can't keep.
+pub const C_MARKET_SELL: &str = "market.sell";
+// {command_id, item_id, unit_price, qty} -- buy IMMEDIATELY against the book.
+// Never rests: whatever can't fill now simply isn't bought. Sweeps
+// cheapest-first, and every fill executes at the RESTING order's price, not
+// your limit -- price improvement goes to whoever crosses the spread. Bounded
+// by your limit, your gold, the resting size, and your own warehouse capacity.
+pub const C_MARKET_BUY: &str = "market.buy";
+// {command_id, order_id} -- cancel your own resting order; unsold escrow
+// returns to available.
+pub const C_MARKET_CANCEL: &str = "market.cancel";
+// {item_id} -- ask for one commodity's depth without waiting for a change.
+pub const C_MARKET_BOOK_REQUEST: &str = "market.book_request";
+// {market_id, item_id, asks: [{price, qty}], bids: [...]} -- depth AGGREGATED
+// by price level. Individual order ownership is never broadcast: it keeps the
+// message small and stops players reading each other's positions. Pushed to the
+// whole district on any change (markets are per-district, so this is cheap;
+// the design doc's MarketSubscribe is the upgrade path if it stops being).
+pub const S_MARKET_BOOK: &str = "market.book";
+// {market_id, orders: [{order_id, side, item_id, unit_price, qty_total,
+// qty_remaining}]} -- YOUR resting orders only, pushed on market.open and
+// after any change to them.
+pub const S_MARKET_ORDERS: &str = "market.orders";
+// {market_id, item_id, unit_price, qty} -- a fill just happened; the ticker.
+pub const S_MARKET_TRADE: &str = "market.trade";
+
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control

@@ -235,6 +235,29 @@ const S_MARKET_ERROR := "market.error"
 const C_WAREHOUSE_DEPOSIT := "warehouse.deposit"
 const C_WAREHOUSE_WITHDRAW := "warehouse.withdraw"
 const S_WAREHOUSE_STATE := "warehouse.state"
+## Order book (#139). All carry a client-generated `command_id`, deduped
+## server-side so a reconnect-and-resend can't place or buy twice, and all
+## share `market.open`'s range gate.
+## - `market.sell {command_id, item_id, unit_price, qty}` rests a sell,
+##   escrowing the goods out of your warehouse here.
+## - `market.buy {…}` executes IMMEDIATELY against the book and never rests;
+##   every fill pays the RESTING price, not your limit, so crossing the
+##   spread keeps the price improvement.
+## - `market.cancel {command_id, order_id}` returns unsold escrow.
+## - `market.book_request {item_id}` → `market.book {market_id, item_id,
+##   asks, bids}`, depth aggregated by price level with no ownership.
+## - `market.orders` is YOUR resting orders; `market.trade` is the ticker.
+const C_MARKET_SELL := "market.sell"
+const C_MARKET_BUY := "market.buy"
+const C_MARKET_CANCEL := "market.cancel"
+const C_MARKET_BOOK_REQUEST := "market.book_request"
+const S_MARKET_BOOK := "market.book"
+const S_MARKET_ORDERS := "market.orders"
+const S_MARKET_TRADE := "market.trade"
+## Display-only mirrors of the server's order rules (world.rs).
+const PRICE_TICK_GOLD := 1
+const MIN_ORDER_QTY := 1
+const MAX_ORDER_QTY := 10000
 ## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
 ## the panel; the server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0
