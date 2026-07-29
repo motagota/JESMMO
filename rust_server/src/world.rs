@@ -709,10 +709,28 @@ pub fn capital() -> Capital {
     let town_centre = (WORLD_SIZE / 2, WORLD_SIZE / 2);
     let (tcx, tcy) = town_centre;
 
-    // No authored build orders: the capital starts with none. City work (starting
-    // with dirt paths) is commissioned at runtime by the mayor via `mayor.build_create`
-    // rather than authored here — see `Db::insert_build_order`'s placement fields.
-    let build_orders: Vec<SeedBuildOrder> = vec![];
+    // Authored build orders. The capital had none for a long time — city work
+    // (starting with dirt paths) is commissioned at runtime by the mayor via
+    // `mayor.build_create`. The Market (market epic #136, issue #137) is the
+    // first authored one: it must exist as a fixed, findable place before any
+    // trading can hang off it, and it's deliberately player-BUILT rather than
+    // pre-placed, so a fresh server's first market is a community effort.
+    //
+    // Sited 100m east of the town centre: a short walk from spawn, and clear
+    // of the storehouse (12830, 12810) and build board (12770, 12810) by more
+    // than their interaction ranges, so their panels don't all stack open at
+    // once.
+    let build_orders: Vec<SeedBuildOrder> = vec![SeedBuildOrder {
+        district: "civic",
+        kind: "market",
+        required_json: r#"{"wood":50,"stone":30}"#,
+        prereq: None,
+        structure_kind: "market",
+        structure_x: tcx + 100,
+        structure_y: tcy,
+        required_skill: None,
+        required_level: 0,
+    }];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
     // spawn finds wood immediately) plus wood/stone spread through every
@@ -1011,10 +1029,21 @@ mod tests {
     }
 
     #[test]
-    fn capital_authors_no_roads_or_build_orders() {
+    fn capital_authors_only_the_market_build_order() {
         let c = capital();
-        // Roads and city work are commissioned at runtime by the mayor now, not authored.
-        assert!(c.build_orders.is_empty(), "the capital should start with no seeded build orders");
+        // Roads and most city work are commissioned at runtime by the mayor,
+        // not authored. The Market (#137) is the deliberate exception: trading
+        // needs a fixed, findable place to hang off, so it's authored — but
+        // still player-BUILT, seeding `open` rather than pre-placed.
+        assert_eq!(c.build_orders.len(), 1, "only the market is authored");
+        let m = &c.build_orders[0];
+        assert_eq!((m.kind, m.structure_kind), ("market", "market"));
+        assert!(m.prereq.is_none(), "nothing gates the market — it's the root of the trade tree");
+        assert_eq!(m.required_level, 0, "and no skill gate keeps newcomers out of the economy");
+        // Sited inside its own district, within a short walk of spawn.
+        let (tcx, tcy) = c.town_centre;
+        assert_eq!(c.district_at(m.structure_x, m.structure_y).map(|d| d.id), Some(m.district));
+        assert!((m.structure_x - tcx).pow(2) + (m.structure_y - tcy).pow(2) < 200 * 200);
     }
 
     #[test]

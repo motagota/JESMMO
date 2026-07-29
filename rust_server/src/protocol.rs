@@ -170,6 +170,22 @@ pub const C_RENT_SET_AUTOPAY: &str = "rent.set_autopay"; // {plot_id, enabled} -
 // `reason` is a short tag ("build_wages") for client feedback and telemetry.
 pub const S_GOLD_UPDATE: &str = "gold.update";
 
+// --- market.* — player-to-player trading (market epic #136, issue #137) ---------
+// {} -- ask to trade at whatever market you're standing next to. Deliberately
+// carries NO market id: the server resolves it from the caller's live position
+// like every other proximity-gated action, so a client can't name a market it
+// isn't at. Answered with market.opened, or market.error when nothing's in
+// range. This is the subsystem's first command and establishes the range gate
+// (MARKET_RANGE, server-enforced) that every later market command inherits.
+pub const C_MARKET_OPEN: &str = "market.open";
+// {market_id, x, y} -- you're at a built market and may trade. `market_id` is
+// the completed build order's own id; books/warehouses/listings are keyed by it
+// from day one, since per-market state is the point of the design even though
+// only the capital's market exists in v1.
+pub const S_MARKET_OPENED: &str = "market.opened";
+// {code, detail} -- a market command was refused ("out_of_range", ...).
+pub const S_MARKET_ERROR: &str = "market.error";
+
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control

@@ -30,6 +30,7 @@ var _minimap: Minimap
 var _storage: StoragePanel
 var _inventory: InventoryPanel
 var _build: BuildPanel
+var _market: MarketPanel
 var _skills: SkillsPanel
 var _craft: CraftPanel
 var _build_place: BuildPlace
@@ -64,6 +65,9 @@ var _seeded_position := false
 var _skill_levels: Dictionary = {}
 var _sleep_down := false
 var _rent_panel_down := false
+## The market entity we've already announced arrival at (#137), so stepping up
+## to one sends `market.open` exactly once rather than every frame in range.
+var _market_entity := ""
 
 func _ready() -> void:
     _editor_mode = OS.get_cmdline_user_args().has("--editor-mode") \
@@ -107,6 +111,10 @@ func _ready() -> void:
     _build = BuildPanel.new()
     _build.visible = false
     add_child(_build)
+
+    _market = MarketPanel.new()
+    _market.visible = false
+    add_child(_market)
 
     _skills = SkillsPanel.new()
     add_child(_skills)
@@ -167,6 +175,18 @@ func _process(_delta: float) -> void:
     _build.show_panel(near_board or not near_cell.is_empty())
     var near_craft := _entities.nearest_crafting(_player.world_pos(), Protocol.STORAGE_RANGE) != ""
     _craft.show_panel(near_craft)
+
+    # The market (#137). Stepping into range announces arrival ONCE — the
+    # server re-checks range itself and answers with the market's id, so the
+    # panel only ever shows what the server already agreed to.
+    var market_entity := _entities.nearest_market(_player.world_pos(), Protocol.MARKET_RANGE)
+    if market_entity != _market_entity:
+        _market_entity = market_entity
+        if market_entity != "":
+            _net.send_market_open()
+        else:
+            _market.set_market("") # walked away: stop showing it as tradable
+    _market.show_panel(market_entity != "")
 
     # E purely talks to the nearest NPC in range (#127) — bare-hands resource
     # interaction doesn't exist anymore, every resource is ability-swing-gated
@@ -325,8 +345,12 @@ func _wire_signals() -> void:
     # just tallied.
     _net.gold_update.connect(func(gold, delta, _reason):
         _hud.set_gold(gold)
+        _market.set_gold(gold)
         if delta > 0:
             _hud.flash_gain("gold", delta))
+    # Market (#137): the server confirmed we're at a real one and may trade.
+    _net.market_opened.connect(func(market_id, _x, _y): _market.set_market(market_id))
+    _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
     _net.rent_status.connect(_on_rent_status)
     _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))
@@ -545,6 +569,7 @@ func _on_plot_assigned(plot_id: String, district: String, bounds: Dictionary, _t
 func _on_rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int) -> void:
     _hud.set_rent_hint(state, due_at)
     _hud.set_gold(gold) # seeds the purse readout at login, before any wage lands
+    _market.set_gold(gold)
     _rent.set_status(plot_id, due_at, paid_through, state, auto_pay, gold)
 
 ## The client already knows every zone's district from `partition`, so it

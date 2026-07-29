@@ -80,6 +80,10 @@ signal road_demolition_planned(order_id: String, demo_order_id: String)
 ## exact shapes.
 signal road_cells(order_id: String, cells: Array)
 signal road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool)
+## Market (#137): you're standing at a built market and may trade, or the
+## command was refused (out of range, no market built yet).
+signal market_opened(market_id: String, x: int, y: int)
+signal market_error(code: String, detail: String)
 signal home_respawn_set(bed_id: String)
 ## The character's gold balance changed (#145) — `delta` is signed, `reason`
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
@@ -288,6 +292,15 @@ func _handle_text(text: String) -> void:
                 msg.get("required", {}),
                 msg.get("progress", {}),
                 bool(msg.get("completed", false)))
+        Protocol.S_MARKET_OPENED:
+            market_opened.emit(
+                String(msg.get("market_id", "")),
+                int(msg.get("x", 0)),
+                int(msg.get("y", 0)))
+        Protocol.S_MARKET_ERROR:
+            market_error.emit(
+                String(msg.get("code", "")),
+                String(msg.get("detail", "market command refused")))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),
@@ -470,6 +483,11 @@ func send_road_cancel(order_id: String) -> void:
 ## Post a demolition order for a built/part-built road (#106, editor only).
 func send_road_demolish(order_id: String) -> void:
     _send({"type": Protocol.C_ROAD_DEMOLISH, "order_id": order_id})
+
+## Ask to trade at the market you're standing next to (#137). No id: the
+## server resolves and range-checks it from your live position.
+func send_market_open() -> void:
+    _send({"type": Protocol.C_MARKET_OPEN})
 
 ## Ask for a road order's full cell list (#134) — no role restriction, a
 ## stateless read like terrain/object list requests. Answered with

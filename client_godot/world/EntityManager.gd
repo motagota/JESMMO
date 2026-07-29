@@ -58,6 +58,11 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 	_entities[id]["item_id"] = String(state.get("item_id", ""))
 	_entities[id]["qty"] = int(state.get("qty", 0))
 	_entities[id]["name"] = String(state.get("name", ""))
+	# Completed city structures all share `state.type == "structure"` and
+	# distinguish themselves by `state.kind` (dirt_road, market, ...) — unlike
+	# authored fixtures and home structures, which use their own kind AS the
+	# type. Keep it so a built fixture can be found by what it is (#137).
+	_entities[id]["structure_kind"] = String(state.get("kind", ""))
 
 ## The id of the nearest live resource node within `max_dist` world units of
 ## `from` (world coords), or "" if none. Used by the gather interaction.
@@ -102,6 +107,24 @@ func nearest_bed(from: Vector2, max_dist: float) -> String:
 ## The id of the nearest crafting station within `max_dist`, or "" if none (#12).
 func nearest_crafting(from: Vector2, max_dist: float) -> String:
 	return _nearest(from, max_dist, "crafting", false)
+
+## The nearest BUILT market (#137). Unlike the authored storehouse/build board,
+## a market is a completed city build order, so it arrives as
+## `type == "structure"` carrying `kind == "market"` — matched on the stored
+## `structure_kind` rather than the entity type. The server enforces the same
+## range independently; this only decides whether to show the panel.
+func nearest_market(from: Vector2, max_dist: float) -> String:
+	var best := ""
+	var best_d := max_dist
+	for id in _entities:
+		var rec: Dictionary = _entities[id]
+		if rec.get("kind", "") != "structure" or rec.get("structure_kind", "") != "market":
+			continue
+		var d := from.distance_to(rec.get("wpos", Vector2.ZERO))
+		if d <= best_d:
+			best_d = d
+			best = id
+	return best
 
 ## Whether a proposed footprint — `corner` (world units, top-left) sized
 ## `footprint` — would overlap any already-placed home structure (bed/storage/
@@ -216,13 +239,23 @@ func _make_node(kind: String, state: Dictionary, id := "") -> MeshInstance3D:
 		"structure":
 			# A completed city structure (well/wall/stall). A pale stone block labelled
 			# with its kind; the authored kind rides in state.kind.
+			var structure_kind := String(state.get("kind", ""))
 			var block := BoxMesh.new()
-			block.size = Vector3(3.0, 2.4, 3.0)
-			mi.mesh = block
-			mi.material_override = _solid(Color(0.75, 0.78, 0.8))
-			var kind_name := String(state.get("kind", "")).capitalize()
-			if kind_name != "":
-				_add_label(mi, kind_name, 2.6, Color(0.85, 0.95, 1.0))
+			if structure_kind == "market":
+				# The market (#137) is a destination, not scenery — bigger and
+				# warmer than a generic civic block so it reads as somewhere to
+				# walk TO from across the town centre.
+				block.size = Vector3(5.0, 3.2, 5.0)
+				mi.mesh = block
+				mi.material_override = _solid(Color(0.72, 0.52, 0.28))
+				_add_label(mi, "⚖ Market", 3.6, Color(1.0, 0.88, 0.55))
+			else:
+				block.size = Vector3(3.0, 2.4, 3.0)
+				mi.mesh = block
+				mi.material_override = _solid(Color(0.75, 0.78, 0.8))
+				var kind_name := structure_kind.capitalize()
+				if kind_name != "":
+					_add_label(mi, kind_name, 2.6, Color(0.85, 0.95, 1.0))
 		"bed":
 			# A home bed: a low, warm-toned slab (the respawn anchor, #12).
 			var frame := BoxMesh.new()

@@ -215,6 +215,20 @@ const S_RENT_WARNING := "rent.warning"
 const S_RENT_RECLAIMED := "rent.reclaimed"
 const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 
+# --- gameplay: market — player-to-player trading (epic #136, #137) ------------
+## `market.open {}` — ask to trade at whatever market you're standing next to.
+## Deliberately carries no id: the server resolves it from your live position
+## like every other proximity-gated action, and enforces `MARKET_RANGE`
+## itself, so this panel being open is never what authorises a trade.
+## Answered with `market.opened {market_id, x, y}` or `market.error {code,
+## detail}`.
+const C_MARKET_OPEN := "market.open"
+const S_MARKET_OPENED := "market.opened"
+const S_MARKET_ERROR := "market.error"
+## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
+## the panel; the server's own check is what actually gates trading.
+const MARKET_RANGE := 60.0
+
 # --- gameplay: gold balance (build wages, #145) -------------------------------
 ## `{gold, delta, reason}` — the authoritative balance after it changed, what
 ## moved, and why. Until #145 gold only ever changed at rent time, so

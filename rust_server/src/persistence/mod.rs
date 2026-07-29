@@ -3295,12 +3295,20 @@ mod tests {
         db.seed_capital(&cap, 100).await.unwrap();
         let plots = db.plot_count().await.unwrap();
         assert_eq!(plots, cap.starter_plots().len() as i64);
-        // No build orders are authored — city work is commissioned at runtime.
-        assert!(db.build_orders_for_district("civic").await.unwrap().is_empty());
+        // The Market (#137) is the one authored order — seeded `open`, i.e.
+        // still to be built. Everything else is mayor-commissioned at runtime.
+        let seeded = db.build_orders_for_district("civic").await.unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!((seeded[0].kind.as_str(), seeded[0].state.as_str()), ("market", "open"));
 
-        // Re-seed (simulating a restart): no duplicate plots.
+        // Re-seed (simulating a restart): no duplicate plots, and no duplicate
+        // build orders — each authored kind is created at most once per district.
         db.seed_capital(&cap, 200).await.unwrap();
         assert_eq!(db.plot_count().await.unwrap(), plots);
+        assert_eq!(
+            db.build_orders_for_district("civic").await.unwrap().len(), 1,
+            "re-seeding must not duplicate the market"
+        );
 
         // A fresh character can claim one of the seeded starter plots.
         let cid = a_character(&db).await;

@@ -92,6 +92,12 @@ const ROAD_MAX_POINTS: usize = 64;
 /// and built independently — see `cut_road_cells`.
 const ROAD_CELL_LEN_M: f64 = 5.0;
 
+/// How close a player must stand to a built Market to trade at it (market
+/// epic #136, issue #137). Enforced SERVER-side on every market command, not
+/// merely used to show the panel: the design is explicit that opening the UI
+/// out of range is refused, not just hidden.
+const MARKET_RANGE: i32 = 60;
+
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
 /// minted once at character creation (500, migration 0006) and only ever
@@ -2335,6 +2341,52 @@ impl Proxy {
                     self.push_to_player(pid, structure_status_json(&o.kind, &p, o.path_json.as_deref()));
                 }
             }
+        }
+    }
+
+    /// The BUILT market the player is standing at, as `(market_id, x, y)`, or
+    /// `None` if there isn't one in range (market epic #136, issue #137).
+    ///
+    /// A market is an ordinary completed build order whose `structure_kind` is
+    /// `market` — so "is there a market here" is a DB question, and the order's
+    /// own id **is** the market id. Books, warehouses, and listings are all
+    /// keyed by that id from day one: only the capital's market exists in v1,
+    /// but per-market state is the whole point of the design (#136), and
+    /// retrofitting a key later is worse than carrying one now.
+    async fn market_at(&self, db: &Db, pid: &str) -> Option<(String, i64, i64)> {
+        let (px, py) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y))?;
+        let district = self.capital.district_at(px, py)?.id.to_string();
+        let orders = db.build_orders_for_district(&district).await.ok()?;
+        orders.iter().find_map(|o| {
+            if o.state != "completed" || o.structure_kind.as_deref() != Some("market") {
+                return None;
+            }
+            let (x, y) = (o.x?, o.y?);
+            (dist2(px, py, x as i32, y as i32) <= (MARKET_RANGE as i64).pow(2))
+                .then(|| (o.id.clone(), x, y))
+        })
+    }
+
+    /// Apply `market.open` (#137): the client asking to trade at whatever
+    /// market it's standing next to. Deliberately carries no market id — the
+    /// server resolves it from the caller's live position, exactly like every
+    /// other proximity-gated action here, so a client can't name a market it
+    /// isn't at. Answered with `market.opened {market_id}`, or `market.error`
+    /// when there's no built market in range.
+    ///
+    /// This is the market subsystem's first command, and it establishes the
+    /// range gate every later one inherits (`market_at` returning `None` IS
+    /// the refusal).
+    async fn apply_market_open(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        match self.market_at(&db, pid).await {
+            Some((market_id, x, y)) => self.push_to_player(pid, json!({
+                "type": "market.opened", "market_id": market_id, "x": x, "y": y,
+            })),
+            None => self.push_to_player(pid, json!({
+                "type": "market.error", "code": "out_of_range",
+                "detail": "stand at a built market to trade",
+            })),
         }
     }
 
@@ -4705,6 +4757,14 @@ impl Proxy {
                     // as `terrain.edit_op` and `mayor.build_create`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("road.plan") {
                         self.apply_road_plan(&player_id, data).await;
+                        continue;
+                    }
+                    // `market.open` (#137) resolves the market from the
+                    // caller's live position, so it's answered here with the
+                    // gateway's position cache rather than round-tripping the
+                    // zone — same as `build_contribute`'s own proximity gate.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
+                        self.apply_market_open(&player_id).await;
                         continue;
                     }
                     // `road.cells_request` (#134) is a stateless read, same
@@ -9516,6 +9576,76 @@ mod tests {
             .unwrap();
         recv_until(&mut ws, "build.completed").await;
         assert_eq!(db.build_order_by_id(&order.id).await.unwrap().unwrap().state, "completed");
+
+        drop(ws);
+    }
+
+    /// The Market (#137): it must be BUILT before it can be traded at, the
+    /// range gate is enforced server-side (not merely hidden client-side), and
+    /// the market id is the completed order's own — never something the client
+    /// names, so it can't claim to be at a market it isn't at.
+    #[tokio::test]
+    async fn market_open_requires_a_built_market_in_range() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        // The real gateway seeds the authored capital at boot; the test
+        // harness doesn't, so do it here to get the authored market order.
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // The authored market order seeds `open` (unbuilt) at boot.
+        let orders = db.build_orders_for_district("civic").await.unwrap();
+        let market = orders.iter().find(|o| o.kind == "market").expect("the market is authored");
+        assert_eq!(market.state, "open", "a fresh capital's market is unbuilt");
+        let (mx, my) = (market.x.unwrap(), market.y.unwrap());
+
+        let email = format!("trader_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Trader"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Standing right on the site, but nothing is built there yet: refused.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: mx as i32, y: my as i32, hp: 100 });
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range", "an unbuilt market can't be traded at");
+
+        // Build it for real, through the ordinary contribution flow. Its
+        // 80-unit cost exceeds `MAX_CARRY` (50), so it takes two trips — a
+        // deliberate property of a civic build this size, not a test quirk.
+        for (item, qty) in [("wood", 50), ("stone", 30)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "gather_yield", "player_id": pid,
+                    "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+                }).to_string()))
+                .unwrap();
+            recv_until(&mut ws, "inv.update").await;
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": market.id, "item_id": item, "qty": qty,
+                }).to_string()))
+                .unwrap();
+        }
+        recv_until(&mut ws, "build.completed").await;
+
+        // Now in range of a BUILT market: accepted, and the id is the order's.
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(opened["market_id"].as_str().unwrap(), market.id, "market id is the order's own id");
+        assert_eq!((opened["x"].as_i64(), opened["y"].as_i64()), (Some(mx), Some(my)));
+
+        // Walk out of range: refused again, even though it's built. Range is
+        // enforced here, not merely used to hide the panel.
+        proxy.entity_state.lock().unwrap().insert(
+            pid.clone(), EntityCache { x: mx as i32 + MARKET_RANGE + 5, y: my as i32, hp: 100 },
+        );
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
 
         drop(ws);
     }
