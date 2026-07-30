@@ -112,6 +112,9 @@ const MARKET_COMMANDS_PER_MINUTE: i64 = 60;
 const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How many listings one browse of the board returns (#142).
 const LISTING_PAGE_LIMIT: i64 = 100;
+/// How often the trade ledger is rolled into candles (#143). A background
+/// cadence — aggregation must never sit in front of a trade.
+const CANDLE_ROLLUP_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
@@ -2861,6 +2864,60 @@ impl Proxy {
         true
     }
 
+    /// Roll the trade ledger into OHLCV candles and prune old ones (#143).
+    ///
+    /// A background job on purpose: aggregation never sits in front of a trade.
+    /// It re-rolls a window that overlaps the current bucket rather than only
+    /// the closed one, because the in-progress hour keeps changing — and the
+    /// rollup is idempotent, so redoing it costs nothing but CPU.
+    async fn candle_rollup(self: Arc<Self>) {
+        loop {
+            sleep(CANDLE_ROLLUP_INTERVAL).await;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            let interval = mmo::world::CANDLE_INTERVAL_SECS;
+            // Two intervals back, so a late-arriving trade in the previous
+            // bucket is still picked up.
+            let from = mmo::world::candle_bucket(now, interval) - interval;
+            if let Err(e) = db.roll_up_candles(interval, from, now + 1).await {
+                eprintln!("[Proxy] candle rollup: {e}");
+                continue;
+            }
+            let cutoff = mmo::world::candle_bucket(
+                now - mmo::world::HISTORY_RETAIN_DAYS * 86_400,
+                interval,
+            );
+            match db.prune_candles(cutoff).await {
+                Ok(n) if n > 0 => println!("[Proxy] MARKET: pruned {n} candle(s) past retention"),
+                Ok(_) => {}
+                Err(e) => eprintln!("[Proxy] candle prune: {e}"),
+            }
+        }
+    }
+
+    /// Answer `market.history_request` (#143) with a commodity's candles.
+    async fn send_history(&self, pid: &str, market_id: &str, item_id: &str, days: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let interval = mmo::world::CANDLE_INTERVAL_SECS;
+        let now = now_secs();
+        let days = days.clamp(1, mmo::world::HISTORY_RETAIN_DAYS);
+        let from = mmo::world::candle_bucket(now - days * 86_400, interval);
+        let Ok(candles) = db.candles(market_id, item_id, interval, from, now + interval).await else {
+            return;
+        };
+        let arr: Vec<Value> = candles
+            .iter()
+            .map(|c| json!({
+                "t": c.bucket_start, "o": c.open, "h": c.high, "l": c.low,
+                "c": c.close, "v": c.volume, "n": c.trades,
+            }))
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "market.history", "market_id": market_id, "item_id": item_id,
+            "interval_secs": interval, "candles": arr,
+        }));
+    }
+
     /// Release the escrow of every expired order (#140), then tell each owner.
     /// An order left resting holds goods or gold hostage, so this is what
     /// stops a forgotten order stranding them forever.
@@ -5317,6 +5374,18 @@ impl Proxy {
                         }
                         continue;
                     }
+                    // `market.history_request` (#143): a stateless read of the
+                    // derived candle cache.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.history_request") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let days = data.get("days").and_then(|v| v.as_i64()).unwrap_or(7);
+                        if let Some(db) = self.db.clone() {
+                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                                self.send_history(&player_id, &market_id, &item_id, days).await;
+                            }
+                        }
+                        continue;
+                    }
                     // `market.book_request` (#139): a stateless read of one
                     // commodity's depth, so the client can look at a book
                     // without waiting for someone else's trade to push one.
@@ -5590,6 +5659,10 @@ impl Proxy {
         // back for.
         let me = self.clone();
         tokio::spawn(async move { me.sweep_expired_orders().await });
+
+        // Price-history rollup (#143): ledger -> candles, off the trade path.
+        let me = self.clone();
+        tokio::spawn(async move { me.candle_rollup().await });
 
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
@@ -10747,6 +10820,108 @@ mod tests {
             "seller paid the ask net of sale tax"
         );
         assert!(db.listing_by_id(&listing_id).await.unwrap().is_none(), "the listing is gone");
+
+        drop(seller);
+        drop(buyer);
+    }
+
+    /// Price history over the wire (#143): real trades roll up into candles a
+    /// client can ask for.
+    #[tokio::test]
+    async fn market_history_answers_with_candles_from_real_trades() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("hs_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "HistSeller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("hb_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "HistBuyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // An empty history is an empty list, not an error or a fake candle.
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(
+            json!({"type": "market.history_request", "item_id": "wood"}).to_string(),
+        )).await.unwrap();
+        let h = recv_until(&mut buyer, "market.history").await;
+        assert_eq!(h["item_id"].as_str().unwrap(), "wood");
+        assert_eq!(h["interval_secs"].as_i64(), Some(mmo::world::CANDLE_INTERVAL_SECS));
+        assert!(h["candles"].as_array().unwrap().is_empty(), "no trades yet, so no candles");
+
+        // Trade for real.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        loop {
+            let v = recv_until(&mut seller, "inv.update").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["item_id"] == "wood") {
+                break;
+            }
+        }
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        )).await.unwrap();
+        recv_until(&mut seller, "warehouse.state").await;
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "h1", "item_id": "wood", "unit_price": 11, "qty": 20,
+        }).to_string())).await.unwrap();
+        recv_until(&mut seller, "market.orders").await;
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "h2", "item_id": "wood", "unit_price": 11, "qty": 7,
+        }).to_string())).await.unwrap();
+        for _ in 0..40 {
+            if !db.recent_trades(&market.id, "wood", 5).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The rollup is a background job on a slow cadence, so drive it
+        // directly rather than waiting minutes for the timer.
+        let now = now_secs();
+        db.roll_up_candles(mmo::world::CANDLE_INTERVAL_SECS, 0, now + 1).await.unwrap();
+
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(
+            json!({"type": "market.history_request", "item_id": "wood", "days": 1}).to_string(),
+        )).await.unwrap();
+        let h = loop {
+            let v = recv_until(&mut buyer, "market.history").await;
+            if !v["candles"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let candles = h["candles"].as_array().unwrap();
+        assert_eq!(candles.len(), 1);
+        let c = &candles[0];
+        assert_eq!((c["o"].as_i64(), c["h"].as_i64(), c["l"].as_i64(), c["c"].as_i64()),
+            (Some(11), Some(11), Some(11), Some(11)), "one price, so OHLC all agree");
+        assert_eq!(c["v"].as_i64(), Some(7), "volume is units traded");
+        assert_eq!(c["n"].as_i64(), Some(1), "one fill");
+        assert_eq!(
+            c["t"].as_i64().unwrap() % mmo::world::CANDLE_INTERVAL_SECS, 0,
+            "a bucket start is always a multiple of the interval"
+        );
 
         drop(seller);
         drop(buyer);

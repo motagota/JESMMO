@@ -266,6 +266,14 @@ const DEFAULT_ORDER_HOURS := 24
 ## `market.fees {market_id, listing_fee, sale_tax}` — what the house took from
 ## your last command (#141).
 const S_MARKET_FEES := "market.fees"
+## Price history (#143). `market.history_request {item_id, days?}` reads the
+## DERIVED candle cache — the trade ledger is the source of truth and a
+## background job rolls it up, so asking never blocks a trade.
+## `market.history {market_id, item_id, interval_secs, candles}` answers with
+## `{t, o, h, l, c, v, n}` per bucket, oldest first. ABSENT buckets mean no
+## trades and must render as a GAP, never a carried-forward flat price.
+const C_MARKET_HISTORY_REQUEST := "market.history_request"
+const S_MARKET_HISTORY := "market.history"
 ## Listing board for unique items (#142). A tool's durability makes it
 ## individually priced, so uniques are offered one at a time at a fixed ask
 ## rather than on a book. `listing.buy` carries `expected_price` — a listing

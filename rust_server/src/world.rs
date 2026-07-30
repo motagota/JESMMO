@@ -318,6 +318,27 @@ pub fn sale_tax(value: i64) -> i64 {
     div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN).max(1)
 }
 
+// --- Price history (epic #136, issue #143) -----------------------------------
+
+/// The candle resolution the rollup materialises. One hour: fine enough to see
+/// a price move within a play session, coarse enough that a month of history is
+/// a few hundred rows per commodity.
+pub const CANDLE_INTERVAL_SECS: i64 = 3600;
+/// How long candles are kept. The ledger they're derived from is never pruned —
+/// only this cache is, so old history can always be rebuilt if wanted.
+pub const HISTORY_RETAIN_DAYS: i64 = 30;
+
+/// The bucket a timestamp belongs to: the interval's opening second. Flooring
+/// (not rounding) is what makes a trade land in exactly one bucket, including
+/// one landing precisely on a boundary — it opens the new interval rather than
+/// closing the old one.
+pub fn candle_bucket(at: i64, interval_secs: i64) -> i64 {
+    if interval_secs <= 0 {
+        return at;
+    }
+    at.div_euclid(interval_secs) * interval_secs
+}
+
 /// Why an order was refused, as a stable code for the wire (#139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderReject {

@@ -1126,6 +1126,19 @@ impl ListingReject {
     }
 }
 
+/// One OHLCV candle of price history (#143). Derived from the trade ledger;
+/// never authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Candle {
+    pub bucket_start: i64,
+    pub open: i64,
+    pub high: i64,
+    pub low: i64,
+    pub close: i64,
+    pub volume: i64,
+    pub trades: i64,
+}
+
 /// One aggregated price level of a book — what the client is shown (#139).
 /// Individual order ownership is deliberately NOT part of this: it keeps the
 /// broadcast small and stops players reading each other's positions.
@@ -2352,6 +2365,157 @@ impl Db {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    // --- Price history (epic #136, issue #143) -----------------------------
+
+    /// Recompute the OHLCV candles covering `[from, to)` from the trade ledger
+    /// (#143), replacing whatever was cached for those buckets.
+    ///
+    /// The aggregation is done in Rust rather than SQL on purpose: open and
+    /// close are the FIRST and LAST trade in a bucket by insertion order, which
+    /// in SQL needs window functions or correlated subqueries to express and is
+    /// easy to get subtly wrong. Folding an ordered stream is obviously
+    /// correct, and this is a background job — it doesn't need to be clever.
+    ///
+    /// Idempotent: running it twice over the same range produces the same rows,
+    /// which is what lets it be both an incremental job and a full rebuild.
+    pub async fn roll_up_candles(
+        &self,
+        interval_secs: i64,
+        from: i64,
+        to: i64,
+    ) -> Result<i64, DbError> {
+        if interval_secs <= 0 || to <= from {
+            return Ok(0);
+        }
+        // Ordered by insertion (`rowid`) within a timestamp, so "first" and
+        // "last" in a bucket mean what they say — the same reason
+        // `recent_trades` can't tie-break on a random UUID (#140).
+        let trades = sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+            "SELECT market_id, item_id, unit_price, qty, created_at FROM market_trade \
+             WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, rowid ASC",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // (market, item, bucket) -> candle, folded in ledger order.
+        let mut acc: BTreeMap<(String, String, i64), Candle> = BTreeMap::new();
+        for (market_id, item_id, price, qty, at) in trades {
+            let bucket = world::candle_bucket(at, interval_secs);
+            acc.entry((market_id, item_id, bucket))
+                .and_modify(|c| {
+                    c.high = c.high.max(price);
+                    c.low = c.low.min(price);
+                    c.close = price; // later trade wins
+                    c.volume += qty;
+                    c.trades += 1;
+                })
+                .or_insert(Candle {
+                    bucket_start: bucket,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: qty,
+                    trades: 1,
+                });
+        }
+
+        let mut tx = self.pool.begin().await?;
+        // Clear the range first, so a bucket that no longer has trades (a
+        // ledger correction, or a narrowed rebuild) disappears rather than
+        // lingering as a stale candle.
+        sqlx::query(
+            "DELETE FROM market_candle WHERE interval_secs = ? \
+             AND bucket_start >= ? AND bucket_start < ?",
+        )
+        .bind(interval_secs)
+        .bind(world::candle_bucket(from, interval_secs))
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+        let written = acc.len() as i64;
+        for ((market_id, item_id, _), c) in &acc {
+            sqlx::query(
+                "INSERT INTO market_candle (market_id, item_id, interval_secs, bucket_start, \
+                 open, high, low, close, volume, trades) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(market_id)
+            .bind(item_id)
+            .bind(interval_secs)
+            .bind(c.bucket_start)
+            .bind(c.open)
+            .bind(c.high)
+            .bind(c.low)
+            .bind(c.close)
+            .bind(c.volume)
+            .bind(c.trades)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    /// Rebuild every candle from the whole ledger (#143). Exists because the
+    /// cache must be provably derived: a from-scratch rebuild has to reproduce
+    /// exactly what the incremental job produced, and a test asserts it does.
+    pub async fn rebuild_all_candles(&self, interval_secs: i64) -> Result<i64, DbError> {
+        let span: Option<(Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT MIN(created_at), MAX(created_at) FROM market_trade")
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((Some(min), Some(max))) = span else {
+            sqlx::query("DELETE FROM market_candle WHERE interval_secs = ?")
+                .bind(interval_secs)
+                .execute(&self.pool)
+                .await?;
+            return Ok(0);
+        };
+        sqlx::query("DELETE FROM market_candle WHERE interval_secs = ?")
+            .bind(interval_secs)
+            .execute(&self.pool)
+            .await?;
+        self.roll_up_candles(interval_secs, min, max + 1).await
+    }
+
+    /// One commodity's candles, oldest first (#143). **Absent buckets are
+    /// absent** — a quiet hour is a gap, not a flat candle at the last price,
+    /// because inventing a price nobody paid is worse than showing nothing.
+    pub async fn candles(
+        &self,
+        market_id: &str,
+        item_id: &str,
+        interval_secs: i64,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Candle>, DbError> {
+        sqlx::query_as::<_, Candle>(
+            "SELECT bucket_start, open, high, low, close, volume, trades FROM market_candle \
+             WHERE market_id = ? AND item_id = ? AND interval_secs = ? \
+             AND bucket_start >= ? AND bucket_start < ? ORDER BY bucket_start ASC",
+        )
+        .bind(market_id)
+        .bind(item_id)
+        .bind(interval_secs)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Drop candles older than the retention window (#143). Touches ONLY the
+    /// derived cache — `market_trade` is append-only and is never pruned, so
+    /// pruned history can always be rebuilt.
+    pub async fn prune_candles(&self, before: i64) -> Result<u64, DbError> {
+        let res = sqlx::query("DELETE FROM market_candle WHERE bucket_start < ?")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     /// Total gold burned as market fees (#141) — listing fees plus sale tax,
@@ -5488,6 +5652,194 @@ mod tests {
             "min durability skips the worn ones: {healthy:?}"
         );
         assert!(db.listings_for_market(&m, Some("pickaxe"), None, None, 50).await.unwrap().is_empty());
+    }
+
+    // --- Price history (#143) -----------------------------------------------
+
+    /// Write a trade straight onto the ledger. The rollup only reads
+    /// `market_trade`, so a fixture doesn't need the whole matching engine to
+    /// exercise it — and driving it directly is what lets a test pin exact
+    /// timestamps and orderings.
+    async fn a_trade(db: &Db, market: &str, item: &str, price: i64, qty: i64, at: i64) {
+        sqlx::query(
+            "INSERT INTO market_trade (id, market_id, item_id, unit_price, qty, seller_id, \
+             buyer_id, sale_tax_gold, listing_fee_gold, created_at) \
+             VALUES (?, ?, ?, ?, ?, 's', 'b', 0, 0, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(market)
+        .bind(item)
+        .bind(price)
+        .bind(qty)
+        .bind(at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn candles_roll_up_ohlcv_and_leave_quiet_hours_as_gaps() {
+        let (db, _t) = TempDb::open().await;
+        let m = "mkt";
+        const H: i64 = 3600;
+
+        // Hour 0: four trades. Open 10, high 14, low 8, close 12, volume 10.
+        a_trade(&db, m, "wood", 10, 1, 0).await;
+        a_trade(&db, m, "wood", 14, 2, 100).await;
+        a_trade(&db, m, "wood", 8, 3, 200).await;
+        a_trade(&db, m, "wood", 12, 4, 3599).await;
+        // Hour 1: nothing at all.
+        // Hour 2: one trade.
+        a_trade(&db, m, "wood", 20, 5, 2 * H + 10).await;
+
+        db.roll_up_candles(H, 0, 3 * H).await.unwrap();
+        let c = db.candles(m, "wood", H, 0, 3 * H).await.unwrap();
+        assert_eq!(c.len(), 2, "the quiet hour is a GAP, not a fabricated flat candle");
+        assert_eq!(
+            c[0],
+            Candle { bucket_start: 0, open: 10, high: 14, low: 8, close: 12, volume: 10, trades: 4 }
+        );
+        assert_eq!(
+            c[1],
+            Candle { bucket_start: 2 * H, open: 20, high: 20, low: 20, close: 20, volume: 5, trades: 1 }
+        );
+
+        // Open/close follow LEDGER order, not price order — a later cheaper
+        // trade still closes the candle.
+        assert!(c[0].close < c[0].open || c[0].close != c[0].high);
+    }
+
+    #[tokio::test]
+    async fn a_trade_on_an_interval_boundary_lands_in_exactly_one_candle() {
+        let (db, _t) = TempDb::open().await;
+        let m = "mkt";
+        const H: i64 = 3600;
+
+        // One second before the boundary, exactly on it, and one after.
+        a_trade(&db, m, "wood", 5, 1, H - 1).await;
+        a_trade(&db, m, "wood", 6, 1, H).await;
+        a_trade(&db, m, "wood", 7, 1, H + 1).await;
+        db.roll_up_candles(H, 0, 3 * H).await.unwrap();
+        let c = db.candles(m, "wood", H, 0, 3 * H).await.unwrap();
+
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].bucket_start, c[0].trades), (0, 1), "the earlier hour keeps only its own");
+        assert_eq!(
+            (c[1].bucket_start, c[1].trades, c[1].open, c[1].close), (H, 2, 6, 7),
+            "a trade exactly on the boundary OPENS the new hour"
+        );
+        let total: i64 = c.iter().map(|x| x.trades).sum();
+        assert_eq!(total, 3, "every trade counted exactly once");
+    }
+
+    #[tokio::test]
+    async fn candles_are_per_market_and_per_commodity() {
+        let (db, _t) = TempDb::open().await;
+        const H: i64 = 3600;
+        a_trade(&db, "m1", "wood", 10, 1, 10).await;
+        a_trade(&db, "m1", "stone", 99, 1, 20).await;
+        a_trade(&db, "m2", "wood", 50, 1, 30).await;
+        db.roll_up_candles(H, 0, H).await.unwrap();
+
+        assert_eq!(db.candles("m1", "wood", H, 0, H).await.unwrap()[0].close, 10);
+        assert_eq!(db.candles("m1", "stone", H, 0, H).await.unwrap()[0].close, 99);
+        assert_eq!(db.candles("m2", "wood", H, 0, H).await.unwrap()[0].close, 50,
+            "the same commodity at another market has its own price");
+    }
+
+    /// The candles are a DERIVED CACHE (#143). A from-scratch rebuild must
+    /// reproduce exactly what the incremental job produced — otherwise the
+    /// cache is secretly authoritative and losing it loses data.
+    #[tokio::test]
+    async fn rebuilding_candles_from_scratch_reproduces_them_identically() {
+        let (db, _t) = TempDb::open().await;
+        let m = "mkt";
+        const H: i64 = 3600;
+        let mut seed: u64 = 0xc0ffee;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as i64
+        };
+        for i in 0..60 {
+            let at = i * 400 + next() % 300;
+            let item = if next() % 2 == 0 { "wood" } else { "stone" };
+            a_trade(&db, m, item, 1 + next() % 40, 1 + next() % 6, at).await;
+        }
+
+        // Incremental: roll up hour by hour, as the background job does.
+        for h in 0..8 {
+            db.roll_up_candles(H, h * H, (h + 1) * H).await.unwrap();
+        }
+        let incremental = (
+            db.candles(m, "wood", H, 0, 10 * H).await.unwrap(),
+            db.candles(m, "stone", H, 0, 10 * H).await.unwrap(),
+        );
+        assert!(!incremental.0.is_empty() && !incremental.1.is_empty(), "the fixture should produce candles");
+
+        // From scratch: wipe and recompute everything at once.
+        db.rebuild_all_candles(H).await.unwrap();
+        let rebuilt = (
+            db.candles(m, "wood", H, 0, 10 * H).await.unwrap(),
+            db.candles(m, "stone", H, 0, 10 * H).await.unwrap(),
+        );
+        assert_eq!(incremental, rebuilt, "a rebuild must reproduce the cache exactly");
+
+        // And re-running the same range is idempotent, not additive.
+        db.roll_up_candles(H, 0, 10 * H).await.unwrap();
+        assert_eq!(
+            db.candles(m, "wood", H, 0, 10 * H).await.unwrap(), rebuilt.0,
+            "rolling up twice must not double-count"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_history_never_touches_the_trade_ledger() {
+        let (db, _t) = TempDb::open().await;
+        let m = "mkt";
+        const H: i64 = 3600;
+        const DAY: i64 = 86_400;
+        a_trade(&db, m, "wood", 10, 1, 0).await; // old
+        a_trade(&db, m, "wood", 20, 1, 40 * DAY).await; // recent
+        db.roll_up_candles(H, 0, 41 * DAY).await.unwrap();
+        assert_eq!(db.candles(m, "wood", H, 0, 41 * DAY).await.unwrap().len(), 2);
+
+        // Prune everything before day 30.
+        let pruned = db.prune_candles(30 * DAY).await.unwrap();
+        assert_eq!(pruned, 1, "only the out-of-window candle went");
+        let left = db.candles(m, "wood", H, 0, 41 * DAY).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].close, 20);
+
+        // The LEDGER is untouched — which is why pruned history is recoverable.
+        let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_trade")
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(ledger, 2, "the append-only ledger must never be pruned");
+        db.rebuild_all_candles(H).await.unwrap();
+        assert_eq!(
+            db.candles(m, "wood", H, 0, 41 * DAY).await.unwrap().len(), 2,
+            "and so pruned candles can be rebuilt from it"
+        );
+    }
+
+    /// Real trades (not hand-written ledger rows) roll up correctly — proves
+    /// the engine records what the history needs.
+    #[tokio::test]
+    async fn real_trades_produce_history() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 30).await;
+        let buyer = a_character(&db).await;
+        sell(&db, &m, &seller, "wood", 8, 10).await;
+        buy(&db, &m, &buyer, "wood", 8, 6).await;
+
+        let now = now_secs();
+        db.roll_up_candles(world::CANDLE_INTERVAL_SECS, 0, now + 1).await.unwrap();
+        let c = db
+            .candles(&m, "wood", world::CANDLE_INTERVAL_SECS, 0, now + 1)
+            .await
+            .unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].open, c[0].close, c[0].volume), (8, 8, 6));
     }
 
     /// Matching determinism (#136 §12): the same command sequence must produce

@@ -242,6 +242,47 @@ func _process(_delta: float) -> bool:
 	if kept != [[42, 9]]:
 		_fail("the order should place what's still in the form, got %s" % [kept]); return true
 
+	# --- price history (#143) -------------------------------------------------
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	_market._watching = "wood"
+	_market.set_book("wood", [{"price": 8, "qty": 20}], [])
+	if _market._chart == null:
+		_fail("the commodities tab should show a chart"); return true
+	# Hour 1 is deliberately absent: a quiet hour must stay a GAP, because
+	# carrying the last price forward would invent a price nobody paid.
+	var H := 3600
+	_market.set_history("wood", H, [
+		{"t": 0, "o": 10, "h": 14, "l": 8, "c": 12, "v": 10, "n": 4},
+		{"t": 2 * H, "o": 20, "h": 22, "l": 19, "c": 21, "v": 5, "n": 2},
+	])
+	if _market._history.size() != 2:
+		_fail("history should be held for the watched item, got %s" % [_market._history]); return true
+	if _market._chart._candles.size() != 2:
+		_fail("the chart should receive the candles, got %s" % [_market._chart._candles]); return true
+	# The chart spans the whole window (3 buckets) rather than closing the gap
+	# up — otherwise a quiet hour would silently vanish from the timeline.
+	var span: int = (int(_market._chart._candles[1]["t"]) - int(_market._chart._candles[0]["t"])) / _market._chart._interval + 1
+	if span != 3:
+		_fail("the chart's time span should include the empty bucket, got %d" % span); return true
+
+	# History for another commodity must be ignored, exactly like depth.
+	_market.set_history("stone", H, [{"t": 0, "o": 99, "h": 99, "l": 99, "c": 99, "v": 1, "n": 1}])
+	if _market._history.size() != 2 or int(_market._history[0]["o"]) != 10:
+		_fail("history for an unwatched item leaked in: %s" % [_market._history]); return true
+
+	# Switching commodity clears the old chart, so one market's history can
+	# never be read as another's.
+	_market._watch("stone")
+	if not _market._history.is_empty():
+		_fail("switching commodity should clear history, got %s" % [_market._history]); return true
+	_market._watch("wood")
+
+	# Drawing an empty chart must not crash — a brand-new commodity has no
+	# history at all, which is the common case on a fresh server.
+	_market.set_history("wood", H, [])
+	_market._chart.set_history("wood", H, [])
+	_market._chart.queue_redraw()
+
 	# --- listing board (#142) -------------------------------------------------
 	_market.set_section(MarketPanel.Section.LISTINGS)
 	_market.set_gold(100)
@@ -313,7 +354,7 @@ func _process(_delta: float) -> bool:
 	if not _body_text().contains("not trading"):
 		_fail("walking away should clear the trading state"); return true
 
-	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable; book renders anonymous depth and ignores other commodities' pushes; fees previewed before committing and the form survives rebuilds; listings priced per-item with the shown price carried into the buy")
+	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable; book renders anonymous depth and ignores other commodities' pushes; fees previewed before committing and the form survives rebuilds; listings priced per-item with the shown price carried into the buy; the price chart keeps quiet hours as gaps")
 	quit(0)
 	return true
 

@@ -95,6 +95,9 @@ signal market_trade(market_id: String, item_id: String, unit_price: int, qty: in
 ## What the house took from your last market command (#141): the listing fee
 ## (both sides, never refunded) and any sale tax out of your proceeds.
 signal market_fees(market_id: String, listing_fee: int, sale_tax: int)
+## OHLCV price history for one commodity (#143), oldest first. Absent buckets
+## are absent — a quiet hour is a gap, not a flat candle.
+signal market_history(market_id: String, item_id: String, interval_secs: int, candles: Array)
 ## Listing board (#142): the board itself, and a broadcast when something on
 ## it sells so every onlooker stops showing an item that's gone.
 signal listing_page(market_id: String, listings: Array)
@@ -349,6 +352,12 @@ func _handle_text(text: String) -> void:
                 String(msg.get("listing_id", "")),
                 String(msg.get("item_id", "")),
                 int(msg.get("ask_price", 0)))
+        Protocol.S_MARKET_HISTORY:
+            market_history.emit(
+                String(msg.get("market_id", "")),
+                String(msg.get("item_id", "")),
+                int(msg.get("interval_secs", 3600)),
+                msg.get("candles", []))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),
@@ -586,6 +595,11 @@ func send_listing_list(item_id := "", min_durability := 0, max_price := 0) -> vo
     if max_price > 0:
         msg["max_price"] = max_price
     _send(msg)
+
+## Ask for a commodity's price history (#143). `days` is clamped server-side to
+## the retention window.
+func send_market_history_request(item_id: String, days := 7) -> void:
+    _send({"type": Protocol.C_MARKET_HISTORY_REQUEST, "item_id": item_id, "days": days})
 
 func send_market_book_request(item_id: String) -> void:
     _send({"type": Protocol.C_MARKET_BOOK_REQUEST, "item_id": item_id})

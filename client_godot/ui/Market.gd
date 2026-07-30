@@ -56,6 +56,11 @@ var _last_trade := ""
 ## What the house took on the last command (#141) — a fee you can't see is a
 ## fee you'll assume is a bug.
 var _last_fees := ""
+## Price history for the watched commodity (#143) — the feature that lets a
+## player SEE the economy rather than infer it from the current spread.
+var _history: Array = []
+var _history_interval := 3600
+var _chart: PriceChart
 ## The listing board (#142) as the server sent it, cheapest first.
 var _listings: Array = []
 ## The commodities a v1 book can hold — the stackable items. Tools are
@@ -170,6 +175,16 @@ func note_fees(listing_fee: int, sale_tax: int) -> void:
 	_last_fees = "paid: " + ", ".join(parts) if not parts.is_empty() else ""
 	if _section == Section.COMMODITIES:
 		_rebuild()
+
+## OHLCV history for the watched commodity (#143), from `market.history`.
+## Ignored for anything we're not looking at, same as depth.
+func set_history(item_id: String, interval_secs: int, candles: Array) -> void:
+	if item_id != _watching:
+		return
+	_history_interval = interval_secs
+	_history = candles
+	if _chart != null and not _chart.is_queued_for_deletion():
+		_chart.set_history(_watching, _history_interval, _history)
 
 ## The listing board (#142), from `listing.page`.
 func set_listings(listings: Array) -> void:
@@ -342,6 +357,13 @@ func _rebuild_book() -> void:
 		tick.text = "  " + _last_trade
 		_body.add_child(tick)
 
+	# The chart before the ladder: a trader wants the shape of the market
+	# before the current spread (#143).
+	_chart = PriceChart.new()
+	_chart.custom_minimum_size = Vector2(380, 110)
+	_body.add_child(_chart)
+	_chart.set_history(_watching, _history_interval, _history)
+
 	var asks_head := Label.new()
 	asks_head.add_theme_font_size_override("font_size", 11)
 	asks_head.modulate = Color(0.95, 0.7, 0.7)
@@ -494,6 +516,7 @@ func _watch(item_id: String) -> void:
 	_watching = item_id
 	_asks = []
 	_bids = []
+	_history = []
 	do_watch.emit(item_id)
 	_rebuild()
 

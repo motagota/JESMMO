@@ -247,6 +247,19 @@ pub const S_MARKET_TRADE: &str = "market.trade";
 // nonzero amount, so splitting one order into many can't dodge the sink.
 pub const S_MARKET_FEES: &str = "market.fees";
 
+// --- price history (issue #143) -------------------------------------------------
+// {item_id, days?} -- ask for a commodity's OHLCV price history at this market.
+// A stateless read of a DERIVED CACHE: `market_trade` is the append-only source
+// of truth, and candles are rolled up by a background job so aggregation never
+// sits in front of a trade. Clamped to the retention window.
+pub const C_MARKET_HISTORY_REQUEST: &str = "market.history_request";
+// {market_id, item_id, interval_secs, candles: [{t, o, h, l, c, v, n}]} --
+// t = bucket start (unix seconds, a multiple of interval_secs), o/h/l/c the
+// open/high/low/close price, v the volume traded, n the number of fills.
+// ABSENT buckets mean no trades and must render as a GAP — carrying the last
+// price forward would invent a price nobody paid.
+pub const S_MARKET_HISTORY: &str = "market.history";
+
 // --- listing board — unique items (issue #142) ----------------------------------
 // Two pickaxes at different durability aren't the same good, so a unique item
 // can't have an order book: "the price of a pickaxe" is meaningless. Uniques are
