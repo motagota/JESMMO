@@ -247,6 +247,37 @@ pub const S_MARKET_TRADE: &str = "market.trade";
 // nonzero amount, so splitting one order into many can't dodge the sink.
 pub const S_MARKET_FEES: &str = "market.fees";
 
+// --- listing board — unique items (issue #142) ----------------------------------
+// Two pickaxes at different durability aren't the same good, so a unique item
+// can't have an order book: "the price of a pickaxe" is meaningless. Uniques are
+// offered individually at a fixed ask and bought outright. `world::is_commodity`
+// draws the line — anything that stacks goes to the book instead.
+//
+// {command_id, warehouse_item_id, ask_price, duration_hours} -- offer a unique
+// item you have sitting `available` in this market's warehouse. It moves to
+// `locked`: genuinely escrowed, so it can't be withdrawn out from under a buyer.
+// Charges the #141 listing fee.
+pub const C_LISTING_PLACE: &str = "listing.place";
+// {command_id, listing_id, expected_price} -- buy outright, first-come. Settled
+// by a compare-and-clear, so exactly one of N simultaneous buyers wins and the
+// losers are charged nothing. `expected_price` must match the ask: a listing
+// that changed under you is refused rather than silently charged at a new price.
+// The escrowed instance is handed over by reassigning its warehouse row, so what
+// arrives is provably the item advertised -- same id, same durability.
+pub const C_LISTING_BUY: &str = "listing.buy";
+// {command_id, listing_id} -- withdraw your own; the item returns intact. The
+// listing fee stays spent, as on a cancelled order.
+pub const C_LISTING_CANCEL: &str = "listing.cancel";
+// {item_id?, min_durability?, max_price?} -- browse the board, cheapest first.
+pub const C_LISTING_LIST: &str = "listing.list";
+// {market_id, listings: [{listing_id, item_id, ask_price, mine, expires_at,
+// durability?, max_durability?}]} -- the board. `mine` marks your own, which is
+// the one place ownership IS revealed.
+pub const S_LISTING_PAGE: &str = "listing.page";
+// {market_id, listing_id, item_id, ask_price} -- a listing just sold; broadcast
+// so every onlooker's board stops showing something that's gone.
+pub const S_LISTING_SOLD: &str = "listing.sold";
+
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control

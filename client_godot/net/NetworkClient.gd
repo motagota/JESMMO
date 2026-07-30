@@ -95,6 +95,10 @@ signal market_trade(market_id: String, item_id: String, unit_price: int, qty: in
 ## What the house took from your last market command (#141): the listing fee
 ## (both sides, never refunded) and any sale tax out of your proceeds.
 signal market_fees(market_id: String, listing_fee: int, sale_tax: int)
+## Listing board (#142): the board itself, and a broadcast when something on
+## it sells so every onlooker stops showing an item that's gone.
+signal listing_page(market_id: String, listings: Array)
+signal listing_sold(market_id: String, listing_id: String, item_id: String, ask_price: int)
 signal home_respawn_set(bed_id: String)
 ## The character's gold balance changed (#145) — `delta` is signed, `reason`
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
@@ -337,6 +341,14 @@ func _handle_text(text: String) -> void:
                 String(msg.get("market_id", "")),
                 int(msg.get("listing_fee", 0)),
                 int(msg.get("sale_tax", 0)))
+        Protocol.S_LISTING_PAGE:
+            listing_page.emit(String(msg.get("market_id", "")), msg.get("listings", []))
+        Protocol.S_LISTING_SOLD:
+            listing_sold.emit(
+                String(msg.get("market_id", "")),
+                String(msg.get("listing_id", "")),
+                String(msg.get("item_id", "")),
+                int(msg.get("ask_price", 0)))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),
@@ -548,6 +560,32 @@ func send_market_buy(item_id: String, unit_price: int, qty: int, duration_hours:
 
 func send_market_cancel(order_id: String) -> void:
     _send({"type": Protocol.C_MARKET_CANCEL, "command_id": _command_id(), "order_id": order_id})
+
+## Listing board (#142). `expected_price` is what you were SHOWN — the server
+## refuses the buy if the ask has changed since, so you can never be charged a
+## price you didn't agree to.
+func send_listing_place(warehouse_item_id: String, ask_price: int, duration_hours: int) -> void:
+    _send({"type": Protocol.C_LISTING_PLACE, "command_id": _command_id(),
+        "warehouse_item_id": warehouse_item_id, "ask_price": ask_price,
+        "duration_hours": duration_hours})
+
+func send_listing_buy(listing_id: String, expected_price: int) -> void:
+    _send({"type": Protocol.C_LISTING_BUY, "command_id": _command_id(),
+        "listing_id": listing_id, "expected_price": expected_price})
+
+func send_listing_cancel(listing_id: String) -> void:
+    _send({"type": Protocol.C_LISTING_CANCEL, "command_id": _command_id(), "listing_id": listing_id})
+
+## Browse the board. Every filter is optional; omit for everything.
+func send_listing_list(item_id := "", min_durability := 0, max_price := 0) -> void:
+    var msg := {"type": Protocol.C_LISTING_LIST}
+    if item_id != "":
+        msg["item_id"] = item_id
+    if min_durability > 0:
+        msg["min_durability"] = min_durability
+    if max_price > 0:
+        msg["max_price"] = max_price
+    _send(msg)
 
 func send_market_book_request(item_id: String) -> void:
     _send({"type": Protocol.C_MARKET_BOOK_REQUEST, "item_id": item_id})

@@ -1071,6 +1071,61 @@ pub struct MarketTrade {
     pub created_at: i64,
 }
 
+/// One unique item offered on the listing board (#142). Its
+/// `warehouse_item_id` is the escrowed instance, whose id has been the same
+/// since the seller's own inventory row (#128).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarketListing {
+    pub id: String,
+    pub market_id: String,
+    pub seller_id: String,
+    pub warehouse_item_id: String,
+    pub item_id: String,
+    pub durability: Option<i64>,
+    pub ask_price: i64,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Why a listing purchase was refused (#142). Distinguishing these matters:
+/// "someone beat you to it" and "the price moved" want different reactions
+/// from the player, and neither is a failure of theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingReject {
+    /// Bought, cancelled, or expired between the browse and the click.
+    Gone,
+    /// The ask isn't what the buyer was shown — never charge a surprise price.
+    PriceChanged,
+    /// Not enough gold for the ask.
+    NoFunds,
+    /// The buyer's warehouse at this market has no room to receive it.
+    NoRoom,
+    /// You can't buy your own listing.
+    OwnListing,
+}
+
+impl ListingReject {
+    pub fn code(self) -> &'static str {
+        match self {
+            ListingReject::Gone => "listing_gone",
+            ListingReject::PriceChanged => "price_changed",
+            ListingReject::NoFunds => "no_funds",
+            ListingReject::NoRoom => "warehouse_full",
+            ListingReject::OwnListing => "own_listing",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            ListingReject::Gone => "someone else took it first",
+            ListingReject::PriceChanged => "the asking price changed — take another look",
+            ListingReject::NoFunds => "not enough gold",
+            ListingReject::NoRoom => "no room in your warehouse here to receive it",
+            ListingReject::OwnListing => "that's your own listing",
+        }
+    }
+}
+
 /// One aggregated price level of a book — what the client is shown (#139).
 /// Individual order ownership is deliberately NOT part of this: it keeps the
 /// broadcast small and stops players reading each other's positions.
@@ -1986,6 +2041,317 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
+    }
+
+    // --- Listing board for unique items (epic #136, issue #142) ------------
+
+    /// Offer a unique item for sale at a fixed ask (#142).
+    ///
+    /// The instance must already be sitting `available` in the seller's
+    /// warehouse at this market — the same rule commodities follow (#139): you
+    /// bank goods at a market before you can sell them there. Listing then
+    /// moves it to `locked`, so it is genuinely escrowed rather than flagged,
+    /// and can't be withdrawn out from under a buyer.
+    ///
+    /// Charges the #141 listing fee on the ask, refused outright if the seller
+    /// can't cover it (nothing is escrowed against an order never placed).
+    /// Returns `None` if the instance isn't theirs, isn't available, or isn't a
+    /// unique item.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_listing(
+        &self,
+        market_id: &str,
+        seller_id: &str,
+        warehouse_item_id: &str,
+        ask_price: i64,
+        expires_at: i64,
+        command_id: &str,
+        now: i64,
+    ) -> Result<Option<MarketListing>, DbError> {
+        if ask_price <= 0 {
+            return Ok(None);
+        }
+        let mut tx = self.pool.begin().await?;
+        if !Self::claim_command_in_tx(&mut tx, command_id, seller_id, now).await? {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE id = ? AND market_id = ? \
+             AND character_id = ? AND state = 'available'",
+        )
+        .bind(warehouse_item_id)
+        .bind(market_id)
+        .bind(seller_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        // Commodities belong on the book, not here — the board is for things
+        // whose per-instance state makes them individually priced.
+        if world::is_commodity(&row.item_id) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let fee = world::listing_fee(ask_price);
+        let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(seller_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if fee > purse {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE market_warehouse_item SET state = 'locked' WHERE id = ?")
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await?;
+        burn_fee_in_tx(&mut tx, market_id, seller_id, "listing", fee, None, None, now).await?;
+
+        let listing = MarketListing {
+            id: Uuid::new_v4().to_string(),
+            market_id: market_id.to_string(),
+            seller_id: seller_id.to_string(),
+            warehouse_item_id: row.id.clone(),
+            item_id: row.item_id.clone(),
+            durability: row.durability,
+            ask_price,
+            created_at: now,
+            expires_at,
+        };
+        sqlx::query(
+            "INSERT INTO market_listing (id, market_id, seller_id, warehouse_item_id, item_id, \
+             durability, ask_price, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&listing.id)
+        .bind(market_id)
+        .bind(seller_id)
+        .bind(&listing.warehouse_item_id)
+        .bind(&listing.item_id)
+        .bind(listing.durability)
+        .bind(ask_price)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(listing))
+    }
+
+    /// Buy a listing outright (#142). First-come and atomic.
+    ///
+    /// The race is settled by a **compare-and-clear**: the DELETE is what
+    /// claims the listing, and only the caller whose DELETE reports a row
+    /// affected proceeds to move gold. Everyone else gets `Gone` having been
+    /// charged nothing — there is no window in which two buyers can both be
+    /// mid-purchase, and no partial charge for a loser.
+    ///
+    /// `expected_price` must match the ask, so a listing that changed under the
+    /// player is refused rather than silently charged at a new price.
+    ///
+    /// The escrowed instance is handed over by REASSIGNING its warehouse row to
+    /// the buyer, so the item that arrives is provably the one advertised —
+    /// same row id, same durability — rather than a freshly minted copy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn buy_listing(
+        &self,
+        buyer_id: &str,
+        listing_id: &str,
+        expected_price: i64,
+        slots: i64,
+        command_id: &str,
+        now: i64,
+    ) -> Result<Result<(MarketListing, i64), ListingReject>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        if !Self::claim_command_in_tx(&mut tx, command_id, buyer_id, now).await? {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::Gone));
+        }
+        let listing = sqlx::query_as::<_, MarketListing>(
+            "SELECT * FROM market_listing WHERE id = ?",
+        )
+        .bind(listing_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(listing) = listing else {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::Gone));
+        };
+        if listing.seller_id == buyer_id {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::OwnListing));
+        }
+        if listing.ask_price != expected_price {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::PriceChanged));
+        }
+        let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(buyer_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if purse < listing.ask_price {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::NoFunds));
+        }
+        // The buyer must have somewhere to put it before anything moves.
+        let used: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM market_warehouse_item WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(&listing.market_id)
+        .bind(buyer_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if used >= slots {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::NoRoom));
+        }
+
+        // THE claim. Whoever's delete lands owns the sale; a loser's reports 0
+        // rows and stops here, uncharged.
+        let claimed = sqlx::query("DELETE FROM market_listing WHERE id = ?")
+            .bind(listing_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed == 0 {
+            tx.commit().await?;
+            return Ok(Err(ListingReject::Gone));
+        }
+
+        // Hand the very same escrowed instance to the buyer.
+        sqlx::query(
+            "UPDATE market_warehouse_item SET character_id = ?, state = 'available' WHERE id = ?",
+        )
+        .bind(buyer_id)
+        .bind(&listing.warehouse_item_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Gold: buyer pays the ask, seller receives it net of sale tax (#141).
+        let tax = world::sale_tax(listing.ask_price);
+        sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+            .bind(listing.ask_price)
+            .bind(buyer_id)
+            .execute(&mut *tx)
+            .await?;
+        grant_gold_in_tx(&mut tx, &listing.seller_id, listing.ask_price).await?;
+
+        let trade_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO market_trade (id, market_id, item_id, unit_price, qty, seller_id, \
+             buyer_id, sale_tax_gold, listing_fee_gold, created_at) \
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, ?)",
+        )
+        .bind(&trade_id)
+        .bind(&listing.market_id)
+        .bind(&listing.item_id)
+        .bind(listing.ask_price)
+        .bind(&listing.seller_id)
+        .bind(buyer_id)
+        .bind(tax)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        burn_fee_in_tx(
+            &mut tx, &listing.market_id, &listing.seller_id, "sale_tax", tax, None,
+            Some(&trade_id), now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Ok((listing, tax)))
+    }
+
+    /// Withdraw a listing (#142): the escrowed instance returns to the seller's
+    /// `available` warehouse stock, intact. Ownership-checked. The listing fee
+    /// stays spent, exactly as on a cancelled order (#141).
+    pub async fn cancel_listing(
+        &self,
+        seller_id: &str,
+        listing_id: &str,
+    ) -> Result<Option<MarketListing>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let listing = sqlx::query_as::<_, MarketListing>(
+            "SELECT * FROM market_listing WHERE id = ? AND seller_id = ?",
+        )
+        .bind(listing_id)
+        .bind(seller_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(listing) = listing else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        sqlx::query("DELETE FROM market_listing WHERE id = ?")
+            .bind(listing_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE market_warehouse_item SET state = 'available' WHERE id = ?")
+            .bind(&listing.warehouse_item_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(listing))
+    }
+
+    /// Release every listing past its expiry (#142) — identical to a cancel, so
+    /// forgetting about a listing can never cost you the item.
+    pub async fn expire_listings(&self, now: i64) -> Result<Vec<MarketListing>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let due = sqlx::query_as::<_, MarketListing>(
+            "SELECT * FROM market_listing WHERE expires_at > 0 AND expires_at <= ? ORDER BY id",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        for l in &due {
+            sqlx::query("DELETE FROM market_listing WHERE id = ?")
+                .bind(&l.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE market_warehouse_item SET state = 'available' WHERE id = ?")
+                .bind(&l.warehouse_item_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(due)
+    }
+
+    /// Browse a market's listing board (#142), cheapest first. Every filter is
+    /// optional: `item_id` narrows to one kind, `min_durability` skips
+    /// near-broken tools, `max_price` skips what you can't afford.
+    pub async fn listings_for_market(
+        &self,
+        market_id: &str,
+        item_id: Option<&str>,
+        min_durability: Option<i64>,
+        max_price: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MarketListing>, DbError> {
+        sqlx::query_as::<_, MarketListing>(
+            "SELECT * FROM market_listing WHERE market_id = ? \
+             AND (?2 IS NULL OR item_id = ?2) \
+             AND (?3 IS NULL OR COALESCE(durability, 0) >= ?3) \
+             AND (?4 IS NULL OR ask_price <= ?4) \
+             ORDER BY ask_price ASC, created_at ASC LIMIT ?5",
+        )
+        .bind(market_id)
+        .bind(item_id)
+        .bind(min_durability)
+        .bind(max_price)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// A single listing by id, for the gateway's own checks.
+    pub async fn listing_by_id(&self, id: &str) -> Result<Option<MarketListing>, DbError> {
+        sqlx::query_as::<_, MarketListing>("SELECT * FROM market_listing WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     /// Total gold burned as market fees (#141) — listing fees plus sale tax,
@@ -4883,6 +5249,245 @@ mod tests {
         assert_eq!(listing, world::listing_fee(80) * 2, "both sides paid to list");
         assert_eq!(tax, world::sale_tax(80), "the seller paid tax on the fill");
         assert_eq!(listing + tax, db.total_fees_burned().await.unwrap());
+    }
+
+    // --- Listing board for unique items (#142) ------------------------------
+
+    /// A seller with a worn pickaxe banked at the market, ready to list. Returns
+    /// `(seller_id, warehouse_item_id, durability)`.
+    async fn a_seller_with_a_worn_tool(db: &Db, market: &str) -> (String, String, i64) {
+        let cid = a_character(db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        let inv = db.inventory_for_character(&cid).await.unwrap();
+        let pick = inv.iter().find(|i| i.item_id == "pickaxe").unwrap().clone();
+        // Wear it, so "the same instance" is actually falsifiable.
+        db.equip_instance(&cid, &pick.id).await.unwrap();
+        db.wear_equipped_tool(&cid, "tool", 13).await.unwrap();
+        db.warehouse_deposit(market, &cid, "pickaxe", 1, 60).await.unwrap();
+        let held = db.warehouse_for_character(market, &cid).await.unwrap();
+        let row = held.iter().find(|r| r.item_id == "pickaxe").unwrap();
+        (cid, row.id.clone(), row.durability.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_listed_tool_keeps_its_exact_instance_and_wear_through_the_sale() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let (seller, wh_id, wear) = a_seller_with_a_worn_tool(&db, &m).await;
+        assert_eq!(wear, 37, "50 - 13");
+
+        let listing = db
+            .place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+            .await
+            .unwrap()
+            .expect("the listing should be accepted");
+        assert_eq!(listing.durability, Some(37), "the board advertises its actual wear");
+        // Escrowed, not merely flagged: it can't be withdrawn while listed.
+        assert_eq!(db.warehouse_withdraw(&m, &seller, "pickaxe", 1).await.unwrap(), 0);
+
+        let buyer = a_character(&db).await;
+        let (sold, tax) = db
+            .buy_listing(&buyer, &listing.id, 60, 60, "", 0)
+            .await
+            .unwrap()
+            .expect("the purchase should go through");
+        assert_eq!(sold.id, listing.id);
+
+        // The SAME row, now the buyer's, still worn to 37 — not a fresh tool.
+        let buyer_held = db.warehouse_for_character(&m, &buyer).await.unwrap();
+        assert_eq!(buyer_held.len(), 1);
+        assert_eq!(buyer_held[0].id, wh_id, "the very instance that was advertised");
+        assert_eq!(buyer_held[0].durability, Some(37));
+        assert_eq!(buyer_held[0].state, "available", "and collectable");
+        assert!(db.warehouse_for_character(&m, &seller).await.unwrap().is_empty());
+
+        // And it withdraws to carried inventory as the same instance again.
+        assert_eq!(db.warehouse_withdraw(&m, &buyer, "pickaxe", 1).await.unwrap(), 1);
+        let back = db.inventory_for_character(&buyer).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        assert_eq!((back.id, back.durability), (wh_id, Some(37)));
+        assert!(tax > 0, "the sale was taxed (#141)");
+    }
+
+    /// The listing race (#136 §12): N buyers, one item. Exactly one wins,
+    /// exactly one charge happens, and every loser is told it's gone rather
+    /// than charged for nothing.
+    #[tokio::test]
+    async fn concurrent_buyers_race_for_one_listing_and_exactly_one_wins() {
+        let (db, _t) = TempDb::open().await;
+        let db = std::sync::Arc::new(db);
+        let m = a_market(&db).await;
+        let (seller, wh_id, _) = a_seller_with_a_worn_tool(&db, &m).await;
+        let listing = db.place_listing(&m, &seller, &wh_id, 50, NO_EXPIRY, "", 0)
+            .await.unwrap().unwrap();
+
+        const BUYERS: usize = 8;
+        let mut buyers = Vec::new();
+        for _ in 0..BUYERS {
+            buyers.push(a_character(&db).await);
+        }
+        let before: Vec<i64> = {
+            let mut v = Vec::new();
+            for b in &buyers {
+                v.push(db.character_gold(b).await.unwrap());
+            }
+            v
+        };
+
+        // All of them pounce at once.
+        let mut tasks = Vec::new();
+        for b in buyers.clone() {
+            let db = db.clone();
+            let id = listing.id.clone();
+            tasks.push(tokio::spawn(async move {
+                db.buy_listing(&b, &id, 50, 60, "", 0).await.unwrap()
+            }));
+        }
+        let mut wins = 0;
+        let mut gone = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(_) => wins += 1,
+                Err(ListingReject::Gone) => gone += 1,
+                Err(other) => panic!("unexpected rejection: {other:?}"),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one buyer may win");
+        assert_eq!(gone, BUYERS - 1, "everyone else is told it's gone");
+
+        // Exactly one charge, and the losers paid nothing at all.
+        let mut charged = 0;
+        for (b, was) in buyers.iter().zip(&before) {
+            let now = db.character_gold(b).await.unwrap();
+            if now != *was {
+                charged += 1;
+                assert_eq!(*was - now, 50, "the winner paid exactly the ask");
+            }
+        }
+        assert_eq!(charged, 1, "no loser was charged a penny");
+
+        // The item exists exactly once, with exactly one owner.
+        let owners: Vec<String> = sqlx::query_scalar(
+            "SELECT character_id FROM market_warehouse_item WHERE id = ?",
+        )
+        .bind(&wh_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(owners.len(), 1, "the instance was never duplicated");
+        assert!(buyers.contains(&owners[0]));
+        assert_eq!(db.recent_trades(&m, "pickaxe", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn buying_a_listing_refuses_a_changed_price_and_your_own_listing() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let (seller, wh_id, _) = a_seller_with_a_worn_tool(&db, &m).await;
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+            .await.unwrap().unwrap();
+
+        // A stale price is refused outright — never charge a surprise price.
+        let buyer = a_character(&db).await;
+        let purse = db.character_gold(&buyer).await.unwrap();
+        assert_eq!(
+            db.buy_listing(&buyer, &listing.id, 45, 60, "", 0).await.unwrap(),
+            Err(ListingReject::PriceChanged)
+        );
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), purse, "nothing charged");
+        assert!(db.listing_by_id(&listing.id).await.unwrap().is_some(), "listing untouched");
+
+        // You can't buy your own.
+        assert_eq!(
+            db.buy_listing(&seller, &listing.id, 60, 60, "", 0).await.unwrap(),
+            Err(ListingReject::OwnListing)
+        );
+
+        // Nor one you can't afford.
+        let broke = a_character(&db).await;
+        sqlx::query("UPDATE character SET gold = 0 WHERE id = ?")
+            .bind(&broke).execute(&db.pool).await.unwrap();
+        assert_eq!(
+            db.buy_listing(&broke, &listing.id, 60, 60, "", 0).await.unwrap(),
+            Err(ListingReject::NoFunds)
+        );
+        assert!(db.listing_by_id(&listing.id).await.unwrap().is_some(), "still for sale");
+    }
+
+    #[tokio::test]
+    async fn cancelling_or_expiring_a_listing_returns_the_item_intact() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+
+        // Cancel.
+        let (seller, wh_id, wear) = a_seller_with_a_worn_tool(&db, &m).await;
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+            .await.unwrap().unwrap();
+        let other = a_character(&db).await;
+        assert!(db.cancel_listing(&other, &listing.id).await.unwrap().is_none(), "not yours");
+        assert!(db.cancel_listing(&seller, &listing.id).await.unwrap().is_some());
+        let held = db.warehouse_for_character(&m, &seller).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!((held[0].id.as_str(), held[0].state.as_str(), held[0].durability), (wh_id.as_str(), "available", Some(wear)));
+
+        // Expiry does exactly the same — forgetting a listing can't cost you
+        // the item.
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, 100, "", 0)
+            .await.unwrap().unwrap();
+        assert!(db.expire_listings(99).await.unwrap().is_empty(), "not due yet");
+        let expired = db.expire_listings(100).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, listing.id);
+        let held = db.warehouse_for_character(&m, &seller).await.unwrap();
+        assert_eq!((held[0].state.as_str(), held[0].durability), ("available", Some(wear)));
+        assert!(db.listing_by_id(&listing.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_board_rejects_commodities_and_filters_and_sorts() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+
+        // A stackable good can never be listed — it belongs on the book.
+        let stacker = a_seller(&db, &m, "wood", 10).await;
+        let wood_row = db.warehouse_for_character(&m, &stacker).await.unwrap()[0].id.clone();
+        assert!(
+            db.place_listing(&m, &stacker, &wood_row, 5, NO_EXPIRY, "", 0).await.unwrap().is_none(),
+            "commodities go to the order book, not the board"
+        );
+
+        // Three tools at different prices and wear.
+        let mut made = Vec::new();
+        for (ask, extra_wear) in [(90, 0), (40, 20), (65, 5)] {
+            let cid = a_character(&db).await;
+            db.add_to_inventory(&cid, "axe", 1).await.unwrap();
+            let inv = db.inventory_for_character(&cid).await.unwrap();
+            let axe = inv.iter().find(|i| i.item_id == "axe").unwrap().clone();
+            if extra_wear > 0 {
+                db.equip_instance(&cid, &axe.id).await.unwrap();
+                db.wear_equipped_tool(&cid, "tool", extra_wear).await.unwrap();
+            }
+            db.warehouse_deposit(&m, &cid, "axe", 1, 60).await.unwrap();
+            let row = db.warehouse_for_character(&m, &cid).await.unwrap()
+                .into_iter().find(|r| r.item_id == "axe").unwrap();
+            made.push(db.place_listing(&m, &cid, &row.id, ask, NO_EXPIRY, "", 0).await.unwrap().unwrap());
+        }
+        assert_eq!(made.len(), 3);
+
+        // Cheapest first.
+        let all = db.listings_for_market(&m, None, None, None, 50).await.unwrap();
+        let prices: Vec<i64> = all.iter().map(|l| l.ask_price).collect();
+        assert_eq!(prices, vec![40, 65, 90], "board sorts by ask, cheapest first");
+
+        // Filters compose.
+        let cheap = db.listings_for_market(&m, Some("axe"), None, Some(70), 50).await.unwrap();
+        assert_eq!(cheap.len(), 2);
+        let healthy = db.listings_for_market(&m, None, Some(46), None, 50).await.unwrap();
+        assert!(
+            healthy.iter().all(|l| l.durability.unwrap() >= 46),
+            "min durability skips the worn ones: {healthy:?}"
+        );
+        assert!(db.listings_for_market(&m, Some("pickaxe"), None, None, 50).await.unwrap().is_empty());
     }
 
     /// Matching determinism (#136 §12): the same command sequence must produce

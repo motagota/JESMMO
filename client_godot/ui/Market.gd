@@ -23,6 +23,11 @@ signal do_sell(item_id: String, unit_price: int, qty: int, duration_hours: int)
 signal do_buy(item_id: String, unit_price: int, qty: int, duration_hours: int)
 signal do_cancel(order_id: String)
 signal do_watch(item_id: String)
+## Listing board (#142): offer a unique item you have banked here, buy one at
+## the price you were SHOWN, or withdraw your own.
+signal do_list(warehouse_item_id: String, ask_price: int, duration_hours: int)
+signal do_buy_listing(listing_id: String, expected_price: int)
+signal do_cancel_listing(listing_id: String)
 
 ## The section the player is looking at. Kept as an explicit enum rather than
 ## tab indices so the later issues can add their own without renumbering.
@@ -51,6 +56,8 @@ var _last_trade := ""
 ## What the house took on the last command (#141) — a fee you can't see is a
 ## fee you'll assume is a bug.
 var _last_fees := ""
+## The listing board (#142) as the server sent it, cheapest first.
+var _listings: Array = []
 ## The commodities a v1 book can hold — the stackable items. Tools are
 ## excluded by the server too (they go to the listing board, #142); listing
 ## them here would just be an invitation to a rejection.
@@ -164,6 +171,102 @@ func note_fees(listing_fee: int, sale_tax: int) -> void:
 	if _section == Section.COMMODITIES:
 		_rebuild()
 
+## The listing board (#142), from `listing.page`.
+func set_listings(listings: Array) -> void:
+	_listings = listings
+	if _section == Section.LISTINGS:
+		_rebuild()
+
+## The listings section (#142): what's for sale, and what of yours you could
+## offer. Unique items are individually priced because their wear differs, so
+## each row shows its own condition rather than a shared market price.
+func _rebuild_listings() -> void:
+	var head := Label.new()
+	head.add_theme_font_size_override("font_size", 12)
+	head.modulate = Color(0.8, 0.85, 0.95)
+	head.text = "For sale here — cheapest first"
+	_body.add_child(head)
+	if _listings.is_empty():
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (nothing listed)"
+		_body.add_child(none)
+	for l_v in _listings:
+		var l: Dictionary = l_v
+		var lid := String(l.get("listing_id", ""))
+		var ask := int(l.get("ask_price", 0))
+		var mine: bool = bool(l.get("mine", false))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(230, 0)
+		var cond := ""
+		if l.has("durability"):
+			cond = "  (%d/%d)" % [int(l.get("durability", 0)), int(l.get("max_durability", 0))]
+		lbl.text = "  %s%s  —  %dg" % [String(l.get("item_id", "")), cond, ask]
+		if mine:
+			lbl.text += "   (yours)"
+			lbl.modulate = Color(0.8, 0.85, 0.95)
+		row.add_child(lbl)
+		if mine:
+			var pull := Button.new()
+			pull.text = "Withdraw"
+			pull.pressed.connect(func(): do_cancel_listing.emit(lid))
+			row.add_child(pull)
+		else:
+			var buy := Button.new()
+			buy.text = "Buy %dg" % ask
+			buy.disabled = ask > _gold
+			# The price we were SHOWN travels with the buy, so a listing that
+			# changed under us is refused rather than silently charged.
+			buy.pressed.connect(func(): do_buy_listing.emit(lid, ask))
+			row.add_child(buy)
+		_body.add_child(row)
+
+	# What of yours could be offered: unique items banked here and not already
+	# escrowed against something.
+	var offer_head := Label.new()
+	offer_head.add_theme_font_size_override("font_size", 12)
+	offer_head.modulate = Color(0.8, 0.85, 0.95)
+	offer_head.text = "Yours, banked here — offer at %dg for %s" % [_form_price, _duration_label()]
+	_body.add_child(offer_head)
+	var offerable := 0
+	for it_v in _warehouse:
+		var it: Dictionary = it_v
+		# Only uniques (they carry durability) that aren't already locked.
+		if not it.has("durability") or String(it.get("state", "")) != "available":
+			continue
+		offerable += 1
+		var wid := String(it.get("id", ""))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(230, 0)
+		lbl.text = "  %s  (%d/%d)" % [
+			String(it.get("item_id", "")), int(it.get("durability", 0)),
+			int(it.get("max_durability", 0))]
+		row.add_child(lbl)
+		var btn := Button.new()
+		btn.text = "List"
+		btn.pressed.connect(func(): do_list.emit(wid, _form_price, _duration()))
+		row.add_child(btn)
+		_body.add_child(row)
+	if offerable == 0:
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (deposit a tool here to offer it)"
+		_body.add_child(none)
+
+	var note := Label.new()
+	note.add_theme_font_size_override("font_size", 10)
+	note.modulate = Color(0.6, 0.6, 0.65)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	note.custom_minimum_size = Vector2(380, 0)
+	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee(_form_price)
+	_body.add_child(note)
+
+func _duration_label() -> String:
+	var h := _duration()
+	return "%dh" % h if h < 24 else "%dd" % (h / 24)
+
 ## Your warehouse at this market (#138), straight from `warehouse.state`.
 func set_warehouse(items: Array, used: int, slots: int) -> void:
 	_warehouse = items
@@ -199,21 +302,13 @@ func _rebuild() -> void:
 		_body.add_child(waiting)
 		return
 
-	var todo := Label.new()
-	todo.add_theme_font_size_override("font_size", 12)
-	todo.modulate = Color(0.65, 0.65, 0.7)
-	todo.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	todo.custom_minimum_size = Vector2(380, 0)
 	match _section:
 		Section.COMMODITIES:
 			_rebuild_book()
-			return
 		Section.LISTINGS:
-			todo.text = "Listing board — unique items (tools carry their own durability) at a fixed ask."
+			_rebuild_listings()
 		Section.WAREHOUSE:
 			_rebuild_warehouse()
-			return
-	_body.add_child(todo)
 
 ## The commodities section (#139): which good you're watching, its depth, the
 ## ticker, your own resting orders, and the place-order controls.

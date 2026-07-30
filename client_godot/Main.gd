@@ -366,6 +366,14 @@ func _wire_signals() -> void:
         _market.note_trade(item_id, unit_price, qty))
     _net.market_fees.connect(func(_mid, listing_fee, sale_tax):
         _market.note_fees(listing_fee, sale_tax))
+    # Listing board (#142).
+    _net.listing_page.connect(func(_mid, listings): _market.set_listings(listings))
+    _net.listing_sold.connect(func(_mid, _lid, item_id, ask):
+        _hud.flash_announce("%s sold for %dg" % [item_id, ask])
+        _net.send_listing_list()) # the board moved; refresh it
+    _market.do_list.connect(func(wid, ask, hours): _net.send_listing_place(wid, ask, hours))
+    _market.do_buy_listing.connect(func(lid, expected): _net.send_listing_buy(lid, expected))
+    _market.do_cancel_listing.connect(func(lid): _net.send_listing_cancel(lid))
     _market.do_sell.connect(func(item_id, price, qty, hours): _net.send_market_sell(item_id, price, qty, hours))
     _market.do_buy.connect(func(item_id, price, qty, hours): _net.send_market_buy(item_id, price, qty, hours))
     _market.do_cancel.connect(func(order_id): _net.send_market_cancel(order_id))

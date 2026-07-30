@@ -83,8 +83,8 @@ func _process(_delta: float) -> bool:
 	if not _body_text().contains("nothing stored here yet"):
 		_fail("warehouse section didn't render empty, got: %s" % _body_text()); return true
 	_market.set_section(MarketPanel.Section.LISTINGS)
-	if not _body_text().contains("durability"):
-		_fail("listings section didn't render, got: %s" % _body_text()); return true
+	if not _body_text().contains("nothing listed"):
+		_fail("listings section didn't render empty, got: %s" % _body_text()); return true
 
 	# --- warehouse section (#138) ---------------------------------------------
 	_market.set_section(MarketPanel.Section.WAREHOUSE)
@@ -242,13 +242,78 @@ func _process(_delta: float) -> bool:
 	if kept != [[42, 9]]:
 		_fail("the order should place what's still in the form, got %s" % [kept]); return true
 
+	# --- listing board (#142) -------------------------------------------------
+	_market.set_section(MarketPanel.Section.LISTINGS)
+	_market.set_gold(100)
+	_market.set_listings([
+		{"listing_id": "L1", "item_id": "axe", "ask_price": 40, "mine": false,
+			"durability": 31, "max_durability": 50},
+		{"listing_id": "L2", "item_id": "pickaxe", "ask_price": 250, "mine": false,
+			"durability": 50, "max_durability": 50},
+		{"listing_id": "L3", "item_id": "axe", "ask_price": 60, "mine": true,
+			"durability": 12, "max_durability": 50},
+	])
+	var lb := _body_text()
+	# Each unique is priced on its own, so its condition must be on its row.
+	if not lb.contains("axe  (31/50)  —  40g") or not lb.contains("pickaxe  (50/50)  —  250g"):
+		_fail("listings should show per-item wear and ask, got: %s" % lb); return true
+	if not lb.contains("(yours)"):
+		_fail("your own listing should be marked, got: %s" % lb); return true
+
+	# You withdraw your own; you buy other people's. Never both on one row.
+	if _buttons("Withdraw") != 1:
+		_fail("only your own listing offers Withdraw, got %d" % _buttons("Withdraw")); return true
+	if _buttons("Buy 40g") != 1 or _buttons("Buy 250g") != 1:
+		_fail("each other listing gets its own priced Buy button"); return true
+
+	# The 250g one is unaffordable on 100g, so its button is disabled rather
+	# than offering a purchase the server would refuse.
+	var dear := _find_button("Buy 250g")
+	var cheap := _find_button("Buy 40g")
+	if dear == null or not dear.disabled:
+		_fail("an unaffordable listing shouldn't offer a live Buy button"); return true
+	if cheap == null or cheap.disabled:
+		_fail("an affordable listing should be buyable"); return true
+
+	# Buying carries the price we were SHOWN, so a listing that changed under us
+	# is refused server-side rather than charged at a new price.
+	var bought_listing := []
+	_market.do_buy_listing.connect(func(lid, expected): bought_listing.append([lid, expected]))
+	cheap.pressed.emit()
+	if bought_listing != [["L1", 40]]:
+		_fail("buy should carry the shown price, got %s" % [bought_listing]); return true
+
+	var pulled := []
+	_market.do_cancel_listing.connect(func(lid): pulled.append(lid))
+	_press("Withdraw")
+	if pulled != ["L3"]:
+		_fail("withdraw should target your own listing, got %s" % [pulled]); return true
+
+	# Only unique items banked here and NOT already escrowed can be offered.
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+		{"id": "w2", "item_id": "pickaxe", "qty": 1, "state": "locked", "durability": 20, "max_durability": 50},
+		{"id": "w3", "item_id": "stone", "qty": 30, "state": "available"},
+	], 3, 60)
+	if _buttons("List") != 1:
+		_fail("only the available unique should be listable (not the locked one, not the stone), got %d"
+			% _buttons("List")); return true
+	var listed := []
+	_market.do_list.connect(func(wid, ask, hours): listed.append([wid, ask, hours]))
+	_market._form_price = 55
+	_market.set_listings([]) # force a rebuild at that price
+	_press("List")
+	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
+		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
+
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.
+	_market.set_section(MarketPanel.Section.COMMODITIES)
 	_market.set_market("")
 	if not _body_text().contains("not trading"):
 		_fail("walking away should clear the trading state"); return true
 
-	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable with tools keeping their wear; book renders anonymous depth, ignores other commodities' pushes, and place/cancel emit correctly")
+	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable; book renders anonymous depth and ignores other commodities' pushes; fees previewed before committing and the form survives rebuilds; listings priced per-item with the shown price carried into the buy")
 	quit(0)
 	return true
 
@@ -263,6 +328,19 @@ func _buttons(label: String, node: Node = null) -> int:
 		elif c.get_child_count() > 0:
 			n += _buttons(label, c)
 	return n
+
+## The first visible button with the given label, or null.
+func _find_button(label: String, node: Node = null) -> Button:
+	for c in (node if node != null else _market._body).get_children():
+		if c.is_queued_for_deletion():
+			continue
+		if c is Button and c.text == label:
+			return c
+		elif c.get_child_count() > 0:
+			var found := _find_button(label, c)
+			if found != null:
+				return found
+	return null
 
 ## Press the first visible button with the given label.
 func _press(label: String, node: Node = null) -> bool:

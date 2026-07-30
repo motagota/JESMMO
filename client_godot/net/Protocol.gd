@@ -266,6 +266,18 @@ const DEFAULT_ORDER_HOURS := 24
 ## `market.fees {market_id, listing_fee, sale_tax}` — what the house took from
 ## your last command (#141).
 const S_MARKET_FEES := "market.fees"
+## Listing board for unique items (#142). A tool's durability makes it
+## individually priced, so uniques are offered one at a time at a fixed ask
+## rather than on a book. `listing.buy` carries `expected_price` — a listing
+## that changed under you is refused, never silently charged at a new price —
+## and purchase is first-come, settled server-side so exactly one of several
+## simultaneous buyers wins and the losers pay nothing.
+const C_LISTING_PLACE := "listing.place"
+const C_LISTING_BUY := "listing.buy"
+const C_LISTING_CANCEL := "listing.cancel"
+const C_LISTING_LIST := "listing.list"
+const S_LISTING_PAGE := "listing.page"
+const S_LISTING_SOLD := "listing.sold"
 ## Display-only mirrors of the server's fee formulas (world.rs). Used to show
 ## the cost BEFORE you commit; the server's own numbers are authoritative and
 ## are what actually get charged.
