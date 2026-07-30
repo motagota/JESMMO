@@ -17,6 +17,7 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
 
+use crate::market_config::MarketConfig;
 use crate::util::now_secs;
 use crate::world;
 
@@ -1676,8 +1677,7 @@ impl Db {
         unit_price: i64,
         qty: i64,
         expires_at: i64,
-        slots: i64,
-        max_open: i64,
+        cfg: &MarketConfig,
         command_id: &str,
         now: i64,
     ) -> Result<BuyOutcome, DbError> {
@@ -1696,7 +1696,7 @@ impl Db {
         .bind(character_id)
         .fetch_one(&mut *tx)
         .await?;
-        if open >= max_open {
+        if open >= cfg.max_open_orders {
             tx.commit().await?;
             return Ok(out);
         }
@@ -1714,7 +1714,7 @@ impl Db {
             let mut take = qty.min(if unit_price > 0 { purse / unit_price } else { 0 });
             while take > 0 {
                 let notional = take * unit_price;
-                let total = notional + world::listing_fee(notional);
+                let total = notional + cfg.listing_fee(notional);
                 if total <= purse {
                     break;
                 }
@@ -1741,7 +1741,7 @@ impl Db {
             .fetch_one(&mut *tx)
             .await?;
             let would_escrow = qty.min(stock);
-            if would_escrow > 0 && world::listing_fee(would_escrow * unit_price) > purse {
+            if would_escrow > 0 && cfg.listing_fee(would_escrow * unit_price) > purse {
                 // Can't pay to list it: refuse OUTRIGHT rather than escrow
                 // goods against an order that was never placed.
                 tx.commit().await?;
@@ -1759,7 +1759,7 @@ impl Db {
         // whatever happens next — filled, rested, cancelled, or expired. That
         // is precisely what makes posting an order you don't mean to honour
         // cost something (#141).
-        out.listing_fee = world::listing_fee(escrowed_qty * unit_price);
+        out.listing_fee = cfg.listing_fee(escrowed_qty * unit_price);
         burn_fee_in_tx(
             &mut tx, market_id, character_id, "listing", out.listing_fee, None, None, now,
         )
@@ -1802,7 +1802,8 @@ impl Db {
 
             // The buyer must be able to receive before anything moves.
             let landed =
-                warehouse_credit_in_tx(&mut tx, market_id, buyer, item_id, take, slots).await?;
+                warehouse_credit_in_tx(&mut tx, market_id, buyer, item_id, take, cfg.warehouse_slots)
+                    .await?;
             if landed <= 0 {
                 break; // buyer's warehouse is full — stop rather than vanish goods
             }
@@ -1815,7 +1816,7 @@ impl Db {
             // their proceeds (#141) — they receive value minus tax, and the tax
             // is burned.
             let value = landed * exec;
-            let tax = world::sale_tax(value);
+            let tax = cfg.sale_tax(value);
             if buying {
                 // We escrowed at our limit; we pay `exec` and get the rest back.
                 let refund = landed * (unit_price - exec);
@@ -2078,6 +2079,7 @@ impl Db {
         warehouse_item_id: &str,
         ask_price: i64,
         expires_at: i64,
+        cfg: &MarketConfig,
         command_id: &str,
         now: i64,
     ) -> Result<Option<MarketListing>, DbError> {
@@ -2108,7 +2110,7 @@ impl Db {
             tx.commit().await?;
             return Ok(None);
         }
-        let fee = world::listing_fee(ask_price);
+        let fee = cfg.listing_fee(ask_price);
         let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
             .bind(seller_id)
             .fetch_one(&mut *tx)
@@ -2173,7 +2175,7 @@ impl Db {
         buyer_id: &str,
         listing_id: &str,
         expected_price: i64,
-        slots: i64,
+        cfg: &MarketConfig,
         command_id: &str,
         now: i64,
     ) -> Result<Result<(MarketListing, i64), ListingReject>, DbError> {
@@ -2216,7 +2218,7 @@ impl Db {
         .bind(buyer_id)
         .fetch_one(&mut *tx)
         .await?;
-        if used >= slots {
+        if used >= cfg.warehouse_slots {
             tx.commit().await?;
             return Ok(Err(ListingReject::NoRoom));
         }
@@ -2243,7 +2245,7 @@ impl Db {
         .await?;
 
         // Gold: buyer pays the ask, seller receives it net of sale tax (#141).
-        let tax = world::sale_tax(listing.ask_price);
+        let tax = cfg.sale_tax(listing.ask_price);
         sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
             .bind(listing.ask_price)
             .bind(buyer_id)
@@ -5030,17 +5032,27 @@ mod tests {
     /// pinned the original sell-rests / buy-crosses behaviour keep guarding it
     /// verbatim. `NO_EXPIRY` keeps them out of the sweep's way.
     const NO_EXPIRY: i64 = i64::MAX;
-    const LOTS_OF_SLOTS: i64 = 60;
-    const LOTS_OF_ORDERS: i64 = 1000;
+
+    /// The tuning these tests run against: the values #136-#143 shipped, never
+    /// the repo's `market.toml` (#152). A suite whose expected fees shifted when
+    /// somebody tuned a live config file would be worse than no suite —
+    /// `market_config`'s own tests cover loading and overriding.
+    ///
+    /// `max_open_orders` is raised well above the shipped 40 because most of
+    /// these tests build deep books on purpose; the cap itself is pinned by
+    /// `the_open_order_cap_is_enforced`, which sets its own.
+    fn test_cfg() -> MarketConfig {
+        MarketConfig { max_open_orders: 1000, ..MarketConfig::default() }
+    }
 
     async fn sell(db: &Db, m: &str, who: &str, item: &str, price: i64, qty: i64) -> BuyOutcome {
-        db.place_order(m, who, "sell", item, price, qty, NO_EXPIRY, LOTS_OF_SLOTS, LOTS_OF_ORDERS, "", 0)
+        db.place_order(m, who, "sell", item, price, qty, NO_EXPIRY, &test_cfg(), "", 0)
             .await
             .unwrap()
     }
 
     async fn buy(db: &Db, m: &str, who: &str, item: &str, price: i64, qty: i64) -> BuyOutcome {
-        db.place_order(m, who, "buy", item, price, qty, NO_EXPIRY, LOTS_OF_SLOTS, LOTS_OF_ORDERS, "", 0)
+        db.place_order(m, who, "buy", item, price, qty, NO_EXPIRY, &test_cfg(), "", 0)
             .await
             .unwrap()
     }
@@ -5078,7 +5090,7 @@ mod tests {
         assert_eq!(out.spent, expected, "each fill at the resting price, not the 10 bid");
         assert!(out.spent < 12 * 10, "the aggressor keeps the price improvement");
         // The buyer also paid a listing fee to place the order (#141).
-        assert_eq!(out.listing_fee, world::listing_fee(12 * 10));
+        assert_eq!(out.listing_fee, test_cfg().listing_fee(12 * 10));
         assert_eq!(
             db.character_gold(&buyer).await.unwrap(),
             buyer_start - expected - out.listing_fee
@@ -5088,12 +5100,12 @@ mod tests {
         // balances were captured.)
         assert_eq!(
             db.character_gold(&s2).await.unwrap(),
-            s2_start + (4 * 7 - world::sale_tax(4 * 7)),
+            s2_start + (4 * 7 - test_cfg().sale_tax(4 * 7)),
             "seller receives the fill minus sale tax"
         );
         assert_eq!(
             db.character_gold(&s1).await.unwrap(),
-            s1_start + (6 * 8 - world::sale_tax(6 * 8)) + (2 * 9 - world::sale_tax(2 * 9)),
+            s1_start + (6 * 8 - test_cfg().sale_tax(6 * 8)) + (2 * 9 - test_cfg().sale_tax(2 * 9)),
             "taxed per fill, not once on the total"
         );
 
@@ -5116,7 +5128,7 @@ mod tests {
         assert_eq!(prices, vec![7, 8, 9]);
         for t in &trades {
             assert_eq!(
-                t.sale_tax_gold, world::sale_tax(t.unit_price * t.qty),
+                t.sale_tax_gold, test_cfg().sale_tax(t.unit_price * t.qty),
                 "each ledger row records its own tax, so fee revenue reconciles"
             );
         }
@@ -5137,7 +5149,7 @@ mod tests {
         let out = buy(&db, &m, &buyer, "wood", 4, 10).await;
         assert_eq!((out.filled, out.spent), (0, 0), "nothing crossed");
         assert_eq!(out.resting_qty, 10);
-        let fee = world::listing_fee(10 * 4);
+        let fee = test_cfg().listing_fee(10 * 4);
         assert_eq!(out.listing_fee, fee);
         assert_eq!(
             db.character_gold(&buyer).await.unwrap(), start - 40 - fee,
@@ -5219,7 +5231,7 @@ mod tests {
         // Net of the sale tax on that fill, and of what they paid to list.
         assert_eq!(
             db.character_gold(&seller).await.unwrap(),
-            seller_start + 36 - world::sale_tax(36) - out.listing_fee
+            seller_start + 36 - test_cfg().sale_tax(36) - out.listing_fee
         );
 
         // The buyer's escrow covered it exactly — no further charge.
@@ -5246,7 +5258,7 @@ mod tests {
         let buyer = a_character(&db).await;
         buy(&db, &m, &buyer, "wood", 7, 5).await;
         assert_eq!(
-            db.character_gold(&s1).await.unwrap(), s1_gold + 35 - world::sale_tax(35),
+            db.character_gold(&s1).await.unwrap(), s1_gold + 35 - test_cfg().sale_tax(35),
             "oldest at the level fills first"
         );
         assert_eq!(db.character_gold(&s2).await.unwrap(), s2_gold, "the newer one is untouched");
@@ -5287,8 +5299,8 @@ mod tests {
         let buyer_start = db.character_gold(&buyer).await.unwrap();
 
         // One of each side, both expiring at t=100.
-        db.place_order(&m, &seller, "sell", "wood", 9, 20, 100, 60, 1000, "", 0).await.unwrap();
-        let bid = db.place_order(&m, &buyer, "buy", "wood", 4, 10, 100, 60, 1000, "", 0).await.unwrap();
+        db.place_order(&m, &seller, "sell", "wood", 9, 20, 100, &test_cfg(), "", 0).await.unwrap();
+        let bid = db.place_order(&m, &buyer, "buy", "wood", 4, 10, 100, &test_cfg(), "", 0).await.unwrap();
         let bid_fee = bid.listing_fee;
         assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40 - bid_fee);
 
@@ -5311,7 +5323,7 @@ mod tests {
 
         // An order with no expiry (0 — placed before expiry existed, #139) is
         // never retro-expired.
-        db.place_order(&m, &seller, "sell", "wood", 9, 5, 0, 60, 1000, "", 0).await.unwrap();
+        db.place_order(&m, &seller, "sell", "wood", 9, 5, 0, &test_cfg(), "", 0).await.unwrap();
         assert!(db.expire_orders(i64::MAX).await.unwrap().is_empty(), "0 means no expiry, not long past");
     }
 
@@ -5320,9 +5332,13 @@ mod tests {
         let (db, _t) = TempDb::open().await;
         let m = a_market(&db).await;
         let cid = a_seller(&db, &m, "wood", 30).await;
+        // A cap of 3, not the shipped 40 — the point is the boundary, and this
+        // is also the one test that must NOT use the shared `test_cfg()`, whose
+        // cap is deliberately raised out of the way of deep-book tests.
+        let capped = MarketConfig { max_open_orders: 3, ..test_cfg() };
         for i in 0..3 {
             let out = db
-                .place_order(&m, &cid, "sell", "wood", 5 + i, 2, NO_EXPIRY, 60, 3, "", 0)
+                .place_order(&m, &cid, "sell", "wood", 5 + i, 2, NO_EXPIRY, &capped, "", 0)
                 .await
                 .unwrap();
             assert!(out.resting_order_id.is_some(), "order {i} should rest");
@@ -5330,7 +5346,7 @@ mod tests {
         // At the cap: refused outright, and nothing is escrowed for it.
         let held_before: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
             .iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
-        let out = db.place_order(&m, &cid, "sell", "wood", 9, 2, NO_EXPIRY, 60, 3, "", 0).await.unwrap();
+        let out = db.place_order(&m, &cid, "sell", "wood", 9, 2, NO_EXPIRY, &capped, "", 0).await.unwrap();
         assert!(out.resting_order_id.is_none());
         assert_eq!(out.filled, 0);
         let held_after: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
@@ -5410,8 +5426,8 @@ mod tests {
         let by_kind = db.fees_by_kind(&m).await.unwrap();
         let listing: i64 = by_kind.iter().filter(|(k, _)| k == "listing").map(|(_, g)| g).sum();
         let tax: i64 = by_kind.iter().filter(|(k, _)| k == "sale_tax").map(|(_, g)| g).sum();
-        assert_eq!(listing, world::listing_fee(80) * 2, "both sides paid to list");
-        assert_eq!(tax, world::sale_tax(80), "the seller paid tax on the fill");
+        assert_eq!(listing, test_cfg().listing_fee(80) * 2, "both sides paid to list");
+        assert_eq!(tax, test_cfg().sale_tax(80), "the seller paid tax on the fill");
         assert_eq!(listing + tax, db.total_fees_burned().await.unwrap());
     }
 
@@ -5441,7 +5457,7 @@ mod tests {
         assert_eq!(wear, 37, "50 - 13");
 
         let listing = db
-            .place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+            .place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, &test_cfg(), "", 0)
             .await
             .unwrap()
             .expect("the listing should be accepted");
@@ -5451,7 +5467,7 @@ mod tests {
 
         let buyer = a_character(&db).await;
         let (sold, tax) = db
-            .buy_listing(&buyer, &listing.id, 60, 60, "", 0)
+            .buy_listing(&buyer, &listing.id, 60, &test_cfg(), "", 0)
             .await
             .unwrap()
             .expect("the purchase should go through");
@@ -5482,7 +5498,7 @@ mod tests {
         let db = std::sync::Arc::new(db);
         let m = a_market(&db).await;
         let (seller, wh_id, _) = a_seller_with_a_worn_tool(&db, &m).await;
-        let listing = db.place_listing(&m, &seller, &wh_id, 50, NO_EXPIRY, "", 0)
+        let listing = db.place_listing(&m, &seller, &wh_id, 50, NO_EXPIRY, &test_cfg(), "", 0)
             .await.unwrap().unwrap();
 
         const BUYERS: usize = 8;
@@ -5504,7 +5520,7 @@ mod tests {
             let db = db.clone();
             let id = listing.id.clone();
             tasks.push(tokio::spawn(async move {
-                db.buy_listing(&b, &id, 50, 60, "", 0).await.unwrap()
+                db.buy_listing(&b, &id, 50, &test_cfg(), "", 0).await.unwrap()
             }));
         }
         let mut wins = 0;
@@ -5548,14 +5564,14 @@ mod tests {
         let (db, _t) = TempDb::open().await;
         let m = a_market(&db).await;
         let (seller, wh_id, _) = a_seller_with_a_worn_tool(&db, &m).await;
-        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, &test_cfg(), "", 0)
             .await.unwrap().unwrap();
 
         // A stale price is refused outright — never charge a surprise price.
         let buyer = a_character(&db).await;
         let purse = db.character_gold(&buyer).await.unwrap();
         assert_eq!(
-            db.buy_listing(&buyer, &listing.id, 45, 60, "", 0).await.unwrap(),
+            db.buy_listing(&buyer, &listing.id, 45, &test_cfg(), "", 0).await.unwrap(),
             Err(ListingReject::PriceChanged)
         );
         assert_eq!(db.character_gold(&buyer).await.unwrap(), purse, "nothing charged");
@@ -5563,7 +5579,7 @@ mod tests {
 
         // You can't buy your own.
         assert_eq!(
-            db.buy_listing(&seller, &listing.id, 60, 60, "", 0).await.unwrap(),
+            db.buy_listing(&seller, &listing.id, 60, &test_cfg(), "", 0).await.unwrap(),
             Err(ListingReject::OwnListing)
         );
 
@@ -5572,7 +5588,7 @@ mod tests {
         sqlx::query("UPDATE character SET gold = 0 WHERE id = ?")
             .bind(&broke).execute(&db.pool).await.unwrap();
         assert_eq!(
-            db.buy_listing(&broke, &listing.id, 60, 60, "", 0).await.unwrap(),
+            db.buy_listing(&broke, &listing.id, 60, &test_cfg(), "", 0).await.unwrap(),
             Err(ListingReject::NoFunds)
         );
         assert!(db.listing_by_id(&listing.id).await.unwrap().is_some(), "still for sale");
@@ -5585,7 +5601,7 @@ mod tests {
 
         // Cancel.
         let (seller, wh_id, wear) = a_seller_with_a_worn_tool(&db, &m).await;
-        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, "", 0)
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, &test_cfg(), "", 0)
             .await.unwrap().unwrap();
         let other = a_character(&db).await;
         assert!(db.cancel_listing(&other, &listing.id).await.unwrap().is_none(), "not yours");
@@ -5596,7 +5612,7 @@ mod tests {
 
         // Expiry does exactly the same — forgetting a listing can't cost you
         // the item.
-        let listing = db.place_listing(&m, &seller, &wh_id, 60, 100, "", 0)
+        let listing = db.place_listing(&m, &seller, &wh_id, 60, 100, &test_cfg(), "", 0)
             .await.unwrap().unwrap();
         assert!(db.expire_listings(99).await.unwrap().is_empty(), "not due yet");
         let expired = db.expire_listings(100).await.unwrap();
@@ -5616,7 +5632,7 @@ mod tests {
         let stacker = a_seller(&db, &m, "wood", 10).await;
         let wood_row = db.warehouse_for_character(&m, &stacker).await.unwrap()[0].id.clone();
         assert!(
-            db.place_listing(&m, &stacker, &wood_row, 5, NO_EXPIRY, "", 0).await.unwrap().is_none(),
+            db.place_listing(&m, &stacker, &wood_row, 5, NO_EXPIRY, &test_cfg(), "", 0).await.unwrap().is_none(),
             "commodities go to the order book, not the board"
         );
 
@@ -5634,7 +5650,7 @@ mod tests {
             db.warehouse_deposit(&m, &cid, "axe", 1, 60).await.unwrap();
             let row = db.warehouse_for_character(&m, &cid).await.unwrap()
                 .into_iter().find(|r| r.item_id == "axe").unwrap();
-            made.push(db.place_listing(&m, &cid, &row.id, ask, NO_EXPIRY, "", 0).await.unwrap().unwrap());
+            made.push(db.place_listing(&m, &cid, &row.id, ask, NO_EXPIRY, &test_cfg(), "", 0).await.unwrap().unwrap());
         }
         assert_eq!(made.len(), 3);
 
@@ -5833,9 +5849,9 @@ mod tests {
         buy(&db, &m, &buyer, "wood", 8, 6).await;
 
         let now = now_secs();
-        db.roll_up_candles(world::CANDLE_INTERVAL_SECS, 0, now + 1).await.unwrap();
+        db.roll_up_candles(test_cfg().candle_interval_secs, 0, now + 1).await.unwrap();
         let c = db
-            .candles(&m, "wood", world::CANDLE_INTERVAL_SECS, 0, now + 1)
+            .candles(&m, "wood", test_cfg().candle_interval_secs, 0, now + 1)
             .await
             .unwrap();
         assert_eq!(c.len(), 1);
@@ -5857,7 +5873,7 @@ mod tests {
                 ("buy", 8, 7), ("buy", 12, 6), ("sell", 6, 3), ("buy", 5, 4),
             ] {
                 let who = if side == "sell" { &s } else { &b };
-                db.place_order(&m, who, side, "wood", price, qty, NO_EXPIRY, 60, 1000, "", 0)
+                db.place_order(&m, who, side, "wood", price, qty, NO_EXPIRY, &test_cfg(), "", 0)
                     .await
                     .unwrap();
             }
@@ -5927,7 +5943,7 @@ mod tests {
             let db = &db;
             let m = m.clone();
             async move {
-                db.place_order(&m, &who, side, "wood", price, qty, NO_EXPIRY, 60, 1000, cmd, 0)
+                db.place_order(&m, &who, side, "wood", price, qty, NO_EXPIRY, &test_cfg(), cmd, 0)
                     .await
                     .unwrap()
             }

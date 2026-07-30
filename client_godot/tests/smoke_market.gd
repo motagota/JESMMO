@@ -198,28 +198,65 @@ func _process(_delta: float) -> bool:
 	# The cost of placing must be visible BEFORE committing — the server charges
 	# its own number, and these mirrored formulas have to agree with it or the
 	# preview is a lie.
+	var shipped := Protocol.market_rules_default()
 	_market._form_price = 8
 	_market._form_qty = 20
 	_market.set_book("stone", [], []) # force a rebuild at these values
 	var fees := _body_text()
-	if not fees.contains("listing fee %dg" % Protocol.listing_fee(160)):
+	if not fees.contains("listing fee %dg" % Protocol.listing_fee_with(shipped, 160)):
 		_fail("the listing fee should be previewed, got: %s" % fees); return true
 	if not fees.contains("not refunded if you cancel"):
 		_fail("the preview must say the fee isn't refundable, got: %s" % fees); return true
-	if not fees.contains("taxed %dg" % Protocol.sale_tax(160)):
+	if not fees.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
 		_fail("the sale tax should be previewed, got: %s" % fees); return true
 
 	# Fees round up and are never zero — the anti-exploit. A fee that rounded to
 	# zero on small orders would make splitting an order a free lane.
-	if Protocol.listing_fee(1) < 1 or Protocol.sale_tax(1) < 1:
+	if Protocol.listing_fee_with(shipped, 1) < 1 or Protocol.sale_tax_with(shipped, 1) < 1:
 		_fail("fees must never be zero on a nonzero amount"); return true
-	if Protocol.listing_fee(101) != 2 or Protocol.sale_tax(101) != 4:
-		_fail("fees must round UP (got %d / %d)" % [Protocol.listing_fee(101), Protocol.sale_tax(101)]); return true
+	if Protocol.listing_fee_with(shipped, 101) != 2 or Protocol.sale_tax_with(shipped, 101) != 4:
+		_fail("fees must round UP (got %d / %d)" % [
+			Protocol.listing_fee_with(shipped, 101), Protocol.sale_tax_with(shipped, 101)]); return true
 	var split := 0
 	for i in range(20):
-		split += Protocol.listing_fee(8)
-	if split < Protocol.listing_fee(160):
+		split += Protocol.listing_fee_with(shipped, 8)
+	if split < Protocol.listing_fee_with(shipped, 160):
 		_fail("splitting an order must not be cheaper than placing it whole"); return true
+
+	# --- the preview follows the SERVER's rates (#152) -------------------------
+	# The whole point of moving the rates onto the wire. Until #152 these were
+	# hardcoded consts and the panel could safely mirror them; now they're
+	# per-district config, so a panel still previewing its own numbers would
+	# quote a fee this market doesn't charge — and the player would only find out
+	# by being short-changed. Hand it a market whose rates are nothing like the
+	# defaults and the preview must move with them.
+	var steep := Protocol.market_rules_default()
+	steep["sale_tax_num"] = 25
+	steep["listing_fee_min_gold"] = 7
+	_market.set_market("market_steep", steep)
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], [])
+	var steep_text := _body_text()
+	# 25% of 160 = 40, vs the shipped 3% -> 5.
+	if not steep_text.contains("taxed 40g"):
+		_fail("the preview must use the server's tax rate, got: %s" % steep_text); return true
+	if steep_text.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
+		_fail("the preview is still quoting the hardcoded rate: %s" % steep_text); return true
+	# And the fee floor: 1% of 160 = 2, raised to this market's 7g floor.
+	if not steep_text.contains("listing fee 7g"):
+		_fail("the preview must use the server's fee floor, got: %s" % steep_text); return true
+	# A market that sends NO rules falls back to the shipped defaults rather
+	# than previewing zeroes.
+	_market.set_market("market_old", {})
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], [])
+	var old_text := _body_text()
+	if not old_text.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
+		_fail("a server sending no rules should fall back to defaults, got: %s" % old_text); return true
+	_market.set_market("market_test", shipped) # restore for the rest of the run
+	_market.set_book("stone", [], [])
 
 	# What the house actually took shows up after the fact.
 	_market.note_fees(2, 5)

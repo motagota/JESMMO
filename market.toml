@@ -1,0 +1,132 @@
+# Market tuning for the Phase 1 capital (market phase 2 epic #151, issue #152).
+# Loaded at gateway boot by `rust_server::market_config::MarketConfigSet::load`.
+#
+# WHY THIS FILE EXISTS
+# Every value here used to be a Rust `const`, so trying a different sale tax
+# meant a rebuild and a restart. That friction is exactly what stops a balance
+# pass (#129) from happening, and #129 is open waiting on playtest data. Edit a
+# number here and restart the gateway.
+#
+# THIS FILE IS OPTIONAL. Delete it and the server runs the values #136-#143
+# shipped — every default in `MarketConfig::default()` equals the const it
+# replaced, asserted by `defaults_match_the_shipped_constants`. Config is an
+# override mechanism, not a required input.
+#
+# BUT A BROKEN FILE IS FATAL. A misspelled key or an out-of-range value refuses
+# to boot and names the offending key, rather than falling back to defaults.
+# Silently ignoring a typo is how a server ends up running numbers nobody chose,
+# and an economy misconfigured for a week can't be fixed by editing this file
+# afterwards — the trades already happened.
+#
+# NO HOT RELOAD. Restart the gateway to pick up a change. That's deliberate: it
+# avoids a whole class of question about orders placed under the old rates.
+#
+# THE CLIENT DOES NOT READ THIS FILE and must never be assumed to. The rates in
+# force at a market ride on `market.opened`, because the panel previews a fee
+# before you commit and a preview that disagrees with what the server charges is
+# a trust bug, not a cosmetic one. `Protocol.gd` keeps matching numbers only as
+# a fallback for a server too old to send them.
+
+# ---------------------------------------------------------------------------
+# Defaults: in force at every market that has no [districts.<id>] table below.
+# ---------------------------------------------------------------------------
+[defaults]
+
+# How close (world units) a player must stand to trade. The server's own check
+# in `market_at` is authoritative; the client mirrors this only to decide when
+# to show the panel.
+range = 60
+
+# Warehouse slots one player gets at one market. Per market, not global — that's
+# what stops deposited stock from following a player between markets, and what
+# makes hauling goods the gameplay rather than a menu action.
+warehouse_slots = 60
+
+# Order prices are whole gold and must be a multiple of this. A tick keeps the
+# book's price levels countable (and its depth broadcasts small) instead of
+# letting a thousand orders sit one copper apart.
+price_tick_gold = 1
+
+# Bounds on a single order's size. Below the floor is noise; above the cap is a
+# mis-click or an attempt to wedge the book.
+min_order_qty = 1
+max_order_qty = 10000
+
+# How long a resting order may hold its escrow before the sweep releases it. A
+# resting order holds goods or gold hostage, so "forever" is not on the list.
+# `default_order_hours` must be one of these — an unrecognised request falls
+# back to it, so a default outside the list would make the fallback invalid.
+order_durations_hours = [12, 24, 72, 168]
+default_order_hours = 24
+
+# Resting orders one player may hold at one market. Caps the cost of rebuilding
+# a book on boot, and stops one player papering it with hundreds of tiny orders.
+max_open_orders = 40
+
+# Sliding-window rate limit on market commands, per player (not per market).
+commands_per_minute = 60
+
+# Cap on one listing-board page.
+listing_page_limit = 100
+
+# --- Fees: the coin sink (#141) --------------------------------------------
+# Fees are BURNED, not paid to anyone. Together with build wages (#145) they are
+# the two halves of the economy: wages create gold, fees destroy it.
+#
+# Every fee rounds UP and is never zero on a nonzero amount. That is anti-abuse,
+# not greed: a fee rounding to zero on small trades would make a free lane, and
+# splitting one big order into a hundred tiny ones would dodge the sink
+# entirely. To turn a fee off you must zero BOTH the rate and the floor.
+#
+# These numbers are PLACEHOLDERS pending #129. The design doc's flat 5 *copper*
+# didn't translate to a currency that is whole gold in small numbers (a 20-wood
+# order is ~160 notional, a character starts with 500), so the shape was kept
+# and the scale adapted.
+
+# Charged to BOTH sides at placement, never refunded — that's what makes posting
+# an order you don't mean to honour cost something.
+# Fee = max(listing_fee_min_gold, ceil(notional * num / den)).
+listing_fee_min_gold = 1
+listing_fee_num = 1
+listing_fee_den = 100
+
+# Charged to the seller out of each fill's value.
+# Tax = max(1, ceil(value * num / den)).
+sale_tax_num = 3
+sale_tax_den = 100
+
+# --- Price history (#143) ---------------------------------------------------
+
+# Candle resolution the rollup materialises. One hour: fine enough to see a
+# price move within a play session, coarse enough that a month of history is a
+# few hundred rows per commodity.
+candle_interval_secs = 3600
+
+# How long candles are kept. The `market_trade` ledger they derive from is never
+# pruned, so pruning this only costs the CPU to rebuild.
+history_retain_days = 30
+
+# ---------------------------------------------------------------------------
+# Per-district overrides.
+#
+# Keyed by DISTRICT, not market id, because a market's id is a `Uuid::new_v4()`
+# minted when its build order is inserted — not authorable here, and different
+# after every DB reseed. A rate pinned to a uuid would silently revert to the
+# defaults the next time the world was reseeded, which is the worst possible
+# failure mode for an economy tunable. Districts are authored in
+# `world::capital()` and stable forever.
+#
+# Known districts: market, suburbs, civic, craftworks, old_quarter. A table for
+# anything else is a boot failure — otherwise a typo would sit here looking
+# effective forever while changing nothing.
+#
+# A table only states what it CHANGES; everything else layers over [defaults]
+# above (the resolved ones, not the shipped ones).
+#
+# Nothing is overridden yet. The second market (#153) lands in the `market`
+# district and is where a cheaper-but-remote market becomes a real trade-off:
+#
+#   [districts.market]
+#   sale_tax_num = 1        # cheaper to sell at, but it's a long haul
+#   warehouse_slots = 120   # and worth storing at
+# ---------------------------------------------------------------------------

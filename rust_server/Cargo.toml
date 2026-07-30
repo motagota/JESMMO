@@ -46,3 +46,6 @@ terrain-common = { path = "../terrain-common" }
 # Wraps terrain tile bytes for terrain streaming (terrain.tile_data) so they
 # ride the existing all-JSON/text-frame wire protocol unchanged.
 base64 = "0.22"
+# Market tuning from the repo-root `market.toml` (#152) — same version the
+# terrain bake already uses for `terrain.toml`, so the repo has one TOML parser.
+toml = "0.8"

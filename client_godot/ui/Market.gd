@@ -38,6 +38,12 @@ var _body: VBoxContainer
 var _tabs: HBoxContainer
 var _section: Section = Section.COMMODITIES
 var _market_id := ""
+## The tuning in force at THIS market, as `market.opened` sent it (#152): fee
+## rates, price tick, order bounds, durations. Seeded with the shipped fallbacks
+## so the panel is never previewing from nothing, but the server's values replace
+## them on arrival — the rates are per-district config, so a hardcoded copy would
+## quote a fee this market doesn't charge.
+var _rules: Dictionary = Protocol.market_rules_default()
 var _gold := 0
 ## The warehouse at THIS market (#138) — rows as the server sent them, plus
 ## slot usage. Locked rows are shown but never offered a Withdraw button.
@@ -123,11 +129,20 @@ func show_panel(show: bool) -> void:
 ## The server acked that we're at a real market and may trade (#137). The id is
 ## the completed build order's own id — every later market command is scoped to
 ## it, even though only the capital's market exists in v1.
-func set_market(market_id: String) -> void:
-	if _market_id == market_id:
+func set_market(market_id: String, rules: Dictionary = {}) -> void:
+	# The rules can change without the id doing so (a config edit and restart),
+	# and on arrival at a market with different rates the id changes too — so
+	# both are compared before deciding this is a no-op.
+	var next_rules: Dictionary = rules if not rules.is_empty() else Protocol.market_rules_default()
+	if _market_id == market_id and _rules == next_rules:
 		return
 	_market_id = market_id
+	_rules = next_rules
 	_rebuild()
+
+## An int from the market's rules, falling back to the shipped default.
+func _rule(key: String) -> int:
+	return int(_rules.get(key, Protocol.market_rules_default().get(key, 0)))
 
 ## The purse, mirrored from `gold.update` (#145) — you can't judge a price
 ## without it, and every section needs it.
@@ -275,7 +290,7 @@ func _rebuild_listings() -> void:
 	note.modulate = Color(0.6, 0.6, 0.65)
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	note.custom_minimum_size = Vector2(380, 0)
-	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee(_form_price)
+	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee_with(_rules, _form_price)
 	_body.add_child(note)
 
 func _duration_label() -> String:
@@ -403,11 +418,11 @@ func _rebuild_book() -> void:
 	price_lbl.text = "price"
 	form.add_child(price_lbl)
 	_price_field = SpinBox.new()
-	_price_field.min_value = Protocol.PRICE_TICK_GOLD
+	_price_field.min_value = _rule("price_tick_gold")
 	_price_field.max_value = 100000
-	_price_field.step = Protocol.PRICE_TICK_GOLD
+	_price_field.step = _rule("price_tick_gold")
 	if _form_price <= 0:
-		_form_price = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+		_form_price = maxi(best_ask, _rule("price_tick_gold"))
 	_price_field.value = _form_price
 	_price_field.value_changed.connect(func(v): _form_price = int(v))
 	form.add_child(_price_field)
@@ -415,8 +430,8 @@ func _rebuild_book() -> void:
 	qty_lbl.text = "qty"
 	form.add_child(qty_lbl)
 	_qty_field = SpinBox.new()
-	_qty_field.min_value = Protocol.MIN_ORDER_QTY
-	_qty_field.max_value = Protocol.MAX_ORDER_QTY
+	_qty_field.min_value = _rule("min_order_qty")
+	_qty_field.max_value = _rule("max_order_qty")
 	_qty_field.value = _form_qty
 	_qty_field.value_changed.connect(func(v): _form_qty = int(v))
 	form.add_child(_qty_field)
@@ -427,10 +442,11 @@ func _rebuild_book() -> void:
 	form.add_child(for_lbl)
 	_duration_field = OptionButton.new()
 	_duration_field.focus_mode = Control.FOCUS_NONE
-	for i in range(Protocol.ORDER_DURATIONS_HOURS.size()):
-		var h: int = Protocol.ORDER_DURATIONS_HOURS[i]
+	var durations: Array = _rules.get("order_durations_hours", Protocol.ORDER_DURATIONS_HOURS)
+	for i in range(durations.size()):
+		var h: int = int(durations[i])
 		_duration_field.add_item("%dh" % h if h < 24 else "%dd" % (h / 24), h)
-		if h == (_form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS):
+		if h == _duration():
 			_duration_field.select(i)
 	_duration_field.item_selected.connect(func(i): _form_hours = _duration_field.get_item_id(i))
 	form.add_child(_duration_field)
@@ -454,8 +470,10 @@ func _rebuild_book() -> void:
 	hint.text = "Either side fills against the book first, then rests for whatever's left. A sell escrows goods from your warehouse here; a buy escrows gold. You always trade at the RESTING order's price, so crossing the spread keeps you the difference."
 	_body.add_child(hint)
 
-	# What this order will cost to place, before committing to it (#141). The
-	# server charges its own number; this is the same formula so the two agree.
+	# What this order will cost to place, before committing to it (#141). Same
+	# formula as the server, driven by the rates the server told us are in force
+	# HERE (#152) — the rates are per-district config now, so previewing from a
+	# hardcoded copy would quietly quote a fee this market doesn't charge.
 	var notional := _form_price * _form_qty
 	var cost := Label.new()
 	cost.add_theme_font_size_override("font_size", 11)
@@ -463,8 +481,8 @@ func _rebuild_book() -> void:
 	cost.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	cost.custom_minimum_size = Vector2(380, 0)
 	cost.text = "listing fee %dg (charged either way, not refunded if you cancel) · a full sale would be taxed %dg, netting %dg" % [
-		Protocol.listing_fee(notional), Protocol.sale_tax(notional),
-		notional - Protocol.sale_tax(notional)]
+		Protocol.listing_fee_with(_rules, notional), Protocol.sale_tax_with(_rules, notional),
+		notional - Protocol.sale_tax_with(_rules, notional)]
 	_body.add_child(cost)
 	if _last_fees != "":
 		var paid := Label.new()
@@ -502,9 +520,10 @@ func _rebuild_book() -> void:
 		row.add_child(cancel)
 		_body.add_child(row)
 
-## The selected rest duration, in hours.
+## The selected rest duration, in hours. Falls back to this market's own default
+## rather than a compile-time one (#152).
 func _duration() -> int:
-	return _form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS
+	return _form_hours if _form_hours > 0 else _rule("default_order_hours")
 
 ## Which commodity's book is on screen — Main seeds its depth on market.open.
 func watching() -> String:
