@@ -80,6 +80,18 @@ signal road_demolition_planned(order_id: String, demo_order_id: String)
 ## exact shapes.
 signal road_cells(order_id: String, cells: Array)
 signal road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool)
+## Market (#137): you're standing at a built market and may trade, or the
+## command was refused (out of range, no market built yet).
+signal market_opened(market_id: String, x: int, y: int)
+signal market_error(code: String, detail: String)
+## Your warehouse at one market (#138): every row, available and locked alike,
+## plus slot usage. Pushed on `market.open` and after every deposit/withdraw.
+signal warehouse_state(market_id: String, items: Array, used: int, slots: int)
+## Order book (#139): aggregated depth for one commodity, your own resting
+## orders, and the trade ticker.
+signal market_book(market_id: String, item_id: String, asks: Array, bids: Array)
+signal market_orders(market_id: String, orders: Array)
+signal market_trade(market_id: String, item_id: String, unit_price: int, qty: int)
 signal home_respawn_set(bed_id: String)
 ## The character's gold balance changed (#145) — `delta` is signed, `reason`
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
@@ -288,6 +300,35 @@ func _handle_text(text: String) -> void:
                 msg.get("required", {}),
                 msg.get("progress", {}),
                 bool(msg.get("completed", false)))
+        Protocol.S_MARKET_OPENED:
+            market_opened.emit(
+                String(msg.get("market_id", "")),
+                int(msg.get("x", 0)),
+                int(msg.get("y", 0)))
+        Protocol.S_MARKET_ERROR:
+            market_error.emit(
+                String(msg.get("code", "")),
+                String(msg.get("detail", "market command refused")))
+        Protocol.S_WAREHOUSE_STATE:
+            warehouse_state.emit(
+                String(msg.get("market_id", "")),
+                msg.get("items", []),
+                int(msg.get("used", 0)),
+                int(msg.get("slots", 0)))
+        Protocol.S_MARKET_BOOK:
+            market_book.emit(
+                String(msg.get("market_id", "")),
+                String(msg.get("item_id", "")),
+                msg.get("asks", []),
+                msg.get("bids", []))
+        Protocol.S_MARKET_ORDERS:
+            market_orders.emit(String(msg.get("market_id", "")), msg.get("orders", []))
+        Protocol.S_MARKET_TRADE:
+            market_trade.emit(
+                String(msg.get("market_id", "")),
+                String(msg.get("item_id", "")),
+                int(msg.get("unit_price", 0)),
+                int(msg.get("qty", 0)))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),
@@ -470,6 +511,43 @@ func send_road_cancel(order_id: String) -> void:
 ## Post a demolition order for a built/part-built road (#106, editor only).
 func send_road_demolish(order_id: String) -> void:
     _send({"type": Protocol.C_ROAD_DEMOLISH, "order_id": order_id})
+
+## Ask to trade at the market you're standing next to (#137). No id: the
+## server resolves and range-checks it from your live position.
+func send_market_open() -> void:
+    _send({"type": Protocol.C_MARKET_OPEN})
+
+## Move goods between carried inventory and your warehouse at the market
+## you're standing at (#138). Same range gate as `market.open`; the server
+## bounds both by what's actually there, carry capacity, and slot capacity.
+func send_warehouse_deposit(item_id: String, qty: int) -> void:
+    _send({"type": Protocol.C_WAREHOUSE_DEPOSIT, "item_id": item_id, "qty": qty})
+
+func send_warehouse_withdraw(item_id: String, qty: int) -> void:
+    _send({"type": Protocol.C_WAREHOUSE_WITHDRAW, "item_id": item_id, "qty": qty})
+
+## Order book (#139). `command_id` is client-generated and deduped server-side,
+## so a resend after a dropped connection can't place or buy twice.
+func send_market_sell(item_id: String, unit_price: int, qty: int, duration_hours: int) -> void:
+    _send({"type": Protocol.C_MARKET_SELL, "command_id": _command_id(),
+        "item_id": item_id, "unit_price": unit_price, "qty": qty,
+        "duration_hours": duration_hours})
+
+func send_market_buy(item_id: String, unit_price: int, qty: int, duration_hours: int) -> void:
+    _send({"type": Protocol.C_MARKET_BUY, "command_id": _command_id(),
+        "item_id": item_id, "unit_price": unit_price, "qty": qty,
+        "duration_hours": duration_hours})
+
+func send_market_cancel(order_id: String) -> void:
+    _send({"type": Protocol.C_MARKET_CANCEL, "command_id": _command_id(), "order_id": order_id})
+
+func send_market_book_request(item_id: String) -> void:
+    _send({"type": Protocol.C_MARKET_BOOK_REQUEST, "item_id": item_id})
+
+## A fresh idempotency key per command. Time alone isn't unique enough at this
+## resolution (the same trap as #128's test emails), so mix in randomness.
+func _command_id() -> String:
+    return "%d-%d" % [Time.get_ticks_usec(), randi()]
 
 ## Ask for a road order's full cell list (#134) — no role restriction, a
 ## stateless read like terrain/object list requests. Answered with

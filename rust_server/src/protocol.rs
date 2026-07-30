@@ -170,6 +170,74 @@ pub const C_RENT_SET_AUTOPAY: &str = "rent.set_autopay"; // {plot_id, enabled} -
 // `reason` is a short tag ("build_wages") for client feedback and telemetry.
 pub const S_GOLD_UPDATE: &str = "gold.update";
 
+// --- market.* — player-to-player trading (market epic #136, issue #137) ---------
+// {} -- ask to trade at whatever market you're standing next to. Deliberately
+// carries NO market id: the server resolves it from the caller's live position
+// like every other proximity-gated action, so a client can't name a market it
+// isn't at. Answered with market.opened, or market.error when nothing's in
+// range. This is the subsystem's first command and establishes the range gate
+// (MARKET_RANGE, server-enforced) that every later market command inherits.
+pub const C_MARKET_OPEN: &str = "market.open";
+// {market_id, x, y} -- you're at a built market and may trade. `market_id` is
+// the completed build order's own id; books/warehouses/listings are keyed by it
+// from day one, since per-market state is the point of the design even though
+// only the capital's market exists in v1.
+pub const S_MARKET_OPENED: &str = "market.opened";
+// {code, detail} -- a market command was refused ("out_of_range",
+// "warehouse_full", ...).
+pub const S_MARKET_ERROR: &str = "market.error";
+// {item_id, qty} -- move goods between carried inventory and your warehouse AT
+// the market you're standing at (#138). Both share market.open's server-side
+// range gate. Custody is the point: goods are local, so you deposit stock to
+// sell it and collect purchases where you bought them; nothing teleports
+// between markets. Tools move as INSTANCES, keeping their own durability and
+// row id (#128), which is what lets the listing board sell a specific worn one.
+pub const C_WAREHOUSE_DEPOSIT: &str = "warehouse.deposit";
+pub const C_WAREHOUSE_WITHDRAW: &str = "warehouse.withdraw";
+// {market_id, items: [{id, item_id, qty, state, durability?, max_durability?}],
+// used, slots} -- your full warehouse at one market, pushed on market.open and
+// after every deposit/withdraw. `state` is "available" | "locked"; locked stock
+// is escrowed against an open sell order (#139) and can't be withdrawn, and
+// travels as its own row rather than being merged into the available total so
+// the client can show WHY it isn't takeable. Capacity is counted in SLOTS
+// (rows), not units.
+pub const S_WAREHOUSE_STATE: &str = "warehouse.state";
+
+// --- market order book (issue #139) ---------------------------------------------
+// All three share market.open's server-side range gate and carry a
+// client-generated `command_id`, deduped server-side so a reconnect-and-resend
+// can't place or buy twice. The commodity key is `item_id` ALONE (no quality
+// system exists); only stackable items are commodities, and tools go to the
+// listing board (#142) instead.
+//
+// {command_id, item_id, unit_price, qty} -- rest a SELL order. Escrows the
+// goods out of your warehouse at this market (available -> locked) and rests
+// the order for exactly what could be escrowed, never a promise you can't keep.
+pub const C_MARKET_SELL: &str = "market.sell";
+// {command_id, item_id, unit_price, qty} -- buy IMMEDIATELY against the book.
+// Never rests: whatever can't fill now simply isn't bought. Sweeps
+// cheapest-first, and every fill executes at the RESTING order's price, not
+// your limit -- price improvement goes to whoever crosses the spread. Bounded
+// by your limit, your gold, the resting size, and your own warehouse capacity.
+pub const C_MARKET_BUY: &str = "market.buy";
+// {command_id, order_id} -- cancel your own resting order; unsold escrow
+// returns to available.
+pub const C_MARKET_CANCEL: &str = "market.cancel";
+// {item_id} -- ask for one commodity's depth without waiting for a change.
+pub const C_MARKET_BOOK_REQUEST: &str = "market.book_request";
+// {market_id, item_id, asks: [{price, qty}], bids: [...]} -- depth AGGREGATED
+// by price level. Individual order ownership is never broadcast: it keeps the
+// message small and stops players reading each other's positions. Pushed to the
+// whole district on any change (markets are per-district, so this is cheap;
+// the design doc's MarketSubscribe is the upgrade path if it stops being).
+pub const S_MARKET_BOOK: &str = "market.book";
+// {market_id, orders: [{order_id, side, item_id, unit_price, qty_total,
+// qty_remaining}]} -- YOUR resting orders only, pushed on market.open and
+// after any change to them.
+pub const S_MARKET_ORDERS: &str = "market.orders";
+// {market_id, item_id, unit_price, qty} -- a fill just happened; the ticker.
+pub const S_MARKET_TRADE: &str = "market.trade";
+
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
 pub const S_DISTRICT_READY: &str = "district.ready"; // zone loaded; resume control

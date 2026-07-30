@@ -215,6 +215,58 @@ const S_RENT_WARNING := "rent.warning"
 const S_RENT_RECLAIMED := "rent.reclaimed"
 const C_RENT_SET_AUTOPAY := "rent.set_autopay"
 
+# --- gameplay: market — player-to-player trading (epic #136, #137) ------------
+## `market.open {}` — ask to trade at whatever market you're standing next to.
+## Deliberately carries no id: the server resolves it from your live position
+## like every other proximity-gated action, and enforces `MARKET_RANGE`
+## itself, so this panel being open is never what authorises a trade.
+## Answered with `market.opened {market_id, x, y}` or `market.error {code,
+## detail}`.
+const C_MARKET_OPEN := "market.open"
+const S_MARKET_OPENED := "market.opened"
+const S_MARKET_ERROR := "market.error"
+## Warehouse (#138) — custody of goods held AT a market. `warehouse.deposit` /
+## `warehouse.withdraw {item_id, qty}` share `market.open`'s server-side range
+## gate; `warehouse.state {market_id, items, used, slots}` is pushed on open
+## and after every move. Each item is `{id, item_id, qty, state,
+## durability?, max_durability?}` with `state` "available" | "locked" —
+## locked stock is escrowed against an open sell order and can't be
+## withdrawn. Capacity is in SLOTS (rows), not units.
+const C_WAREHOUSE_DEPOSIT := "warehouse.deposit"
+const C_WAREHOUSE_WITHDRAW := "warehouse.withdraw"
+const S_WAREHOUSE_STATE := "warehouse.state"
+## Order book (#139). All carry a client-generated `command_id`, deduped
+## server-side so a reconnect-and-resend can't place or buy twice, and all
+## share `market.open`'s range gate.
+## - `market.sell {command_id, item_id, unit_price, qty}` rests a sell,
+##   escrowing the goods out of your warehouse here.
+## - `market.buy {…}` executes IMMEDIATELY against the book and never rests;
+##   every fill pays the RESTING price, not your limit, so crossing the
+##   spread keeps the price improvement.
+## - `market.cancel {command_id, order_id}` returns unsold escrow.
+## - `market.book_request {item_id}` → `market.book {market_id, item_id,
+##   asks, bids}`, depth aggregated by price level with no ownership.
+## - `market.orders` is YOUR resting orders; `market.trade` is the ticker.
+const C_MARKET_SELL := "market.sell"
+const C_MARKET_BUY := "market.buy"
+const C_MARKET_CANCEL := "market.cancel"
+const C_MARKET_BOOK_REQUEST := "market.book_request"
+const S_MARKET_BOOK := "market.book"
+const S_MARKET_ORDERS := "market.orders"
+const S_MARKET_TRADE := "market.trade"
+## Display-only mirrors of the server's order rules (world.rs).
+const PRICE_TICK_GOLD := 1
+const MIN_ORDER_QTY := 1
+const MAX_ORDER_QTY := 10000
+## How long a resting order may hold its escrow before the server's sweep
+## releases it (#140). The server clamps anything it doesn't offer to the
+## default, so this list is a convenience, not a trust boundary.
+const ORDER_DURATIONS_HOURS := [12, 24, 72, 168]
+const DEFAULT_ORDER_HOURS := 24
+## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
+## the panel; the server's own check is what actually gates trading.
+const MARKET_RANGE := 60.0
+
 # --- gameplay: gold balance (build wages, #145) -------------------------------
 ## `{gold, delta, reason}` — the authoritative balance after it changed, what
 ## moved, and why. Until #145 gold only ever changed at rent time, so

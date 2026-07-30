@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
@@ -157,6 +158,180 @@ async fn remove_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &s
     Ok(take)
 }
 
+/// Put `qty` of a STACKABLE item into a warehouse as `available`, merging into
+/// an existing available stack if there is one and otherwise claiming a fresh
+/// slot. Returns how much actually landed — 0 when the warehouse is full and
+/// there's nothing to merge into.
+///
+/// Shared by deposits (#138) and by delivering a purchase (#139), so a bought
+/// good obeys exactly the same capacity rule as a deposited one.
+async fn warehouse_credit_in_tx(
+    tx: &mut Tx<'_>,
+    market_id: &str,
+    character_id: &str,
+    item_id: &str,
+    qty: i64,
+    slots: i64,
+) -> Result<i64, DbError> {
+    if qty <= 0 {
+        return Ok(0);
+    }
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+         AND item_id = ? AND state = 'available' LIMIT 1",
+    )
+    .bind(market_id)
+    .bind(character_id)
+    .bind(item_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match existing {
+        Some(id) => {
+            sqlx::query("UPDATE market_warehouse_item SET qty = qty + ? WHERE id = ?")
+                .bind(qty)
+                .bind(&id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        None => {
+            let used: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM market_warehouse_item WHERE market_id = ? AND character_id = ?",
+            )
+            .bind(market_id)
+            .bind(character_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if used >= slots {
+                return Ok(0);
+            }
+            sqlx::query(
+                "INSERT INTO market_warehouse_item \
+                 (id, market_id, character_id, item_id, qty, state, durability) \
+                 VALUES (?, ?, ?, ?, ?, 'available', NULL)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(market_id)
+            .bind(character_id)
+            .bind(item_id)
+            .bind(qty)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(qty)
+}
+
+/// Move `qty` from `available` to `locked` in a warehouse, inside a
+/// caller-owned transaction — escrow against a sell order (#139). Splits a
+/// stack when only part of it is being committed; a tool instance is
+/// indivisible and moves whole. Returns how much was actually locked, which is
+/// bounded by what's available.
+async fn warehouse_lock_in_tx(
+    tx: &mut Tx<'_>,
+    market_id: &str,
+    character_id: &str,
+    item_id: &str,
+    qty: i64,
+) -> Result<i64, DbError> {
+    if qty <= 0 {
+        return Ok(0);
+    }
+    let rows = sqlx::query_as::<_, WarehouseItem>(
+        "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+         AND item_id = ? AND state = 'available' ORDER BY id",
+    )
+    .bind(market_id)
+    .bind(character_id)
+    .bind(item_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut locked = 0i64;
+    for r in &rows {
+        let want = qty - locked;
+        if want <= 0 {
+            break;
+        }
+        if r.durability.is_some() || r.qty <= want {
+            sqlx::query("UPDATE market_warehouse_item SET state = 'locked' WHERE id = ?")
+                .bind(&r.id)
+                .execute(&mut **tx)
+                .await?;
+            locked += r.qty;
+        } else {
+            sqlx::query("UPDATE market_warehouse_item SET qty = qty - ? WHERE id = ?")
+                .bind(want)
+                .bind(&r.id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO market_warehouse_item \
+                 (id, market_id, character_id, item_id, qty, state, durability) \
+                 VALUES (?, ?, ?, ?, ?, 'locked', NULL)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(market_id)
+            .bind(character_id)
+            .bind(item_id)
+            .bind(want)
+            .execute(&mut **tx)
+            .await?;
+            locked += want;
+        }
+    }
+    Ok(locked)
+}
+
+/// Take `qty` out of a warehouse's `locked` escrow. With `back_to_available`
+/// the goods return to the owner (a cancel or expiry); without it they simply
+/// leave — they've been sold, and the buyer was credited separately.
+async fn release_locked_in_tx(
+    tx: &mut Tx<'_>,
+    market_id: &str,
+    character_id: &str,
+    item_id: &str,
+    qty: i64,
+    back_to_available: bool,
+) -> Result<i64, DbError> {
+    if qty <= 0 {
+        return Ok(0);
+    }
+    let rows = sqlx::query_as::<_, WarehouseItem>(
+        "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+         AND item_id = ? AND state = 'locked' ORDER BY id",
+    )
+    .bind(market_id)
+    .bind(character_id)
+    .bind(item_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut still = qty;
+    for r in &rows {
+        if still <= 0 {
+            break;
+        }
+        let take = still.min(r.qty);
+        if take == r.qty {
+            sqlx::query("DELETE FROM market_warehouse_item WHERE id = ?")
+                .bind(&r.id)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE market_warehouse_item SET qty = qty - ? WHERE id = ?")
+                .bind(take)
+                .bind(&r.id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        if back_to_available {
+            // i64::MAX slots: returning your own escrow must never fail for
+            // want of a slot — it was already yours a moment ago.
+            warehouse_credit_in_tx(tx, market_id, character_id, item_id, take, i64::MAX).await?;
+        }
+        still -= take;
+    }
+    Ok(qty - still)
+}
+
 /// Mint `amount` gold into a character's purse, inside a caller-owned
 /// transaction (build wages, #145 — the game's first gold faucet). Kept as an
 /// in-tx helper on purpose: wages MUST commit together with the contribution
@@ -243,9 +418,34 @@ impl Db {
     /// Open (creating the file if needed) and bring the schema up to date by
     /// running any pending migrations from `./migrations`.
     pub async fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+        // SQLite serialises writers. Without a busy timeout the second
+        // concurrent write transaction fails IMMEDIATELY with "database is
+        // locked" rather than waiting its turn — which surfaced under the
+        // market's write-heavy load (#140) as deposits and trades randomly
+        // failing. WAL additionally lets readers run alongside a writer,
+        // which is most of this workload.
+        let opts = SqliteConnectOptions::from_str(url)?
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        // ONE connection. sqlx opens deferred transactions, so a transaction
+        // that reads before it writes (most of them — check capacity, then
+        // insert) tries to upgrade a read lock to a write lock while another
+        // connection already holds the write lock. SQLite returns
+        // "database is locked" for that case *immediately*, and `busy_timeout`
+        // deliberately does not retry it, because waiting could deadlock.
+        // Surfaced under the market's write-heavy load (#140) as deposits and
+        // trades randomly failing.
+        //
+        // A single connection removes the whole class: every transaction
+        // queues on the pool instead of racing for locks, which is what this
+        // gateway already is logically — one authoritative writer. Safe here
+        // because DB work never nests (helpers that run inside a transaction
+        // take `&mut Tx` rather than reaching for a second connection); a
+        // nested acquire would deadlock instead. Real concurrency is what the
+        // Postgres port (#41) is for.
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -782,6 +982,91 @@ impl BuildOrder {
     }
 }
 
+/// One row of a player's warehouse at one market (market epic #136, #138).
+/// `state` is `available` or `locked` (locked = escrowed against an open sell
+/// order, #139). `durability` mirrors `InventoryItem`'s: `None` for an
+/// ordinary stackable, `Some` for a single tool instance.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WarehouseItem {
+    pub id: String,
+    pub market_id: String,
+    pub character_id: String,
+    pub item_id: String,
+    pub qty: i64,
+    pub state: String,
+    pub durability: Option<i64>,
+}
+
+/// A resting order on a market's book (market epic #136, issue #139).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarketOrder {
+    pub id: String,
+    pub market_id: String,
+    pub character_id: String,
+    pub side: String,
+    pub item_id: String,
+    pub unit_price: i64,
+    pub qty_total: i64,
+    pub qty_remaining: i64,
+    pub created_seq: i64,
+    pub created_at: i64,
+}
+
+/// One executed fill, straight off the append-only ledger (#139).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarketTrade {
+    pub id: String,
+    pub market_id: String,
+    pub item_id: String,
+    pub unit_price: i64,
+    pub qty: i64,
+    pub seller_id: String,
+    pub buyer_id: String,
+    pub sale_tax_gold: i64,
+    pub listing_fee_gold: i64,
+    pub created_at: i64,
+}
+
+/// One aggregated price level of a book — what the client is shown (#139).
+/// Individual order ownership is deliberately NOT part of this: it keeps the
+/// broadcast small and stops players reading each other's positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookLevel {
+    pub unit_price: i64,
+    pub qty: i64,
+}
+
+/// The outcome of placing an order (#139's aggressive buy, generalised in
+/// #140 to either side resting or crossing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuyOutcome {
+    /// Units actually traded immediately, across every level crossed.
+    pub filled: i64,
+    /// Gold the placer spent (a buy) — at EXECUTION prices, which are the
+    /// resting orders' own, so crossing above the ask keeps the difference.
+    pub spent: i64,
+    /// Gold the placer received (a sell).
+    pub earned: i64,
+    /// Escrowed gold handed back: price improvement on a buy that crossed
+    /// below its own limit.
+    pub refunded: i64,
+    /// The remainder that rested, if any — `None` when the order fully filled
+    /// or nothing could be escrowed.
+    pub resting_order_id: Option<String>,
+    /// Units left resting on the book.
+    pub resting_qty: i64,
+    /// Each fill, for the ticker and for notifying counterparties.
+    pub fills: Vec<MarketTrade>,
+    /// Resting orders touched, as `(order_id, owner_id, qty_remaining)` — the
+    /// gateway pushes each counterparty their own order update.
+    pub touched: Vec<(String, String, i64)>,
+    /// This command was a duplicate (`command_id` already seen) and was
+    /// deliberately not applied. Distinct from "applied and did nothing":
+    /// the caller should stay SILENT rather than report a failure, since the
+    /// client already got an answer the first time round.
+    pub deduped: bool,
+}
+
 /// A gatherable resource node.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ResourceNode {
@@ -979,6 +1264,723 @@ impl Db {
         }
         tx.commit().await?;
         Ok(moved)
+    }
+
+    // --- Market warehouse (market epic #136, issue #138) -------------------
+
+    /// Everything this character holds at this market, available and locked
+    /// alike, oldest first so the client's list is stable across refreshes.
+    pub async fn warehouse_for_character(
+        &self,
+        market_id: &str,
+        character_id: &str,
+    ) -> Result<Vec<WarehouseItem>, DbError> {
+        sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+             ORDER BY item_id, id",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Move up to `qty` of `item_id` from carried inventory into this market's
+    /// warehouse, in one transaction. Returns the amount moved (0 if nothing
+    /// could be).
+    ///
+    /// **Capacity is in SLOTS, not units** (`slots`, from the caller's const):
+    /// one row is one slot, so a stack of 90 planks costs the same slot as a
+    /// stack of 2, and every tool instance costs its own. A deposit that would
+    /// need a NEW row when already at capacity is refused **outright** — never
+    /// partially applied — since a half-landed deposit is exactly the kind of
+    /// thing players report as lost goods. Topping up an existing stack is
+    /// always allowed, because it consumes no additional slot.
+    ///
+    /// Tools (#128) move as instances: the `inventory_item` row's own id and
+    /// durability are carried over unchanged, so the thing in the warehouse is
+    /// the same worn pickaxe you put in, not a fresh one.
+    pub async fn warehouse_deposit(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+        slots: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let used_slots: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM market_warehouse_item WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let moved = if world::tool_max_durability(item_id).is_some() {
+            // Instanced: each tool needs its own slot, so only take as many as
+            // there is room for — and none at all if there's no room.
+            let room = (slots - used_slots).max(0);
+            let take = qty.min(room);
+            if take == 0 {
+                tx.commit().await?;
+                return Ok(0);
+            }
+            let rows = sqlx::query_as::<_, InventoryItem>(
+                "SELECT id, character_id, item_id, qty, slot, durability FROM inventory_item \
+                 WHERE character_id = ? AND item_id = ? ORDER BY id LIMIT ?",
+            )
+            .bind(character_id)
+            .bind(item_id)
+            .bind(take)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in &rows {
+                // Depositing the tool you're holding takes it out of your hand
+                // rather than refusing — same courtesy as #128's break, and
+                // required anyway: `equipment.instance_id` references the
+                // inventory row we're about to delete.
+                sqlx::query("DELETE FROM equipment WHERE character_id = ? AND instance_id = ?")
+                    .bind(character_id)
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM inventory_item WHERE id = ?")
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO market_warehouse_item \
+                     (id, market_id, character_id, item_id, qty, state, durability) \
+                     VALUES (?, ?, ?, ?, 1, 'available', ?)",
+                )
+                .bind(&r.id) // same id in = same instance out
+                .bind(market_id)
+                .bind(character_id)
+                .bind(item_id)
+                .bind(r.durability)
+                .execute(&mut *tx)
+                .await?;
+            }
+            rows.len() as i64
+        } else {
+            // Stackable: merges into this market's existing available stack if
+            // there is one, otherwise needs a free slot.
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+                 AND item_id = ? AND state = 'available' LIMIT 1",
+            )
+            .bind(market_id)
+            .bind(character_id)
+            .bind(item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing.is_none() && used_slots >= slots {
+                tx.commit().await?;
+                return Ok(0); // no room, and nothing to merge into
+            }
+            let moved = remove_inventory_in_tx(&mut tx, character_id, item_id, qty).await?;
+            warehouse_credit_in_tx(&mut tx, market_id, character_id, item_id, moved, slots).await?;
+            moved
+        };
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Move up to `qty` of `item_id` from this market's warehouse back into
+    /// carried inventory. Draws from **`available` rows only** — locked stock
+    /// is escrowed against an open order and is not the player's to take back
+    /// until they cancel it. Also bounded by remaining carry capacity, exactly
+    /// like [`Db::withdraw`] from home storage.
+    pub async fn warehouse_withdraw(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        if qty <= 0 {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let carried: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        if room <= 0 {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let rows = sqlx::query_as::<_, WarehouseItem>(
+            "SELECT * FROM market_warehouse_item WHERE market_id = ? AND character_id = ? \
+             AND item_id = ? AND state = 'available' ORDER BY id",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut moved = 0i64;
+        for r in &rows {
+            let want = qty.min(room) - moved;
+            if want <= 0 {
+                break;
+            }
+            if r.durability.is_some() {
+                // A tool instance: all or nothing, and it goes back to carried
+                // inventory as the SAME row id, keeping its wear.
+                sqlx::query("DELETE FROM market_warehouse_item WHERE id = ?")
+                    .bind(&r.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO inventory_item (id, character_id, item_id, qty, slot, durability) \
+                     VALUES (?, ?, ?, 1, NULL, ?)",
+                )
+                .bind(&r.id)
+                .bind(character_id)
+                .bind(item_id)
+                .bind(r.durability)
+                .execute(&mut *tx)
+                .await?;
+                moved += 1;
+            } else {
+                let take = want.min(r.qty);
+                if take <= 0 {
+                    continue;
+                }
+                if take == r.qty {
+                    sqlx::query("DELETE FROM market_warehouse_item WHERE id = ?")
+                        .bind(&r.id)
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    sqlx::query("UPDATE market_warehouse_item SET qty = qty - ? WHERE id = ?")
+                        .bind(take)
+                        .bind(&r.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                add_inventory_in_tx(&mut tx, character_id, item_id, take).await?;
+                moved += take;
+            }
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Move `qty` of an item from `available` to `locked` in this market's
+    /// warehouse — escrow against an open sell order (#139 will call this;
+    /// #138 ships it so the state actually means something and can be tested).
+    /// Returns the amount locked, bounded by what's available.
+    pub async fn warehouse_lock(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let locked = warehouse_lock_in_tx(&mut tx, market_id, character_id, item_id, qty).await?;
+        tx.commit().await?;
+        Ok(locked)
+    }
+
+    // --- Market order book (market epic #136, issue #139) ------------------
+
+    /// Record a client-generated `command_id`, returning `false` if it has been
+    /// seen before (#139). A reconnect-and-resend is indistinguishable from a
+    /// duplicate, and both want the same answer: do nothing the second time.
+    async fn claim_command_in_tx(
+        tx: &mut Tx<'_>,
+        command_id: &str,
+        character_id: &str,
+        now: i64,
+    ) -> Result<bool, DbError> {
+        if command_id.is_empty() {
+            return Ok(true); // unversioned callers (tests, internal) aren't deduped
+        }
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO market_command (command_id, character_id, created_at) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(command_id)
+        .bind(character_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Place an order on either side of the book (#140, generalising #139's
+    /// sell-rests / buy-crosses split): escrow, match against everything the
+    /// order crosses, then rest whatever is left.
+    ///
+    /// **Escrow first, always.** A sell locks goods out of the seller's
+    /// warehouse (`available` → `locked`); a buy deducts `unit_price * qty`
+    /// gold from the purse. The order is then sized to what could ACTUALLY be
+    /// escrowed — offering 50 planks while holding 20 places an order for 20 —
+    /// so the book never advertises a promise its owner can't keep.
+    ///
+    /// **Price-time priority**: the opposite side is swept best-price-first,
+    /// ties broken by `created_seq` (a sequence number, never a clock — two
+    /// orders placed in the same millisecond still have a total order, and no
+    /// clock adjustment can reorder a book).
+    ///
+    /// **The resting order's price wins.** A buyer bidding 12 into an 8 ask
+    /// pays 8 and is refunded the 4 difference per unit out of escrow; a
+    /// seller asking 5 into a resting 9 bid receives 9. Price improvement
+    /// always goes to whoever crossed the spread.
+    ///
+    /// **Self-matching is skipped, not cancelled** — matching continues to the
+    /// next order at that level, so a player with resting orders on both sides
+    /// can still trade with everyone else and can never wash-trade with
+    /// themselves.
+    ///
+    /// The remainder rests, which by construction cannot cross the opposite
+    /// best (everything crossable was just consumed) — the book-never-crosses
+    /// invariant holds after every call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_order(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        side: &str,
+        item_id: &str,
+        unit_price: i64,
+        qty: i64,
+        expires_at: i64,
+        slots: i64,
+        max_open: i64,
+        command_id: &str,
+        now: i64,
+    ) -> Result<BuyOutcome, DbError> {
+        let mut out = BuyOutcome::default();
+        let buying = side == "buy";
+        let mut tx = self.pool.begin().await?;
+        if !Self::claim_command_in_tx(&mut tx, command_id, character_id, now).await? {
+            tx.commit().await?;
+            out.deduped = true;
+            return Ok(out);
+        }
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM market_order WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if open >= max_open {
+            tx.commit().await?;
+            return Ok(out);
+        }
+
+        // --- escrow -------------------------------------------------------
+        let escrowed_qty = if buying {
+            let gold: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let affordable = if unit_price > 0 { gold / unit_price } else { 0 };
+            let take = qty.min(affordable);
+            if take > 0 {
+                sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+                    .bind(take * unit_price)
+                    .bind(character_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            take
+        } else {
+            warehouse_lock_in_tx(&mut tx, market_id, character_id, item_id, qty).await?
+        };
+        if escrowed_qty <= 0 {
+            tx.commit().await?;
+            return Ok(out);
+        }
+
+        // --- match --------------------------------------------------------
+        // Buys sweep the cheapest asks; sells sweep the richest bids.
+        let (opposite, price_order) = if buying { ("sell", "ASC") } else { ("buy", "DESC") };
+        let cmp = if buying { "<=" } else { ">=" };
+        let sql = format!(
+            "SELECT * FROM market_order WHERE market_id = ? AND item_id = ? AND side = ? \
+             AND unit_price {cmp} ? ORDER BY unit_price {price_order}, created_seq ASC"
+        );
+        let resting = sqlx::query_as::<_, MarketOrder>(&sql)
+            .bind(market_id)
+            .bind(item_id)
+            .bind(opposite)
+            .bind(unit_price)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        let mut want = escrowed_qty;
+        for o in &resting {
+            if want <= 0 {
+                break;
+            }
+            if o.character_id == character_id {
+                continue; // self-match: skip it, leave it resting, keep going
+            }
+            let take = want.min(o.qty_remaining);
+            if take <= 0 {
+                continue;
+            }
+            let exec = o.unit_price; // the RESTING price, always
+            let (buyer, seller) = if buying {
+                (character_id, o.character_id.as_str())
+            } else {
+                (o.character_id.as_str(), character_id)
+            };
+
+            // The buyer must be able to receive before anything moves.
+            let landed =
+                warehouse_credit_in_tx(&mut tx, market_id, buyer, item_id, take, slots).await?;
+            if landed <= 0 {
+                break; // buyer's warehouse is full — stop rather than vanish goods
+            }
+
+            // Goods leave the seller's escrow.
+            release_locked_in_tx(&mut tx, market_id, seller, item_id, landed, false).await?;
+
+            // Gold. Whoever was RESTING already escrowed at their own price, so
+            // only the aggressor settles here.
+            let value = landed * exec;
+            if buying {
+                // We escrowed at our limit; we pay `exec` and get the rest back.
+                let refund = landed * (unit_price - exec);
+                if refund > 0 {
+                    grant_gold_in_tx(&mut tx, character_id, refund).await?;
+                    out.refunded += refund;
+                }
+                grant_gold_in_tx(&mut tx, seller, value).await?;
+                out.spent += value;
+            } else {
+                // The resting buyer's escrow covers it exactly; we just collect.
+                grant_gold_in_tx(&mut tx, character_id, value).await?;
+                out.earned += value;
+            }
+
+            let remaining = o.qty_remaining - landed;
+            if remaining > 0 {
+                sqlx::query("UPDATE market_order SET qty_remaining = ? WHERE id = ?")
+                    .bind(remaining)
+                    .bind(&o.id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                sqlx::query("DELETE FROM market_order WHERE id = ?")
+                    .bind(&o.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            out.touched.push((o.id.clone(), o.character_id.clone(), remaining));
+
+            let trade = MarketTrade {
+                id: Uuid::new_v4().to_string(),
+                market_id: market_id.to_string(),
+                item_id: item_id.to_string(),
+                unit_price: exec,
+                qty: landed,
+                seller_id: seller.to_string(),
+                buyer_id: buyer.to_string(),
+                sale_tax_gold: 0,
+                listing_fee_gold: 0,
+                created_at: now,
+            };
+            sqlx::query(
+                "INSERT INTO market_trade (id, market_id, item_id, unit_price, qty, seller_id, \
+                 buyer_id, sale_tax_gold, listing_fee_gold, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+            )
+            .bind(&trade.id)
+            .bind(market_id)
+            .bind(item_id)
+            .bind(exec)
+            .bind(landed)
+            .bind(&trade.seller_id)
+            .bind(&trade.buyer_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            out.fills.push(trade);
+            out.filled += landed;
+            want -= landed;
+        }
+
+        // --- rest the remainder -------------------------------------------
+        if want > 0 {
+            let seq: i64 =
+                sqlx::query_scalar("SELECT COALESCE(MAX(created_seq), 0) + 1 FROM market_order")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO market_order (id, market_id, character_id, side, item_id, unit_price, \
+                 qty_total, qty_remaining, created_seq, created_at, expires_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(market_id)
+            .bind(character_id)
+            .bind(side)
+            .bind(item_id)
+            .bind(unit_price)
+            .bind(want)
+            .bind(want)
+            .bind(seq)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+            out.resting_order_id = Some(id);
+            out.resting_qty = want;
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Release one resting order's escrow and remove it, inside a caller-owned
+    /// transaction. A sell returns its unsold goods to `available`; a buy
+    /// returns `unit_price * qty_remaining` gold to the purse (it was deducted
+    /// at the buyer's own limit, and every fill settled at that same rate or
+    /// refunded the difference, so the remainder is exactly what's owed).
+    ///
+    /// Shared by cancel and expiry (#140), because an expired order and a
+    /// cancelled one must release identically — anything else is a way to lose
+    /// goods by not looking at the game for a day.
+    async fn release_order_in_tx(tx: &mut Tx<'_>, order: &MarketOrder) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM market_order WHERE id = ?")
+            .bind(&order.id)
+            .execute(&mut **tx)
+            .await?;
+        if order.side == "sell" {
+            release_locked_in_tx(
+                tx, &order.market_id, &order.character_id, &order.item_id,
+                order.qty_remaining, true,
+            )
+            .await?;
+        } else {
+            grant_gold_in_tx(
+                tx, &order.character_id, order.qty_remaining * order.unit_price,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Cancel a resting order (#139, escrow generalised in #140): returns the
+    /// unfilled escrow — goods for a sell, gold for a buy — and removes the
+    /// order. Ownership-checked: you can only cancel your own.
+    pub async fn cancel_order(
+        &self,
+        character_id: &str,
+        order_id: &str,
+    ) -> Result<Option<MarketOrder>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let order = sqlx::query_as::<_, MarketOrder>(
+            "SELECT * FROM market_order WHERE id = ? AND character_id = ?",
+        )
+        .bind(order_id)
+        .bind(character_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(order) = order else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        Self::release_order_in_tx(&mut tx, &order).await?;
+        tx.commit().await?;
+        Ok(Some(order))
+    }
+
+    /// Release every order whose `expires_at` has passed (#140). Behaves
+    /// exactly like a cancel, per order. `expires_at = 0` means "no expiry" —
+    /// orders placed before expiry existed (#139) must not be retro-expired.
+    /// Returns the released orders so the gateway can tell their owners.
+    pub async fn expire_orders(&self, now: i64) -> Result<Vec<MarketOrder>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let due = sqlx::query_as::<_, MarketOrder>(
+            "SELECT * FROM market_order WHERE expires_at > 0 AND expires_at <= ? ORDER BY id",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        for o in &due {
+            Self::release_order_in_tx(&mut tx, o).await?;
+        }
+        tx.commit().await?;
+        Ok(due)
+    }
+
+    /// A commodity's book at one market, aggregated by price level (#139).
+    /// Sells ascending (best ask first); buys descending (best bid first).
+    pub async fn book_for(
+        &self,
+        market_id: &str,
+        item_id: &str,
+        side: &str,
+    ) -> Result<Vec<BookLevel>, DbError> {
+        let order = if side == "sell" { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT unit_price, SUM(qty_remaining) AS qty FROM market_order \
+             WHERE market_id = ? AND item_id = ? AND side = ? \
+             GROUP BY unit_price ORDER BY unit_price {order}"
+        );
+        let rows = sqlx::query_as::<_, (i64, i64)>(&sql)
+            .bind(market_id)
+            .bind(item_id)
+            .bind(side)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(unit_price, qty)| BookLevel { unit_price, qty }).collect())
+    }
+
+    /// This character's own resting orders at a market (#139) — their own
+    /// positions only; the aggregated book is what everyone else sees.
+    pub async fn open_orders_for_character(
+        &self,
+        market_id: &str,
+        character_id: &str,
+    ) -> Result<Vec<MarketOrder>, DbError> {
+        sqlx::query_as::<_, MarketOrder>(
+            "SELECT * FROM market_order WHERE market_id = ? AND character_id = ? \
+             ORDER BY item_id, unit_price, created_seq",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The most recent trades at a market, newest first — the ticker, and the
+    /// raw material #143 rolls into candles.
+    ///
+    /// `created_at` is only second-resolution, so a burst of fills from one
+    /// sweep all share a timestamp; `rowid` breaks the tie by true insertion
+    /// order. Ordering by the id would sort by a random UUID instead, which
+    /// makes the ledger's order meaningless and the trade log
+    /// nondeterministic. (`rowid` is SQLite's implicit counter — the Postgres
+    /// port, #41, would want an explicit sequence column here.)
+    pub async fn recent_trades(
+        &self,
+        market_id: &str,
+        item_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MarketTrade>, DbError> {
+        sqlx::query_as::<_, MarketTrade>(
+            "SELECT * FROM market_trade WHERE market_id = ? AND item_id = ? \
+             ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        )
+        .bind(market_id)
+        .bind(item_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every invariant the book must satisfy on boot (#136 §8.3, issue #140),
+    /// as a list of human-readable violations — empty means healthy.
+    ///
+    /// The caller treats a non-empty result as a **hard startup failure**, not
+    /// a warning: every one of these means goods or gold have been duplicated
+    /// or destroyed, and a market that has silently minted stock is worse than
+    /// a market that won't start.
+    ///
+    /// Checks, across every market:
+    /// - **goods escrow reconciles** — `locked` warehouse stock equals what the
+    ///   open sell book promises, per item;
+    /// - **no nonsense quantities** — nothing rests at zero or above its own
+    ///   original size;
+    /// - **the book doesn't cross between DIFFERENT owners** — if A's bid is at
+    ///   or above B's ask, one of them should have matched instead of resting.
+    ///   Crossing is legitimate when both sides are the SAME player: self-match
+    ///   prevention deliberately skips those, so someone holding a bid at 8 and
+    ///   an ask at 5 is a crossed book that is nonetheless correct.
+    ///
+    /// Gold escrow has no equivalent cross-check: escrowed gold is simply
+    /// absent from purses, with the open buy book as its only record, so there
+    /// is nothing independent to compare it against. Keeping the deduction and
+    /// the order row in one transaction is what protects it.
+    pub async fn book_health(&self) -> Result<Vec<String>, DbError> {
+        let mut problems = Vec::new();
+
+        let escrow = sqlx::query_as::<_, (String, String, i64, i64)>(
+            "SELECT w.market_id, w.item_id, \
+                COALESCE((SELECT SUM(qty_remaining) FROM market_order o \
+                    WHERE o.market_id = w.market_id AND o.item_id = w.item_id AND o.side = 'sell'), 0), \
+                COALESCE(SUM(w.qty), 0) \
+             FROM market_warehouse_item w WHERE w.state = 'locked' \
+             GROUP BY w.market_id, w.item_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (market, item, book, locked) in escrow {
+            if book != locked {
+                problems.push(format!(
+                    "escrow drift at {market}/{item}: open sells promise {book}, warehouse holds {locked}"
+                ));
+            }
+        }
+
+        let bad = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT id, qty_remaining, qty_total FROM market_order \
+             WHERE qty_remaining <= 0 OR qty_remaining > qty_total",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (id, remaining, total) in bad {
+            problems.push(format!("order {id} rests at {remaining} of {total}"));
+        }
+
+        // Only a cross between DIFFERENT owners is a fault — same-owner
+        // crossings are what self-match prevention leaves behind by design.
+        let crossed = sqlx::query_as::<_, (String, String, i64, i64)>(
+            "SELECT b.market_id, b.item_id, MAX(b.unit_price), MIN(s.unit_price) \
+             FROM market_order b JOIN market_order s \
+               ON b.market_id = s.market_id AND b.item_id = s.item_id \
+             WHERE b.side = 'buy' AND s.side = 'sell' \
+               AND b.character_id <> s.character_id \
+               AND b.unit_price >= s.unit_price \
+             GROUP BY b.market_id, b.item_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (market, item, bid, ask) in crossed {
+            problems.push(format!(
+                "crossed book at {market}/{item}: a bid at {bid} rests against another player's ask at {ask}"
+            ));
+        }
+        Ok(problems)
+    }
+
+    /// Total goods escrowed against open sell orders at a market, per item —
+    /// the boot-time reconciliation (#136 §8.3): it must equal the `locked`
+    /// stock in the warehouse, or escrow has drifted and something has been
+    /// duplicated. Returned rather than asserted so the caller decides how
+    /// loudly to fail.
+    pub async fn escrow_reconciliation(
+        &self,
+        market_id: &str,
+    ) -> Result<Vec<(String, i64, i64)>, DbError> {
+        sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT item_id, \
+                COALESCE((SELECT SUM(qty_remaining) FROM market_order o \
+                    WHERE o.market_id = w.market_id AND o.item_id = w.item_id AND o.side = 'sell'), 0), \
+                COALESCE(SUM(w.qty), 0) \
+             FROM market_warehouse_item w \
+             WHERE w.market_id = ? AND w.state = 'locked' GROUP BY w.item_id",
+        )
+        .bind(market_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn inventory_for_character(
@@ -3295,12 +4297,20 @@ mod tests {
         db.seed_capital(&cap, 100).await.unwrap();
         let plots = db.plot_count().await.unwrap();
         assert_eq!(plots, cap.starter_plots().len() as i64);
-        // No build orders are authored — city work is commissioned at runtime.
-        assert!(db.build_orders_for_district("civic").await.unwrap().is_empty());
+        // The Market (#137) is the one authored order — seeded `open`, i.e.
+        // still to be built. Everything else is mayor-commissioned at runtime.
+        let seeded = db.build_orders_for_district("civic").await.unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!((seeded[0].kind.as_str(), seeded[0].state.as_str()), ("market", "open"));
 
-        // Re-seed (simulating a restart): no duplicate plots.
+        // Re-seed (simulating a restart): no duplicate plots, and no duplicate
+        // build orders — each authored kind is created at most once per district.
         db.seed_capital(&cap, 200).await.unwrap();
         assert_eq!(db.plot_count().await.unwrap(), plots);
+        assert_eq!(
+            db.build_orders_for_district("civic").await.unwrap().len(), 1,
+            "re-seeding must not duplicate the market"
+        );
 
         // A fresh character can claim one of the seeded starter plots.
         let cid = a_character(&db).await;
@@ -3350,6 +4360,631 @@ mod tests {
         assert_eq!(well.state, "completed");
         assert!(well.completed_at.is_some());
         assert_eq!(db.contribute(&a, &order.id, "stone", 1, 0).await.unwrap().moved, 0);
+    }
+
+    /// A market to warehouse against — the warehouse is keyed by a completed
+    /// market order's id, so tests need a real order row to reference.
+    async fn a_market(db: &Db) -> String {
+        db.insert_build_order("civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0, None, None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// #139-shaped shims over #140's unified `place_order`, so the tests that
+    /// pinned the original sell-rests / buy-crosses behaviour keep guarding it
+    /// verbatim. `NO_EXPIRY` keeps them out of the sweep's way.
+    const NO_EXPIRY: i64 = i64::MAX;
+    const LOTS_OF_SLOTS: i64 = 60;
+    const LOTS_OF_ORDERS: i64 = 1000;
+
+    async fn sell(db: &Db, m: &str, who: &str, item: &str, price: i64, qty: i64) -> BuyOutcome {
+        db.place_order(m, who, "sell", item, price, qty, NO_EXPIRY, LOTS_OF_SLOTS, LOTS_OF_ORDERS, "", 0)
+            .await
+            .unwrap()
+    }
+
+    async fn buy(db: &Db, m: &str, who: &str, item: &str, price: i64, qty: i64) -> BuyOutcome {
+        db.place_order(m, who, "buy", item, price, qty, NO_EXPIRY, LOTS_OF_SLOTS, LOTS_OF_ORDERS, "", 0)
+            .await
+            .unwrap()
+    }
+
+    /// A seller stocked at a market, ready to rest orders.
+    async fn a_seller(db: &Db, market: &str, item: &str, qty: i64) -> String {
+        let cid = a_character(db).await;
+        db.add_to_inventory(&cid, item, qty).await.unwrap();
+        db.warehouse_deposit(market, &cid, item, qty, 60).await.unwrap();
+        cid
+    }
+
+    #[tokio::test]
+    async fn a_buy_sweeps_cheapest_first_and_pays_the_resting_price() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        // Two sellers, three price levels — deliberately placed out of price
+        // order so "cheapest first" can't pass by accident of insertion order.
+        let s1 = a_seller(&db, &m, "wood", 30).await;
+        let s2 = a_seller(&db, &m, "wood", 30).await;
+        sell(&db, &m, &s1, "wood", 9, 5).await;
+        sell(&db, &m, &s2, "wood", 7, 4).await;
+        sell(&db, &m, &s1, "wood", 8, 6).await;
+
+        let buyer = a_character(&db).await;
+        let buyer_start = db.character_gold(&buyer).await.unwrap();
+        let s1_start = db.character_gold(&s1).await.unwrap();
+        let s2_start = db.character_gold(&s2).await.unwrap();
+
+        // Bid 10 for 12: sweeps 4@7, then 6@8, then 2@9 — paying each RESTING
+        // price, never the 10 bid.
+        let out = buy(&db, &m, &buyer, "wood", 10, 12).await;
+        assert_eq!(out.filled, 12);
+        let expected = 4 * 7 + 6 * 8 + 2 * 9;
+        assert_eq!(out.spent, expected, "each fill at the resting price, not the 10 bid");
+        assert!(out.spent < 12 * 10, "the aggressor keeps the price improvement");
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - expected);
+        // Sellers are paid immediately, each for their own fills.
+        assert_eq!(db.character_gold(&s2).await.unwrap(), s2_start + 4 * 7);
+        assert_eq!(db.character_gold(&s1).await.unwrap(), s1_start + 6 * 8 + 2 * 9);
+
+        // The 9-level order is partially filled and still resting; the others
+        // are gone. The book only ever holds live orders.
+        let asks = db.book_for(&m, "wood", "sell").await.unwrap();
+        assert_eq!(asks, vec![BookLevel { unit_price: 9, qty: 3 }]);
+
+        // Goods landed in the BUYER's warehouse at this market.
+        let held: i64 = db.warehouse_for_character(&m, &buyer).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood" && r.state == "available").map(|r| r.qty).sum();
+        assert_eq!(held, 12);
+
+        // Three fills on the append-only ledger, at execution prices.
+        let trades = db.recent_trades(&m, "wood", 10).await.unwrap();
+        assert_eq!(trades.len(), 3);
+        let mut prices: Vec<i64> = trades.iter().map(|t| t.unit_price).collect();
+        prices.sort();
+        assert_eq!(prices, vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn a_buy_below_the_ask_rests_and_escrows_instead_of_filling() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 40).await;
+        sell(&db, &m, &seller, "wood", 5, 10).await;
+        sell(&db, &m, &seller, "wood", 50, 10).await;
+
+        // A bid below every ask no longer just evaporates (#139's behaviour) —
+        // it RESTS, escrowing the gold it would need at its own limit.
+        let buyer = a_character(&db).await;
+        let start = db.character_gold(&buyer).await.unwrap();
+        let out = buy(&db, &m, &buyer, "wood", 4, 10).await;
+        assert_eq!((out.filled, out.spent), (0, 0), "nothing crossed");
+        assert_eq!(out.resting_qty, 10);
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), start - 40, "escrowed 10 x 4");
+        assert_eq!(db.book_for(&m, "wood", "buy").await.unwrap(), vec![BookLevel { unit_price: 4, qty: 10 }]);
+
+        // Cancelling gives every escrowed coin back — escrow is held, not spent.
+        let mine = db.open_orders_for_character(&m, &buyer).await.unwrap();
+        db.cancel_order(&buyer, &mine[0].id).await.unwrap();
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), start, "escrow fully returned");
+
+        // A bid crossing only the cheap level takes that level and rests the
+        // rest of its size at its own price.
+        let out = buy(&db, &m, &buyer, "wood", 5, 15).await;
+        assert_eq!((out.filled, out.spent), (10, 50));
+        assert_eq!(out.resting_qty, 5, "the uncrossed remainder rests");
+
+        // Gold bounds the ESCROW, so an order is sized to what can be afforded.
+        db.cancel_order(&buyer, &db.open_orders_for_character(&m, &buyer).await.unwrap()[0].id)
+            .await
+            .unwrap();
+        let purse = db.character_gold(&buyer).await.unwrap();
+        let out = buy(&db, &m, &buyer, "wood", 50, 100).await;
+        assert_eq!(out.filled + out.resting_qty, purse / 50, "sized by the purse, not the ask");
+    }
+
+    #[tokio::test]
+    async fn you_cannot_trade_with_your_own_resting_order() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_seller(&db, &m, "wood", 20).await;
+        sell(&db, &m, &cid, "wood", 5, 10).await;
+        let gold = db.character_gold(&cid).await.unwrap();
+
+        // Crossing your own ask matches nothing — and the ask SURVIVES, rather
+        // than being cancelled out from under you.
+        let out = buy(&db, &m, &cid, "wood", 99, 10).await;
+        assert_eq!((out.filled, out.spent), (0, 0), "self-match is skipped, not executed");
+        assert_eq!(db.book_for(&m, "wood", "sell").await.unwrap().len(), 1, "the ask survives");
+
+        // The buy rested instead, so gold moved into escrow — not to yourself.
+        // Cancelling it proves nothing was actually spent.
+        assert!(out.resting_qty > 0, "the unmatched buy rests");
+        let mine = db.open_orders_for_character(&m, &cid).await.unwrap();
+        let buy_order = mine.iter().find(|o| o.side == "buy").unwrap();
+        db.cancel_order(&cid, &buy_order.id).await.unwrap();
+        assert_eq!(db.character_gold(&cid).await.unwrap(), gold, "no wash trade, no gold lost");
+    }
+
+    #[tokio::test]
+    async fn a_resting_buy_is_filled_by_a_later_seller_at_the_bid() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+
+        // A buyer rests a bid at 9 with nothing to cross.
+        let buyer = a_character(&db).await;
+        let buyer_start = db.character_gold(&buyer).await.unwrap();
+        let out = buy(&db, &m, &buyer, "wood", 9, 10).await;
+        assert_eq!(out.resting_qty, 10);
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90);
+
+        // A seller arrives asking 6 — below the bid, so it crosses. The RESTING
+        // order's price wins, so the seller is paid 9, not their own 6.
+        let seller = a_seller(&db, &m, "wood", 20).await;
+        let seller_start = db.character_gold(&seller).await.unwrap();
+        let out = sell(&db, &m, &seller, "wood", 6, 4).await;
+        assert_eq!(out.filled, 4);
+        assert_eq!(out.earned, 36, "4 x the resting bid of 9, not the 6 asked");
+        assert_eq!(db.character_gold(&seller).await.unwrap(), seller_start + 36);
+
+        // The buyer's escrow covered it exactly — no further charge.
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90);
+        let held: i64 = db.warehouse_for_character(&m, &buyer).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+        assert_eq!(held, 4, "goods landed with the resting buyer");
+        assert_eq!(db.book_for(&m, "wood", "buy").await.unwrap(), vec![BookLevel { unit_price: 9, qty: 6 }]);
+    }
+
+    #[tokio::test]
+    async fn the_book_never_crosses_and_sweeps_in_price_time_order() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let s1 = a_seller(&db, &m, "wood", 30).await;
+        let s2 = a_seller(&db, &m, "wood", 30).await;
+
+        // Two asks at the SAME price; s1's is older, so it must fill first.
+        sell(&db, &m, &s1, "wood", 7, 5).await;
+        sell(&db, &m, &s2, "wood", 7, 5).await;
+        let s1_gold = db.character_gold(&s1).await.unwrap();
+        let s2_gold = db.character_gold(&s2).await.unwrap();
+
+        let buyer = a_character(&db).await;
+        buy(&db, &m, &buyer, "wood", 7, 5).await;
+        assert_eq!(db.character_gold(&s1).await.unwrap(), s1_gold + 35, "oldest at the level fills first");
+        assert_eq!(db.character_gold(&s2).await.unwrap(), s2_gold, "the newer one is untouched");
+
+        // After every command the book must not cross between different
+        // owners: a resting order can only survive because nothing on the
+        // other side was both crossable AND someone else's. (`book_health`
+        // encodes exactly that, including the same-owner exemption that
+        // self-match prevention deliberately creates.)
+        for _ in 0..5 {
+            buy(&db, &m, &buyer, "wood", 6, 3).await;
+            sell(&db, &m, &s1, "wood", 8, 3).await;
+            let bids = db.book_for(&m, "wood", "buy").await.unwrap();
+            let asks = db.book_for(&m, "wood", "sell").await.unwrap();
+            if let (Some(b), Some(a)) = (bids.first(), asks.first()) {
+                assert!(b.unit_price < a.unit_price, "book crossed: bid {} >= ask {}", b.unit_price, a.unit_price);
+            }
+            assert!(db.book_health().await.unwrap().is_empty(), "invariants hold");
+        }
+
+        // And the exemption is real: one player holding both sides of a cross
+        // is CORRECT, not a fault — they simply can't trade with themselves.
+        let solo = a_seller(&db, &m, "wood", 10).await;
+        sell(&db, &m, &solo, "wood", 4, 5).await;
+        buy(&db, &m, &solo, "wood", 20, 5).await;
+        assert!(
+            db.book_health().await.unwrap().is_empty(),
+            "a self-crossed book is what self-match prevention leaves behind, not corruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_releases_escrow_exactly_like_a_cancel() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 20).await;
+        let buyer = a_character(&db).await;
+        let buyer_start = db.character_gold(&buyer).await.unwrap();
+
+        // One of each side, both expiring at t=100.
+        db.place_order(&m, &seller, "sell", "wood", 9, 20, 100, 60, 1000, "", 0).await.unwrap();
+        db.place_order(&m, &buyer, "buy", "wood", 4, 10, 100, 60, 1000, "", 0).await.unwrap();
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40);
+
+        // Not due yet: nothing moves.
+        assert!(db.expire_orders(99).await.unwrap().is_empty());
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40);
+
+        // Due: both release, goods back to available and gold back to purse.
+        let expired = db.expire_orders(100).await.unwrap();
+        assert_eq!(expired.len(), 2);
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start, "escrowed gold returned");
+        let held = db.warehouse_for_character(&m, &seller).await.unwrap();
+        assert!(held.iter().all(|r| r.state == "available"), "goods un-escrowed");
+        assert_eq!(held.iter().map(|r| r.qty).sum::<i64>(), 20);
+        assert!(db.book_for(&m, "wood", "sell").await.unwrap().is_empty());
+
+        // An order with no expiry (0 — placed before expiry existed, #139) is
+        // never retro-expired.
+        db.place_order(&m, &seller, "sell", "wood", 9, 5, 0, 60, 1000, "", 0).await.unwrap();
+        assert!(db.expire_orders(i64::MAX).await.unwrap().is_empty(), "0 means no expiry, not long past");
+    }
+
+    #[tokio::test]
+    async fn the_open_order_cap_is_enforced() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_seller(&db, &m, "wood", 30).await;
+        for i in 0..3 {
+            let out = db
+                .place_order(&m, &cid, "sell", "wood", 5 + i, 2, NO_EXPIRY, 60, 3, "", 0)
+                .await
+                .unwrap();
+            assert!(out.resting_order_id.is_some(), "order {i} should rest");
+        }
+        // At the cap: refused outright, and nothing is escrowed for it.
+        let held_before: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
+            .iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
+        let out = db.place_order(&m, &cid, "sell", "wood", 9, 2, NO_EXPIRY, 60, 3, "", 0).await.unwrap();
+        assert!(out.resting_order_id.is_none());
+        assert_eq!(out.filled, 0);
+        let held_after: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
+            .iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
+        assert_eq!(held_before, held_after, "a refused order escrows nothing");
+    }
+
+    /// Matching determinism (#136 §12): the same command sequence must produce
+    /// a byte-identical trade log, or the engine has hidden nondeterminism and
+    /// no bug in it is reproducible.
+    #[tokio::test]
+    async fn matching_is_deterministic() {
+        async fn run() -> String {
+            let (db, _t) = TempDb::open().await;
+            let m = a_market(&db).await;
+            let s = a_seller(&db, &m, "wood", 40).await;
+            let b = a_character(&db).await;
+            for (side, price, qty) in [
+                ("sell", 9, 5), ("sell", 7, 6), ("sell", 8, 4),
+                ("buy", 8, 7), ("buy", 12, 6), ("sell", 6, 3), ("buy", 5, 4),
+            ] {
+                let who = if side == "sell" { &s } else { &b };
+                db.place_order(&m, who, side, "wood", price, qty, NO_EXPIRY, 60, 1000, "", 0)
+                    .await
+                    .unwrap();
+            }
+            // The ledger, minus the ids/timestamps that are meant to differ.
+            db.recent_trades(&m, "wood", 100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|t| format!("{}@{}x{}", t.item_id, t.unit_price, t.qty))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let first = run().await;
+        assert!(!first.is_empty(), "the fixture should actually trade");
+        assert_eq!(first, run().await, "same commands, same trade log");
+    }
+
+    #[tokio::test]
+    async fn a_sell_order_escrows_only_what_the_seller_actually_holds() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_seller(&db, &m, "wood", 20).await;
+
+        // Offering 50 while holding 20 rests an order for 20 — never a promise
+        // the seller can't keep.
+        let order = sell(&db, &m, &cid, "wood", 5, 50).await;
+        assert_eq!(order.resting_qty, 20);
+        assert!(order.resting_order_id.is_some());
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert!(held.iter().all(|r| r.state == "locked"), "all of it is escrowed");
+
+        // With nothing left available, a second order rests nothing at all.
+        let nothing = sell(&db, &m, &cid, "wood", 5, 5).await;
+        assert_eq!((nothing.resting_qty, nothing.filled), (0, 0));
+        assert!(nothing.resting_order_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_sell_order_returns_the_unsold_escrow() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 20).await;
+        let order_id = sell(&db, &m, &seller, "wood", 5, 20).await.resting_order_id.unwrap();
+
+        // Sell half of it first, so the cancel has to return the REMAINDER.
+        let buyer = a_character(&db).await;
+        buy(&db, &m, &buyer, "wood", 5, 8).await;
+
+        // Someone else can't cancel it.
+        assert!(db.cancel_order(&buyer, &order_id).await.unwrap().is_none());
+
+        assert!(db.cancel_order(&seller, &order_id).await.unwrap().is_some());
+        let held = db.warehouse_for_character(&m, &seller).await.unwrap();
+        let available: i64 = held.iter().filter(|r| r.state == "available").map(|r| r.qty).sum();
+        let locked: i64 = held.iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
+        assert_eq!((available, locked), (12, 0), "the 12 unsold come back, the 8 sold are gone");
+        assert!(db.book_for(&m, "wood", "sell").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_command_id_never_places_or_buys_twice() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 30).await;
+
+        let place = |who: String, side: &'static str, price: i64, qty: i64, cmd: &'static str| {
+            let db = &db;
+            let m = m.clone();
+            async move {
+                db.place_order(&m, &who, side, "wood", price, qty, NO_EXPIRY, 60, 1000, cmd, 0)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(place(seller.clone(), "sell", 5, 10, "cmd-1").await.resting_order_id.is_some());
+        let resent = place(seller.clone(), "sell", 5, 10, "cmd-1").await;
+        assert!(resent.resting_order_id.is_none(), "a resent placement is a no-op, not a second order");
+        assert_eq!(resent.filled, 0);
+        assert_eq!(
+            db.book_for(&m, "wood", "sell").await.unwrap(),
+            vec![BookLevel { unit_price: 5, qty: 10 }],
+            "still exactly one order's worth on the book"
+        );
+
+        let buyer = a_character(&db).await;
+        let purse = db.character_gold(&buyer).await.unwrap();
+        assert_eq!(place(buyer.clone(), "buy", 5, 4, "cmd-2").await.filled, 4);
+        let charged = db.character_gold(&buyer).await.unwrap();
+        let second = place(buyer.clone(), "buy", 5, 4, "cmd-2").await;
+        assert_eq!((second.filled, second.spent), (0, 0), "a resent buy doesn't double-charge");
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), charged, "and escrows nothing either");
+        assert!(charged < purse);
+        assert_eq!(db.recent_trades(&m, "wood", 10).await.unwrap().len(), 1);
+    }
+
+    /// The epic's headline invariant (#136 §12) over the whole trading loop:
+    /// across sells, buys and cancels, goods and gold are both conserved. This
+    /// is the test that matters most — duplication kills economies.
+    #[tokio::test]
+    async fn trading_conserves_goods_and_gold() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let s = a_seller(&db, &m, "wood", 50).await;
+        let b = a_character(&db).await;
+        db.add_to_inventory(&b, "wood", 10).await.unwrap();
+        db.warehouse_deposit(&m, &b, "wood", 10, 60).await.unwrap();
+
+        let total_wood = 60;
+        let total_gold = db.character_gold(&s).await.unwrap() + db.character_gold(&b).await.unwrap();
+
+        async fn wood_now(db: &Db, m: &str, who: &[&str]) -> i64 {
+            let mut n = 0i64;
+            for w in who {
+                n += qty_of(&db.inventory_for_character(w).await.unwrap(), "wood");
+                n += db.warehouse_for_character(m, w).await.unwrap()
+                    .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum::<i64>();
+            }
+            n
+        }
+
+        let mut seed: u64 = 0xfeed;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as i64
+        };
+        for step in 0..50 {
+            match next() % 4 {
+                0 => { sell(&db, &m, &s, "wood", 1 + next() % 9, 1 + next() % 7).await; }
+                1 => { sell(&db, &m, &b, "wood", 1 + next() % 9, 1 + next() % 5).await; }
+                2 => {
+                    let who = if next() % 2 == 0 { s.clone() } else { b.clone() };
+                    buy(&db, &m, &who, "wood", 1 + next() % 12, 1 + next() % 7).await;
+                }
+                _ => {
+                    let who = if next() % 2 == 0 { s.clone() } else { b.clone() };
+                    if let Some(o) = db.open_orders_for_character(&m, &who).await.unwrap().first() {
+                        db.cancel_order(&who, &o.id).await.unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                wood_now(&db, &m, &[&s, &b]).await, total_wood,
+                "wood conserved at step {step}"
+            );
+            // Gold is conserved across purses PLUS escrow. Escrowed gold is
+            // simply absent from purses, with the open buy book as its only
+            // record — so the book is part of the accounting, not outside it.
+            let escrowed: i64 = db
+                .open_orders_for_character(&m, &s)
+                .await
+                .unwrap()
+                .iter()
+                .chain(db.open_orders_for_character(&m, &b).await.unwrap().iter())
+                .filter(|o| o.side == "buy")
+                .map(|o| o.unit_price * o.qty_remaining)
+                .sum();
+            assert_eq!(
+                db.character_gold(&s).await.unwrap() + db.character_gold(&b).await.unwrap() + escrowed,
+                total_gold,
+                "gold conserved at step {step} (no fees burn yet — that's #141)"
+            );
+            assert!(db.book_health().await.unwrap().is_empty(), "book invariants hold at step {step}");
+        }
+    }
+
+    #[tokio::test]
+    async fn escrow_reconciles_against_the_open_book() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let s = a_seller(&db, &m, "wood", 30).await;
+        sell(&db, &m, &s, "wood", 5, 12).await;
+        sell(&db, &m, &s, "wood", 6, 8).await;
+
+        // Escrowed stock must exactly equal what the open book promises — a
+        // mismatch means goods were duplicated or lost (#136 §8.3).
+        for (item, book_qty, locked_qty) in db.escrow_reconciliation(&m).await.unwrap() {
+            assert_eq!(book_qty, locked_qty, "{item}: book says {book_qty}, escrow holds {locked_qty}");
+        }
+
+        // Still true after a partial fill and a cancel.
+        let buyer = a_character(&db).await;
+        buy(&db, &m, &buyer, "wood", 5, 7).await;
+        let mine = db.open_orders_for_character(&m, &s).await.unwrap();
+        db.cancel_order(&s, &mine[0].id).await.unwrap();
+        for (item, book_qty, locked_qty) in db.escrow_reconciliation(&m).await.unwrap() {
+            assert_eq!(book_qty, locked_qty, "{item} after fill+cancel");
+        }
+    }
+
+    #[tokio::test]
+    async fn warehouse_deposit_and_withdraw_round_trip_and_respect_carry_capacity() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+
+        // Deposit moves carried -> available.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 20, 60).await.unwrap(), 20);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1, "one stack, one slot");
+        assert_eq!((held[0].qty, held[0].state.as_str()), (20, "available"));
+        assert_eq!(qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood"), 10);
+
+        // A second deposit of the same item merges into the existing stack
+        // rather than eating another slot.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 10, 60).await.unwrap(), 10);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!((held.len(), held[0].qty), (1, 30));
+
+        // Withdraw is bounded by remaining carry capacity (MAX_CARRY = 50).
+        db.add_to_inventory(&cid, "stone", 45).await.unwrap();
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 30).await.unwrap(), 5, "only 5 carry slots left");
+        assert_eq!(db.warehouse_for_character(&m, &cid).await.unwrap()[0].qty, 25);
+
+        // Depositing an item you don't carry moves nothing.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "plank", 5, 60).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn warehouse_locked_stock_is_not_withdrawable() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "wood", 30).await.unwrap();
+        db.warehouse_deposit(&m, &cid, "wood", 30, 60).await.unwrap();
+
+        // Lock 10 against a (future) sell order: the stack splits.
+        assert_eq!(db.warehouse_lock(&m, &cid, "wood", 10).await.unwrap(), 10);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        let available: i64 = held.iter().filter(|r| r.state == "available").map(|r| r.qty).sum();
+        let locked: i64 = held.iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
+        assert_eq!((available, locked), (20, 10));
+
+        // Withdrawing "everything" only takes the available part — escrowed
+        // stock isn't the player's to take back until the order is cancelled.
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 999).await.unwrap(), 20);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!((held[0].qty, held[0].state.as_str()), (10, "locked"));
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "wood", 10).await.unwrap(), 0, "locked stays put");
+    }
+
+    #[tokio::test]
+    async fn warehouse_capacity_is_slots_and_a_full_warehouse_refuses_outright() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        // Two slots only. Fill both with different items.
+        db.add_to_inventory(&cid, "wood", 5).await.unwrap();
+        db.add_to_inventory(&cid, "stone", 5).await.unwrap();
+        db.add_to_inventory(&cid, "plank", 5).await.unwrap();
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 5, 2).await.unwrap(), 5);
+        assert_eq!(db.warehouse_deposit(&m, &cid, "stone", 5, 2).await.unwrap(), 5);
+
+        // A third distinct item needs a third slot: refused OUTRIGHT, with
+        // nothing moved — a half-landed deposit is what players report as
+        // lost goods.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "plank", 5, 2).await.unwrap(), 0);
+        assert_eq!(qty_of(&db.inventory_for_character(&cid).await.unwrap(), "plank"), 5, "nothing taken");
+        assert_eq!(db.warehouse_for_character(&m, &cid).await.unwrap().len(), 2);
+
+        // Topping up an item already stored consumes no new slot, so it's
+        // still allowed at capacity.
+        db.add_to_inventory(&cid, "wood", 5).await.unwrap();
+        assert_eq!(db.warehouse_deposit(&m, &cid, "wood", 5, 2).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn warehousing_a_tool_preserves_the_instance_and_its_wear() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
+        let inv = db.inventory_for_character(&cid).await.unwrap();
+        let pick = inv.iter().find(|i| i.item_id == "pickaxe").unwrap().clone();
+        assert_eq!(pick.durability, Some(50));
+
+        // Wear it, so "the same instance" is actually falsifiable.
+        db.equip_instance(&cid, &pick.id).await.unwrap();
+        db.wear_equipped_tool(&cid, "tool", 7).await.unwrap();
+        let worn = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        assert_eq!(worn.durability, Some(43));
+
+        // Deposit: same row id, same wear, one slot.
+        assert_eq!(db.warehouse_deposit(&m, &cid, "pickaxe", 1, 60).await.unwrap(), 1);
+        let held = db.warehouse_for_character(&m, &cid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, worn.id, "the SAME instance, not a fresh tool");
+        assert_eq!((held[0].durability, held[0].qty), (Some(43), 1));
+        assert!(db.inventory_for_character(&cid).await.unwrap().iter().all(|i| i.item_id != "pickaxe"));
+        // Stowing the tool you're holding takes it out of your hand, rather
+        // than refusing the deposit or leaving a dangling equipment row.
+        assert!(db.equipped_tool(&cid, "tool").await.unwrap().is_none(), "deposited tool is unequipped");
+
+        // Withdraw: still the same instance, still worn.
+        assert_eq!(db.warehouse_withdraw(&m, &cid, "pickaxe", 1).await.unwrap(), 1);
+        let back = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        assert_eq!((back.id, back.durability), (worn.id, Some(43)));
+        assert!(db.warehouse_for_character(&m, &cid).await.unwrap().is_empty());
+    }
+
+    /// The epic's headline invariant, first installment (#136 §12): across a
+    /// stream of deposits, withdrawals and locks, an item is conserved —
+    /// `carried + available + locked` never changes. Duplication kills
+    /// economies, so this is the test that matters most here.
+    #[tokio::test]
+    async fn warehouse_conserves_goods_across_a_random_command_stream() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_character(&db).await;
+        const TOTAL: i64 = 40;
+        db.add_to_inventory(&cid, "wood", TOTAL).await.unwrap();
+
+        // Deterministic pseudo-random stream, so a failure is reproducible.
+        let mut seed: u64 = 0x5eed;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as i64
+        };
+        for step in 0..60 {
+            let qty = next() % 13; // includes 0 and over-asks
+            match next() % 3 {
+                0 => { db.warehouse_deposit(&m, &cid, "wood", qty, 60).await.unwrap(); }
+                1 => { db.warehouse_withdraw(&m, &cid, "wood", qty).await.unwrap(); }
+                _ => { db.warehouse_lock(&m, &cid, "wood", qty).await.unwrap(); }
+            }
+            let carried = qty_of(&db.inventory_for_character(&cid).await.unwrap(), "wood");
+            let held: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
+                .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+            assert_eq!(carried + held, TOTAL, "wood conserved at step {step}");
+        }
     }
 
     /// Build wages (#145) are paid on the units that actually MOVED, in the

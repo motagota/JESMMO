@@ -92,6 +92,25 @@ const ROAD_MAX_POINTS: usize = 64;
 /// and built independently — see `cut_road_cells`.
 const ROAD_CELL_LEN_M: f64 = 5.0;
 
+/// How close a player must stand to a built Market to trade at it (market
+/// epic #136, issue #137). Enforced SERVER-side on every market command, not
+/// merely used to show the panel: the design is explicit that opening the UI
+/// out of range is refused, not just hidden.
+const MARKET_RANGE: i32 = 60;
+
+/// Warehouse capacity per player per market (#138), counted in SLOTS: one row
+/// is one slot, so a stack of 90 planks costs the same as a stack of 2, and
+/// each tool instance costs its own. Generous on purpose — the warehouse is
+/// working stock for trading, and a cramped one just means tedious trips.
+const WAREHOUSE_SLOTS: i64 = 60;
+
+/// Market commands one player may issue per minute (#140). Placement makes the
+/// server sweep a book and write a row per fill, so it wants a ceiling — set
+/// far above anything a human trading by hand will reach.
+const MARKET_COMMANDS_PER_MINUTE: i64 = 60;
+/// How often expired resting orders are swept and their escrow released.
+const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
 /// minted once at character creation (500, migration 0006) and only ever
@@ -387,6 +406,10 @@ struct Proxy {
     /// only: a gateway restart clears everyone's cooldowns, same as any
     /// other session-scoped guard (e.g. `cooldowns` above, for zone splits).
     ability_cooldowns: Mutex<HashMap<(String, String), Instant>>,
+    /// Per-character market command timestamps in the last minute (#140), for
+    /// the rate limit. In-memory and session-scoped like the cooldowns above:
+    /// a restart forgiving everyone's rate history is harmless.
+    market_rate: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 /// Cap on the rolling DB-latency sample window (#16) — recent-enough to be a
@@ -608,6 +631,7 @@ impl Proxy {
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
             ability_cooldowns: Mutex::new(HashMap::new()),
+            market_rate: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2336,6 +2360,380 @@ impl Proxy {
                 }
             }
         }
+    }
+
+    /// The BUILT market the player is standing at, as `(market_id, x, y)`, or
+    /// `None` if there isn't one in range (market epic #136, issue #137).
+    ///
+    /// A market is an ordinary completed build order whose `structure_kind` is
+    /// `market` — so "is there a market here" is a DB question, and the order's
+    /// own id **is** the market id. Books, warehouses, and listings are all
+    /// keyed by that id from day one: only the capital's market exists in v1,
+    /// but per-market state is the whole point of the design (#136), and
+    /// retrofitting a key later is worse than carrying one now.
+    async fn market_at(&self, db: &Db, pid: &str) -> Option<(String, i64, i64)> {
+        let (px, py) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y))?;
+        let district = self.capital.district_at(px, py)?.id.to_string();
+        let orders = db.build_orders_for_district(&district).await.ok()?;
+        orders.iter().find_map(|o| {
+            if o.state != "completed" || o.structure_kind.as_deref() != Some("market") {
+                return None;
+            }
+            let (x, y) = (o.x?, o.y?);
+            (dist2(px, py, x as i32, y as i32) <= (MARKET_RANGE as i64).pow(2))
+                .then(|| (o.id.clone(), x, y))
+        })
+    }
+
+    /// Apply `market.open` (#137): the client asking to trade at whatever
+    /// market it's standing next to. Deliberately carries no market id — the
+    /// server resolves it from the caller's live position, exactly like every
+    /// other proximity-gated action here, so a client can't name a market it
+    /// isn't at. Answered with `market.opened {market_id}`, or `market.error`
+    /// when there's no built market in range.
+    ///
+    /// This is the market subsystem's first command, and it establishes the
+    /// range gate every later one inherits (`market_at` returning `None` IS
+    /// the refusal).
+    async fn apply_market_open(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        match self.market_at(&db, pid).await {
+            Some((market_id, x, y)) => {
+                self.push_to_player(pid, json!({
+                    "type": "market.opened", "market_id": market_id, "x": x, "y": y,
+                }));
+                // Hydrate what you're holding here, so the panel is useful the
+                // moment it opens rather than after a round trip (#138), plus
+                // your own resting orders (#139).
+                self.send_warehouse(pid, &market_id).await;
+                self.send_own_orders(pid, &market_id).await;
+            }
+            None => self.push_to_player(pid, json!({
+                "type": "market.error", "code": "out_of_range",
+                "detail": "stand at a built market to trade",
+            })),
+        }
+    }
+
+    /// Push this player's warehouse at `market_id` (#138). `available` and
+    /// `locked` travel as distinct rows, not a merged total: locked stock is
+    /// escrowed against an open order and can't be withdrawn, and a player
+    /// staring at goods they can't take needs to see WHY.
+    async fn send_warehouse(&self, pid: &str, market_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(rows) = db.warehouse_for_character(market_id, pid).await else { return };
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut v = json!({
+                    "id": r.id, "item_id": r.item_id, "qty": r.qty, "state": r.state,
+                });
+                if let Some(d) = r.durability {
+                    v["durability"] = json!(d);
+                    if let Some(max) = mmo::world::tool_max_durability(&r.item_id) {
+                        v["max_durability"] = json!(max);
+                    }
+                }
+                v
+            })
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "warehouse.state", "market_id": market_id,
+            "items": items, "used": rows.len(), "slots": WAREHOUSE_SLOTS,
+        }));
+    }
+
+    /// Apply `warehouse.deposit` / `warehouse.withdraw` (#138). Both are gated
+    /// through `market_at` — the same server-side range check `market.open`
+    /// established (#137) — so a client can't stock a market it isn't standing
+    /// at. Guests have no durable inventory, so they're a no-op.
+    async fn apply_warehouse_op(&self, pid: &str, op: &str, item_id: &str, qty: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": "out_of_range",
+                "detail": "stand at a built market to use its warehouse",
+            }));
+            return;
+        };
+        let moved = match op {
+            "deposit" => db.warehouse_deposit(&market_id, pid, item_id, qty, WAREHOUSE_SLOTS).await,
+            "withdraw" => db.warehouse_withdraw(&market_id, pid, item_id, qty).await,
+            _ => Ok(0),
+        };
+        match moved {
+            Ok(0) if op == "deposit" => self.push_to_player(pid, json!({
+                "type": "market.error", "code": "warehouse_full",
+                "detail": "no room in your warehouse here",
+            })),
+            Ok(_) => {}
+            Err(e) => {
+                // Never fail silently: a player whose deposit died on a
+                // transient DB error would otherwise see nothing at all and
+                // assume the goods vanished.
+                eprintln!("[Proxy] warehouse.{op}: {e}");
+                self.push_to_player(pid, json!({
+                    "type": "market.error", "code": "server_error",
+                    "detail": "that didn't go through — try again",
+                }));
+                return;
+            }
+        }
+        self.send_inventory(pid).await;
+        self.send_warehouse(pid, &market_id).await;
+    }
+
+    /// A commodity's aggregated book as a wire message (#139). Levels only —
+    /// individual order ownership is never broadcast, which keeps the message
+    /// small and stops players reading each other's positions.
+    async fn book_json(&self, market_id: &str, item_id: &str) -> Option<Value> {
+        let db = self.db.clone()?;
+        let asks = db.book_for(market_id, item_id, "sell").await.ok()?;
+        let bids = db.book_for(market_id, item_id, "buy").await.ok()?;
+        let level = |l: &mmo::persistence::BookLevel| json!({"price": l.unit_price, "qty": l.qty});
+        Some(json!({
+            "type": "market.book", "market_id": market_id, "item_id": item_id,
+            "asks": asks.iter().map(level).collect::<Vec<_>>(),
+            "bids": bids.iter().map(level).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Answer one player's `market.book_request`.
+    async fn send_book(&self, pid: &str, market_id: &str, item_id: &str) {
+        if let Some(v) = self.book_json(market_id, item_id).await {
+            self.push_to_player(pid, v);
+        }
+    }
+
+    /// Push the changed book to everyone in the district. Deliberately not a
+    /// subscription model yet: markets are per-district and depth messages are
+    /// small, so broadcasting on change keeps every onlooker's book live with
+    /// no extra machinery. If traffic ever matters, the design doc's
+    /// `MarketSubscribe` is the upgrade path.
+    async fn broadcast_book(&self, district: &str, market_id: &str, item_id: &str) {
+        if let Some(v) = self.book_json(market_id, item_id).await {
+            self.broadcast_to_district(district, v);
+        }
+    }
+
+    /// Push this player's own resting orders at a market (#139).
+    async fn send_own_orders(&self, pid: &str, market_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(orders) = db.open_orders_for_character(market_id, pid).await else { return };
+        let arr: Vec<Value> = orders
+            .iter()
+            .map(|o| json!({
+                "order_id": o.id, "side": o.side, "item_id": o.item_id,
+                "unit_price": o.unit_price, "qty_total": o.qty_total,
+                "qty_remaining": o.qty_remaining,
+            }))
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "market.orders", "market_id": market_id, "orders": arr,
+        }));
+    }
+
+    /// Apply `market.sell` / `market.buy` / `market.cancel` (#139). All three
+    /// share `market.open`'s server-side range gate, and all three refuse with
+    /// a typed `market.error` rather than a silent no-op, so a client can tell
+    /// "rejected" from "nothing matched".
+    async fn apply_market_order(&self, pid: &str, op: &str, data: &Value) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let reject = |code: &str, detail: &str| {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": code, "detail": detail,
+            }));
+        };
+        if !self.allow_market_command(pid) {
+            let r = mmo::world::OrderReject::RateLimited;
+            reject(r.code(), r.detail());
+            return;
+        }
+        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+            reject("out_of_range", "stand at a built market to trade");
+            return;
+        };
+        let district = self
+            .entity_state
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|c| (c.x, c.y))
+            .and_then(|(x, y)| self.capital.district_at(x, y).map(|d| d.id.to_string()))
+            .unwrap_or_default();
+        let command_id = data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
+        let now = now_secs();
+
+        if op == "cancel" {
+            let order_id = data.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+            match db.cancel_order(pid, order_id).await {
+                Ok(Some(o)) => {
+                    self.send_warehouse(pid, &market_id).await;
+                    self.send_own_orders(pid, &market_id).await;
+                    self.broadcast_book(&district, &market_id, &o.item_id).await;
+                }
+                Ok(None) => reject("no_such_order", "that order isn't yours, or is already gone"),
+                Err(e) => eprintln!("[Proxy] market.cancel: {e}"),
+            }
+            return;
+        }
+
+        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let unit_price = data.get("unit_price").and_then(|v| v.as_i64()).unwrap_or(0);
+        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Err(r) = mmo::world::validate_order(&item_id, unit_price, qty) {
+            reject(r.code(), r.detail());
+            return;
+        }
+
+        // Either side may now rest (#140), so both go through one path.
+        let hours = mmo::world::order_duration_hours(
+            data.get("duration_hours").and_then(|v| v.as_i64()).unwrap_or(0),
+        );
+        let expires_at = now + hours * 3600;
+        match db
+            .place_order(
+                &market_id, pid, op, &item_id, unit_price, qty, expires_at,
+                WAREHOUSE_SLOTS, mmo::world::MAX_OPEN_ORDERS_PER_MARKET, command_id, now,
+            )
+            .await
+        {
+            // A resent command was already answered the first time — stay
+            // silent rather than report a failure that didn't happen.
+            Ok(out) if out.deduped => {}
+            Ok(out) if out.filled == 0 && out.resting_order_id.is_none() => {
+                // Nothing traded and nothing rested: say which it was, since
+                // "couldn't escrow" and "hit the cap" need different fixes.
+                if op == "sell" {
+                    reject("no_stock", "deposit that item into this market's warehouse before selling it")
+                } else {
+                    reject("no_funds", "not enough gold to escrow that order")
+                }
+            }
+            Ok(out) => {
+                // The placer's gold moved — ALWAYS push the balance, not just
+                // on a fill: resting a buy escrows gold out of the purse, and
+                // a client whose readout silently went stale would think it
+                // still had money it doesn't. `delta` stays the trade result
+                // (0 for a pure escrow), so escrow doesn't flash as a gain.
+                let delta = out.earned + out.refunded - out.spent;
+                self.push_gold(pid, delta, "market_trade").await;
+                self.send_warehouse(pid, &market_id).await;
+                self.send_own_orders(pid, &market_id).await;
+
+                // Each counterparty learns their order shrank, gets paid or
+                // receives goods, and sees their own escrow drop. Proceeds are
+                // summed per seller so the delta is a real "+N gold", not a
+                // bare balance.
+                let mut proceeds: std::collections::BTreeMap<&str, i64> = Default::default();
+                for t in &out.fills {
+                    if t.seller_id != pid {
+                        *proceeds.entry(t.seller_id.as_str()).or_insert(0) += t.unit_price * t.qty;
+                    }
+                }
+                for (seller_id, earned) in &proceeds {
+                    self.push_gold(seller_id, *earned, "market_sale").await;
+                }
+                for (_, owner, _) in &out.touched {
+                    self.send_warehouse(owner, &market_id).await;
+                    self.send_own_orders(owner, &market_id).await;
+                }
+                for t in &out.fills {
+                    self.broadcast_to_district(&district, json!({
+                        "type": "market.trade", "market_id": market_id,
+                        "item_id": t.item_id, "unit_price": t.unit_price, "qty": t.qty,
+                    }));
+                }
+                self.broadcast_book(&district, &market_id, &item_id).await;
+            }
+            Err(e) => {
+                eprintln!("[Proxy] market.{op}: {e}");
+                reject("server_error", "that order didn't go through — try again");
+            }
+        }
+    }
+
+    /// Per-player market command rate limit (#140): a sliding one-minute
+    /// window. Order placement is the cheapest way to make the server do
+    /// expensive work (a book sweep plus a write per fill), so it needs a
+    /// ceiling that a human trading by hand will never reach.
+    fn allow_market_command(&self, pid: &str) -> bool {
+        let now = Instant::now();
+        let mut hits = self.market_rate.lock().unwrap();
+        let stamps = hits.entry(pid.to_string()).or_default();
+        stamps.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if stamps.len() as i64 >= MARKET_COMMANDS_PER_MINUTE {
+            return false;
+        }
+        stamps.push(now);
+        true
+    }
+
+    /// Release the escrow of every expired order (#140), then tell each owner.
+    /// An order left resting holds goods or gold hostage, so this is what
+    /// stops a forgotten order stranding them forever.
+    async fn sweep_expired_orders(self: Arc<Self>) {
+        loop {
+            sleep(ORDER_EXPIRY_INTERVAL).await;
+            let Some(db) = self.db.clone() else { continue };
+            let expired = match db.expire_orders(now_secs()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[Proxy] order expiry sweep: {e}");
+                    continue;
+                }
+            };
+            if expired.is_empty() {
+                continue;
+            }
+            println!("[Proxy] MARKET: expired {} resting order(s), escrow released", expired.len());
+            for o in &expired {
+                self.push_gold(&o.character_id, 0, "order_expired").await;
+                self.send_warehouse(&o.character_id, &o.market_id).await;
+                self.send_own_orders(&o.character_id, &o.market_id).await;
+                if let Some(d) = self.district_of_market(&db, &o.market_id).await {
+                    self.broadcast_book(&d, &o.market_id, &o.item_id).await;
+                }
+            }
+        }
+    }
+
+    /// The district a market sits in, for book broadcasts that aren't driven
+    /// by a player's own position (the expiry sweep).
+    async fn district_of_market(&self, db: &Db, market_id: &str) -> Option<String> {
+        let o = db.build_order_by_id(market_id).await.ok()??;
+        Some(o.district)
+    }
+
+    /// Push a player's authoritative gold balance (#145's `gold.update`), used
+    /// wherever gold moves for a reason other than wages. `delta` is
+    /// informational; the balance is read back from the DB either way.
+    async fn push_gold(&self, pid: &str, delta: i64, reason: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let balance = db.character_gold(pid).await.unwrap_or(0);
+        self.push_to_player(pid, json!({
+            "type": "gold.update", "gold": balance, "delta": delta, "reason": reason,
+        }));
     }
 
     /// The wage rate a given order kind pays per contributed unit (#145).
@@ -4707,6 +5105,51 @@ impl Proxy {
                         self.apply_road_plan(&player_id, data).await;
                         continue;
                     }
+                    // `market.open` (#137) resolves the market from the
+                    // caller's live position, so it's answered here with the
+                    // gateway's position cache rather than round-tripping the
+                    // zone — same as `build_contribute`'s own proximity gate.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
+                        self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // `market.book_request` (#139): a stateless read of one
+                    // commodity's depth, so the client can look at a book
+                    // without waiting for someone else's trade to push one.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.book_request") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if let Some(db) = self.db.clone() {
+                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                                self.send_book(&player_id, &market_id, &item_id).await;
+                            }
+                        }
+                        continue;
+                    }
+                    // `market.sell` / `market.buy` / `market.cancel` (#139)
+                    // share market.open's range gate.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("market."))
+                        .filter(|op| matches!(*op, "sell" | "buy" | "cancel"))
+                    {
+                        let op = op.to_string();
+                        self.apply_market_order(&player_id, &op, &data).await;
+                        continue;
+                    }
+                    // `warehouse.*` (#138) share market.open's range gate.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("warehouse."))
+                        .filter(|op| *op == "deposit" || *op == "withdraw")
+                    {
+                        let op = op.to_string();
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.apply_warehouse_op(&player_id, &op, &item_id, qty).await;
+                        continue;
+                    }
                     // `road.cells_request` (#134) is a stateless read, same
                     // reasoning as `terrain.list`/`object.list`.
                     if data.get("type").and_then(|v| v.as_str()) == Some("road.cells_request") {
@@ -4939,6 +5382,11 @@ impl Proxy {
         let me = self.clone();
         tokio::spawn(async move { me.rent_monitor().await });
 
+        // Order expiry sweep (#140): releases escrow from orders nobody came
+        // back for.
+        let me = self.clone();
+        tokio::spawn(async move { me.sweep_expired_orders().await });
+
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
         // whichever comes first ends the process, but either way we get one
@@ -5074,6 +5522,22 @@ async fn main() {
                 Ok(()) => println!("[Proxy] Capital seeded ({} starter plots)", mmo::world::capital().starter_plots().len()),
                 Err(e) => println!("[Proxy] WARNING: capital seeding failed: {e}"),
             }
+            // Market book reconciliation (#136 §8.3, issue #140). A HARD
+            // failure, not a warning: every violation here means goods or gold
+            // have been duplicated or destroyed, and a market that has
+            // silently minted stock is far worse than one that won't start.
+            match db.book_health().await {
+                Ok(problems) if problems.is_empty() => {
+                    println!("[Proxy] Market books reconciled — escrow matches the open book")
+                }
+                Ok(problems) => {
+                    for p in &problems {
+                        eprintln!("[Proxy] FATAL: {p}");
+                    }
+                    panic!("market book reconciliation failed ({} problem(s)) — refusing to start", problems.len());
+                }
+                Err(e) => panic!("market book reconciliation could not run: {e}"),
+            }
             // Seed the one mayor login (idempotent — a no-op once the account exists).
             let mayor_hash = auth::hash_password(MAYOR_PASSWORD).unwrap_or_default();
             let (tcx, tcy) = mmo::world::capital().town_centre;
@@ -5143,6 +5607,7 @@ mod tests {
             terrain_edit_lock: tokio::sync::Mutex::new(()),
             world_objects: tokio::sync::OnceCell::new(),
             ability_cooldowns: Mutex::new(HashMap::new()),
+            market_rate: Mutex::new(HashMap::new()),
         })
     }
 
@@ -6093,6 +6558,14 @@ mod tests {
             .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
             .await;
         (proxy, dbf, zone)
+    }
+
+    /// Park a player's cached position. Must be called right BEFORE each
+    /// proximity-gated command: login inserts the character's saved position
+    /// into the same cache *after* `welcome` is sent, so a one-time setup at
+    /// the top of a test gets silently overwritten.
+    fn stand_at(proxy: &Arc<Proxy>, pid: &str, x: i32, y: i32) {
+        proxy.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp: 100 });
     }
 
     /// Poll a road order's aggregate `progress_json` until it matches
@@ -9518,6 +9991,427 @@ mod tests {
         assert_eq!(db.build_order_by_id(&order.id).await.unwrap().unwrap().state, "completed");
 
         drop(ws);
+    }
+
+    /// The Market (#137): it must be BUILT before it can be traded at, the
+    /// range gate is enforced server-side (not merely hidden client-side), and
+    /// the market id is the completed order's own — never something the client
+    /// names, so it can't claim to be at a market it isn't at.
+    #[tokio::test]
+    async fn market_open_requires_a_built_market_in_range() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        // The real gateway seeds the authored capital at boot; the test
+        // harness doesn't, so do it here to get the authored market order.
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // The authored market order seeds `open` (unbuilt) at boot.
+        let orders = db.build_orders_for_district("civic").await.unwrap();
+        let market = orders.iter().find(|o| o.kind == "market").expect("the market is authored");
+        assert_eq!(market.state, "open", "a fresh capital's market is unbuilt");
+        let (mx, my) = (market.x.unwrap(), market.y.unwrap());
+
+        let email = format!("trader_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Trader"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Standing right on the site, but nothing is built there yet: refused.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: mx as i32, y: my as i32, hp: 100 });
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range", "an unbuilt market can't be traded at");
+
+        // Build it for real, through the ordinary contribution flow. Its
+        // 80-unit cost exceeds `MAX_CARRY` (50), so it takes two trips — a
+        // deliberate property of a civic build this size, not a test quirk.
+        for (item, qty) in [("wood", 50), ("stone", 30)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "gather_yield", "player_id": pid,
+                    "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+                }).to_string()))
+                .unwrap();
+            recv_until(&mut ws, "inv.update").await;
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": market.id, "item_id": item, "qty": qty,
+                }).to_string()))
+                .unwrap();
+        }
+        recv_until(&mut ws, "build.completed").await;
+
+        // Now in range of a BUILT market: accepted, and the id is the order's.
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(opened["market_id"].as_str().unwrap(), market.id, "market id is the order's own id");
+        assert_eq!((opened["x"].as_i64(), opened["y"].as_i64()), (Some(mx), Some(my)));
+
+        // Walk out of range: refused again, even though it's built. Range is
+        // enforced here, not merely used to hide the panel.
+        proxy.entity_state.lock().unwrap().insert(
+            pid.clone(), EntityCache { x: mx as i32 + MARKET_RANGE + 5, y: my as i32, hp: 100 },
+        );
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
+
+        drop(ws);
+    }
+
+    /// The warehouse over the wire (#138): gated by the same server-side range
+    /// check as `market.open`, hydrated on open, and pushed after every move.
+    #[tokio::test]
+    async fn warehouse_deposit_and_withdraw_are_range_gated_and_push_state() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        // A built market to trade at, without hauling 80 units in a test.
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let email = format!("stocker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Stocker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 30, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        // Out of range: refused, and nothing moves.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12000, y: 12800, hp: 100 });
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 10}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
+        assert!(db.warehouse_for_character(&market.id, &pid).await.unwrap().is_empty());
+
+        // Step up to the market: opening hydrates the (empty) warehouse.
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100 });
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let state = recv_until(&mut ws, "warehouse.state").await;
+        assert_eq!(state["market_id"].as_str().unwrap(), market.id);
+        assert!(state["items"].as_array().unwrap().is_empty());
+        assert_eq!(state["slots"].as_i64().unwrap(), WAREHOUSE_SLOTS);
+
+        // Deposit: state comes back with the stock, and carry drops.
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let state = loop {
+            let v = recv_until(&mut ws, "warehouse.state").await;
+            if !v["items"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let items = state["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item_id"].as_str().unwrap(), "wood");
+        assert_eq!(items[0]["qty"].as_i64().unwrap(), 20);
+        assert_eq!(items[0]["state"].as_str().unwrap(), "available");
+        assert_eq!(state["used"].as_i64().unwrap(), 1);
+
+        // Withdraw it back.
+        ws.send(Message::Text(
+            json!({"type": "warehouse.withdraw", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let v = recv_until(&mut ws, "warehouse.state").await;
+            if v["items"].as_array().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            qty_of_inventory(&db, &pid, "wood").await, 30,
+            "everything came back to carry"
+        );
+
+        drop(ws);
+    }
+
+    async fn qty_of_inventory(db: &Db, pid: &str, item: &str) -> i64 {
+        db.inventory_for_character(pid)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|i| i.item_id == item)
+            .map(|i| i.qty)
+            .sum()
+    }
+
+    /// The trading loop over the wire (#139): stock a warehouse, rest a sell,
+    /// have someone else cross it, and check both sides are paid and told.
+    #[tokio::test]
+    async fn market_sell_and_buy_execute_over_the_wire_at_the_resting_price() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Two traders, both standing at the market.
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("s_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "Seller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("b_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "Buyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Seller mines wood and banks it at the market.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        // Loop past login hydration's EMPTY inv.update — grabbing that one
+        // instead of the gather's would deposit before the wood arrives.
+        loop {
+            let v = recv_until(&mut seller, "inv.update").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["item_id"] == "wood") {
+                break;
+            }
+        }
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        )).await.unwrap();
+        recv_until(&mut seller, "warehouse.state").await;
+
+        // A tool can never go on the book — it belongs to the listing board.
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "c0", "item_id": "pickaxe", "unit_price": 5, "qty": 1,
+        }).to_string())).await.unwrap();
+        let err = recv_until(&mut seller, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "not_a_commodity");
+
+        // Rest a sell at 8.
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "c1", "item_id": "wood", "unit_price": 8, "qty": 20,
+        }).to_string())).await.unwrap();
+        let orders = recv_until(&mut seller, "market.orders").await;
+        let mine = orders["orders"].as_array().unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["unit_price"].as_i64().unwrap(), 8);
+        let order_id = mine[0]["order_id"].as_str().unwrap().to_string();
+
+        // The buyer sees the depth, aggregated by level and with no ownership.
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(
+            json!({"type": "market.book_request", "item_id": "wood"}).to_string(),
+        )).await.unwrap();
+        let book = recv_until(&mut buyer, "market.book").await;
+        assert_eq!(book["asks"], json!([{"price": 8, "qty": 20}]));
+        assert!(book.to_string().find(&sid).is_none(), "depth must not leak who is selling");
+
+        // Bid 12 for 5: pays the resting 8, not the 12 bid.
+        let buyer_gold = db.character_gold(&bid_).await.unwrap();
+        let seller_gold = db.character_gold(&sid).await.unwrap();
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
+        }).to_string())).await.unwrap();
+        // Poll the durable outcome rather than racing the ticker frame: under
+        // parallel test load the broadcast can sit behind a queue of other
+        // pushes, which makes a strict frame wait a test of frame ordering
+        // instead of of the trade.
+        let mut traded = Vec::new();
+        for _ in 0..40 {
+            traded = db.recent_trades(&market.id, "wood", 10).await.unwrap();
+            if !traded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(traded.len(), 1, "the buy should have crossed the resting ask");
+        assert_eq!((traded[0].unit_price, traded[0].qty), (8, 5), "executed at the resting 8");
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "5 x the resting 8");
+        assert_eq!(db.character_gold(&sid).await.unwrap(), seller_gold + 40, "seller paid immediately");
+
+        // Goods landed in the BUYER's warehouse at this market.
+        let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+        assert_eq!(held, 5);
+
+        // A resend of the same command_id doesn't buy again — and stays
+        // SILENT, because the client already got its answer the first time.
+        // A failure message here would be a lie about what happened.
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
+        }).to_string())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "charged exactly once");
+        assert_eq!(
+            db.recent_trades(&market.id, "wood", 10).await.unwrap().len(), 1,
+            "and traded exactly once"
+        );
+
+        // Cancelling returns the unsold escrow to available.
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.cancel", "command_id": "c3", "order_id": order_id,
+        }).to_string())).await.unwrap();
+        let state = loop {
+            let v = recv_until(&mut seller, "warehouse.state").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["state"] == "available") {
+                break v;
+            }
+        };
+        let avail: i64 = state["items"].as_array().unwrap().iter()
+            .filter(|i| i["state"] == "available").map(|i| i["qty"].as_i64().unwrap()).sum();
+        assert_eq!(avail, 15, "20 offered - 5 sold = 15 back");
+
+        drop(seller);
+        drop(buyer);
+    }
+
+    /// #140 over the wire: a buy with nothing to cross RESTS (escrowing gold)
+    /// and shows up as a bid, a later seller crosses it and is paid the BID,
+    /// and the rate limit refuses a flood.
+    #[tokio::test]
+    async fn a_resting_bid_is_visible_and_filled_at_the_bid_price() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("rb_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "RestingBuyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("ls_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "LateSeller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // An empty book: the buy rests instead of failing.
+        let buyer_gold = db.character_gold(&bid_).await.unwrap();
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "b1", "item_id": "wood", "unit_price": 9, "qty": 10,
+        }).to_string())).await.unwrap();
+        let orders = recv_until(&mut buyer, "market.orders").await;
+        let mine = orders["orders"].as_array().unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["side"].as_str().unwrap(), "buy");
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90, "escrowed 10 x 9");
+
+        // It shows as depth on the BID side.
+        let book = recv_until(&mut buyer, "market.book").await;
+        assert_eq!(book["bids"], json!([{"price": 9, "qty": 10}]));
+
+        // A seller arrives with stock and asks 6 — under the bid, so it
+        // crosses and they're paid the RESTING 9.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "wood", "qty": 10, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        loop {
+            let v = recv_until(&mut seller, "inv.update").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["item_id"] == "wood") {
+                break;
+            }
+        }
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 10}).to_string(),
+        )).await.unwrap();
+        recv_until(&mut seller, "warehouse.state").await;
+        let seller_gold = db.character_gold(&sid).await.unwrap();
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "s1", "item_id": "wood", "unit_price": 6, "qty": 4,
+        }).to_string())).await.unwrap();
+        let mut trades = Vec::new();
+        for _ in 0..40 {
+            trades = db.recent_trades(&market.id, "wood", 10).await.unwrap();
+            if !trades.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            trades.len(), 1,
+            "the crossing sell should have traded. seller warehouse={:?} bids={:?} asks={:?}",
+            db.warehouse_for_character(&market.id, &sid).await.unwrap(),
+            db.book_for(&market.id, "wood", "buy").await.unwrap(),
+            db.book_for(&market.id, "wood", "sell").await.unwrap(),
+        );
+        assert_eq!((trades[0].unit_price, trades[0].qty), (9, 4), "paid the resting bid");
+        assert_eq!(
+            db.character_gold(&sid).await.unwrap(), seller_gold + 36,
+            "paid the resting bid of 9, not their own ask of 6"
+        );
+        // The buyer's escrow covered it — no further charge.
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90);
+        let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+        assert_eq!(held, 4, "goods delivered to the resting buyer");
+
+        // The rate limit lets a normal trader through and stops a flood.
+        // Checked directly rather than by flooding the socket: a flood also
+        // trips the open-order cap and buries the answer under a hundred
+        // other frames, which makes the assertion about frame ordering
+        // instead of about the limiter.
+        let flooder = format!("flood-{}", Uuid::new_v4().simple());
+        for i in 0..MARKET_COMMANDS_PER_MINUTE {
+            assert!(proxy.allow_market_command(&flooder), "command {i} is within the limit");
+        }
+        assert!(!proxy.allow_market_command(&flooder), "one past the limit is refused");
+        // Other players are unaffected — the window is per character.
+        assert!(proxy.allow_market_command(&sid));
+
+        drop(buyer);
+        drop(seller);
     }
 
     /// Build wages (#145): an ordinary contribution pays the city's rate and
