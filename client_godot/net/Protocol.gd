@@ -263,6 +263,54 @@ const MAX_ORDER_QTY := 10000
 ## default, so this list is a convenience, not a trust boundary.
 const ORDER_DURATIONS_HOURS := [12, 24, 72, 168]
 const DEFAULT_ORDER_HOURS := 24
+## `market.fees {market_id, listing_fee, sale_tax}` — what the house took from
+## your last command (#141).
+const S_MARKET_FEES := "market.fees"
+## Price history (#143). `market.history_request {item_id, days?}` reads the
+## DERIVED candle cache — the trade ledger is the source of truth and a
+## background job rolls it up, so asking never blocks a trade.
+## `market.history {market_id, item_id, interval_secs, candles}` answers with
+## `{t, o, h, l, c, v, n}` per bucket, oldest first. ABSENT buckets mean no
+## trades and must render as a GAP, never a carried-forward flat price.
+const C_MARKET_HISTORY_REQUEST := "market.history_request"
+const S_MARKET_HISTORY := "market.history"
+## Listing board for unique items (#142). A tool's durability makes it
+## individually priced, so uniques are offered one at a time at a fixed ask
+## rather than on a book. `listing.buy` carries `expected_price` — a listing
+## that changed under you is refused, never silently charged at a new price —
+## and purchase is first-come, settled server-side so exactly one of several
+## simultaneous buyers wins and the losers pay nothing.
+const C_LISTING_PLACE := "listing.place"
+const C_LISTING_BUY := "listing.buy"
+const C_LISTING_CANCEL := "listing.cancel"
+const C_LISTING_LIST := "listing.list"
+const S_LISTING_PAGE := "listing.page"
+const S_LISTING_SOLD := "listing.sold"
+## Display-only mirrors of the server's fee formulas (world.rs). Used to show
+## the cost BEFORE you commit; the server's own numbers are authoritative and
+## are what actually get charged.
+const LISTING_FEE_MIN_GOLD := 1
+const LISTING_FEE_NUM := 1
+const LISTING_FEE_DEN := 100
+const SALE_TAX_NUM := 3
+const SALE_TAX_DEN := 100
+
+## Integer ceiling division — fees round toward the house, never down.
+static func _div_ceil(n: int, d: int) -> int:
+    return 0 if n <= 0 else (n + d - 1) / d
+
+## What it costs to place an order of this notional (both sides pay, and it is
+## never refunded). Mirrors `world::listing_fee`.
+static func listing_fee(notional: int) -> int:
+    if notional <= 0:
+        return 0
+    return maxi(_div_ceil(notional * LISTING_FEE_NUM, LISTING_FEE_DEN), LISTING_FEE_MIN_GOLD)
+
+## Tax a seller pays out of one fill's value. Mirrors `world::sale_tax`.
+static func sale_tax(value: int) -> int:
+    if value <= 0:
+        return 0
+    return maxi(_div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN), 1)
 ## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
 ## the panel; the server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0

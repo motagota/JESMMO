@@ -352,7 +352,8 @@ func _wire_signals() -> void:
     # Market (#137): the server confirmed we're at a real one and may trade.
     _net.market_opened.connect(func(market_id, _x, _y):
         _market.set_market(market_id)
-        _net.send_market_book_request(_market.watching())) # seed the depth we're looking at
+        _net.send_market_book_request(_market.watching()) # seed the depth we're looking at
+        _net.send_market_history_request(_market.watching()))
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
     # Warehouse (#138): custody of goods held at this market.
     _net.warehouse_state.connect(func(_market_id, items, used, slots):
@@ -364,10 +365,25 @@ func _wire_signals() -> void:
     _net.market_orders.connect(func(_mid, orders): _market.set_orders(orders))
     _net.market_trade.connect(func(_mid, item_id, unit_price, qty):
         _market.note_trade(item_id, unit_price, qty))
+    _net.market_fees.connect(func(_mid, listing_fee, sale_tax):
+        _market.note_fees(listing_fee, sale_tax))
+    # Price history (#143).
+    _net.market_history.connect(func(_mid, item_id, interval, candles):
+        _market.set_history(item_id, interval, candles))
+    # Listing board (#142).
+    _net.listing_page.connect(func(_mid, listings): _market.set_listings(listings))
+    _net.listing_sold.connect(func(_mid, _lid, item_id, ask):
+        _hud.flash_announce("%s sold for %dg" % [item_id, ask])
+        _net.send_listing_list()) # the board moved; refresh it
+    _market.do_list.connect(func(wid, ask, hours): _net.send_listing_place(wid, ask, hours))
+    _market.do_buy_listing.connect(func(lid, expected): _net.send_listing_buy(lid, expected))
+    _market.do_cancel_listing.connect(func(lid): _net.send_listing_cancel(lid))
     _market.do_sell.connect(func(item_id, price, qty, hours): _net.send_market_sell(item_id, price, qty, hours))
     _market.do_buy.connect(func(item_id, price, qty, hours): _net.send_market_buy(item_id, price, qty, hours))
     _market.do_cancel.connect(func(order_id): _net.send_market_cancel(order_id))
-    _market.do_watch.connect(func(item_id): _net.send_market_book_request(item_id))
+    _market.do_watch.connect(func(item_id):
+        _net.send_market_book_request(item_id)
+        _net.send_market_history_request(item_id))
     _net.rent_status.connect(_on_rent_status)
     _net.rent_warning.connect(func(_plot_id_arg, due_at): _hud.flash_announce(
         "Rent is due soon (in %dh) — press P to pay" % maxi((due_at - int(Time.get_unix_time_from_system())) / 3600, 0)))

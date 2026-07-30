@@ -237,6 +237,59 @@ pub const S_MARKET_BOOK: &str = "market.book";
 pub const S_MARKET_ORDERS: &str = "market.orders";
 // {market_id, item_id, unit_price, qty} -- a fill just happened; the ticker.
 pub const S_MARKET_TRADE: &str = "market.trade";
+// {market_id, listing_fee, sale_tax} -- what the house just took from YOUR
+// command (issue #141). A listing fee is charged to BOTH sides at placement on
+// notional and is never refunded on cancel or expiry -- that's what makes
+// posting an order you don't mean to honour cost something. Sale tax comes out
+// of a seller's proceeds per fill. Both are BURNED at the capital market: the
+// gold leaves the economy, which is the point (rent was the only sink before
+// #145 made gold earnable at all). Every fee rounds UP and is never zero on a
+// nonzero amount, so splitting one order into many can't dodge the sink.
+pub const S_MARKET_FEES: &str = "market.fees";
+
+// --- price history (issue #143) -------------------------------------------------
+// {item_id, days?} -- ask for a commodity's OHLCV price history at this market.
+// A stateless read of a DERIVED CACHE: `market_trade` is the append-only source
+// of truth, and candles are rolled up by a background job so aggregation never
+// sits in front of a trade. Clamped to the retention window.
+pub const C_MARKET_HISTORY_REQUEST: &str = "market.history_request";
+// {market_id, item_id, interval_secs, candles: [{t, o, h, l, c, v, n}]} --
+// t = bucket start (unix seconds, a multiple of interval_secs), o/h/l/c the
+// open/high/low/close price, v the volume traded, n the number of fills.
+// ABSENT buckets mean no trades and must render as a GAP — carrying the last
+// price forward would invent a price nobody paid.
+pub const S_MARKET_HISTORY: &str = "market.history";
+
+// --- listing board — unique items (issue #142) ----------------------------------
+// Two pickaxes at different durability aren't the same good, so a unique item
+// can't have an order book: "the price of a pickaxe" is meaningless. Uniques are
+// offered individually at a fixed ask and bought outright. `world::is_commodity`
+// draws the line — anything that stacks goes to the book instead.
+//
+// {command_id, warehouse_item_id, ask_price, duration_hours} -- offer a unique
+// item you have sitting `available` in this market's warehouse. It moves to
+// `locked`: genuinely escrowed, so it can't be withdrawn out from under a buyer.
+// Charges the #141 listing fee.
+pub const C_LISTING_PLACE: &str = "listing.place";
+// {command_id, listing_id, expected_price} -- buy outright, first-come. Settled
+// by a compare-and-clear, so exactly one of N simultaneous buyers wins and the
+// losers are charged nothing. `expected_price` must match the ask: a listing
+// that changed under you is refused rather than silently charged at a new price.
+// The escrowed instance is handed over by reassigning its warehouse row, so what
+// arrives is provably the item advertised -- same id, same durability.
+pub const C_LISTING_BUY: &str = "listing.buy";
+// {command_id, listing_id} -- withdraw your own; the item returns intact. The
+// listing fee stays spent, as on a cancelled order.
+pub const C_LISTING_CANCEL: &str = "listing.cancel";
+// {item_id?, min_durability?, max_price?} -- browse the board, cheapest first.
+pub const C_LISTING_LIST: &str = "listing.list";
+// {market_id, listings: [{listing_id, item_id, ask_price, mine, expires_at,
+// durability?, max_durability?}]} -- the board. `mine` marks your own, which is
+// the one place ownership IS revealed.
+pub const S_LISTING_PAGE: &str = "listing.page";
+// {market_id, listing_id, item_id, ask_price} -- a listing just sold; broadcast
+// so every onlooker's board stops showing something that's gone.
+pub const S_LISTING_SOLD: &str = "listing.sold";
 
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}

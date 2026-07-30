@@ -110,6 +110,11 @@ const WAREHOUSE_SLOTS: i64 = 60;
 const MARKET_COMMANDS_PER_MINUTE: i64 = 60;
 /// How often expired resting orders are swept and their escrow released.
 const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+/// How many listings one browse of the board returns (#142).
+const LISTING_PAGE_LIMIT: i64 = 100;
+/// How often the trade ledger is rolled into candles (#143). A background
+/// cadence — aggregation must never sit in front of a trade.
+const CANDLE_ROLLUP_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
@@ -2407,6 +2412,7 @@ impl Proxy {
                 // your own resting orders (#139).
                 self.send_warehouse(pid, &market_id).await;
                 self.send_own_orders(pid, &market_id).await;
+                self.send_listings(pid, &market_id, &json!({})).await;
             }
             None => self.push_to_player(pid, json!({
                 "type": "market.error", "code": "out_of_range",
@@ -2543,6 +2549,159 @@ impl Proxy {
         }));
     }
 
+    /// Push a market's listing board (#142), optionally filtered.
+    async fn send_listings(&self, pid: &str, market_id: &str, data: &Value) {
+        let Some(db) = self.db.clone() else { return };
+        let item = data.get("item_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let min_dur = data.get("min_durability").and_then(|v| v.as_i64());
+        let max_price = data.get("max_price").and_then(|v| v.as_i64());
+        let Ok(rows) = db
+            .listings_for_market(market_id, item, min_dur, max_price, LISTING_PAGE_LIMIT)
+            .await
+        else {
+            return;
+        };
+        let listings: Vec<Value> = rows
+            .iter()
+            .map(|l| {
+                let mut v = json!({
+                    "listing_id": l.id, "item_id": l.item_id, "ask_price": l.ask_price,
+                    "mine": l.seller_id == pid, "expires_at": l.expires_at,
+                });
+                if let Some(d) = l.durability {
+                    v["durability"] = json!(d);
+                    if let Some(max) = mmo::world::tool_max_durability(&l.item_id) {
+                        v["max_durability"] = json!(max);
+                    }
+                }
+                v
+            })
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "listing.page", "market_id": market_id, "listings": listings,
+        }));
+    }
+
+    /// Apply `listing.place` / `listing.buy` / `listing.cancel` (#142) — the
+    /// board for unique items. Shares `market.open`'s range gate and the same
+    /// rate limit as the order book.
+    async fn apply_listing_op(&self, pid: &str, op: &str, data: &Value) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return;
+        }
+        let reject = |code: &str, detail: &str| {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": code, "detail": detail,
+            }));
+        };
+        if !self.allow_market_command(pid) {
+            let r = mmo::world::OrderReject::RateLimited;
+            reject(r.code(), r.detail());
+            return;
+        }
+        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+            reject("out_of_range", "stand at a built market to trade");
+            return;
+        };
+        let command_id = data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
+        let now = now_secs();
+
+        match op {
+            "place" => {
+                let wh_id = data.get("warehouse_item_id").and_then(|v| v.as_str()).unwrap_or("");
+                let ask = data.get("ask_price").and_then(|v| v.as_i64()).unwrap_or(0);
+                let hours = mmo::world::order_duration_hours(
+                    data.get("duration_hours").and_then(|v| v.as_i64()).unwrap_or(0),
+                );
+                if ask <= 0 {
+                    let r = mmo::world::OrderReject::BadPrice;
+                    reject(r.code(), r.detail());
+                    return;
+                }
+                match db
+                    .place_listing(&market_id, pid, wh_id, ask, now + hours * 3600, command_id, now)
+                    .await
+                {
+                    Ok(Some(l)) => {
+                        self.push_to_player(pid, json!({
+                            "type": "market.fees", "market_id": market_id,
+                            "listing_fee": mmo::world::listing_fee(l.ask_price), "sale_tax": 0,
+                        }));
+                        self.push_gold(pid, 0, "listing_placed").await;
+                        self.send_warehouse(pid, &market_id).await;
+                        self.send_listings(pid, &market_id, &json!({})).await;
+                    }
+                    Ok(None) => reject(
+                        "cannot_list",
+                        "that has to be a unique item sitting in this market's warehouse, and you must afford the listing fee",
+                    ),
+                    Err(e) => {
+                        eprintln!("[Proxy] listing.place: {e}");
+                        reject("server_error", "that didn't go through — try again");
+                    }
+                }
+            }
+            "buy" => {
+                let listing_id = data.get("listing_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let expected = data.get("expected_price").and_then(|v| v.as_i64()).unwrap_or(-1);
+                // Read the seller BEFORE the buy: a successful purchase deletes
+                // the listing, so afterwards there's nothing left to ask.
+                let seller = db.listing_by_id(&listing_id).await.ok().flatten().map(|l| l.seller_id);
+                match db
+                    .buy_listing(pid, &listing_id, expected, WAREHOUSE_SLOTS, command_id, now)
+                    .await
+                {
+                    Ok(Ok((l, tax))) => {
+                        self.push_gold(pid, -l.ask_price, "listing_bought").await;
+                        self.send_warehouse(pid, &market_id).await;
+                        if let Some(seller) = seller {
+                            self.push_gold(&seller, l.ask_price - tax, "listing_sold").await;
+                            self.push_to_player(&seller, json!({
+                                "type": "market.fees", "market_id": market_id,
+                                "listing_fee": 0, "sale_tax": tax,
+                            }));
+                            self.send_warehouse(&seller, &market_id).await;
+                            self.send_listings(&seller, &market_id, &json!({})).await;
+                        }
+                        self.send_listings(pid, &market_id, &json!({})).await;
+                        // The board is a shared view, so everyone's copy is stale.
+                        if let Some(d) = self.district_of_market(&db, &market_id).await {
+                            self.broadcast_to_district(&d, json!({
+                                "type": "listing.sold", "market_id": market_id,
+                                "listing_id": l.id, "item_id": l.item_id, "ask_price": l.ask_price,
+                            }));
+                        }
+                    }
+                    Ok(Err(r)) => reject(r.code(), r.detail()),
+                    Err(e) => {
+                        eprintln!("[Proxy] listing.buy: {e}");
+                        reject("server_error", "that didn't go through — try again");
+                    }
+                }
+            }
+            "cancel" => {
+                let listing_id = data.get("listing_id").and_then(|v| v.as_str()).unwrap_or("");
+                match db.cancel_listing(pid, listing_id).await {
+                    Ok(Some(_)) => {
+                        self.send_warehouse(pid, &market_id).await;
+                        self.send_listings(pid, &market_id, &json!({})).await;
+                    }
+                    Ok(None) => reject("no_such_listing", "that listing isn't yours, or is already gone"),
+                    Err(e) => eprintln!("[Proxy] listing.cancel: {e}"),
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Apply `market.sell` / `market.buy` / `market.cancel` (#139). All three
     /// share `market.open`'s server-side range gate, and all three refuse with
     /// a typed `market.error` rather than a silent no-op, so a client can tell
@@ -2621,6 +2780,10 @@ impl Proxy {
             // A resent command was already answered the first time — stay
             // silent rather than report a failure that didn't happen.
             Ok(out) if out.deduped => {}
+            Ok(out) if out.fee_unaffordable => {
+                let r = mmo::world::OrderReject::CannotAffordFee;
+                reject(r.code(), r.detail());
+            }
             Ok(out) if out.filled == 0 && out.resting_order_id.is_none() => {
                 // Nothing traded and nothing rested: say which it was, since
                 // "couldn't escrow" and "hit the cap" need different fixes.
@@ -2636,8 +2799,16 @@ impl Proxy {
                 // a client whose readout silently went stale would think it
                 // still had money it doesn't. `delta` stays the trade result
                 // (0 for a pure escrow), so escrow doesn't flash as a gain.
-                let delta = out.earned + out.refunded - out.spent;
+                let delta = out.earned + out.refunded - out.spent - out.listing_fee - out.sale_tax;
                 self.push_gold(pid, delta, "market_trade").await;
+                // Tell them what the house took (#141) — a fee you can't see
+                // is a fee you'll assume is a bug.
+                if out.listing_fee > 0 || out.sale_tax > 0 {
+                    self.push_to_player(pid, json!({
+                        "type": "market.fees", "market_id": market_id,
+                        "listing_fee": out.listing_fee, "sale_tax": out.sale_tax,
+                    }));
+                }
                 self.send_warehouse(pid, &market_id).await;
                 self.send_own_orders(pid, &market_id).await;
 
@@ -2648,7 +2819,11 @@ impl Proxy {
                 let mut proceeds: std::collections::BTreeMap<&str, i64> = Default::default();
                 for t in &out.fills {
                     if t.seller_id != pid {
-                        *proceeds.entry(t.seller_id.as_str()).or_insert(0) += t.unit_price * t.qty;
+                        // NET of the sale tax that came out of this fill
+                        // (#141) — showing the gross would be a lie about
+                        // what landed in their purse.
+                        *proceeds.entry(t.seller_id.as_str()).or_insert(0) +=
+                            t.unit_price * t.qty - t.sale_tax_gold;
                     }
                 }
                 for (seller_id, earned) in &proceeds {
@@ -2689,6 +2864,60 @@ impl Proxy {
         true
     }
 
+    /// Roll the trade ledger into OHLCV candles and prune old ones (#143).
+    ///
+    /// A background job on purpose: aggregation never sits in front of a trade.
+    /// It re-rolls a window that overlaps the current bucket rather than only
+    /// the closed one, because the in-progress hour keeps changing — and the
+    /// rollup is idempotent, so redoing it costs nothing but CPU.
+    async fn candle_rollup(self: Arc<Self>) {
+        loop {
+            sleep(CANDLE_ROLLUP_INTERVAL).await;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            let interval = mmo::world::CANDLE_INTERVAL_SECS;
+            // Two intervals back, so a late-arriving trade in the previous
+            // bucket is still picked up.
+            let from = mmo::world::candle_bucket(now, interval) - interval;
+            if let Err(e) = db.roll_up_candles(interval, from, now + 1).await {
+                eprintln!("[Proxy] candle rollup: {e}");
+                continue;
+            }
+            let cutoff = mmo::world::candle_bucket(
+                now - mmo::world::HISTORY_RETAIN_DAYS * 86_400,
+                interval,
+            );
+            match db.prune_candles(cutoff).await {
+                Ok(n) if n > 0 => println!("[Proxy] MARKET: pruned {n} candle(s) past retention"),
+                Ok(_) => {}
+                Err(e) => eprintln!("[Proxy] candle prune: {e}"),
+            }
+        }
+    }
+
+    /// Answer `market.history_request` (#143) with a commodity's candles.
+    async fn send_history(&self, pid: &str, market_id: &str, item_id: &str, days: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let interval = mmo::world::CANDLE_INTERVAL_SECS;
+        let now = now_secs();
+        let days = days.clamp(1, mmo::world::HISTORY_RETAIN_DAYS);
+        let from = mmo::world::candle_bucket(now - days * 86_400, interval);
+        let Ok(candles) = db.candles(market_id, item_id, interval, from, now + interval).await else {
+            return;
+        };
+        let arr: Vec<Value> = candles
+            .iter()
+            .map(|c| json!({
+                "t": c.bucket_start, "o": c.open, "h": c.high, "l": c.low,
+                "c": c.close, "v": c.volume, "n": c.trades,
+            }))
+            .collect();
+        self.push_to_player(pid, json!({
+            "type": "market.history", "market_id": market_id, "item_id": item_id,
+            "interval_secs": interval, "candles": arr,
+        }));
+    }
+
     /// Release the escrow of every expired order (#140), then tell each owner.
     /// An order left resting holds goods or gold hostage, so this is what
     /// stops a forgotten order stranding them forever.
@@ -2696,6 +2925,18 @@ impl Proxy {
         loop {
             sleep(ORDER_EXPIRY_INTERVAL).await;
             let Some(db) = self.db.clone() else { continue };
+            // Listings expire on the same tick, and release identically (#142).
+            match db.expire_listings(now_secs()).await {
+                Ok(gone) if !gone.is_empty() => {
+                    println!("[Proxy] MARKET: expired {} listing(s), items returned", gone.len());
+                    for l in &gone {
+                        self.send_warehouse(&l.seller_id, &l.market_id).await;
+                        self.send_listings(&l.seller_id, &l.market_id, &json!({})).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[Proxy] listing expiry sweep: {e}"),
+            }
             let expired = match db.expire_orders(now_secs()).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -5113,6 +5354,38 @@ impl Proxy {
                         self.apply_market_open(&player_id).await;
                         continue;
                     }
+                    // `listing.*` (#142) share market.open's range gate.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("listing."))
+                        .filter(|op| matches!(*op, "place" | "buy" | "cancel"))
+                    {
+                        let op = op.to_string();
+                        self.apply_listing_op(&player_id, &op, &data).await;
+                        continue;
+                    }
+                    // `listing.list` (#142) is a stateless, filterable read.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("listing.list") {
+                        if let Some(db) = self.db.clone() {
+                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                                self.send_listings(&player_id, &market_id, &data).await;
+                            }
+                        }
+                        continue;
+                    }
+                    // `market.history_request` (#143): a stateless read of the
+                    // derived candle cache.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("market.history_request") {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let days = data.get("days").and_then(|v| v.as_i64()).unwrap_or(7);
+                        if let Some(db) = self.db.clone() {
+                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                                self.send_history(&player_id, &market_id, &item_id, days).await;
+                            }
+                        }
+                        continue;
+                    }
                     // `market.book_request` (#139): a stateless read of one
                     // commodity's depth, so the client can look at a book
                     // without waiting for someone else's trade to push one.
@@ -5386,6 +5659,10 @@ impl Proxy {
         // back for.
         let me = self.clone();
         tokio::spawn(async move { me.sweep_expired_orders().await });
+
+        // Price-history rollup (#143): ledger -> candles, off the trade path.
+        let me = self.clone();
+        tokio::spawn(async move { me.candle_rollup().await });
 
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
@@ -10262,8 +10539,18 @@ mod tests {
         }
         assert_eq!(traded.len(), 1, "the buy should have crossed the resting ask");
         assert_eq!((traded[0].unit_price, traded[0].qty), (8, 5), "executed at the resting 8");
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "5 x the resting 8");
-        assert_eq!(db.character_gold(&sid).await.unwrap(), seller_gold + 40, "seller paid immediately");
+        // Net of fees (#141): the buyer paid 40 plus a listing fee; the seller
+        // received 40 minus sale tax.
+        let buy_fee = mmo::world::listing_fee(12 * 5);
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 40 - buy_fee,
+            "5 x the resting 8, plus the listing fee"
+        );
+        assert_eq!(
+            db.character_gold(&sid).await.unwrap(),
+            seller_gold + 40 - mmo::world::sale_tax(40),
+            "seller paid immediately, net of sale tax"
+        );
 
         // Goods landed in the BUYER's warehouse at this market.
         let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
@@ -10278,7 +10565,10 @@ mod tests {
             "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
         }).to_string())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "charged exactly once");
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 40 - buy_fee,
+            "charged exactly once — a resend costs no second fee either"
+        );
         assert_eq!(
             db.recent_trades(&market.id, "wood", 10).await.unwrap().len(), 1,
             "and traded exactly once"
@@ -10343,7 +10633,11 @@ mod tests {
         let mine = orders["orders"].as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["side"].as_str().unwrap(), "buy");
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90, "escrowed 10 x 9");
+        let bid_fee = mmo::world::listing_fee(9 * 10);
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 90 - bid_fee,
+            "escrowed 10 x 9, plus the listing fee"
+        );
 
         // It shows as depth on the BID side.
         let book = recv_until(&mut buyer, "market.book").await;
@@ -10388,11 +10682,12 @@ mod tests {
         );
         assert_eq!((trades[0].unit_price, trades[0].qty), (9, 4), "paid the resting bid");
         assert_eq!(
-            db.character_gold(&sid).await.unwrap(), seller_gold + 36,
-            "paid the resting bid of 9, not their own ask of 6"
+            db.character_gold(&sid).await.unwrap(),
+            seller_gold + 36 - mmo::world::sale_tax(36) - mmo::world::listing_fee(6 * 4),
+            "paid the resting bid of 9 not their own 6, net of sale tax and their listing fee"
         );
-        // The buyer's escrow covered it — no further charge.
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90);
+        // The buyer's escrow covered it — no further charge beyond the fee.
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90 - bid_fee);
         let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
             .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
         assert_eq!(held, 4, "goods delivered to the resting buyer");
@@ -10412,6 +10707,224 @@ mod tests {
 
         drop(buyer);
         drop(seller);
+    }
+
+    /// The listing board over the wire (#142): bank a worn tool, list it, and
+    /// have someone else buy it — arriving as the same instance, same wear.
+    #[tokio::test]
+    async fn a_unique_item_lists_and_sells_over_the_wire() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("ls_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "ToolSeller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("lb_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "ToolBuyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Give the seller a pickaxe and wear it, so identity is falsifiable.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "pickaxe", "qty": 1, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        let inv = loop {
+            let v = recv_until(&mut seller, "inv.update").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["item_id"] == "pickaxe") {
+                break v;
+            }
+        };
+        let instance = inv["items"].as_array().unwrap().iter()
+            .find(|i| i["item_id"] == "pickaxe").unwrap()["id"].as_str().unwrap().to_string();
+        db.equip_instance(&sid, &instance).await.unwrap();
+        db.wear_equipped_tool(&sid, "tool", 8).await.unwrap();
+
+        // Bank it, then list it.
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "pickaxe", "qty": 1}).to_string(),
+        )).await.unwrap();
+        let state = loop {
+            let v = recv_until(&mut seller, "warehouse.state").await;
+            if !v["items"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let wh_id = state["items"].as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(state["items"].as_array().unwrap()[0]["durability"].as_i64(), Some(42));
+
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "listing.place", "command_id": "l1",
+            "warehouse_item_id": wh_id, "ask_price": 75, "duration_hours": 24,
+        }).to_string())).await.unwrap();
+        let page = loop {
+            let v = recv_until(&mut seller, "listing.page").await;
+            if !v["listings"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let listed = &page["listings"].as_array().unwrap()[0];
+        assert_eq!(listed["ask_price"].as_i64(), Some(75));
+        assert_eq!(listed["durability"].as_i64(), Some(42), "the board advertises real wear");
+        assert_eq!(listed["mine"].as_bool(), Some(true));
+        let listing_id = listed["listing_id"].as_str().unwrap().to_string();
+
+        // A stale price is refused, and nothing is charged.
+        let buyer_gold = db.character_gold(&bid_).await.unwrap();
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "listing.buy", "command_id": "b1", "listing_id": listing_id, "expected_price": 60,
+        }).to_string())).await.unwrap();
+        let err = recv_until(&mut buyer, "market.error").await;
+        assert_eq!(err["code"].as_str().unwrap(), "price_changed");
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold, "no surprise charge");
+
+        // At the advertised price it goes through.
+        let seller_gold = db.character_gold(&sid).await.unwrap();
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "listing.buy", "command_id": "b2", "listing_id": listing_id, "expected_price": 75,
+        }).to_string())).await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..40 {
+            held = db.warehouse_for_character(&market.id, &bid_).await.unwrap();
+            if !held.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(held.len(), 1, "the buyer received it");
+        assert_eq!(held[0].id, wh_id, "the SAME instance that was advertised");
+        assert_eq!(held[0].durability, Some(42), "with its wear intact");
+        assert_eq!(held[0].state, "available", "and collectable");
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 75);
+        assert_eq!(
+            db.character_gold(&sid).await.unwrap(),
+            seller_gold + 75 - mmo::world::sale_tax(75),
+            "seller paid the ask net of sale tax"
+        );
+        assert!(db.listing_by_id(&listing_id).await.unwrap().is_none(), "the listing is gone");
+
+        drop(seller);
+        drop(buyer);
+    }
+
+    /// Price history over the wire (#143): real trades roll up into candles a
+    /// client can ask for.
+    #[tokio::test]
+    async fn market_history_answers_with_candles_from_real_trades() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut seller = dial(&proxy).await;
+        seller.send(Message::Text(json!({
+            "type": "register", "email": format!("hs_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "HistSeller",
+        }).to_string())).await.unwrap();
+        let sid = recv_until(&mut seller, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let mut buyer = dial(&proxy).await;
+        buyer.send(Message::Text(json!({
+            "type": "register", "email": format!("hb_{}@t.test", Uuid::new_v4().simple()),
+            "password": "pw12", "name": "HistBuyer",
+        }).to_string())).await.unwrap();
+        let bid_ = recv_until(&mut buyer, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // An empty history is an empty list, not an error or a fake candle.
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(
+            json!({"type": "market.history_request", "item_id": "wood"}).to_string(),
+        )).await.unwrap();
+        let h = recv_until(&mut buyer, "market.history").await;
+        assert_eq!(h["item_id"].as_str().unwrap(), "wood");
+        assert_eq!(h["interval_secs"].as_i64(), Some(mmo::world::CANDLE_INTERVAL_SECS));
+        assert!(h["candles"].as_array().unwrap().is_empty(), "no trades yet, so no candles");
+
+        // Trade for real.
+        zone.to_proxy.send(Message::Text(json!({
+            "type": "gather_yield", "player_id": sid,
+            "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+        }).to_string())).unwrap();
+        loop {
+            let v = recv_until(&mut seller, "inv.update").await;
+            if v["items"].as_array().unwrap().iter().any(|i| i["item_id"] == "wood") {
+                break;
+            }
+        }
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        )).await.unwrap();
+        recv_until(&mut seller, "warehouse.state").await;
+        stand_at(&proxy, &sid, 12800, 12800);
+        seller.send(Message::Text(json!({
+            "type": "market.sell", "command_id": "h1", "item_id": "wood", "unit_price": 11, "qty": 20,
+        }).to_string())).await.unwrap();
+        recv_until(&mut seller, "market.orders").await;
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(json!({
+            "type": "market.buy", "command_id": "h2", "item_id": "wood", "unit_price": 11, "qty": 7,
+        }).to_string())).await.unwrap();
+        for _ in 0..40 {
+            if !db.recent_trades(&market.id, "wood", 5).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The rollup is a background job on a slow cadence, so drive it
+        // directly rather than waiting minutes for the timer.
+        let now = now_secs();
+        db.roll_up_candles(mmo::world::CANDLE_INTERVAL_SECS, 0, now + 1).await.unwrap();
+
+        stand_at(&proxy, &bid_, 12800, 12800);
+        buyer.send(Message::Text(
+            json!({"type": "market.history_request", "item_id": "wood", "days": 1}).to_string(),
+        )).await.unwrap();
+        let h = loop {
+            let v = recv_until(&mut buyer, "market.history").await;
+            if !v["candles"].as_array().unwrap().is_empty() {
+                break v;
+            }
+        };
+        let candles = h["candles"].as_array().unwrap();
+        assert_eq!(candles.len(), 1);
+        let c = &candles[0];
+        assert_eq!((c["o"].as_i64(), c["h"].as_i64(), c["l"].as_i64(), c["c"].as_i64()),
+            (Some(11), Some(11), Some(11), Some(11)), "one price, so OHLC all agree");
+        assert_eq!(c["v"].as_i64(), Some(7), "volume is units traded");
+        assert_eq!(c["n"].as_i64(), Some(1), "one fill");
+        assert_eq!(
+            c["t"].as_i64().unwrap() % mmo::world::CANDLE_INTERVAL_SECS, 0,
+            "a bucket start is always a multiple of the interval"
+        );
+
+        drop(seller);
+        drop(buyer);
     }
 
     /// Build wages (#145): an ordinary contribution pays the city's rate and

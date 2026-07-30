@@ -83,8 +83,8 @@ func _process(_delta: float) -> bool:
 	if not _body_text().contains("nothing stored here yet"):
 		_fail("warehouse section didn't render empty, got: %s" % _body_text()); return true
 	_market.set_section(MarketPanel.Section.LISTINGS)
-	if not _body_text().contains("durability"):
-		_fail("listings section didn't render, got: %s" % _body_text()); return true
+	if not _body_text().contains("nothing listed"):
+		_fail("listings section didn't render empty, got: %s" % _body_text()); return true
 
 	# --- warehouse section (#138) ---------------------------------------------
 	_market.set_section(MarketPanel.Section.WAREHOUSE)
@@ -167,8 +167,8 @@ func _process(_delta: float) -> bool:
 	var bought := []
 	_market.do_sell.connect(func(i, p, q, h): sold.append([i, p, q, h]))
 	_market.do_buy.connect(func(i, p, q, h): bought.append([i, p, q, h]))
-	_market._price_field.value = 11
-	_market._qty_field.value = 7
+	_market._form_price = 11
+	_market._form_qty = 7
 	_press("Sell")
 	_press("Buy")
 	if sold != [["wood", 11, 7, Protocol.DEFAULT_ORDER_HOURS]]:
@@ -179,7 +179,7 @@ func _process(_delta: float) -> bool:
 	# A resting order holds escrow, so it carries a duration (#140) — picking
 	# a different one must actually travel with the command.
 	sold.clear()
-	_market._duration_field.select(0) # the shortest offered
+	_market._form_hours = Protocol.ORDER_DURATIONS_HOURS[0] # the shortest offered
 	_press("Sell")
 	if sold.is_empty() or sold[0][3] != Protocol.ORDER_DURATIONS_HOURS[0]:
 		_fail("the chosen duration should ride the order, got %s" % [sold]); return true
@@ -194,13 +194,167 @@ func _process(_delta: float) -> bool:
 	if _body_text().contains("20 @ 8g"):
 		_fail("old depth survived a commodity switch"); return true
 
+	# --- fees (#141) ----------------------------------------------------------
+	# The cost of placing must be visible BEFORE committing — the server charges
+	# its own number, and these mirrored formulas have to agree with it or the
+	# preview is a lie.
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], []) # force a rebuild at these values
+	var fees := _body_text()
+	if not fees.contains("listing fee %dg" % Protocol.listing_fee(160)):
+		_fail("the listing fee should be previewed, got: %s" % fees); return true
+	if not fees.contains("not refunded if you cancel"):
+		_fail("the preview must say the fee isn't refundable, got: %s" % fees); return true
+	if not fees.contains("taxed %dg" % Protocol.sale_tax(160)):
+		_fail("the sale tax should be previewed, got: %s" % fees); return true
+
+	# Fees round up and are never zero — the anti-exploit. A fee that rounded to
+	# zero on small orders would make splitting an order a free lane.
+	if Protocol.listing_fee(1) < 1 or Protocol.sale_tax(1) < 1:
+		_fail("fees must never be zero on a nonzero amount"); return true
+	if Protocol.listing_fee(101) != 2 or Protocol.sale_tax(101) != 4:
+		_fail("fees must round UP (got %d / %d)" % [Protocol.listing_fee(101), Protocol.sale_tax(101)]); return true
+	var split := 0
+	for i in range(20):
+		split += Protocol.listing_fee(8)
+	if split < Protocol.listing_fee(160):
+		_fail("splitting an order must not be cheaper than placing it whole"); return true
+
+	# What the house actually took shows up after the fact.
+	_market.note_fees(2, 5)
+	var paid := _body_text()
+	if not paid.contains("listing fee 2g") or not paid.contains("sale tax 5g"):
+		_fail("the fees actually charged should render, got: %s" % paid); return true
+
+	# The form must SURVIVE a rebuild. The body is rebuilt on every push —
+	# including other players' trades — so a price you typed would otherwise be
+	# wiped mid-order by someone else's activity.
+	_market._form_price = 42
+	_market._form_qty = 9
+	_market.note_trade("stone", 3, 1) # somebody else trades; panel rebuilds
+	if int(_market._price_field.value) != 42 or int(_market._qty_field.value) != 9:
+		_fail("a rebuild wiped the order form (%s / %s)" % [
+			_market._price_field.value, _market._qty_field.value]); return true
+	var kept := []
+	_market.do_buy.connect(func(i, p, q, h): kept.append([p, q]))
+	_press("Buy")
+	if kept != [[42, 9]]:
+		_fail("the order should place what's still in the form, got %s" % [kept]); return true
+
+	# --- price history (#143) -------------------------------------------------
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	_market._watching = "wood"
+	_market.set_book("wood", [{"price": 8, "qty": 20}], [])
+	if _market._chart == null:
+		_fail("the commodities tab should show a chart"); return true
+	# Hour 1 is deliberately absent: a quiet hour must stay a GAP, because
+	# carrying the last price forward would invent a price nobody paid.
+	var H := 3600
+	_market.set_history("wood", H, [
+		{"t": 0, "o": 10, "h": 14, "l": 8, "c": 12, "v": 10, "n": 4},
+		{"t": 2 * H, "o": 20, "h": 22, "l": 19, "c": 21, "v": 5, "n": 2},
+	])
+	if _market._history.size() != 2:
+		_fail("history should be held for the watched item, got %s" % [_market._history]); return true
+	if _market._chart._candles.size() != 2:
+		_fail("the chart should receive the candles, got %s" % [_market._chart._candles]); return true
+	# The chart spans the whole window (3 buckets) rather than closing the gap
+	# up — otherwise a quiet hour would silently vanish from the timeline.
+	var span: int = (int(_market._chart._candles[1]["t"]) - int(_market._chart._candles[0]["t"])) / _market._chart._interval + 1
+	if span != 3:
+		_fail("the chart's time span should include the empty bucket, got %d" % span); return true
+
+	# History for another commodity must be ignored, exactly like depth.
+	_market.set_history("stone", H, [{"t": 0, "o": 99, "h": 99, "l": 99, "c": 99, "v": 1, "n": 1}])
+	if _market._history.size() != 2 or int(_market._history[0]["o"]) != 10:
+		_fail("history for an unwatched item leaked in: %s" % [_market._history]); return true
+
+	# Switching commodity clears the old chart, so one market's history can
+	# never be read as another's.
+	_market._watch("stone")
+	if not _market._history.is_empty():
+		_fail("switching commodity should clear history, got %s" % [_market._history]); return true
+	_market._watch("wood")
+
+	# Drawing an empty chart must not crash — a brand-new commodity has no
+	# history at all, which is the common case on a fresh server.
+	_market.set_history("wood", H, [])
+	_market._chart.set_history("wood", H, [])
+	_market._chart.queue_redraw()
+
+	# --- listing board (#142) -------------------------------------------------
+	_market.set_section(MarketPanel.Section.LISTINGS)
+	_market.set_gold(100)
+	_market.set_listings([
+		{"listing_id": "L1", "item_id": "axe", "ask_price": 40, "mine": false,
+			"durability": 31, "max_durability": 50},
+		{"listing_id": "L2", "item_id": "pickaxe", "ask_price": 250, "mine": false,
+			"durability": 50, "max_durability": 50},
+		{"listing_id": "L3", "item_id": "axe", "ask_price": 60, "mine": true,
+			"durability": 12, "max_durability": 50},
+	])
+	var lb := _body_text()
+	# Each unique is priced on its own, so its condition must be on its row.
+	if not lb.contains("axe  (31/50)  —  40g") or not lb.contains("pickaxe  (50/50)  —  250g"):
+		_fail("listings should show per-item wear and ask, got: %s" % lb); return true
+	if not lb.contains("(yours)"):
+		_fail("your own listing should be marked, got: %s" % lb); return true
+
+	# You withdraw your own; you buy other people's. Never both on one row.
+	if _buttons("Withdraw") != 1:
+		_fail("only your own listing offers Withdraw, got %d" % _buttons("Withdraw")); return true
+	if _buttons("Buy 40g") != 1 or _buttons("Buy 250g") != 1:
+		_fail("each other listing gets its own priced Buy button"); return true
+
+	# The 250g one is unaffordable on 100g, so its button is disabled rather
+	# than offering a purchase the server would refuse.
+	var dear := _find_button("Buy 250g")
+	var cheap := _find_button("Buy 40g")
+	if dear == null or not dear.disabled:
+		_fail("an unaffordable listing shouldn't offer a live Buy button"); return true
+	if cheap == null or cheap.disabled:
+		_fail("an affordable listing should be buyable"); return true
+
+	# Buying carries the price we were SHOWN, so a listing that changed under us
+	# is refused server-side rather than charged at a new price.
+	var bought_listing := []
+	_market.do_buy_listing.connect(func(lid, expected): bought_listing.append([lid, expected]))
+	cheap.pressed.emit()
+	if bought_listing != [["L1", 40]]:
+		_fail("buy should carry the shown price, got %s" % [bought_listing]); return true
+
+	var pulled := []
+	_market.do_cancel_listing.connect(func(lid): pulled.append(lid))
+	_press("Withdraw")
+	if pulled != ["L3"]:
+		_fail("withdraw should target your own listing, got %s" % [pulled]); return true
+
+	# Only unique items banked here and NOT already escrowed can be offered.
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+		{"id": "w2", "item_id": "pickaxe", "qty": 1, "state": "locked", "durability": 20, "max_durability": 50},
+		{"id": "w3", "item_id": "stone", "qty": 30, "state": "available"},
+	], 3, 60)
+	if _buttons("List") != 1:
+		_fail("only the available unique should be listable (not the locked one, not the stone), got %d"
+			% _buttons("List")); return true
+	var listed := []
+	_market.do_list.connect(func(wid, ask, hours): listed.append([wid, ask, hours]))
+	_market._form_price = 55
+	_market.set_listings([]) # force a rebuild at that price
+	_press("List")
+	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
+		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
+
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.
+	_market.set_section(MarketPanel.Section.COMMODITIES)
 	_market.set_market("")
 	if not _body_text().contains("not trading"):
 		_fail("walking away should clear the trading state"); return true
 
-	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable with tools keeping their wear; book renders anonymous depth, ignores other commodities' pushes, and place/cancel emit correctly")
+	print("SMOKE_OK: markets found by structure_kind; panel gates on the server's ack not proximity; warehouse shows locked stock as unwithdrawable; book renders anonymous depth and ignores other commodities' pushes; fees previewed before committing and the form survives rebuilds; listings priced per-item with the shown price carried into the buy; the price chart keeps quiet hours as gaps")
 	quit(0)
 	return true
 
@@ -215,6 +369,19 @@ func _buttons(label: String, node: Node = null) -> int:
 		elif c.get_child_count() > 0:
 			n += _buttons(label, c)
 	return n
+
+## The first visible button with the given label, or null.
+func _find_button(label: String, node: Node = null) -> Button:
+	for c in (node if node != null else _market._body).get_children():
+		if c.is_queued_for_deletion():
+			continue
+		if c is Button and c.text == label:
+			return c
+		elif c.get_child_count() > 0:
+			var found := _find_button(label, c)
+			if found != null:
+				return found
+	return null
 
 ## Press the first visible button with the given label.
 func _press(label: String, node: Node = null) -> bool:

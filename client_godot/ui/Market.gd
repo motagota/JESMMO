@@ -23,6 +23,11 @@ signal do_sell(item_id: String, unit_price: int, qty: int, duration_hours: int)
 signal do_buy(item_id: String, unit_price: int, qty: int, duration_hours: int)
 signal do_cancel(order_id: String)
 signal do_watch(item_id: String)
+## Listing board (#142): offer a unique item you have banked here, buy one at
+## the price you were SHOWN, or withdraw your own.
+signal do_list(warehouse_item_id: String, ask_price: int, duration_hours: int)
+signal do_buy_listing(listing_id: String, expected_price: int)
+signal do_cancel_listing(listing_id: String)
 
 ## The section the player is looking at. Kept as an explicit enum rather than
 ## tab indices so the later issues can add their own without renumbering.
@@ -48,6 +53,16 @@ var _asks: Array = []
 var _bids: Array = []
 var _orders: Array = []
 var _last_trade := ""
+## What the house took on the last command (#141) — a fee you can't see is a
+## fee you'll assume is a bug.
+var _last_fees := ""
+## Price history for the watched commodity (#143) — the feature that lets a
+## player SEE the economy rather than infer it from the current spread.
+var _history: Array = []
+var _history_interval := 3600
+var _chart: PriceChart
+## The listing board (#142) as the server sent it, cheapest first.
+var _listings: Array = []
 ## The commodities a v1 book can hold — the stackable items. Tools are
 ## excluded by the server too (they go to the listing board, #142); listing
 ## them here would just be an invitation to a rejection.
@@ -55,6 +70,13 @@ const TRADABLE := ["wood", "stone", "plank", "tool_kit"]
 var _price_field: SpinBox
 var _qty_field: SpinBox
 var _duration_field: OptionButton
+## The form's values, held OUTSIDE the widgets. The body is rebuilt from
+## scratch on every push — including other players' trades — so anything left
+## only in a widget would be wiped mid-typing by someone else's activity.
+## `_form_price == 0` means "not set yet": seed it from the best ask once.
+var _form_price := 0
+var _form_qty := 1
+var _form_hours := 0
 
 func _ready() -> void:
 	layer = 8
@@ -143,6 +165,123 @@ func note_trade(item_id: String, unit_price: int, qty: int) -> void:
 	if _section == Section.COMMODITIES:
 		_rebuild()
 
+## What the house just took (#141), from `market.fees`.
+func note_fees(listing_fee: int, sale_tax: int) -> void:
+	var parts := []
+	if listing_fee > 0:
+		parts.append("listing fee %dg" % listing_fee)
+	if sale_tax > 0:
+		parts.append("sale tax %dg" % sale_tax)
+	_last_fees = "paid: " + ", ".join(parts) if not parts.is_empty() else ""
+	if _section == Section.COMMODITIES:
+		_rebuild()
+
+## OHLCV history for the watched commodity (#143), from `market.history`.
+## Ignored for anything we're not looking at, same as depth.
+func set_history(item_id: String, interval_secs: int, candles: Array) -> void:
+	if item_id != _watching:
+		return
+	_history_interval = interval_secs
+	_history = candles
+	if _chart != null and not _chart.is_queued_for_deletion():
+		_chart.set_history(_watching, _history_interval, _history)
+
+## The listing board (#142), from `listing.page`.
+func set_listings(listings: Array) -> void:
+	_listings = listings
+	if _section == Section.LISTINGS:
+		_rebuild()
+
+## The listings section (#142): what's for sale, and what of yours you could
+## offer. Unique items are individually priced because their wear differs, so
+## each row shows its own condition rather than a shared market price.
+func _rebuild_listings() -> void:
+	var head := Label.new()
+	head.add_theme_font_size_override("font_size", 12)
+	head.modulate = Color(0.8, 0.85, 0.95)
+	head.text = "For sale here — cheapest first"
+	_body.add_child(head)
+	if _listings.is_empty():
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (nothing listed)"
+		_body.add_child(none)
+	for l_v in _listings:
+		var l: Dictionary = l_v
+		var lid := String(l.get("listing_id", ""))
+		var ask := int(l.get("ask_price", 0))
+		var mine: bool = bool(l.get("mine", false))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(230, 0)
+		var cond := ""
+		if l.has("durability"):
+			cond = "  (%d/%d)" % [int(l.get("durability", 0)), int(l.get("max_durability", 0))]
+		lbl.text = "  %s%s  —  %dg" % [String(l.get("item_id", "")), cond, ask]
+		if mine:
+			lbl.text += "   (yours)"
+			lbl.modulate = Color(0.8, 0.85, 0.95)
+		row.add_child(lbl)
+		if mine:
+			var pull := Button.new()
+			pull.text = "Withdraw"
+			pull.pressed.connect(func(): do_cancel_listing.emit(lid))
+			row.add_child(pull)
+		else:
+			var buy := Button.new()
+			buy.text = "Buy %dg" % ask
+			buy.disabled = ask > _gold
+			# The price we were SHOWN travels with the buy, so a listing that
+			# changed under us is refused rather than silently charged.
+			buy.pressed.connect(func(): do_buy_listing.emit(lid, ask))
+			row.add_child(buy)
+		_body.add_child(row)
+
+	# What of yours could be offered: unique items banked here and not already
+	# escrowed against something.
+	var offer_head := Label.new()
+	offer_head.add_theme_font_size_override("font_size", 12)
+	offer_head.modulate = Color(0.8, 0.85, 0.95)
+	offer_head.text = "Yours, banked here — offer at %dg for %s" % [_form_price, _duration_label()]
+	_body.add_child(offer_head)
+	var offerable := 0
+	for it_v in _warehouse:
+		var it: Dictionary = it_v
+		# Only uniques (they carry durability) that aren't already locked.
+		if not it.has("durability") or String(it.get("state", "")) != "available":
+			continue
+		offerable += 1
+		var wid := String(it.get("id", ""))
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.custom_minimum_size = Vector2(230, 0)
+		lbl.text = "  %s  (%d/%d)" % [
+			String(it.get("item_id", "")), int(it.get("durability", 0)),
+			int(it.get("max_durability", 0))]
+		row.add_child(lbl)
+		var btn := Button.new()
+		btn.text = "List"
+		btn.pressed.connect(func(): do_list.emit(wid, _form_price, _duration()))
+		row.add_child(btn)
+		_body.add_child(row)
+	if offerable == 0:
+		var none := Label.new()
+		none.modulate = Color(0.6, 0.6, 0.6)
+		none.text = "  (deposit a tool here to offer it)"
+		_body.add_child(none)
+
+	var note := Label.new()
+	note.add_theme_font_size_override("font_size", 10)
+	note.modulate = Color(0.6, 0.6, 0.65)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	note.custom_minimum_size = Vector2(380, 0)
+	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee(_form_price)
+	_body.add_child(note)
+
+func _duration_label() -> String:
+	var h := _duration()
+	return "%dh" % h if h < 24 else "%dd" % (h / 24)
+
 ## Your warehouse at this market (#138), straight from `warehouse.state`.
 func set_warehouse(items: Array, used: int, slots: int) -> void:
 	_warehouse = items
@@ -178,21 +317,13 @@ func _rebuild() -> void:
 		_body.add_child(waiting)
 		return
 
-	var todo := Label.new()
-	todo.add_theme_font_size_override("font_size", 12)
-	todo.modulate = Color(0.65, 0.65, 0.7)
-	todo.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	todo.custom_minimum_size = Vector2(380, 0)
 	match _section:
 		Section.COMMODITIES:
 			_rebuild_book()
-			return
 		Section.LISTINGS:
-			todo.text = "Listing board — unique items (tools carry their own durability) at a fixed ask."
+			_rebuild_listings()
 		Section.WAREHOUSE:
 			_rebuild_warehouse()
-			return
-	_body.add_child(todo)
 
 ## The commodities section (#139): which good you're watching, its depth, the
 ## ticker, your own resting orders, and the place-order controls.
@@ -225,6 +356,13 @@ func _rebuild_book() -> void:
 		tick.modulate = Color(0.6, 0.9, 0.6)
 		tick.text = "  " + _last_trade
 		_body.add_child(tick)
+
+	# The chart before the ladder: a trader wants the shape of the market
+	# before the current spread (#143).
+	_chart = PriceChart.new()
+	_chart.custom_minimum_size = Vector2(380, 110)
+	_body.add_child(_chart)
+	_chart.set_history(_watching, _history_interval, _history)
 
 	var asks_head := Label.new()
 	asks_head.add_theme_font_size_override("font_size", 11)
@@ -268,7 +406,10 @@ func _rebuild_book() -> void:
 	_price_field.min_value = Protocol.PRICE_TICK_GOLD
 	_price_field.max_value = 100000
 	_price_field.step = Protocol.PRICE_TICK_GOLD
-	_price_field.value = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+	if _form_price <= 0:
+		_form_price = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+	_price_field.value = _form_price
+	_price_field.value_changed.connect(func(v): _form_price = int(v))
 	form.add_child(_price_field)
 	var qty_lbl := Label.new()
 	qty_lbl.text = "qty"
@@ -276,7 +417,8 @@ func _rebuild_book() -> void:
 	_qty_field = SpinBox.new()
 	_qty_field.min_value = Protocol.MIN_ORDER_QTY
 	_qty_field.max_value = Protocol.MAX_ORDER_QTY
-	_qty_field.value = 1
+	_qty_field.value = _form_qty
+	_qty_field.value_changed.connect(func(v): _form_qty = int(v))
 	form.add_child(_qty_field)
 	# How long the remainder may rest before the server releases its escrow
 	# (#140) — a resting order holds goods or gold, so it can't sit forever.
@@ -288,19 +430,20 @@ func _rebuild_book() -> void:
 	for i in range(Protocol.ORDER_DURATIONS_HOURS.size()):
 		var h: int = Protocol.ORDER_DURATIONS_HOURS[i]
 		_duration_field.add_item("%dh" % h if h < 24 else "%dd" % (h / 24), h)
-		if h == Protocol.DEFAULT_ORDER_HOURS:
+		if h == (_form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS):
 			_duration_field.select(i)
+	_duration_field.item_selected.connect(func(i): _form_hours = _duration_field.get_item_id(i))
 	form.add_child(_duration_field)
 	_body.add_child(form)
 
 	var actions := HBoxContainer.new()
 	var sell_btn := Button.new()
 	sell_btn.text = "Sell"
-	sell_btn.pressed.connect(func(): do_sell.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
+	sell_btn.pressed.connect(func(): do_sell.emit(_watching, _form_price, _form_qty, _duration()))
 	actions.add_child(sell_btn)
 	var buy_btn := Button.new()
 	buy_btn.text = "Buy"
-	buy_btn.pressed.connect(func(): do_buy.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
+	buy_btn.pressed.connect(func(): do_buy.emit(_watching, _form_price, _form_qty, _duration()))
 	actions.add_child(buy_btn)
 	_body.add_child(actions)
 	var hint := Label.new()
@@ -310,6 +453,25 @@ func _rebuild_book() -> void:
 	hint.custom_minimum_size = Vector2(380, 0)
 	hint.text = "Either side fills against the book first, then rests for whatever's left. A sell escrows goods from your warehouse here; a buy escrows gold. You always trade at the RESTING order's price, so crossing the spread keeps you the difference."
 	_body.add_child(hint)
+
+	# What this order will cost to place, before committing to it (#141). The
+	# server charges its own number; this is the same formula so the two agree.
+	var notional := _form_price * _form_qty
+	var cost := Label.new()
+	cost.add_theme_font_size_override("font_size", 11)
+	cost.modulate = Color(1.0, 0.8, 0.5)
+	cost.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	cost.custom_minimum_size = Vector2(380, 0)
+	cost.text = "listing fee %dg (charged either way, not refunded if you cancel) · a full sale would be taxed %dg, netting %dg" % [
+		Protocol.listing_fee(notional), Protocol.sale_tax(notional),
+		notional - Protocol.sale_tax(notional)]
+	_body.add_child(cost)
+	if _last_fees != "":
+		var paid := Label.new()
+		paid.add_theme_font_size_override("font_size", 11)
+		paid.modulate = Color(0.85, 0.7, 0.7)
+		paid.text = "  " + _last_fees
+		_body.add_child(paid)
 
 	# Your own resting orders — the one place ownership IS shown, because
 	# it's yours.
@@ -342,9 +504,7 @@ func _rebuild_book() -> void:
 
 ## The selected rest duration, in hours.
 func _duration() -> int:
-	if _duration_field == null or _duration_field.selected < 0:
-		return Protocol.DEFAULT_ORDER_HOURS
-	return _duration_field.get_item_id(_duration_field.selected)
+	return _form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS
 
 ## Which commodity's book is on screen — Main seeds its depth on market.open.
 func watching() -> String:
@@ -356,6 +516,7 @@ func _watch(item_id: String) -> void:
 	_watching = item_id
 	_asks = []
 	_bids = []
+	_history = []
 	do_watch.emit(item_id)
 	_rebuild()
 
