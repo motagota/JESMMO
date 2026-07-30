@@ -264,6 +264,60 @@ pub fn order_duration_hours(requested: i64) -> i64 {
     }
 }
 
+// --- Market fees (epic #136, issue #141) ------------------------------------
+//
+// The design doc quotes a flat 5 **copper** listing fee, 0.5% of notional, and
+// 3% sale tax. Those don't translate: this game's currency is whole GOLD in
+// small numbers (a 20-wood order is ~160 notional, a character starts with
+// 500), so a flat 5 would be a third of a typical order and 100% of a small
+// one — it would simply end small trades. Adapted to the same shape at this
+// scale: a 1-gold floor, 1% of notional, 3% sale tax. Real tuning belongs to a
+// balance pass (see #129); the SHAPE is what matters here.
+//
+// Every fee rounds UP and can never be zero on a nonzero amount. Rounding in
+// the house's favour is not greed, it's the anti-exploit: a fee that rounds to
+// zero on small trades makes a free lane, and splitting one big order into a
+// hundred tiny ones would dodge the sink entirely.
+
+/// Minimum listing fee on any order with a nonzero notional.
+pub const LISTING_FEE_MIN_GOLD: i64 = 1;
+/// Listing fee as a fraction of notional: 1%.
+pub const LISTING_FEE_NUM: i64 = 1;
+pub const LISTING_FEE_DEN: i64 = 100;
+/// Sale tax as a fraction of a fill's value: 3%.
+pub const SALE_TAX_NUM: i64 = 3;
+pub const SALE_TAX_DEN: i64 = 100;
+
+/// Integer ceiling division, for fees that must round toward the house.
+fn div_ceil(n: i64, d: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        (n + d - 1) / d
+    }
+}
+
+/// The fee to place an order of `notional` (= `unit_price * qty`) gold, charged
+/// to **both** sides at placement and **never refunded** — that's what makes
+/// posting an order you don't mean to honour cost something.
+///
+/// `max(floor, ceil(pct * notional))`, so it's never zero on a real order.
+pub fn listing_fee(notional: i64) -> i64 {
+    if notional <= 0 {
+        return 0;
+    }
+    div_ceil(notional * LISTING_FEE_NUM, LISTING_FEE_DEN).max(LISTING_FEE_MIN_GOLD)
+}
+
+/// Tax on one fill's value (`execution_price * qty`), charged to the seller out
+/// of their proceeds. Rounds up, and is never zero on a nonzero fill.
+pub fn sale_tax(value: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN).max(1)
+}
+
 /// Why an order was refused, as a stable code for the wire (#139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderReject {
@@ -272,6 +326,7 @@ pub enum OrderReject {
     BadQty,
     TooManyOrders,
     RateLimited,
+    CannotAffordFee,
 }
 
 impl OrderReject {
@@ -282,6 +337,7 @@ impl OrderReject {
             OrderReject::BadQty => "bad_qty",
             OrderReject::TooManyOrders => "too_many_orders",
             OrderReject::RateLimited => "rate_limited",
+            OrderReject::CannotAffordFee => "cannot_afford_fee",
         }
     }
 
@@ -292,6 +348,7 @@ impl OrderReject {
             OrderReject::BadQty => "order size is out of bounds",
             OrderReject::TooManyOrders => "you have too many orders resting at this market",
             OrderReject::RateLimited => "slow down — too many market commands",
+            OrderReject::CannotAffordFee => "not enough gold to cover the listing fee",
         }
     }
 }
@@ -1329,6 +1386,64 @@ mod tests {
         for (_, cell) in &in_suburbs {
             let r = cell.rect();
             assert!(suburbs.contains(r.x0, r.y0) && suburbs.contains(r.x1 - 1, r.y1 - 1));
+        }
+    }
+
+    // --- Market fees (epic #136, issue #141) ------------------------------------
+
+    #[test]
+    fn fees_round_toward_the_house_and_are_never_zero() {
+        // Nothing to charge on nothing.
+        assert_eq!(listing_fee(0), 0);
+        assert_eq!(listing_fee(-5), 0);
+        assert_eq!(sale_tax(0), 0);
+
+        // Below the percentage's resolution, the floor holds — this is the
+        // anti-exploit: a fee rounding to zero on small orders would make a
+        // free lane, and splitting one order into a hundred tiny ones would
+        // dodge the sink entirely.
+        for notional in 1..=100 {
+            assert!(listing_fee(notional) >= LISTING_FEE_MIN_GOLD, "notional {notional} charged nothing");
+        }
+        for value in 1..=100 {
+            assert!(sale_tax(value) >= 1, "fill worth {value} taxed nothing");
+        }
+
+        // Rounds UP, never down.
+        assert_eq!(listing_fee(100), 1); // exactly 1%
+        assert_eq!(listing_fee(101), 2); // 1.01 -> 2
+        assert_eq!(listing_fee(250), 3); // 2.5 -> 3
+        assert_eq!(sale_tax(100), 3); // exactly 3%
+        assert_eq!(sale_tax(101), 4); // 3.03 -> 4
+        assert_eq!(sale_tax(1), 1); // 0.03 -> floored up to 1
+
+        // Monotonic: a bigger order never costs less to list.
+        let mut last = 0;
+        for notional in (0..5_000).step_by(7) {
+            let f = listing_fee(notional);
+            assert!(f >= last, "listing fee dipped at {notional}");
+            last = f;
+        }
+    }
+
+    /// Splitting one order into many must never be cheaper than placing it
+    /// whole — otherwise the fee is a suggestion. (It's strictly *more*
+    /// expensive here, because every slice pays at least the floor.)
+    #[test]
+    fn splitting_an_order_never_dodges_the_fee() {
+        for (price, qty) in [(5, 20), (8, 50), (13, 7), (100, 3)] {
+            let whole = listing_fee(price * qty);
+            let split: i64 = (0..qty).map(|_| listing_fee(price)).sum();
+            assert!(
+                split >= whole,
+                "splitting {qty}x{price} cost {split} vs {whole} whole — that's a free lane"
+            );
+        }
+        // Same for the sale tax across partial fills.
+        for (price, qty) in [(7, 30), (11, 9)] {
+            let whole = sale_tax(price * qty);
+            let split: i64 = (0..qty).map(|_| sale_tax(price)).sum();
+            assert!(split >= whole, "splitting fills dodged tax: {split} < {whole}");
         }
     }
 

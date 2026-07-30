@@ -263,6 +263,34 @@ const MAX_ORDER_QTY := 10000
 ## default, so this list is a convenience, not a trust boundary.
 const ORDER_DURATIONS_HOURS := [12, 24, 72, 168]
 const DEFAULT_ORDER_HOURS := 24
+## `market.fees {market_id, listing_fee, sale_tax}` — what the house took from
+## your last command (#141).
+const S_MARKET_FEES := "market.fees"
+## Display-only mirrors of the server's fee formulas (world.rs). Used to show
+## the cost BEFORE you commit; the server's own numbers are authoritative and
+## are what actually get charged.
+const LISTING_FEE_MIN_GOLD := 1
+const LISTING_FEE_NUM := 1
+const LISTING_FEE_DEN := 100
+const SALE_TAX_NUM := 3
+const SALE_TAX_DEN := 100
+
+## Integer ceiling division — fees round toward the house, never down.
+static func _div_ceil(n: int, d: int) -> int:
+    return 0 if n <= 0 else (n + d - 1) / d
+
+## What it costs to place an order of this notional (both sides pay, and it is
+## never refunded). Mirrors `world::listing_fee`.
+static func listing_fee(notional: int) -> int:
+    if notional <= 0:
+        return 0
+    return maxi(_div_ceil(notional * LISTING_FEE_NUM, LISTING_FEE_DEN), LISTING_FEE_MIN_GOLD)
+
+## Tax a seller pays out of one fill's value. Mirrors `world::sale_tax`.
+static func sale_tax(value: int) -> int:
+    if value <= 0:
+        return 0
+    return maxi(_div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN), 1)
 ## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
 ## the panel; the server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0

@@ -92,6 +92,9 @@ signal warehouse_state(market_id: String, items: Array, used: int, slots: int)
 signal market_book(market_id: String, item_id: String, asks: Array, bids: Array)
 signal market_orders(market_id: String, orders: Array)
 signal market_trade(market_id: String, item_id: String, unit_price: int, qty: int)
+## What the house took from your last market command (#141): the listing fee
+## (both sides, never refunded) and any sale tax out of your proceeds.
+signal market_fees(market_id: String, listing_fee: int, sale_tax: int)
 signal home_respawn_set(bed_id: String)
 ## The character's gold balance changed (#145) — `delta` is signed, `reason`
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
@@ -329,6 +332,11 @@ func _handle_text(text: String) -> void:
                 String(msg.get("item_id", "")),
                 int(msg.get("unit_price", 0)),
                 int(msg.get("qty", 0)))
+        Protocol.S_MARKET_FEES:
+            market_fees.emit(
+                String(msg.get("market_id", "")),
+                int(msg.get("listing_fee", 0)),
+                int(msg.get("sale_tax", 0)))
         Protocol.S_GOLD_UPDATE:
             gold_update.emit(
                 int(msg.get("gold", 0)),

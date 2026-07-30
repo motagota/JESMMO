@@ -48,6 +48,9 @@ var _asks: Array = []
 var _bids: Array = []
 var _orders: Array = []
 var _last_trade := ""
+## What the house took on the last command (#141) — a fee you can't see is a
+## fee you'll assume is a bug.
+var _last_fees := ""
 ## The commodities a v1 book can hold — the stackable items. Tools are
 ## excluded by the server too (they go to the listing board, #142); listing
 ## them here would just be an invitation to a rejection.
@@ -55,6 +58,13 @@ const TRADABLE := ["wood", "stone", "plank", "tool_kit"]
 var _price_field: SpinBox
 var _qty_field: SpinBox
 var _duration_field: OptionButton
+## The form's values, held OUTSIDE the widgets. The body is rebuilt from
+## scratch on every push — including other players' trades — so anything left
+## only in a widget would be wiped mid-typing by someone else's activity.
+## `_form_price == 0` means "not set yet": seed it from the best ask once.
+var _form_price := 0
+var _form_qty := 1
+var _form_hours := 0
 
 func _ready() -> void:
 	layer = 8
@@ -140,6 +150,17 @@ func set_orders(orders: Array) -> void:
 ## The ticker (#139) — the last fill, so a trader can see the market move.
 func note_trade(item_id: String, unit_price: int, qty: int) -> void:
 	_last_trade = "last: %d x %s @ %dg" % [qty, item_id, unit_price]
+	if _section == Section.COMMODITIES:
+		_rebuild()
+
+## What the house just took (#141), from `market.fees`.
+func note_fees(listing_fee: int, sale_tax: int) -> void:
+	var parts := []
+	if listing_fee > 0:
+		parts.append("listing fee %dg" % listing_fee)
+	if sale_tax > 0:
+		parts.append("sale tax %dg" % sale_tax)
+	_last_fees = "paid: " + ", ".join(parts) if not parts.is_empty() else ""
 	if _section == Section.COMMODITIES:
 		_rebuild()
 
@@ -268,7 +289,10 @@ func _rebuild_book() -> void:
 	_price_field.min_value = Protocol.PRICE_TICK_GOLD
 	_price_field.max_value = 100000
 	_price_field.step = Protocol.PRICE_TICK_GOLD
-	_price_field.value = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+	if _form_price <= 0:
+		_form_price = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+	_price_field.value = _form_price
+	_price_field.value_changed.connect(func(v): _form_price = int(v))
 	form.add_child(_price_field)
 	var qty_lbl := Label.new()
 	qty_lbl.text = "qty"
@@ -276,7 +300,8 @@ func _rebuild_book() -> void:
 	_qty_field = SpinBox.new()
 	_qty_field.min_value = Protocol.MIN_ORDER_QTY
 	_qty_field.max_value = Protocol.MAX_ORDER_QTY
-	_qty_field.value = 1
+	_qty_field.value = _form_qty
+	_qty_field.value_changed.connect(func(v): _form_qty = int(v))
 	form.add_child(_qty_field)
 	# How long the remainder may rest before the server releases its escrow
 	# (#140) — a resting order holds goods or gold, so it can't sit forever.
@@ -288,19 +313,20 @@ func _rebuild_book() -> void:
 	for i in range(Protocol.ORDER_DURATIONS_HOURS.size()):
 		var h: int = Protocol.ORDER_DURATIONS_HOURS[i]
 		_duration_field.add_item("%dh" % h if h < 24 else "%dd" % (h / 24), h)
-		if h == Protocol.DEFAULT_ORDER_HOURS:
+		if h == (_form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS):
 			_duration_field.select(i)
+	_duration_field.item_selected.connect(func(i): _form_hours = _duration_field.get_item_id(i))
 	form.add_child(_duration_field)
 	_body.add_child(form)
 
 	var actions := HBoxContainer.new()
 	var sell_btn := Button.new()
 	sell_btn.text = "Sell"
-	sell_btn.pressed.connect(func(): do_sell.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
+	sell_btn.pressed.connect(func(): do_sell.emit(_watching, _form_price, _form_qty, _duration()))
 	actions.add_child(sell_btn)
 	var buy_btn := Button.new()
 	buy_btn.text = "Buy"
-	buy_btn.pressed.connect(func(): do_buy.emit(_watching, int(_price_field.value), int(_qty_field.value), _duration()))
+	buy_btn.pressed.connect(func(): do_buy.emit(_watching, _form_price, _form_qty, _duration()))
 	actions.add_child(buy_btn)
 	_body.add_child(actions)
 	var hint := Label.new()
@@ -310,6 +336,25 @@ func _rebuild_book() -> void:
 	hint.custom_minimum_size = Vector2(380, 0)
 	hint.text = "Either side fills against the book first, then rests for whatever's left. A sell escrows goods from your warehouse here; a buy escrows gold. You always trade at the RESTING order's price, so crossing the spread keeps you the difference."
 	_body.add_child(hint)
+
+	# What this order will cost to place, before committing to it (#141). The
+	# server charges its own number; this is the same formula so the two agree.
+	var notional := _form_price * _form_qty
+	var cost := Label.new()
+	cost.add_theme_font_size_override("font_size", 11)
+	cost.modulate = Color(1.0, 0.8, 0.5)
+	cost.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	cost.custom_minimum_size = Vector2(380, 0)
+	cost.text = "listing fee %dg (charged either way, not refunded if you cancel) · a full sale would be taxed %dg, netting %dg" % [
+		Protocol.listing_fee(notional), Protocol.sale_tax(notional),
+		notional - Protocol.sale_tax(notional)]
+	_body.add_child(cost)
+	if _last_fees != "":
+		var paid := Label.new()
+		paid.add_theme_font_size_override("font_size", 11)
+		paid.modulate = Color(0.85, 0.7, 0.7)
+		paid.text = "  " + _last_fees
+		_body.add_child(paid)
 
 	# Your own resting orders — the one place ownership IS shown, because
 	# it's yours.
@@ -342,9 +387,7 @@ func _rebuild_book() -> void:
 
 ## The selected rest duration, in hours.
 func _duration() -> int:
-	if _duration_field == null or _duration_field.selected < 0:
-		return Protocol.DEFAULT_ORDER_HOURS
-	return _duration_field.get_item_id(_duration_field.selected)
+	return _form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS
 
 ## Which commodity's book is on screen — Main seeds its depth on market.open.
 func watching() -> String:

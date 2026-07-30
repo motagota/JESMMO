@@ -2621,6 +2621,10 @@ impl Proxy {
             // A resent command was already answered the first time — stay
             // silent rather than report a failure that didn't happen.
             Ok(out) if out.deduped => {}
+            Ok(out) if out.fee_unaffordable => {
+                let r = mmo::world::OrderReject::CannotAffordFee;
+                reject(r.code(), r.detail());
+            }
             Ok(out) if out.filled == 0 && out.resting_order_id.is_none() => {
                 // Nothing traded and nothing rested: say which it was, since
                 // "couldn't escrow" and "hit the cap" need different fixes.
@@ -2636,8 +2640,16 @@ impl Proxy {
                 // a client whose readout silently went stale would think it
                 // still had money it doesn't. `delta` stays the trade result
                 // (0 for a pure escrow), so escrow doesn't flash as a gain.
-                let delta = out.earned + out.refunded - out.spent;
+                let delta = out.earned + out.refunded - out.spent - out.listing_fee - out.sale_tax;
                 self.push_gold(pid, delta, "market_trade").await;
+                // Tell them what the house took (#141) — a fee you can't see
+                // is a fee you'll assume is a bug.
+                if out.listing_fee > 0 || out.sale_tax > 0 {
+                    self.push_to_player(pid, json!({
+                        "type": "market.fees", "market_id": market_id,
+                        "listing_fee": out.listing_fee, "sale_tax": out.sale_tax,
+                    }));
+                }
                 self.send_warehouse(pid, &market_id).await;
                 self.send_own_orders(pid, &market_id).await;
 
@@ -2648,7 +2660,11 @@ impl Proxy {
                 let mut proceeds: std::collections::BTreeMap<&str, i64> = Default::default();
                 for t in &out.fills {
                     if t.seller_id != pid {
-                        *proceeds.entry(t.seller_id.as_str()).or_insert(0) += t.unit_price * t.qty;
+                        // NET of the sale tax that came out of this fill
+                        // (#141) — showing the gross would be a lie about
+                        // what landed in their purse.
+                        *proceeds.entry(t.seller_id.as_str()).or_insert(0) +=
+                            t.unit_price * t.qty - t.sale_tax_gold;
                     }
                 }
                 for (seller_id, earned) in &proceeds {
@@ -10262,8 +10278,18 @@ mod tests {
         }
         assert_eq!(traded.len(), 1, "the buy should have crossed the resting ask");
         assert_eq!((traded[0].unit_price, traded[0].qty), (8, 5), "executed at the resting 8");
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "5 x the resting 8");
-        assert_eq!(db.character_gold(&sid).await.unwrap(), seller_gold + 40, "seller paid immediately");
+        // Net of fees (#141): the buyer paid 40 plus a listing fee; the seller
+        // received 40 minus sale tax.
+        let buy_fee = mmo::world::listing_fee(12 * 5);
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 40 - buy_fee,
+            "5 x the resting 8, plus the listing fee"
+        );
+        assert_eq!(
+            db.character_gold(&sid).await.unwrap(),
+            seller_gold + 40 - mmo::world::sale_tax(40),
+            "seller paid immediately, net of sale tax"
+        );
 
         // Goods landed in the BUYER's warehouse at this market.
         let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
@@ -10278,7 +10304,10 @@ mod tests {
             "type": "market.buy", "command_id": "c2", "item_id": "wood", "unit_price": 12, "qty": 5,
         }).to_string())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 40, "charged exactly once");
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 40 - buy_fee,
+            "charged exactly once — a resend costs no second fee either"
+        );
         assert_eq!(
             db.recent_trades(&market.id, "wood", 10).await.unwrap().len(), 1,
             "and traded exactly once"
@@ -10343,7 +10372,11 @@ mod tests {
         let mine = orders["orders"].as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["side"].as_str().unwrap(), "buy");
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90, "escrowed 10 x 9");
+        let bid_fee = mmo::world::listing_fee(9 * 10);
+        assert_eq!(
+            db.character_gold(&bid_).await.unwrap(), buyer_gold - 90 - bid_fee,
+            "escrowed 10 x 9, plus the listing fee"
+        );
 
         // It shows as depth on the BID side.
         let book = recv_until(&mut buyer, "market.book").await;
@@ -10388,11 +10421,12 @@ mod tests {
         );
         assert_eq!((trades[0].unit_price, trades[0].qty), (9, 4), "paid the resting bid");
         assert_eq!(
-            db.character_gold(&sid).await.unwrap(), seller_gold + 36,
-            "paid the resting bid of 9, not their own ask of 6"
+            db.character_gold(&sid).await.unwrap(),
+            seller_gold + 36 - mmo::world::sale_tax(36) - mmo::world::listing_fee(6 * 4),
+            "paid the resting bid of 9 not their own 6, net of sale tax and their listing fee"
         );
-        // The buyer's escrow covered it — no further charge.
-        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90);
+        // The buyer's escrow covered it — no further charge beyond the fee.
+        assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 90 - bid_fee);
         let held: i64 = db.warehouse_for_character(&market.id, &bid_).await.unwrap()
             .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
         assert_eq!(held, 4, "goods delivered to the resting buyer");

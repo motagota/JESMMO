@@ -332,6 +332,50 @@ async fn release_locked_in_tx(
     Ok(qty - still)
 }
 
+/// Burn `gold` out of the economy as a market fee (#141) and record it on the
+/// append-only fee ledger, inside a caller-owned transaction.
+///
+/// "Burn" means exactly that: the gold is deducted and credited nowhere. The
+/// ledger is therefore the ONLY record of what the sink removed — which is
+/// what makes `purses + escrow + burned` checkable, and what a Phase 2 city
+/// treasury (#144) would redirect rather than reinvent. Caller must have
+/// already confirmed the payer can afford it.
+#[allow(clippy::too_many_arguments)]
+async fn burn_fee_in_tx(
+    tx: &mut Tx<'_>,
+    market_id: &str,
+    character_id: &str,
+    kind: &str,
+    gold: i64,
+    order_id: Option<&str>,
+    trade_id: Option<&str>,
+    now: i64,
+) -> Result<(), DbError> {
+    if gold <= 0 {
+        return Ok(());
+    }
+    sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+        .bind(gold)
+        .bind(character_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO market_fee (id, market_id, character_id, kind, gold, order_id, trade_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(market_id)
+    .bind(character_id)
+    .bind(kind)
+    .bind(gold)
+    .bind(order_id)
+    .bind(trade_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Mint `amount` gold into a character's purse, inside a caller-owned
 /// transaction (build wages, #145 — the game's first gold faucet). Kept as an
 /// in-tx helper on purpose: wages MUST commit together with the contribution
@@ -1065,6 +1109,14 @@ pub struct BuyOutcome {
     /// the caller should stay SILENT rather than report a failure, since the
     /// client already got an answer the first time round.
     pub deduped: bool,
+    /// Listing fee burned at placement (#141) — charged whatever happens next,
+    /// and never refunded.
+    pub listing_fee: i64,
+    /// Sale tax burned out of this placer's proceeds, if they sold (#141).
+    pub sale_tax: i64,
+    /// The order was refused because the placer couldn't cover the listing fee
+    /// (#141), as opposed to having no stock or no gold to escrow.
+    pub fee_unaffordable: bool,
 }
 
 /// A gatherable resource node.
@@ -1582,13 +1634,24 @@ impl Db {
         }
 
         // --- escrow -------------------------------------------------------
+        let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_one(&mut *tx)
+            .await?;
         let escrowed_qty = if buying {
-            let gold: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
-                .bind(character_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            let affordable = if unit_price > 0 { gold / unit_price } else { 0 };
-            let take = qty.min(affordable);
+            // A buy must cover BOTH its escrow and its listing fee (#141), and
+            // the fee depends on the notional, which depends on the size —
+            // so size it, then walk down until the pair fits. Converges in a
+            // couple of steps (each pass removes at least the shortfall).
+            let mut take = qty.min(if unit_price > 0 { purse / unit_price } else { 0 });
+            while take > 0 {
+                let notional = take * unit_price;
+                let total = notional + world::listing_fee(notional);
+                if total <= purse {
+                    break;
+                }
+                take -= ((total - purse) / unit_price).max(1);
+            }
             if take > 0 {
                 sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
                     .bind(take * unit_price)
@@ -1598,12 +1661,41 @@ impl Db {
             }
             take
         } else {
+            // A sell's size comes from its stock, so the fee is a separate
+            // affordability question — checked below, before anything moves.
+            let stock: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(qty), 0) FROM market_warehouse_item \
+                 WHERE market_id = ? AND character_id = ? AND item_id = ? AND state = 'available'",
+            )
+            .bind(market_id)
+            .bind(character_id)
+            .bind(item_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let would_escrow = qty.min(stock);
+            if would_escrow > 0 && world::listing_fee(would_escrow * unit_price) > purse {
+                // Can't pay to list it: refuse OUTRIGHT rather than escrow
+                // goods against an order that was never placed.
+                tx.commit().await?;
+                out.fee_unaffordable = true;
+                return Ok(out);
+            }
             warehouse_lock_in_tx(&mut tx, market_id, character_id, item_id, qty).await?
         };
         if escrowed_qty <= 0 {
             tx.commit().await?;
             return Ok(out);
         }
+
+        // The listing fee is charged on what was actually escrowed, and burned
+        // whatever happens next — filled, rested, cancelled, or expired. That
+        // is precisely what makes posting an order you don't mean to honour
+        // cost something (#141).
+        out.listing_fee = world::listing_fee(escrowed_qty * unit_price);
+        burn_fee_in_tx(
+            &mut tx, market_id, character_id, "listing", out.listing_fee, None, None, now,
+        )
+        .await?;
 
         // --- match --------------------------------------------------------
         // Buys sweep the cheapest asks; sells sweep the richest bids.
@@ -1651,8 +1743,11 @@ impl Db {
             release_locked_in_tx(&mut tx, market_id, seller, item_id, landed, false).await?;
 
             // Gold. Whoever was RESTING already escrowed at their own price, so
-            // only the aggressor settles here.
+            // only the aggressor settles here. The seller pays sale tax out of
+            // their proceeds (#141) — they receive value minus tax, and the tax
+            // is burned.
             let value = landed * exec;
+            let tax = world::sale_tax(value);
             if buying {
                 // We escrowed at our limit; we pay `exec` and get the rest back.
                 let refund = landed * (unit_price - exec);
@@ -1666,6 +1761,7 @@ impl Db {
                 // The resting buyer's escrow covers it exactly; we just collect.
                 grant_gold_in_tx(&mut tx, character_id, value).await?;
                 out.earned += value;
+                out.sale_tax += tax;
             }
 
             let remaining = o.qty_remaining - landed;
@@ -1691,14 +1787,14 @@ impl Db {
                 qty: landed,
                 seller_id: seller.to_string(),
                 buyer_id: buyer.to_string(),
-                sale_tax_gold: 0,
+                sale_tax_gold: tax,
                 listing_fee_gold: 0,
                 created_at: now,
             };
             sqlx::query(
                 "INSERT INTO market_trade (id, market_id, item_id, unit_price, qty, seller_id, \
                  buyer_id, sale_tax_gold, listing_fee_gold, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             )
             .bind(&trade.id)
             .bind(market_id)
@@ -1707,8 +1803,14 @@ impl Db {
             .bind(landed)
             .bind(&trade.seller_id)
             .bind(&trade.buyer_id)
+            .bind(tax)
             .bind(now)
             .execute(&mut *tx)
+            .await?;
+            // The seller pays it, whichever side of the match they were on.
+            burn_fee_in_tx(
+                &mut tx, market_id, seller, "sale_tax", tax, None, Some(&trade.id), now,
+            )
             .await?;
             out.fills.push(trade);
             out.filled += landed;
@@ -1882,6 +1984,29 @@ impl Db {
         .bind(market_id)
         .bind(item_id)
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Total gold burned as market fees (#141) — listing fees plus sale tax,
+    /// across every market. The sink's own record: because burned gold is
+    /// credited nowhere, this is the only way to close the books, and
+    /// `purses + escrow + burned` must be constant.
+    pub async fn total_fees_burned(&self) -> Result<i64, DbError> {
+        let total: Option<i64> = sqlx::query_scalar("SELECT SUM(gold) FROM market_fee")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// Fees burned at one market, split by kind — what a Phase 2 city treasury
+    /// (#144) would be crediting instead, and the balance telemetry for
+    /// whether the sink is sized sanely.
+    pub async fn fees_by_kind(&self, market_id: &str) -> Result<Vec<(String, i64)>, DbError> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT kind, SUM(gold) FROM market_fee WHERE market_id = ? GROUP BY kind ORDER BY kind",
+        )
+        .bind(market_id)
         .fetch_all(&self.pool)
         .await
     }
@@ -4422,10 +4547,25 @@ mod tests {
         let expected = 4 * 7 + 6 * 8 + 2 * 9;
         assert_eq!(out.spent, expected, "each fill at the resting price, not the 10 bid");
         assert!(out.spent < 12 * 10, "the aggressor keeps the price improvement");
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - expected);
-        // Sellers are paid immediately, each for their own fills.
-        assert_eq!(db.character_gold(&s2).await.unwrap(), s2_start + 4 * 7);
-        assert_eq!(db.character_gold(&s1).await.unwrap(), s1_start + 6 * 8 + 2 * 9);
+        // The buyer also paid a listing fee to place the order (#141).
+        assert_eq!(out.listing_fee, world::listing_fee(12 * 10));
+        assert_eq!(
+            db.character_gold(&buyer).await.unwrap(),
+            buyer_start - expected - out.listing_fee
+        );
+        // Sellers are paid immediately, each for their own fills — net of the
+        // sale tax on each fill. (Their listing fees were charged before these
+        // balances were captured.)
+        assert_eq!(
+            db.character_gold(&s2).await.unwrap(),
+            s2_start + (4 * 7 - world::sale_tax(4 * 7)),
+            "seller receives the fill minus sale tax"
+        );
+        assert_eq!(
+            db.character_gold(&s1).await.unwrap(),
+            s1_start + (6 * 8 - world::sale_tax(6 * 8)) + (2 * 9 - world::sale_tax(2 * 9)),
+            "taxed per fill, not once on the total"
+        );
 
         // The 9-level order is partially filled and still resting; the others
         // are gone. The book only ever holds live orders.
@@ -4437,12 +4577,19 @@ mod tests {
             .iter().filter(|r| r.item_id == "wood" && r.state == "available").map(|r| r.qty).sum();
         assert_eq!(held, 12);
 
-        // Three fills on the append-only ledger, at execution prices.
+        // Three fills on the append-only ledger, at execution prices, each
+        // carrying the tax that was taken from it (#141).
         let trades = db.recent_trades(&m, "wood", 10).await.unwrap();
         assert_eq!(trades.len(), 3);
         let mut prices: Vec<i64> = trades.iter().map(|t| t.unit_price).collect();
         prices.sort();
         assert_eq!(prices, vec![7, 8, 9]);
+        for t in &trades {
+            assert_eq!(
+                t.sale_tax_gold, world::sale_tax(t.unit_price * t.qty),
+                "each ledger row records its own tax, so fee revenue reconciles"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4460,13 +4607,23 @@ mod tests {
         let out = buy(&db, &m, &buyer, "wood", 4, 10).await;
         assert_eq!((out.filled, out.spent), (0, 0), "nothing crossed");
         assert_eq!(out.resting_qty, 10);
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), start - 40, "escrowed 10 x 4");
+        let fee = world::listing_fee(10 * 4);
+        assert_eq!(out.listing_fee, fee);
+        assert_eq!(
+            db.character_gold(&buyer).await.unwrap(), start - 40 - fee,
+            "escrowed 10 x 4, plus the listing fee"
+        );
         assert_eq!(db.book_for(&m, "wood", "buy").await.unwrap(), vec![BookLevel { unit_price: 4, qty: 10 }]);
 
-        // Cancelling gives every escrowed coin back — escrow is held, not spent.
+        // Cancelling gives every escrowed coin back — but NOT the listing fee
+        // (#141). Paying to post an order is the cost of posting it, whether or
+        // not you then change your mind.
         let mine = db.open_orders_for_character(&m, &buyer).await.unwrap();
         db.cancel_order(&buyer, &mine[0].id).await.unwrap();
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), start, "escrow fully returned");
+        assert_eq!(
+            db.character_gold(&buyer).await.unwrap(), start - fee,
+            "escrow returned, listing fee kept"
+        );
 
         // A bid crossing only the cheap level takes that level and rests the
         // rest of its size at its own price.
@@ -4503,7 +4660,10 @@ mod tests {
         let mine = db.open_orders_for_character(&m, &cid).await.unwrap();
         let buy_order = mine.iter().find(|o| o.side == "buy").unwrap();
         db.cancel_order(&cid, &buy_order.id).await.unwrap();
-        assert_eq!(db.character_gold(&cid).await.unwrap(), gold, "no wash trade, no gold lost");
+        assert_eq!(
+            db.character_gold(&cid).await.unwrap(), gold - out.listing_fee,
+            "no wash trade: escrow came back, only the listing fee was spent"
+        );
     }
 
     #[tokio::test]
@@ -4516,7 +4676,8 @@ mod tests {
         let buyer_start = db.character_gold(&buyer).await.unwrap();
         let out = buy(&db, &m, &buyer, "wood", 9, 10).await;
         assert_eq!(out.resting_qty, 10);
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90);
+        let bid_fee = out.listing_fee;
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90 - bid_fee);
 
         // A seller arrives asking 6 — below the bid, so it crosses. The RESTING
         // order's price wins, so the seller is paid 9, not their own 6.
@@ -4525,10 +4686,14 @@ mod tests {
         let out = sell(&db, &m, &seller, "wood", 6, 4).await;
         assert_eq!(out.filled, 4);
         assert_eq!(out.earned, 36, "4 x the resting bid of 9, not the 6 asked");
-        assert_eq!(db.character_gold(&seller).await.unwrap(), seller_start + 36);
+        // Net of the sale tax on that fill, and of what they paid to list.
+        assert_eq!(
+            db.character_gold(&seller).await.unwrap(),
+            seller_start + 36 - world::sale_tax(36) - out.listing_fee
+        );
 
         // The buyer's escrow covered it exactly — no further charge.
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90);
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 90 - bid_fee);
         let held: i64 = db.warehouse_for_character(&m, &buyer).await.unwrap()
             .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
         assert_eq!(held, 4, "goods landed with the resting buyer");
@@ -4550,7 +4715,10 @@ mod tests {
 
         let buyer = a_character(&db).await;
         buy(&db, &m, &buyer, "wood", 7, 5).await;
-        assert_eq!(db.character_gold(&s1).await.unwrap(), s1_gold + 35, "oldest at the level fills first");
+        assert_eq!(
+            db.character_gold(&s1).await.unwrap(), s1_gold + 35 - world::sale_tax(35),
+            "oldest at the level fills first"
+        );
         assert_eq!(db.character_gold(&s2).await.unwrap(), s2_gold, "the newer one is untouched");
 
         // After every command the book must not cross between different
@@ -4590,17 +4758,22 @@ mod tests {
 
         // One of each side, both expiring at t=100.
         db.place_order(&m, &seller, "sell", "wood", 9, 20, 100, 60, 1000, "", 0).await.unwrap();
-        db.place_order(&m, &buyer, "buy", "wood", 4, 10, 100, 60, 1000, "", 0).await.unwrap();
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40);
+        let bid = db.place_order(&m, &buyer, "buy", "wood", 4, 10, 100, 60, 1000, "", 0).await.unwrap();
+        let bid_fee = bid.listing_fee;
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40 - bid_fee);
 
         // Not due yet: nothing moves.
         assert!(db.expire_orders(99).await.unwrap().is_empty());
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40);
+        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start - 40 - bid_fee);
 
-        // Due: both release, goods back to available and gold back to purse.
+        // Due: both release, goods back to available and gold back to purse —
+        // but the listing fee stays spent, exactly as on a cancel (#141).
         let expired = db.expire_orders(100).await.unwrap();
         assert_eq!(expired.len(), 2);
-        assert_eq!(db.character_gold(&buyer).await.unwrap(), buyer_start, "escrowed gold returned");
+        assert_eq!(
+            db.character_gold(&buyer).await.unwrap(), buyer_start - bid_fee,
+            "escrowed gold returned; expiry refunds no more than a cancel does"
+        );
         let held = db.warehouse_for_character(&m, &seller).await.unwrap();
         assert!(held.iter().all(|r| r.state == "available"), "goods un-escrowed");
         assert_eq!(held.iter().map(|r| r.qty).sum::<i64>(), 20);
@@ -4633,6 +4806,83 @@ mod tests {
         let held_after: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
             .iter().filter(|r| r.state == "locked").map(|r| r.qty).sum();
         assert_eq!(held_before, held_after, "a refused order escrows nothing");
+    }
+
+    /// #141: BOTH sides pay to list, so spoofing — papering the book with
+    /// orders you never intend to honour — bleeds gold. That's most of the
+    /// defence against it.
+    #[tokio::test]
+    async fn spoofing_the_book_bleeds_gold() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let spoofer = a_seller(&db, &m, "wood", 40).await;
+        let start = db.character_gold(&spoofer).await.unwrap();
+
+        // Post and pull, ten times over, on both sides. Nothing ever trades.
+        for i in 0..10 {
+            let s = sell(&db, &m, &spoofer, "wood", 20 + i, 4).await;
+            let b = buy(&db, &m, &spoofer, "wood", 2, 4).await;
+            for id in [s.resting_order_id, b.resting_order_id].into_iter().flatten() {
+                db.cancel_order(&spoofer, &id).await.unwrap();
+            }
+        }
+        let end = db.character_gold(&spoofer).await.unwrap();
+        assert!(end < start, "spoofing must cost something (was {start}, now {end})");
+        assert_eq!(
+            db.recent_trades(&m, "wood", 10).await.unwrap().len(), 0,
+            "and it never actually traded"
+        );
+        // Everything lost went to the sink, nowhere else.
+        assert_eq!(start - end, db.total_fees_burned().await.unwrap());
+
+        // Stock is untouched — only gold was spent.
+        let held: i64 = db.warehouse_for_character(&m, &spoofer).await.unwrap()
+            .iter().filter(|r| r.item_id == "wood").map(|r| r.qty).sum();
+        assert_eq!(held, 40, "the goods came back every time");
+    }
+
+    #[tokio::test]
+    async fn an_order_you_cannot_pay_the_fee_on_is_refused_outright() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cid = a_seller(&db, &m, "wood", 20).await;
+
+        // Drain the purse to nothing, so even the 1-gold floor is out of reach.
+        let purse = db.character_gold(&cid).await.unwrap();
+        sqlx::query("UPDATE character SET gold = 0 WHERE id = ?")
+            .bind(&cid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(purse > 0);
+
+        let out = sell(&db, &m, &cid, "wood", 5, 20).await;
+        assert!(out.fee_unaffordable, "should refuse for want of the fee, not silently");
+        assert!(out.resting_order_id.is_none());
+        // And critically: nothing was escrowed against an order that was never
+        // placed — the goods are all still available.
+        let available: i64 = db.warehouse_for_character(&m, &cid).await.unwrap()
+            .iter().filter(|r| r.state == "available").map(|r| r.qty).sum();
+        assert_eq!(available, 20, "no goods stranded in escrow");
+        assert!(db.book_for(&m, "wood", "sell").await.unwrap().is_empty());
+        assert_eq!(db.total_fees_burned().await.unwrap(), 0, "and nothing was charged");
+    }
+
+    #[tokio::test]
+    async fn the_fee_ledger_accounts_for_every_burn_by_kind() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 20).await;
+        let buyer = a_character(&db).await;
+        sell(&db, &m, &seller, "wood", 8, 10).await;
+        buy(&db, &m, &buyer, "wood", 8, 10).await;
+
+        let by_kind = db.fees_by_kind(&m).await.unwrap();
+        let listing: i64 = by_kind.iter().filter(|(k, _)| k == "listing").map(|(_, g)| g).sum();
+        let tax: i64 = by_kind.iter().filter(|(k, _)| k == "sale_tax").map(|(_, g)| g).sum();
+        assert_eq!(listing, world::listing_fee(80) * 2, "both sides paid to list");
+        assert_eq!(tax, world::sale_tax(80), "the seller paid tax on the fill");
+        assert_eq!(listing + tax, db.total_fees_burned().await.unwrap());
     }
 
     /// Matching determinism (#136 §12): the same command sequence must produce
@@ -4808,10 +5058,18 @@ mod tests {
                 .filter(|o| o.side == "buy")
                 .map(|o| o.unit_price * o.qty_remaining)
                 .sum();
+            // Gold is conserved across purses + escrow + everything the fee
+            // sink has BURNED (#141). Burned gold is credited nowhere, so the
+            // fee ledger is the only thing that closes the books — if this
+            // holds, no gold was created or lost, only moved or destroyed on
+            // purpose.
             assert_eq!(
-                db.character_gold(&s).await.unwrap() + db.character_gold(&b).await.unwrap() + escrowed,
+                db.character_gold(&s).await.unwrap()
+                    + db.character_gold(&b).await.unwrap()
+                    + escrowed
+                    + db.total_fees_burned().await.unwrap(),
                 total_gold,
-                "gold conserved at step {step} (no fees burn yet — that's #141)"
+                "gold conserved at step {step}"
             );
             assert!(db.book_health().await.unwrap().is_empty(), "book invariants hold at step {step}");
         }

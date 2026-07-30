@@ -167,8 +167,8 @@ func _process(_delta: float) -> bool:
 	var bought := []
 	_market.do_sell.connect(func(i, p, q, h): sold.append([i, p, q, h]))
 	_market.do_buy.connect(func(i, p, q, h): bought.append([i, p, q, h]))
-	_market._price_field.value = 11
-	_market._qty_field.value = 7
+	_market._form_price = 11
+	_market._form_qty = 7
 	_press("Sell")
 	_press("Buy")
 	if sold != [["wood", 11, 7, Protocol.DEFAULT_ORDER_HOURS]]:
@@ -179,7 +179,7 @@ func _process(_delta: float) -> bool:
 	# A resting order holds escrow, so it carries a duration (#140) — picking
 	# a different one must actually travel with the command.
 	sold.clear()
-	_market._duration_field.select(0) # the shortest offered
+	_market._form_hours = Protocol.ORDER_DURATIONS_HOURS[0] # the shortest offered
 	_press("Sell")
 	if sold.is_empty() or sold[0][3] != Protocol.ORDER_DURATIONS_HOURS[0]:
 		_fail("the chosen duration should ride the order, got %s" % [sold]); return true
@@ -193,6 +193,54 @@ func _process(_delta: float) -> bool:
 		_fail("switching should request the new book, got %s" % [watched]); return true
 	if _body_text().contains("20 @ 8g"):
 		_fail("old depth survived a commodity switch"); return true
+
+	# --- fees (#141) ----------------------------------------------------------
+	# The cost of placing must be visible BEFORE committing — the server charges
+	# its own number, and these mirrored formulas have to agree with it or the
+	# preview is a lie.
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], []) # force a rebuild at these values
+	var fees := _body_text()
+	if not fees.contains("listing fee %dg" % Protocol.listing_fee(160)):
+		_fail("the listing fee should be previewed, got: %s" % fees); return true
+	if not fees.contains("not refunded if you cancel"):
+		_fail("the preview must say the fee isn't refundable, got: %s" % fees); return true
+	if not fees.contains("taxed %dg" % Protocol.sale_tax(160)):
+		_fail("the sale tax should be previewed, got: %s" % fees); return true
+
+	# Fees round up and are never zero — the anti-exploit. A fee that rounded to
+	# zero on small orders would make splitting an order a free lane.
+	if Protocol.listing_fee(1) < 1 or Protocol.sale_tax(1) < 1:
+		_fail("fees must never be zero on a nonzero amount"); return true
+	if Protocol.listing_fee(101) != 2 or Protocol.sale_tax(101) != 4:
+		_fail("fees must round UP (got %d / %d)" % [Protocol.listing_fee(101), Protocol.sale_tax(101)]); return true
+	var split := 0
+	for i in range(20):
+		split += Protocol.listing_fee(8)
+	if split < Protocol.listing_fee(160):
+		_fail("splitting an order must not be cheaper than placing it whole"); return true
+
+	# What the house actually took shows up after the fact.
+	_market.note_fees(2, 5)
+	var paid := _body_text()
+	if not paid.contains("listing fee 2g") or not paid.contains("sale tax 5g"):
+		_fail("the fees actually charged should render, got: %s" % paid); return true
+
+	# The form must SURVIVE a rebuild. The body is rebuilt on every push —
+	# including other players' trades — so a price you typed would otherwise be
+	# wiped mid-order by someone else's activity.
+	_market._form_price = 42
+	_market._form_qty = 9
+	_market.note_trade("stone", 3, 1) # somebody else trades; panel rebuilds
+	if int(_market._price_field.value) != 42 or int(_market._qty_field.value) != 9:
+		_fail("a rebuild wiped the order form (%s / %s)" % [
+			_market._price_field.value, _market._qty_field.value]); return true
+	var kept := []
+	_market.do_buy.connect(func(i, p, q, h): kept.append([p, q]))
+	_press("Buy")
+	if kept != [[42, 9]]:
+		_fail("the order should place what's still in the form, got %s" % [kept]); return true
 
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.

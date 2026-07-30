@@ -364,6 +364,8 @@ func _wire_signals() -> void:
     _net.market_orders.connect(func(_mid, orders): _market.set_orders(orders))
     _net.market_trade.connect(func(_mid, item_id, unit_price, qty):
         _market.note_trade(item_id, unit_price, qty))
+    _net.market_fees.connect(func(_mid, listing_fee, sale_tax):
+        _market.note_fees(listing_fee, sale_tax))
     _market.do_sell.connect(func(item_id, price, qty, hours): _net.send_market_sell(item_id, price, qty, hours))
     _market.do_buy.connect(func(item_id, price, qty, hours): _net.send_market_buy(item_id, price, qty, hours))
     _market.do_cancel.connect(func(order_id): _net.send_market_cancel(order_id))

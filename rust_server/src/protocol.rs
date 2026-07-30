@@ -237,6 +237,15 @@ pub const S_MARKET_BOOK: &str = "market.book";
 pub const S_MARKET_ORDERS: &str = "market.orders";
 // {market_id, item_id, unit_price, qty} -- a fill just happened; the ticker.
 pub const S_MARKET_TRADE: &str = "market.trade";
+// {market_id, listing_fee, sale_tax} -- what the house just took from YOUR
+// command (issue #141). A listing fee is charged to BOTH sides at placement on
+// notional and is never refunded on cancel or expiry -- that's what makes
+// posting an order you don't mean to honour cost something. Sale tax comes out
+// of a seller's proceeds per fill. Both are BURNED at the capital market: the
+// gold leaves the economy, which is the point (rent was the only sink before
+// #145 made gold earnable at all). Every fee rounds UP and is never zero on a
+// nonzero amount, so splitting one order into many can't dodge the sink.
+pub const S_MARKET_FEES: &str = "market.fees";
 
 // --- district.*  (M4 §4.8 gated transitions) ------------------------------------
 pub const C_DISTRICT_ENTER: &str = "district.enter"; // {from, to}
