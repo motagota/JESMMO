@@ -49,6 +49,11 @@ const PLAYER_ATTACK_COOLDOWN: i32 = 6; // ticks between swings (~0.3s)
 
 // --- Territory control (capture bar) ------------------------------------------
 const MOB_RESPAWN_TICKS: i32 = 40; // a killed mob trickles back ~every 2s
+/// How long an authored creature (#158) stays dead before returning to its
+/// authored spot. Much slower than the ambient trickle: clearing a pack should
+/// feel like an accomplishment that lasts a little while, and a bounty that
+/// respawned under your feet would be farming rather than hunting.
+const AUTHORED_MOB_RESPAWN_TICKS: i32 = 600; // ~30s at 20 Hz
 const CAPTURE_MOB_THRESHOLD: usize = 2; // capture only progresses at/below this many mobs
 const CAPTURE_RATE: f32 = 1.0; // bar units/tick while capturing (~5s to take a zone)
 const CAPTURE_DECAY: f32 = 0.5; // bar units/tick lost when a capture stalls
@@ -104,7 +109,7 @@ const HOME_STRUCTURE_RANGE: i32 = 60; // must be within this of a placed bed/sto
 
 type Tx = mpsc::UnboundedSender<Message>;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum EntityKind {
     Player,
     Mob,
@@ -141,6 +146,17 @@ impl Region {
     }
 }
 
+/// Runtime state for an authored creature (#158). The position is authored and
+/// immutable — a killed dog comes back where it was put, not wherever the RNG
+/// felt like, so a pack stays a landmark across a session.
+struct AuthoredMob {
+    species: &'static str,
+    x: i32,
+    y: i32,
+    /// Ticks until it comes back; 0 while it is alive.
+    respawn_timer: i32,
+}
+
 struct Entity {
     x: i32,
     y: i32,
@@ -174,6 +190,16 @@ struct Entity {
     poison_buildup: i32,
     /// The proc: sticks until death (no cure in v1); only respawn clears it.
     poisoned: bool,
+    /// What kind of creature this is (#158), for authored mobs. `None` for
+    /// players and for the ambient mobs `spawn_mobs` scatters — those stay the
+    /// anonymous territory population they have always been, and only authored
+    /// creatures are named content.
+    species: Option<&'static str>,
+    /// Where an authored creature belongs (#158). Past
+    /// `world::AUTHORED_MOB_LEASH` from here it abandons whatever it is doing
+    /// and walks back — see that constant for why. `None` for players and
+    /// ambient mobs, which roam their whole region freely as they always have.
+    home: Option<(i32, i32)>,
 }
 
 impl Entity {
@@ -194,7 +220,17 @@ impl Entity {
             poison_sources: 0,
             poison_buildup: 0,
             poisoned: false,
+            species: None,
+            home: None,
         }
+    }
+
+    /// An ambient mob: no species, random placement, counts toward territory.
+    /// An authored creature: named, fixed-place, and content rather than
+    /// ambience. Identical to an ambient mob in every combat respect — same hp,
+    /// same AI — so nothing in the tick has to special-case it.
+    fn authored_mob(species: &'static str, x: i32, y: i32) -> Self {
+        Entity { species: Some(species), home: Some((x, y)), ..Entity::mob(x, y) }
     }
 
     fn mob(x: i32, y: i32) -> Self {
@@ -215,6 +251,8 @@ impl Entity {
             poison_sources: 0,
             poison_buildup: 0,
             poisoned: false,
+            species: None,
+            home: None,
         }
     }
 }
@@ -336,6 +374,12 @@ fn entity_status_json(id: &str, e: &Entity) -> Value {
     // Vitals (#87/#88) ride the same state dict hp does, players only — the
     // HUD (#89) shows a breath meter while submerged and a poison gauge
     // while buildup is non-zero.
+    // Species (#158) so a client can name and draw a wild dog as a wild dog
+    // rather than as another anonymous blob. Absent for players and ambient
+    // mobs, which is exactly the distinction it exists to make.
+    if let Some(species) = e.species {
+        state["species"] = json!(species);
+    }
     if e.kind == EntityKind::Player {
         state["breath"] = json!(e.breath);
         state["max_breath"] = json!(BREATH_MAX_TICKS);
@@ -369,6 +413,11 @@ struct ZoneServer {
     /// Gatherable resource nodes in this zone's region (cache-only runtime state),
     /// keyed by node id.
     nodes: Mutex<HashMap<String, ResourceNode>>,
+    /// Authored creatures in this zone's region (#158), keyed by their authored
+    /// id — which is also the live entity id, so a death is matched back to its
+    /// spawn without a second lookup. Runtime state is just the respawn timer;
+    /// the position is authored and never drifts.
+    authored_mobs: Mutex<HashMap<String, AuthoredMob>>,
     /// Authored storage access points in this zone's region (deposit/withdraw spots).
     storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
     /// Authored build-order boards in this zone's region (contribution spots).
@@ -399,6 +448,7 @@ impl ZoneServer {
             mob_counter: Mutex::new(0),
             capital: mmo::world::capital(),
             nodes: Mutex::new(HashMap::new()),
+            authored_mobs: Mutex::new(HashMap::new()),
             storage_points: Mutex::new(Vec::new()),
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
@@ -430,6 +480,32 @@ impl ZoneServer {
                     respawn_timer: 0,
                 },
             );
+        }
+    }
+
+    /// (Re)spawn the authored creatures inside this zone's current region (#158).
+    /// Replaces the set, so a split re-derives what this zone now owns — exactly
+    /// like `spawn_nodes`, and for the same reason: authored content is anchored
+    /// to the world, not to whichever zone happens to be serving it.
+    fn spawn_authored_mobs(&self) {
+        let r = *self.region.lock().unwrap();
+        let spawns = self
+            .capital
+            .mobs_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        let mut authored = self.authored_mobs.lock().unwrap();
+        let mut entities = self.entities.lock().unwrap();
+        // Drop any authored creature this zone no longer owns, so a split
+        // doesn't leave a ghost behind in the half that lost it.
+        for id in authored.keys() {
+            entities.remove(id);
+        }
+        authored.clear();
+        for m in spawns {
+            authored.insert(
+                m.id.to_string(),
+                AuthoredMob { species: m.species, x: m.x, y: m.y, respawn_timer: 0 },
+            );
+            entities.insert(m.id.to_string(), Entity::authored_mob(m.species, m.x, m.y));
         }
     }
 
@@ -745,6 +821,7 @@ impl ZoneServer {
                 // static world authoring) and repopulated by the `home_structures_sync`
                 // the gateway sends right after a region change (#13).
                 self.spawn_mobs(MOBS_PER_ZONE);
+                self.spawn_authored_mobs();
                 self.spawn_nodes();
                 self.spawn_storage_points();
                 self.spawn_build_boards();
@@ -1076,6 +1153,25 @@ impl ZoneServer {
                     }
 
                     let e = entities.get_mut(mid).unwrap();
+                    // Leash first, ahead of both chasing and wandering (#158): an
+                    // authored creature dragged away from its ground gives up and
+                    // goes home. Ahead of the chase on purpose — otherwise a
+                    // player could kite the pack across the district and strand it
+                    // somewhere the siting guarantees don't hold.
+                    let straying = e.home.filter(|(hx, hy)| {
+                        dist2(e.x, e.y, *hx, *hy) > (mmo::world::AUTHORED_MOB_LEASH as i64).pow(2)
+                    });
+                    if let Some((hx, hy)) = straying {
+                        let (sx, sy) = step_toward(e.x, e.y, hx, hy, MOB_SPEED);
+                        let (nx, ny) = clamp_region(&region, e.x + sx, e.y + sy);
+                        e.x = nx;
+                        e.y = ny;
+                        if sx != 0 || sy != 0 {
+                            e.facing = (sx.signum(), sy.signum());
+                        }
+                        changed.insert(mid.clone());
+                        continue;
+                    }
                     if let Some((pid, px, py, d2)) = best {
                         let (sx, sy) = step_toward(mx, my, px, py, MOB_SPEED);
                         let (nx, ny) = clamp_region(&region, e.x + sx, e.y + sy);
@@ -1208,6 +1304,13 @@ impl ZoneServer {
                 for id in dead_mobs {
                     entities.remove(&id);
                     changed.remove(&id);
+                    // An authored creature (#158) is remembered rather than
+                    // forgotten: it owes the world a comeback at the spot it was
+                    // authored, so a pack stays a landmark instead of drifting
+                    // into the RNG's hands after one clearing.
+                    if let Some(a) = self.authored_mobs.lock().unwrap().get_mut(&id) {
+                        a.respawn_timer = AUTHORED_MOB_RESPAWN_TICKS;
+                    }
                     despawns.push(id);
                 }
                 let dead_players: Vec<String> = entities
@@ -1238,8 +1341,35 @@ impl ZoneServer {
                     died.push((id.clone(), max_hp));
                 }
 
-                // --- 4. Trickle mobs back (slowly, so a zone can be cleared). ---
-                let live_mobs = entities.values().filter(|e| e.kind == EntityKind::Mob).count();
+                // --- 4a. Authored creatures come back where they were put (#158).
+                {
+                    let mut authored = self.authored_mobs.lock().unwrap();
+                    for (id, a) in authored.iter_mut() {
+                        if a.respawn_timer <= 0 {
+                            continue;
+                        }
+                        a.respawn_timer -= 1;
+                        if a.respawn_timer == 0 {
+                            entities
+                                .insert(id.clone(), Entity::authored_mob(a.species, a.x, a.y));
+                            changed.insert(id.clone());
+                        }
+                    }
+                }
+
+                // --- 4b. Trickle AMBIENT mobs back (slowly, so a zone can be
+                // cleared). Authored creatures are excluded from the count on
+                // purpose: they are content, not territory, and letting a pack
+                // of five suppress the ambient population would quietly change
+                // how a zone behaves just because someone put dogs in it.
+                let authored_ids: std::collections::HashSet<String> =
+                    self.authored_mobs.lock().unwrap().keys().cloned().collect();
+                let live_mobs = entities
+                    .iter()
+                    .filter(|(id, e)| {
+                        e.kind == EntityKind::Mob && !authored_ids.contains(*id)
+                    })
+                    .count();
                 if live_mobs < MOBS_PER_ZONE {
                     respawn_timer -= 1;
                     if respawn_timer <= 0 {
@@ -1465,6 +1595,7 @@ impl ZoneServer {
         // Seed mobs, resource nodes, storage points, build boards, and plots, then
         // start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
+        self.spawn_authored_mobs();
         self.spawn_nodes();
         self.spawn_storage_points();
         self.spawn_build_boards();
@@ -1518,6 +1649,251 @@ mod tests {
 
     fn zone_for_region(region: Region) -> Arc<ZoneServer> {
         ZoneServer::new("test".to_string(), 0, None, region, 1)
+    }
+
+    // --- authored creatures (wild dogs epic #157, issue #158) ---------------
+
+    /// The authored pack turns up where it was authored, named, when a zone owns
+    /// that ground. Before #158 every mob was an anonymous blob at a random
+    /// point, so "is there a dog over there" had no answer.
+    #[tokio::test]
+    async fn a_zone_owning_the_pack_spawns_it_where_it_was_authored() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+
+        let authored = mmo::world::capital().mobs;
+        let entities = zone.entities.lock().unwrap();
+        for m in &authored {
+            let e = entities.get(m.id).unwrap_or_else(|| panic!("{} did not spawn", m.id));
+            assert_eq!((e.x, e.y), (m.x, m.y), "{} spawned somewhere else", m.id);
+            assert_eq!(e.species, Some(m.species), "{} lost its species", m.id);
+            assert_eq!(e.kind, EntityKind::Mob);
+            assert_eq!(e.hp, MOB_MAX_HP, "an authored creature fights like any other mob");
+        }
+    }
+
+    /// A zone that owns none of the authored ground gets none of them — and
+    /// still fills its ambient population exactly as before. Authored content
+    /// must not become a prerequisite for a zone working.
+    #[tokio::test]
+    async fn a_zone_without_authored_ground_is_unchanged() {
+        // A far corner of the world with nothing authored in it.
+        let empty = Region { x0: 100, y0: 100, x1: 900, y1: 900 };
+        let zone = zone_for_region(empty);
+        zone.spawn_authored_mobs();
+        assert!(zone.authored_mobs.lock().unwrap().is_empty());
+
+        zone.spawn_mobs(MOBS_PER_ZONE);
+        let entities = zone.entities.lock().unwrap();
+        let mobs: Vec<_> = entities.values().filter(|e| e.kind == EntityKind::Mob).collect();
+        assert_eq!(mobs.len(), MOBS_PER_ZONE, "the ambient population changed");
+        assert!(
+            mobs.iter().all(|e| e.species.is_none()),
+            "ambient mobs should stay anonymous — species is what marks authored content"
+        );
+    }
+
+    /// Re-deriving on a region change replaces the set rather than accumulating,
+    /// and a zone that loses the ground loses the creatures on it. This is the
+    /// bug a split would otherwise cause: the same dog alive in two zones.
+    #[tokio::test]
+    async fn a_region_change_re_derives_the_pack_without_ghosts() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let owned = zone.authored_mobs.lock().unwrap().len();
+        assert!(owned > 0, "precondition: the civic region owns the pack");
+
+        // Running it twice must not double anything.
+        zone.spawn_authored_mobs();
+        assert_eq!(zone.authored_mobs.lock().unwrap().len(), owned, "re-derive accumulated");
+        assert_eq!(
+            zone.entities.lock().unwrap().values().filter(|e| e.species.is_some()).count(),
+            owned,
+            "re-derive left duplicate entities"
+        );
+
+        // Hand the ground away: the creatures go with it, leaving no ghost.
+        *zone.region.lock().unwrap() = Region { x0: 100, y0: 100, x1: 900, y1: 900 };
+        zone.spawn_authored_mobs();
+        assert!(zone.authored_mobs.lock().unwrap().is_empty());
+        assert_eq!(
+            zone.entities.lock().unwrap().values().filter(|e| e.species.is_some()).count(),
+            0,
+            "an authored creature was left behind in a zone that no longer owns its ground"
+        );
+    }
+
+    /// Species rides the wire, so a client can name and draw a dog as a dog.
+    /// Absent for players and ambient mobs, which is the distinction it exists
+    /// to make.
+    #[test]
+    fn species_rides_the_entity_wire_only_for_authored_creatures() {
+        let dog = Entity::authored_mob(mmo::world::SPECIES_WILD_DOG, 1, 2);
+        let v = entity_status_json("mob_dog_0", &dog);
+        assert_eq!(v["state"]["species"], mmo::world::SPECIES_WILD_DOG);
+        assert_eq!(v["state"]["type"], "mob");
+
+        let ambient = entity_status_json("mob_x", &Entity::mob(1, 2));
+        assert!(ambient["state"]["species"].is_null(), "ambient mobs are anonymous");
+        let player = entity_status_json("p1", &Entity::player(1, 2, PLAYER_MAX_HP));
+        assert!(player["state"]["species"].is_null(), "players have no species");
+    }
+
+    /// A killed dog comes back **where it was authored**, not at a random point,
+    /// so a pack stays a landmark across a session rather than dispersing after
+    /// one clearing. It also takes materially longer than the ambient trickle:
+    /// clearing a pack should last a moment, and a bounty target that respawned
+    /// under your feet would be farming rather than hunting.
+    #[tokio::test]
+    async fn a_killed_authored_creature_returns_to_its_authored_spot() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+
+        // Kill it, and shove the corpse's timer down so the test doesn't wait
+        // 30 real seconds for the authored cadence.
+        zone.entities.lock().unwrap().get_mut(&id).unwrap().hp = 0;
+        drive(zone.clone(), 2).await;
+        assert!(!zone.entities.lock().unwrap().contains_key(&id), "it should have died");
+        assert!(
+            zone.authored_mobs.lock().unwrap().get(&id).unwrap().respawn_timer > 0,
+            "an authored creature owes the world a comeback"
+        );
+        zone.authored_mobs.lock().unwrap().get_mut(&id).unwrap().respawn_timer = 2;
+
+        drive(zone.clone(), 4).await;
+        let entities = zone.entities.lock().unwrap();
+        let back = entities.get(&id).expect("it should have come back");
+        // Near home, not exactly on it: a respawned mob starts wandering
+        // immediately, which is correct. The property that matters is that it
+        // came back to its authored ground rather than to a random point in a
+        // 12800-wide region — so the tolerance is tiny next to the alternative.
+        let drift = (((back.x - home.0) as f64).powi(2) + ((back.y - home.1) as f64).powi(2)).sqrt();
+        assert!(
+            drift < 100.0,
+            "it came back {drift:.0} from home ({:?} vs {home:?}) — that looks like a random              respawn, not an authored one",
+            (back.x, back.y)
+        );
+        assert_eq!(back.hp, MOB_MAX_HP, "and at full health");
+        assert_eq!(back.species, Some(mmo::world::SPECIES_WILD_DOG));
+    }
+
+    /// An authored creature never strays far from its ground (#158). Mob wander
+    /// is 2 units/tick at 20Hz, so an unleashed one drifts over a thousand units
+    /// within a minute — which is exactly what happened live, scattering the pack
+    /// up to 1250 units from its anchor and carrying it clean out of every
+    /// promise the siting made (dry land, level footing, clear of everything).
+    #[tokio::test]
+    async fn an_authored_creature_stays_near_its_ground() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let homes: Vec<(String, (i32, i32))> = zone
+            .authored_mobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, m)| (id.clone(), (m.x, m.y)))
+            .collect();
+
+        // Long enough to drift far past the leash if nothing held them.
+        drive(zone.clone(), 400).await;
+
+        let leash = mmo::world::AUTHORED_MOB_LEASH as f64;
+        let entities = zone.entities.lock().unwrap();
+        for (id, home) in &homes {
+            let e = entities.get(id).unwrap_or_else(|| panic!("{id} vanished"));
+            let drift =
+                (((e.x - home.0) as f64).powi(2) + ((e.y - home.1) as f64).powi(2)).sqrt();
+            // A step of slack: the leash turns them around, it doesn't teleport
+            // them, so they can be a stride or two beyond it at any instant.
+            assert!(
+                drift <= leash + (MOB_SPEED * 2) as f64,
+                "{id} drifted {drift:.0} from home, past the {leash:.0} leash"
+            );
+        }
+    }
+
+    /// Dragged out and released, it walks home rather than standing where it was
+    /// abandoned. The leash sits ahead of the chase on purpose — otherwise a
+    /// player could kite the pack across the district and strand it.
+    #[tokio::test]
+    async fn a_strayed_creature_walks_back_home() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+
+        // Shove it well past the leash, and park a player next to it so the
+        // chase branch would fire if the leash didn't take priority.
+        let far = (home.0 + 1200, home.1);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.get_mut(&id).unwrap().x = far.0;
+            es.get_mut(&id).unwrap().y = far.1;
+            es.insert("bait".to_string(), Entity::player(far.0 + 20, far.1, PLAYER_MAX_HP));
+        }
+        let before =
+            (((far.0 - home.0) as f64).powi(2) + ((far.1 - home.1) as f64).powi(2)).sqrt();
+
+        drive(zone.clone(), 40).await;
+
+        let entities = zone.entities.lock().unwrap();
+        let e = entities.get(&id).unwrap();
+        let after = (((e.x - home.0) as f64).powi(2) + ((e.y - home.1) as f64).powi(2)).sqrt();
+        assert!(
+            after < before - 50.0,
+            "it stayed out with the player instead of going home ({before:.0} -> {after:.0})"
+        );
+    }
+
+    /// Ambient mobs are NOT leashed — they roam their whole region as they
+    /// always have. The leash is a property of authored content, not of mobs.
+    #[tokio::test]
+    async fn ambient_mobs_are_not_leashed() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_mobs(4);
+        let entities = zone.entities.lock().unwrap();
+        assert!(
+            entities.values().filter(|e| e.kind == EntityKind::Mob).all(|e| e.home.is_none()),
+            "an ambient mob was given a home — it would be leashed to a random point"
+        );
+    }
+
+    /// Authored creatures are CONTENT, ambient mobs are TERRITORY. A pack must
+    /// not suppress the ambient top-up — otherwise putting dogs somewhere would
+    /// quietly change how that zone behaves for reasons nobody wrote down.
+    #[tokio::test]
+    async fn the_pack_does_not_suppress_the_ambient_population() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let pack = zone.authored_mobs.lock().unwrap().len();
+        assert!(pack > 0);
+
+        // No ambient mobs yet: the trickle should still fill to its full quota
+        // despite the pack already standing there.
+        drive(zone.clone(), (MOB_RESPAWN_TICKS as u32 + 2) * MOBS_PER_ZONE as u32).await;
+
+        let entities = zone.entities.lock().unwrap();
+        let ambient = entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Mob && e.species.is_none())
+            .count();
+        assert_eq!(
+            ambient, MOBS_PER_ZONE,
+            "the authored pack ate into the ambient population ({ambient} of {MOBS_PER_ZONE})"
+        );
+        assert_eq!(
+            entities.values().filter(|e| e.species.is_some()).count(),
+            pack,
+            "and the pack is still there"
+        );
     }
 
     /// Drive a freshly-built zone's `game_loop` for `ticks` with a wired (dummy)

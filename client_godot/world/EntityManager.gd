@@ -63,6 +63,10 @@ func upsert(id: String, _zone: String, state: Dictionary) -> void:
 	# authored fixtures and home structures, which use their own kind AS the
 	# type. Keep it so a built fixture can be found by what it is (#137).
 	_entities[id]["structure_kind"] = String(state.get("kind", ""))
+	# Creature species (#158). Only authored creatures carry one; ambient mobs
+	# and players don't, which is exactly the distinction it exists to draw —
+	# a wild dog is content you can hunt, an anonymous mob is scenery.
+	_entities[id]["species"] = String(state.get("species", ""))
 
 ## The id of the nearest live resource node within `max_dist` world units of
 ## `from` (world coords), or "" if none. Used by the gather interaction.
@@ -111,6 +115,22 @@ func nearest_crafting(from: Vector2, max_dist: float) -> String:
 ## The nearest BUILT market (#137). Unlike the authored storehouse/build board,
 ## a market is a completed city build order, so it arrives as
 ## `type == "structure"` carrying `kind == "market"` — matched on the stored
+## The id of the nearest live creature of `species` within `max_dist`, or "" —
+## the lookup a bounty (#161) needs to point a player at something to fight, and
+## the reason species rides the wire at all (#158).
+func nearest_creature(from: Vector2, max_dist: float, species: String) -> String:
+	var best := ""
+	var best_d := max_dist
+	for id in _entities:
+		var rec: Dictionary = _entities[id]
+		if rec.get("kind", "") != "mob" or String(rec.get("species", "")) != species:
+			continue
+		var d := from.distance_to(rec.get("wpos", Vector2.ZERO))
+		if d <= best_d:
+			best_d = d
+			best = id
+	return best
+
 ## `structure_kind` rather than the entity type. The server enforces the same
 ## range independently; this only decides whether to show the panel.
 func nearest_market(from: Vector2, max_dist: float) -> String:
@@ -195,10 +215,22 @@ func _make_node(kind: String, state: Dictionary, id := "") -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	match kind:
 		"mob":
-			var box := BoxMesh.new()
-			box.size = Vector3(1.4, 2.0, 1.4)
-			mi.mesh = box
-			mi.material_override = _solid(Color(0.85, 0.25, 0.25))
+			# A wild dog (#158) reads as a distinct creature rather than another
+			# anonymous red blob: low and long like something on four legs, in a
+			# muddy brown, and named — because a bounty target you can't pick out
+			# of a crowd isn't a target.
+			var species := String(state.get("species", ""))
+			if species == "wild_dog":
+				var dog := BoxMesh.new()
+				dog.size = Vector3(1.1, 1.0, 2.0)
+				mi.mesh = dog
+				mi.material_override = _solid(Color(0.45, 0.32, 0.2))
+				_add_label(mi, "🐺 Wild Dog", 1.5, Color(0.9, 0.8, 0.65))
+			else:
+				var box := BoxMesh.new()
+				box.size = Vector3(1.4, 2.0, 1.4)
+				mi.mesh = box
+				mi.material_override = _solid(Color(0.85, 0.25, 0.25))
 		"resource":
 			# Trees (wood) as green cones, rocks (stone) as grey boxes. The
 			# quarry's rich nodes (#97, authored ids `node_quarry_*`) render

@@ -483,6 +483,32 @@ pub fn structure_footprint(kind: &str) -> Option<(i32, i32)> {
     }
 }
 
+/// An authored hostile creature (wild dogs epic #157, issue #158).
+///
+/// Mobs were anonymous until now: `spawn_mobs` scattered a fixed count at random
+/// points inside whatever region a zone happened to own, every one identical and
+/// nameless. That made them pure ambience — and made "count your dog kills"
+/// impossible, because there was no such thing as a dog.
+///
+/// Authored spawns are the other half of that split, and it is a deliberate one:
+///
+/// * **Authored mobs are CONTENT.** Fixed place, named species, and they come
+///   back where they were put — so a pack is a landmark you can return to and a
+///   bounty can send you somewhere specific.
+/// * **Ambient mobs stay TERRITORY.** Random placement, no species, and they are
+///   what the capture bar counts. Authored dogs deliberately do NOT block a zone
+///   capture or suppress the ambient top-up, or parking six of them in a region
+///   would quietly break territory control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobSpawn {
+    pub id: &'static str,
+    pub district: &'static str,
+    /// What kind of creature. Rides the wire so a client can name and draw it.
+    pub species: &'static str,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// An authored gatherable node: a fixed spawn that yields `item_id` until its
 /// `qty` is exhausted, then respawns. Node *runtime* state (current qty, respawn
 /// timer) is cache-only in the owning zone; this is just the authored spawn.
@@ -687,6 +713,9 @@ pub struct Capital {
     pub storage_points: Vec<StoragePoint>,
     pub build_boards: Vec<BuildBoard>,
     pub npcs: Vec<NpcSpawn>,
+    /// Authored hostile creatures (#158). See [`MobSpawn`] for why these are
+    /// separate from the zone's ambient mob population.
+    pub mobs: Vec<MobSpawn>,
     /// Authoritative heights — loaded once from the baked artifact (issue
     /// #63), not generated in-process. See [`loaded_terrain`].
     pub terrain: std::sync::Arc<terrain_common::Terrain>,
@@ -758,6 +787,75 @@ impl Capital {
     pub fn npcs_in(&self, r: Rect) -> Vec<NpcSpawn> {
         self.npcs.iter().copied().filter(|n| r.contains(n.x, n.y)).collect()
     }
+
+    /// The authored mobs inside `r` (#158). Filtered by region exactly like
+    /// [`Capital::resource_nodes_in`], so a zone split re-derives the creatures
+    /// it now owns rather than duplicating them into both halves or losing them
+    /// from both.
+    pub fn mobs_in(&self, r: Rect) -> Vec<MobSpawn> {
+        self.mobs.iter().copied().filter(|m| r.contains(m.x, m.y)).collect()
+    }
+}
+
+/// Species id for the wild dogs (#158). A string rather than an enum so the
+/// registry, the wire and the client all name the same thing without three
+/// definitions to keep in step.
+pub const SPECIES_WILD_DOG: &str = "wild_dog";
+
+/// How far an authored creature may stray from where it was authored (#158).
+///
+/// Authored siting is a set of promises — dry ground, level footing, clear of
+/// every other interaction, reachable on foot — and **every one of them is about
+/// a place, not a creature**. Mob wander is 2 units/tick at 20Hz, so within a
+/// minute an unleashed dog drifts over a thousand units and takes none of those
+/// promises with it: into the river, onto a resource node, into somebody's
+/// gather prompt. (Found live, exactly that way, with the pack scattered up to
+/// 1250 units from its anchor.)
+///
+/// So authored creatures are leashed: past this radius they stop whatever they
+/// were doing — including a chase — and walk home. `the_wild_dog_pack_is_sited_
+/// where_a_new_player_will_meet_it` requires every clearance to exceed this,
+/// which is what makes "a dog can never wander onto something else" true by
+/// construction rather than by luck.
+pub const AUTHORED_MOB_LEASH: i32 = 250;
+
+/// The authored wild-dog pack (#158): five dogs on the flat ground southwest of
+/// the town centre.
+///
+/// Site (12100, 12400) was surveyed against the bake rather than picked by eye —
+/// dry across the pack's whole footprint, level to within ~5m, and reachable
+/// from spawn without crossing water (drowning is real, #83). It sits **806
+/// units from the town centre**, which is the number that matters most here:
+/// aggro is 180, so a fresh spawn is never harassed at the storehouse, but the
+/// pack is a short deliberate walk rather than an expedition. It is also 200+
+/// units clear of every resource node, NPC, storage point and build site, so a
+/// dog fight never happens on top of another interaction's panel.
+///
+/// Southwest, deliberately: the market is east (12900, 12800), the logging
+/// foreman northeast, and the quarry far west — this is the one quadrant near
+/// spawn with nothing else in it.
+fn mob_spawns() -> Vec<MobSpawn> {
+    const PACK_X: i32 = 12100;
+    const PACK_Y: i32 = 12400;
+    // Loosely clustered so they read as a pack rather than a firing line, and
+    // far enough apart that pulling one doesn't necessarily pull all five.
+    [(0, 0), (-45, -30), (50, -25), (-30, 45), (40, 40)]
+        .iter()
+        .enumerate()
+        .map(|(i, (dx, dy))| MobSpawn {
+            id: match i {
+                0 => "mob_dog_0",
+                1 => "mob_dog_1",
+                2 => "mob_dog_2",
+                3 => "mob_dog_3",
+                _ => "mob_dog_4",
+            },
+            district: "civic",
+            species: SPECIES_WILD_DOG,
+            x: PACK_X + dx,
+            y: PACK_Y + dy,
+        })
+        .collect()
 }
 
 /// The Phase 1 capital: five named districts tiling the 25600x25600 (~655 km²)
@@ -999,6 +1097,7 @@ pub fn capital() -> Capital {
         storage_points,
         build_boards,
         npcs: npc_spawns(),
+        mobs: mob_spawns(),
         terrain,
     }
 }
@@ -1108,6 +1207,136 @@ mod tests {
             let h = t.sample_height(n.x as f32, n.y as f32);
             assert!(h > 100.0, "{} should sit on the mountain bench (h={h:.1})", n.id);
         }
+    }
+
+    /// The wild-dog pack (#158) is authored content, so where it sits is a
+    /// design decision rather than an accident — and one a rebake or a re-site
+    /// could silently ruin. Every property the survey picked the spot for is
+    /// pinned here.
+    #[test]
+    fn the_wild_dog_pack_is_sited_where_a_new_player_will_meet_it() {
+        let c = capital();
+        let t = loaded_terrain();
+        let dogs: Vec<_> = c.mobs.iter().filter(|m| m.species == SPECIES_WILD_DOG).collect();
+        assert!(dogs.len() >= 3, "a pack needs to be a pack, got {}", dogs.len());
+
+        let (tcx, tcy) = c.town_centre;
+        for d in &dogs {
+            // Inside the district that claims it.
+            assert_eq!(
+                c.district_at(d.x, d.y).map(|x| x.id),
+                Some(d.district),
+                "{} is sited outside its own district",
+                d.id
+            );
+
+            // On dry land, across the space a fight actually moves through —
+            // not just the pin. The east band reaches the bay and the river
+            // runs near spawn, so "somewhere nearby" is not automatically land.
+            for (ox, oy) in [(0, 0), (-60, -60), (60, -60), (-60, 60), (60, 60)] {
+                assert!(
+                    !t.is_water((d.x + ox) as f32, (d.y + oy) as f32),
+                    "{} is in the water at ({},{})",
+                    d.id,
+                    d.x + ox,
+                    d.y + oy
+                );
+            }
+
+            let dist = (((d.x - tcx) as f64).powi(2) + ((d.y - tcy) as f64).powi(2)).sqrt();
+            // Far enough that a fresh spawn is never harassed at the storehouse
+            // — mob aggro is 180 — but close enough to be a short deliberate
+            // walk rather than an expedition.
+            assert!(
+                (400.0..1500.0).contains(&dist),
+                "{} is {dist:.0} from spawn; the pack should be a short walk, not an ambush \
+                 at the door or a trek",
+                d.id
+            );
+
+            // Clear of every other interaction by MORE THAN THE LEASH, so a dog
+            // can never *wander* onto somebody's gather prompt or build panel —
+            // not merely start clear of it. Stating it in terms of the leash is
+            // what keeps the two from drifting apart: widen the leash and this
+            // test demands a roomier site, which is the correct conversation to
+            // be forced into.
+            let clearance = (AUTHORED_MOB_LEASH + 100) as f64;
+            for n in &c.resource_nodes {
+                let g = (((n.x - d.x) as f64).powi(2) + ((n.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > clearance, "{} could wander onto resource node {}", d.id, n.id);
+            }
+            for n in &c.npcs {
+                let g = (((n.x - d.x) as f64).powi(2) + ((n.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > clearance, "{} could wander onto NPC {}", d.id, n.id);
+            }
+            for sp in &c.storage_points {
+                let g = (((sp.x - d.x) as f64).powi(2) + ((sp.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > clearance, "{} could wander onto a storage point", d.id);
+            }
+            for o in &c.build_orders {
+                let g = (((o.structure_x - d.x) as f64).powi(2)
+                    + ((o.structure_y - d.y) as f64).powi(2))
+                .sqrt();
+                assert!(g > clearance, "{} could wander onto the {} build site", d.id, o.kind);
+            }
+            for b in &c.build_boards {
+                let g = (((b.x - d.x) as f64).powi(2) + ((b.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > clearance, "{} could wander onto the build board", d.id);
+            }
+        }
+
+        // Reachable on foot from spawn without swimming — drowning is real
+        // (#83), so a pack you can only swim to would be a trap.
+        let lead = dogs[0];
+        for i in 0..=200 {
+            let f = i as f32 / 200.0;
+            let x = tcx as f32 + (lead.x - tcx) as f32 * f;
+            let y = tcy as f32 + (lead.y - tcy) as f32 * f;
+            assert!(!t.is_water(x, y), "the walk to the pack crosses water at ({x:.0},{y:.0})");
+        }
+
+        // They're a pack: clustered together, not scattered across a district.
+        for d in &dogs {
+            let g = (((d.x - lead.x) as f64).powi(2) + ((d.y - lead.y) as f64).powi(2)).sqrt();
+            assert!(g < 300.0, "{} has wandered off from the pack ({g:.0} away)", d.id);
+        }
+
+        // Ids are unique — they double as entity ids in the zone, so a
+        // collision would have two dogs sharing one body.
+        let mut ids: Vec<&str> = c.mobs.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "duplicate authored mob id");
+    }
+
+    /// Region filtering is what makes a zone split safe: each half must derive
+    /// exactly the creatures inside it, with none duplicated into both and none
+    /// lost from both. Same contract `resource_nodes_in` already honours.
+    #[test]
+    fn authored_mobs_are_partitioned_cleanly_by_region() {
+        let c = capital();
+        assert!(!c.mobs.is_empty());
+
+        // The whole world holds every one of them.
+        let all = c.mobs_in(Rect::new(0, 0, WORLD_SIZE, WORLD_SIZE));
+        assert_eq!(all.len(), c.mobs.len());
+
+        // Split the world in half and the two halves partition it exactly.
+        let half = WORLD_SIZE / 2;
+        let left = c.mobs_in(Rect::new(0, 0, half, WORLD_SIZE));
+        let right = c.mobs_in(Rect::new(half, 0, WORLD_SIZE, WORLD_SIZE));
+        assert_eq!(
+            left.len() + right.len(),
+            c.mobs.len(),
+            "a split duplicated or dropped an authored creature"
+        );
+        for m in &left {
+            assert!(!right.contains(m), "{} is owned by both halves of a split", m.id);
+        }
+
+        // An empty corner owns none, and that must be fine rather than a panic.
+        assert!(c.mobs_in(Rect::new(0, 0, 10, 10)).is_empty());
     }
 
     /// #84 made the river/bay a real water mask (`sea_level_m = 0`). Two
