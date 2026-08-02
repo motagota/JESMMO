@@ -6,6 +6,7 @@
 //! and protocol version have a single source of truth.
 
 pub mod auth;
+pub mod market_config;
 pub mod persistence;
 pub mod protocol;
 pub mod util;

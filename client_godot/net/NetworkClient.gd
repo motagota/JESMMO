@@ -82,11 +82,22 @@ signal road_cells(order_id: String, cells: Array)
 signal road_cell_progress(order_id: String, cell_index: int, required: Dictionary, progress: Dictionary, completed: bool)
 ## Market (#137): you're standing at a built market and may trade, or the
 ## command was refused (out of range, no market built yet).
-signal market_opened(market_id: String, x: int, y: int)
+##
+## `rules` (#152) is the tuning in force AT THIS MARKET — fee rates, price tick,
+## order bounds, durations — read from the server's `market.toml` and resolved
+## for this market's district. It arrives here rather than being hardcoded
+## because the panel previews costs before you commit, and a preview that
+## disagrees with what the server charges is a trust bug. Empty from a server
+## too old to send it; `Protocol.market_rules_default()` is the fallback.
+signal market_opened(market_id: String, x: int, y: int, rules: Dictionary)
 signal market_error(code: String, detail: String)
 ## Your warehouse at one market (#138): every row, available and locked alike,
 ## plus slot usage. Pushed on `market.open` and after every deposit/withdraw.
-signal warehouse_state(market_id: String, items: Array, used: int, slots: int)
+## `arrears` (#155) is unpaid storage debt at this market — 0 unless an operator
+## has turned storage fees on. Nonzero means the warehouse is LOCKED: deposits
+## and withdrawals are refused until it's paid. The goods are safe and are still
+## listed; selling still works, which is how the debt gets paid.
+signal warehouse_state(market_id: String, items: Array, used: int, slots: int, arrears: int)
 ## Order book (#139): aggregated depth for one commodity, your own resting
 ## orders, and the trade ticker.
 signal market_book(market_id: String, item_id: String, asks: Array, bids: Array)
@@ -314,7 +325,8 @@ func _handle_text(text: String) -> void:
             market_opened.emit(
                 String(msg.get("market_id", "")),
                 int(msg.get("x", 0)),
-                int(msg.get("y", 0)))
+                int(msg.get("y", 0)),
+                msg.get("rules", {}))
         Protocol.S_MARKET_ERROR:
             market_error.emit(
                 String(msg.get("code", "")),
@@ -324,7 +336,8 @@ func _handle_text(text: String) -> void:
                 String(msg.get("market_id", "")),
                 msg.get("items", []),
                 int(msg.get("used", 0)),
-                int(msg.get("slots", 0)))
+                int(msg.get("slots", 0)),
+                int(msg.get("arrears", 0)))
         Protocol.S_MARKET_BOOK:
             market_book.emit(
                 String(msg.get("market_id", "")),

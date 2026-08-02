@@ -2192,5 +2192,6 @@ dependencies = [
  "terrain-common",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "uuid",
 ]

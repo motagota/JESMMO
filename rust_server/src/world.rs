@@ -236,97 +236,20 @@ pub fn is_commodity(item_id: &str) -> bool {
     items().into_iter().any(|i| i.id == item_id && i.stack_size > 1)
 }
 
-/// Order prices are whole gold, and must be a multiple of this. A tick keeps
-/// the book's price levels countable (and its depth broadcasts small) instead
-/// of letting a thousand orders sit one copper apart.
-pub const PRICE_TICK_GOLD: i64 = 1;
-/// Bounds on a single order's size — an order below the floor is noise, and
-/// one above the cap is a mis-click or an attempt to wedge the book.
-pub const MIN_ORDER_QTY: i64 = 1;
-pub const MAX_ORDER_QTY: i64 = 10_000;
-/// How long a resting order may sit before the sweep releases its escrow
-/// (#140). A resting order holds goods or gold hostage, so "forever" isn't an
-/// option; these are the durations a client may ask for, in hours.
-pub const ORDER_DURATIONS_HOURS: &[i64] = &[12, 24, 72, 168];
-pub const DEFAULT_ORDER_HOURS: i64 = 24;
-/// Resting orders one player may hold at one market (#140). Caps the cost of
-/// rebuilding a book on boot, and stops one player papering a book with
-/// hundreds of tiny orders.
-pub const MAX_OPEN_ORDERS_PER_MARKET: i64 = 40;
-
-/// Clamp a requested order duration to one the server actually offers,
-/// falling back to the default for anything unrecognised.
-pub fn order_duration_hours(requested: i64) -> i64 {
-    if ORDER_DURATIONS_HOURS.contains(&requested) {
-        requested
-    } else {
-        DEFAULT_ORDER_HOURS
-    }
-}
-
-// --- Market fees (epic #136, issue #141) ------------------------------------
+// Order prices, size bounds, durations, order caps and **all fee rates** moved
+// to `crate::market_config::MarketConfig` in #152, so a balance pass is a file
+// edit rather than a rebuild (#129) and two markets can charge different rates.
+// They are deliberately **not** re-exported as consts here: a `const` left in
+// place would be a path by which some call site kept reading the shipped
+// default while the server charged what `market.toml` said.
 //
-// The design doc quotes a flat 5 **copper** listing fee, 0.5% of notional, and
-// 3% sale tax. Those don't translate: this game's currency is whole GOLD in
-// small numbers (a 20-wood order is ~160 notional, a character starts with
-// 500), so a flat 5 would be a third of a typical order and 100% of a small
-// one — it would simply end small trades. Adapted to the same shape at this
-// scale: a 1-gold floor, 1% of notional, 3% sale tax. Real tuning belongs to a
-// balance pass (see #129); the SHAPE is what matters here.
+// The fee arithmetic and its anti-abuse properties (round up, never zero,
+// splitting never dodges the fee) moved with them, as
+// `MarketConfig::listing_fee` / `sale_tax` / `order_duration_hours` /
+// `validate_order`. The doc comments there carry the reasoning.
 //
-// Every fee rounds UP and can never be zero on a nonzero amount. Rounding in
-// the house's favour is not greed, it's the anti-exploit: a fee that rounds to
-// zero on small trades makes a free lane, and splitting one big order into a
-// hundred tiny ones would dodge the sink entirely.
-
-/// Minimum listing fee on any order with a nonzero notional.
-pub const LISTING_FEE_MIN_GOLD: i64 = 1;
-/// Listing fee as a fraction of notional: 1%.
-pub const LISTING_FEE_NUM: i64 = 1;
-pub const LISTING_FEE_DEN: i64 = 100;
-/// Sale tax as a fraction of a fill's value: 3%.
-pub const SALE_TAX_NUM: i64 = 3;
-pub const SALE_TAX_DEN: i64 = 100;
-
-/// Integer ceiling division, for fees that must round toward the house.
-fn div_ceil(n: i64, d: i64) -> i64 {
-    if n <= 0 {
-        0
-    } else {
-        (n + d - 1) / d
-    }
-}
-
-/// The fee to place an order of `notional` (= `unit_price * qty`) gold, charged
-/// to **both** sides at placement and **never refunded** — that's what makes
-/// posting an order you don't mean to honour cost something.
-///
-/// `max(floor, ceil(pct * notional))`, so it's never zero on a real order.
-pub fn listing_fee(notional: i64) -> i64 {
-    if notional <= 0 {
-        return 0;
-    }
-    div_ceil(notional * LISTING_FEE_NUM, LISTING_FEE_DEN).max(LISTING_FEE_MIN_GOLD)
-}
-
-/// Tax on one fill's value (`execution_price * qty`), charged to the seller out
-/// of their proceeds. Rounds up, and is never zero on a nonzero fill.
-pub fn sale_tax(value: i64) -> i64 {
-    if value <= 0 {
-        return 0;
-    }
-    div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN).max(1)
-}
-
-// --- Price history (epic #136, issue #143) -----------------------------------
-
-/// The candle resolution the rollup materialises. One hour: fine enough to see
-/// a price move within a play session, coarse enough that a month of history is
-/// a few hundred rows per commodity.
-pub const CANDLE_INTERVAL_SECS: i64 = 3600;
-/// How long candles are kept. The ledger they're derived from is never pruned —
-/// only this cache is, so old history can always be rebuilt if wanted.
-pub const HISTORY_RETAIN_DAYS: i64 = 30;
+// `candle_bucket` stays here: it's pure time arithmetic that takes the interval
+// as an argument, so it never read a const in the first place.
 
 /// The bucket a timestamp belongs to: the interval's opening second. Flooring
 /// (not rounding) is what makes a trade land in exactly one bucket, including
@@ -374,21 +297,6 @@ impl OrderReject {
     }
 }
 
-/// Shared validation for every order placement (#139): the commodity gate, the
-/// price tick, and the size bounds. One place, so a sell and a buy can never
-/// disagree about what's tradable.
-pub fn validate_order(item_id: &str, unit_price: i64, qty: i64) -> Result<(), OrderReject> {
-    if !is_commodity(item_id) {
-        return Err(OrderReject::NotACommodity);
-    }
-    if unit_price <= 0 || unit_price % PRICE_TICK_GOLD != 0 {
-        return Err(OrderReject::BadPrice);
-    }
-    if !(MIN_ORDER_QTY..=MAX_ORDER_QTY).contains(&qty) {
-        return Err(OrderReject::BadQty);
-    }
-    Ok(())
-}
 
 // --- Equipment & abilities (mining/abilities epic #123) ---------------------
 //
@@ -714,6 +622,21 @@ pub fn loaded_terrain() -> std::sync::Arc<terrain_common::Terrain> {
         .clone()
 }
 
+/// The district ids [`capital`] authors, without building one.
+///
+/// Exists because `market.toml`'s `[districts.<id>]` tables have to be
+/// validated at boot (#152) and `capital()` loads the whole baked terrain
+/// artifact — far too much work to answer "is `civics` a real district?". Kept
+/// honest by `district_ids_match_the_authored_capital`, so this can't drift into
+/// rejecting a district that exists.
+pub const CAPITAL_DISTRICT_IDS: &[&str] =
+    &["market", "suburbs", "civic", "craftworks", "old_quarter"];
+
+/// [`CAPITAL_DISTRICT_IDS`] as a `Vec`, for error messages that list them.
+pub fn capital_district_ids() -> Vec<&'static str> {
+    CAPITAL_DISTRICT_IDS.to_vec()
+}
+
 /// The whole authored capital.
 #[derive(Debug, Clone)]
 pub struct Capital {
@@ -888,17 +811,62 @@ pub fn capital() -> Capital {
     // of the storehouse (12830, 12810) and build board (12770, 12810) by more
     // than their interaction ranges, so their panels don't all stack open at
     // once.
-    let build_orders: Vec<SeedBuildOrder> = vec![SeedBuildOrder {
-        district: "civic",
-        kind: "market",
-        required_json: r#"{"wood":50,"stone":30}"#,
-        prereq: None,
-        structure_kind: "market",
-        structure_x: tcx + 100,
-        structure_y: tcy,
-        required_skill: None,
-        required_level: 0,
-    }];
+    // The second market (market phase 2 epic #151, issue #153) sits in the
+    // **Market District** — the east band, which has carried that name since the
+    // districts were authored and until now contained no market.
+    //
+    // Every market table has been keyed by `market_id` since #137, and
+    // `market_at` resolves by district + range, so this needed no new
+    // machinery. What it adds is *gameplay*: warehouses are per-market, so
+    // deposited stock does not follow a player. Two markets means two books,
+    // two supplies, two prices — and moving goods between them means carrying
+    // them 8.6km. That gap is the arbitrage the design doc treats as core
+    // content, and the topology creates it rather than a mechanic.
+    //
+    // Site (20800, 9600) was chosen by surveying the district against the bake
+    // rather than by eye: 4.3m elevation with 0.29m of spread across a 120m
+    // footprint (flat, and clear of the water mask — the east band reaches the
+    // river mouth and Moreton Bay, so "somewhere east" is not automatically
+    // land), 1600 units inside the band's western edge so a trader standing at
+    // it is unambiguously in this district, ~2.9km from the nearest resource
+    // node, and reachable from spawn without crossing water. Pinned by
+    // `the_second_market_is_sited_on_dry_reachable_ground`.
+    //
+    // `prereq` makes it the REWARD for finishing the capital's market rather
+    // than a parallel option that would split a small player base's effort
+    // across two 80-unit builds. Cost is deliberately IDENTICAL to the first:
+    // the difficulty here is the 8.6km haul (at `MAX_CARRY` 50 that is three
+    // round trips), and charging more on top of that would be punishing rather
+    // than interesting.
+    let build_orders: Vec<SeedBuildOrder> = vec![
+        SeedBuildOrder {
+            district: "civic",
+            kind: "market",
+            required_json: r#"{"wood":50,"stone":30}"#,
+            prereq: None,
+            structure_kind: "market",
+            structure_x: tcx + 100,
+            structure_y: tcy,
+            required_skill: None,
+            required_level: 0,
+        },
+        SeedBuildOrder {
+            district: "market",
+            // A distinct `kind` — the prereq edge is keyed on kind, and the
+            // build board renders it raw, so a second order also called
+            // "market" would be ambiguous in both. `structure_kind` stays
+            // "market", which is what `market_at` and the client's
+            // `nearest_market` actually match on.
+            kind: "market_east",
+            required_json: r#"{"wood":50,"stone":30}"#,
+            prereq: Some("market"),
+            structure_kind: "market",
+            structure_x: 20800,
+            structure_y: 9600,
+            required_skill: None,
+            required_level: 0,
+        },
+    ];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
     // spawn finds wood immediately) plus wood/stone spread through every
@@ -998,6 +966,23 @@ pub fn capital() -> Capital {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CAPITAL_DISTRICT_IDS` exists so `market.toml` can validate a
+    /// `[districts.<id>]` table without loading the whole baked terrain
+    /// artifact (#152). A hand-maintained list can drift, and drift here means
+    /// the server refusing to boot on a district that genuinely exists — so it
+    /// is pinned to the real thing in both directions.
+    #[test]
+    fn district_ids_match_the_authored_capital() {
+        let mut authored: Vec<&str> = capital().districts.iter().map(|d| d.id).collect();
+        let mut listed = capital_district_ids();
+        authored.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(
+            listed, authored,
+            "CAPITAL_DISTRICT_IDS has drifted from capital() — market.toml validation \n             would reject a real district, or accept a typo"
+        );
+    }
 
     #[test]
     fn districts_tile_the_world_without_gaps_or_overlap() {
@@ -1197,21 +1182,117 @@ mod tests {
     }
 
     #[test]
-    fn capital_authors_only_the_market_build_order() {
+    fn capital_authors_only_the_two_markets() {
         let c = capital();
         // Roads and most city work are commissioned at runtime by the mayor,
-        // not authored. The Market (#137) is the deliberate exception: trading
-        // needs a fixed, findable place to hang off, so it's authored — but
-        // still player-BUILT, seeding `open` rather than pre-placed.
-        assert_eq!(c.build_orders.len(), 1, "only the market is authored");
-        let m = &c.build_orders[0];
-        assert_eq!((m.kind, m.structure_kind), ("market", "market"));
-        assert!(m.prereq.is_none(), "nothing gates the market — it's the root of the trade tree");
-        assert_eq!(m.required_level, 0, "and no skill gate keeps newcomers out of the economy");
-        // Sited inside its own district, within a short walk of spawn.
+        // not authored. The markets (#137, #153) are the deliberate exception:
+        // trading needs a fixed, findable place to hang off, so they're authored
+        // — but still player-BUILT, seeding `open`/`locked` rather than
+        // pre-placed. Anything else appearing here should be a deliberate
+        // decision, not a drive-by addition.
+        assert_eq!(c.build_orders.len(), 2, "only the two markets are authored");
+        for o in &c.build_orders {
+            assert_eq!(o.structure_kind, "market", "{} is not a market", o.kind);
+            assert_eq!(o.required_level, 0, "no skill gate keeps newcomers out of the economy");
+            assert_eq!(
+                c.district_at(o.structure_x, o.structure_y).map(|d| d.id),
+                Some(o.district),
+                "{} is sited outside the district that owns it",
+                o.kind
+            );
+        }
+
+        // The capital's, at the root of the trade tree.
         let (tcx, tcy) = c.town_centre;
-        assert_eq!(c.district_at(m.structure_x, m.structure_y).map(|d| d.id), Some(m.district));
-        assert!((m.structure_x - tcx).pow(2) + (m.structure_y - tcy).pow(2) < 200 * 200);
+        let first = c.build_orders.iter().find(|o| o.kind == "market").unwrap();
+        assert_eq!(first.district, "civic");
+        assert!(first.prereq.is_none(), "the first market gates on nothing");
+        assert!((first.structure_x - tcx).pow(2) + (first.structure_y - tcy).pow(2) < 200 * 200,
+            "the first market should be a short walk from spawn");
+
+        // The Market District's (#153), gated behind the first so a small
+        // player base finishes one before starting the other.
+        let second = c.build_orders.iter().find(|o| o.kind == "market_east").unwrap();
+        assert_eq!(second.district, "market", "the Market District finally has a market");
+        assert_eq!(second.prereq, Some("market"), "the second market is the reward for the first");
+        assert_eq!(
+            second.required_json, first.required_json,
+            "the second market costs the same — the 8.6km haul is the difficulty, not the bill"
+        );
+        // Distinct kinds: the prereq edge is keyed on kind, and the build board
+        // renders it raw. Two orders both called "market" would be ambiguous in
+        // both places.
+        assert_ne!(first.kind, second.kind);
+
+        // Far enough that hauling between them is a real journey — that
+        // distance IS the arbitrage, so a future re-site must not quietly
+        // shorten it.
+        let d2 = ((second.structure_x - first.structure_x) as i64).pow(2)
+            + ((second.structure_y - first.structure_y) as i64).pow(2);
+        assert!(d2 > 5000i64.pow(2), "the two markets are too close to be worth hauling between");
+    }
+
+    /// The east band reaches the Brisbane river mouth and Moreton Bay, so
+    /// "somewhere east" is emphatically not automatically land. This pins the
+    /// survey that picked (20800, 9600) — dry, flat, well inside its district,
+    /// clear of the resource nodes, and walkable from spawn without swimming —
+    /// so a future rebake or re-site can't silently drop a market in the water
+    /// or somewhere a player can't reach on foot.
+    #[test]
+    fn the_second_market_is_sited_on_dry_reachable_ground() {
+        let c = capital();
+        let t = loaded_terrain();
+        let m = c.build_orders.iter().find(|o| o.kind == "market_east").unwrap();
+        let (mx, my) = (m.structure_x, m.structure_y);
+
+        // Dry across the whole footprint a trader stands in, not just the pin.
+        for (ox, oy) in [(0, 0), (-60, -60), (60, -60), (-60, 60), (60, 60)] {
+            assert!(
+                !t.is_water((mx + ox) as f32, (my + oy) as f32),
+                "the second market is in the water at ({},{})",
+                mx + ox,
+                my + oy
+            );
+        }
+
+        // Flat enough to be a plaza rather than a cliff face.
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for (ox, oy) in [(-60, -60), (60, -60), (-60, 60), (60, 60), (0, 0)] {
+            let h = t.sample_height((mx + ox) as f32, (my + oy) as f32);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+        assert!(hi - lo < 3.0, "the second market's site is not level (spread {:.2}m)", hi - lo);
+        assert!(lo > 1.0, "the second market sits barely above the waterline ({lo:.2}m)");
+
+        // Well inside its district: a trader standing anywhere in range must
+        // resolve to `market`, or `market_at` would look up the wrong config.
+        let region = c.districts.iter().find(|d| d.id == "market").unwrap().region;
+        let margin = 600;
+        assert!(
+            mx - region.x0 > margin && region.x1 - mx > margin
+                && my - region.y0 > margin && region.y1 - my > margin,
+            "the second market is too close to its district edge"
+        );
+
+        // Clear of every resource node by far more than any interaction range,
+        // so the market panel and a gather prompt never fight for the screen.
+        for n in &c.resource_nodes {
+            let d2 = ((n.x - mx) as i64).pow(2) + ((n.y - my) as i64).pow(2);
+            assert!(d2 > 500i64.pow(2), "resource node {} is on top of the second market", n.id);
+        }
+
+        // Reachable on foot: the straight line from spawn never crosses water.
+        // Drowning is a real hazard (#83), so a market you can only swim to
+        // would be a trap rather than a destination.
+        let (sx, sy) = c.town_centre;
+        for i in 0..=400 {
+            let f = i as f32 / 400.0;
+            let x = sx as f32 + (mx - sx) as f32 * f;
+            let y = sy as f32 + (my - sy) as f32 * f;
+            assert!(!t.is_water(x, y), "the walk to the second market crosses water at ({x:.0},{y:.0})");
+        }
     }
 
     #[test]
@@ -1407,64 +1488,6 @@ mod tests {
         for (_, cell) in &in_suburbs {
             let r = cell.rect();
             assert!(suburbs.contains(r.x0, r.y0) && suburbs.contains(r.x1 - 1, r.y1 - 1));
-        }
-    }
-
-    // --- Market fees (epic #136, issue #141) ------------------------------------
-
-    #[test]
-    fn fees_round_toward_the_house_and_are_never_zero() {
-        // Nothing to charge on nothing.
-        assert_eq!(listing_fee(0), 0);
-        assert_eq!(listing_fee(-5), 0);
-        assert_eq!(sale_tax(0), 0);
-
-        // Below the percentage's resolution, the floor holds — this is the
-        // anti-exploit: a fee rounding to zero on small orders would make a
-        // free lane, and splitting one order into a hundred tiny ones would
-        // dodge the sink entirely.
-        for notional in 1..=100 {
-            assert!(listing_fee(notional) >= LISTING_FEE_MIN_GOLD, "notional {notional} charged nothing");
-        }
-        for value in 1..=100 {
-            assert!(sale_tax(value) >= 1, "fill worth {value} taxed nothing");
-        }
-
-        // Rounds UP, never down.
-        assert_eq!(listing_fee(100), 1); // exactly 1%
-        assert_eq!(listing_fee(101), 2); // 1.01 -> 2
-        assert_eq!(listing_fee(250), 3); // 2.5 -> 3
-        assert_eq!(sale_tax(100), 3); // exactly 3%
-        assert_eq!(sale_tax(101), 4); // 3.03 -> 4
-        assert_eq!(sale_tax(1), 1); // 0.03 -> floored up to 1
-
-        // Monotonic: a bigger order never costs less to list.
-        let mut last = 0;
-        for notional in (0..5_000).step_by(7) {
-            let f = listing_fee(notional);
-            assert!(f >= last, "listing fee dipped at {notional}");
-            last = f;
-        }
-    }
-
-    /// Splitting one order into many must never be cheaper than placing it
-    /// whole — otherwise the fee is a suggestion. (It's strictly *more*
-    /// expensive here, because every slice pays at least the floor.)
-    #[test]
-    fn splitting_an_order_never_dodges_the_fee() {
-        for (price, qty) in [(5, 20), (8, 50), (13, 7), (100, 3)] {
-            let whole = listing_fee(price * qty);
-            let split: i64 = (0..qty).map(|_| listing_fee(price)).sum();
-            assert!(
-                split >= whole,
-                "splitting {qty}x{price} cost {split} vs {whole} whole — that's a free lane"
-            );
-        }
-        // Same for the sale tax across partial fills.
-        for (price, qty) in [(7, 30), (11, 9)] {
-            let whole = sale_tax(price * qty);
-            let split: i64 = (0..qty).map(|_| sale_tax(price)).sum();
-            assert!(split >= whole, "splitting fills dodged tax: {split} < {whole}");
         }
     }
 

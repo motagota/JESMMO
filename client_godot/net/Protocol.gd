@@ -254,7 +254,14 @@ const C_MARKET_BOOK_REQUEST := "market.book_request"
 const S_MARKET_BOOK := "market.book"
 const S_MARKET_ORDERS := "market.orders"
 const S_MARKET_TRADE := "market.trade"
-## Display-only mirrors of the server's order rules (world.rs).
+## FALLBACK order rules. These used to be display-only *mirrors* of Rust consts,
+## which was sound while both sides were compiled from the same numbers. Since
+## #152 the server reads them from `market.toml` PER DISTRICT and sends the
+## effective set in `market.opened` under `rules` — so a hardcoded copy is only
+## a last resort for a server too old to send them.
+##
+## Never preview a cost from these when `rules` has arrived. See
+## `market_rules_default()` and `Market.gd`'s `_rules`.
 const PRICE_TICK_GOLD := 1
 const MIN_ORDER_QTY := 1
 const MAX_ORDER_QTY := 10000
@@ -263,6 +270,8 @@ const MAX_ORDER_QTY := 10000
 ## default, so this list is a convenience, not a trust boundary.
 const ORDER_DURATIONS_HOURS := [12, 24, 72, 168]
 const DEFAULT_ORDER_HOURS := 24
+const MAX_OPEN_ORDERS := 40
+const WAREHOUSE_SLOTS := 60
 ## `market.fees {market_id, listing_fee, sale_tax}` — what the house took from
 ## your last command (#141).
 const S_MARKET_FEES := "market.fees"
@@ -286,33 +295,69 @@ const C_LISTING_CANCEL := "listing.cancel"
 const C_LISTING_LIST := "listing.list"
 const S_LISTING_PAGE := "listing.page"
 const S_LISTING_SOLD := "listing.sold"
-## Display-only mirrors of the server's fee formulas (world.rs). Used to show
-## the cost BEFORE you commit; the server's own numbers are authoritative and
-## are what actually get charged.
+## FALLBACK fee rates, for a server that sends no `rules`. Same status as the
+## order rules above: since #152 the authoritative rates arrive per market.
 const LISTING_FEE_MIN_GOLD := 1
 const LISTING_FEE_NUM := 1
 const LISTING_FEE_DEN := 100
 const SALE_TAX_NUM := 3
 const SALE_TAX_DEN := 100
 
+## The fallback rule set, in the same shape `market.opened` sends. A panel that
+## has not been told otherwise previews from this; one that HAS must preview from
+## what it was told.
+static func market_rules_default() -> Dictionary:
+    return {
+        "range": MARKET_RANGE,
+        "warehouse_slots": WAREHOUSE_SLOTS,
+        "price_tick_gold": PRICE_TICK_GOLD,
+        "min_order_qty": MIN_ORDER_QTY,
+        "max_order_qty": MAX_ORDER_QTY,
+        "order_durations_hours": ORDER_DURATIONS_HOURS,
+        "default_order_hours": DEFAULT_ORDER_HOURS,
+        "max_open_orders": MAX_OPEN_ORDERS,
+        "listing_fee_min_gold": LISTING_FEE_MIN_GOLD,
+        "listing_fee_num": LISTING_FEE_NUM,
+        "listing_fee_den": LISTING_FEE_DEN,
+        "sale_tax_num": SALE_TAX_NUM,
+        "sale_tax_den": SALE_TAX_DEN,
+        "candle_interval_secs": 3600,
+    }
+
 ## Integer ceiling division — fees round toward the house, never down.
 static func _div_ceil(n: int, d: int) -> int:
     return 0 if n <= 0 else (n + d - 1) / d
 
 ## What it costs to place an order of this notional (both sides pay, and it is
-## never refunded). Mirrors `world::listing_fee`.
-static func listing_fee(notional: int) -> int:
+## never refunded), under `rules` as sent by the server.
+##
+## Takes the rules rather than reading consts because the server's rates are
+## per-district data now (#152). Previewing 3% while the server charges 10% is a
+## TRUST bug — the player finds out by being short-changed — so the arithmetic
+## stays mirrored here but the numbers must not be.
+static func listing_fee_with(rules: Dictionary, notional: int) -> int:
     if notional <= 0:
         return 0
-    return maxi(_div_ceil(notional * LISTING_FEE_NUM, LISTING_FEE_DEN), LISTING_FEE_MIN_GOLD)
+    var num: int = rules.get("listing_fee_num", LISTING_FEE_NUM)
+    var den: int = rules.get("listing_fee_den", LISTING_FEE_DEN)
+    var floor_g: int = rules.get("listing_fee_min_gold", LISTING_FEE_MIN_GOLD)
+    if den <= 0:
+        return floor_g
+    return maxi(_div_ceil(notional * num, den), floor_g)
 
-## Tax a seller pays out of one fill's value. Mirrors `world::sale_tax`.
-static func sale_tax(value: int) -> int:
+## Tax a seller pays out of one fill's value, under `rules`.
+static func sale_tax_with(rules: Dictionary, value: int) -> int:
     if value <= 0:
         return 0
-    return maxi(_div_ceil(value * SALE_TAX_NUM, SALE_TAX_DEN), 1)
-## Display-only mirror of the server's `MARKET_RANGE` — decides when to show
-## the panel; the server's own check is what actually gates trading.
+    var num: int = rules.get("sale_tax_num", SALE_TAX_NUM)
+    var den: int = rules.get("sale_tax_den", SALE_TAX_DEN)
+    if den <= 0:
+        return 1
+    return maxi(_div_ceil(value * num, den), 1)
+
+## FALLBACK market range, used only to decide when to *ask* to open a panel —
+## before any `rules` have arrived there is by definition nothing better to use.
+## The server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0
 
 # --- gameplay: gold balance (build wages, #145) -------------------------------

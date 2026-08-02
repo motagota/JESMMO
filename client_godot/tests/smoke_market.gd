@@ -57,6 +57,24 @@ func _process(_delta: float) -> bool:
 	if _entities.nearest_market(SITE, Protocol.MARKET_RANGE) != "structure_market":
 		_fail("the storehouse was matched as a market"); return true
 
+	# --- two markets (#153) ---------------------------------------------------
+	# The Market District's market means `nearest_market` finally has to CHOOSE.
+	# It always picked the closest, but with one market that was untestable, and
+	# untested generality is not generality: Main fires `market.open` on the id
+	# changing, so picking the wrong one would open the wrong panel.
+	var second := SITE + Vector2(Protocol.MARKET_RANGE - 10.0, 0)
+	_entities.upsert("structure_market_east", "zone_a", _structure("market", second))
+	if _entities.nearest_market(SITE, Protocol.MARKET_RANGE) != "structure_market":
+		_fail("standing at the capital's market picked the other one"); return true
+	if _entities.nearest_market(second, Protocol.MARKET_RANGE) != "structure_market_east":
+		_fail("standing at the second market picked the capital's"); return true
+	# Walking away from both still finds nothing — two markets must not widen
+	# the range that opens a panel.
+	var between := SITE + Vector2(0, Protocol.MARKET_RANGE + 5.0)
+	if _entities.nearest_market(between, Protocol.MARKET_RANGE) != "":
+		_fail("a second market widened the proximity gate"); return true
+	_entities.remove("structure_market_east")
+
 	# --- panel shell ----------------------------------------------------------
 	_market.show_panel(false)
 	if _market.visible:
@@ -198,28 +216,65 @@ func _process(_delta: float) -> bool:
 	# The cost of placing must be visible BEFORE committing — the server charges
 	# its own number, and these mirrored formulas have to agree with it or the
 	# preview is a lie.
+	var shipped := Protocol.market_rules_default()
 	_market._form_price = 8
 	_market._form_qty = 20
 	_market.set_book("stone", [], []) # force a rebuild at these values
 	var fees := _body_text()
-	if not fees.contains("listing fee %dg" % Protocol.listing_fee(160)):
+	if not fees.contains("listing fee %dg" % Protocol.listing_fee_with(shipped, 160)):
 		_fail("the listing fee should be previewed, got: %s" % fees); return true
 	if not fees.contains("not refunded if you cancel"):
 		_fail("the preview must say the fee isn't refundable, got: %s" % fees); return true
-	if not fees.contains("taxed %dg" % Protocol.sale_tax(160)):
+	if not fees.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
 		_fail("the sale tax should be previewed, got: %s" % fees); return true
 
 	# Fees round up and are never zero — the anti-exploit. A fee that rounded to
 	# zero on small orders would make splitting an order a free lane.
-	if Protocol.listing_fee(1) < 1 or Protocol.sale_tax(1) < 1:
+	if Protocol.listing_fee_with(shipped, 1) < 1 or Protocol.sale_tax_with(shipped, 1) < 1:
 		_fail("fees must never be zero on a nonzero amount"); return true
-	if Protocol.listing_fee(101) != 2 or Protocol.sale_tax(101) != 4:
-		_fail("fees must round UP (got %d / %d)" % [Protocol.listing_fee(101), Protocol.sale_tax(101)]); return true
+	if Protocol.listing_fee_with(shipped, 101) != 2 or Protocol.sale_tax_with(shipped, 101) != 4:
+		_fail("fees must round UP (got %d / %d)" % [
+			Protocol.listing_fee_with(shipped, 101), Protocol.sale_tax_with(shipped, 101)]); return true
 	var split := 0
 	for i in range(20):
-		split += Protocol.listing_fee(8)
-	if split < Protocol.listing_fee(160):
+		split += Protocol.listing_fee_with(shipped, 8)
+	if split < Protocol.listing_fee_with(shipped, 160):
 		_fail("splitting an order must not be cheaper than placing it whole"); return true
+
+	# --- the preview follows the SERVER's rates (#152) -------------------------
+	# The whole point of moving the rates onto the wire. Until #152 these were
+	# hardcoded consts and the panel could safely mirror them; now they're
+	# per-district config, so a panel still previewing its own numbers would
+	# quote a fee this market doesn't charge — and the player would only find out
+	# by being short-changed. Hand it a market whose rates are nothing like the
+	# defaults and the preview must move with them.
+	var steep := Protocol.market_rules_default()
+	steep["sale_tax_num"] = 25
+	steep["listing_fee_min_gold"] = 7
+	_market.set_market("market_steep", steep)
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], [])
+	var steep_text := _body_text()
+	# 25% of 160 = 40, vs the shipped 3% -> 5.
+	if not steep_text.contains("taxed 40g"):
+		_fail("the preview must use the server's tax rate, got: %s" % steep_text); return true
+	if steep_text.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
+		_fail("the preview is still quoting the hardcoded rate: %s" % steep_text); return true
+	# And the fee floor: 1% of 160 = 2, raised to this market's 7g floor.
+	if not steep_text.contains("listing fee 7g"):
+		_fail("the preview must use the server's fee floor, got: %s" % steep_text); return true
+	# A market that sends NO rules falls back to the shipped defaults rather
+	# than previewing zeroes.
+	_market.set_market("market_old", {})
+	_market._form_price = 8
+	_market._form_qty = 20
+	_market.set_book("stone", [], [])
+	var old_text := _body_text()
+	if not old_text.contains("taxed %dg" % Protocol.sale_tax_with(shipped, 160)):
+		_fail("a server sending no rules should fall back to defaults, got: %s" % old_text); return true
+	_market.set_market("market_test", shipped) # restore for the rest of the run
+	_market.set_book("stone", [], [])
 
 	# What the house actually took shows up after the fact.
 	_market.note_fees(2, 5)
@@ -346,6 +401,90 @@ func _process(_delta: float) -> bool:
 	_press("List")
 	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
 		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
+
+	# --- storage arrears (#155) -----------------------------------------------
+	# A debt must never READ as "your goods are gone". It locks the actions and
+	# says so, while the items stay listed and visibly still yours — that is the
+	# entire point of capping arrears instead of confiscating.
+	_market.set_section(MarketPanel.Section.WAREHOUSE)
+	var owed_before := _buttons("Withdraw")
+	if owed_before == 0:
+		_fail("precondition: something should be withdrawable"); return true
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+		{"id": "w2", "item_id": "stone", "qty": 30, "state": "available"},
+	], 2, 60, 12)
+	var owed_text := _body_text()
+	if not owed_text.contains("You owe 12g storage here"):
+		_fail("arrears should be stated, got: %s" % owed_text); return true
+	if not owed_text.contains("goods are safe"):
+		_fail("arrears must reassure, not alarm, got: %s" % owed_text); return true
+	if not owed_text.contains("Selling still works"):
+		_fail("the way OUT of the debt must be stated, got: %s" % owed_text); return true
+	if not owed_text.contains("stone"):
+		_fail("the goods must still be listed while locked, got: %s" % owed_text); return true
+	if _buttons("Withdraw") != 0 or _buttons("Deposit") != 0:
+		_fail("locked warehouse should offer no deposit/withdraw actions"); return true
+	# Paid off: the actions come back.
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+	], 1, 60, 0)
+	if _body_text().contains("You owe"):
+		_fail("a cleared debt should stop being mentioned"); return true
+	if _buttons("Withdraw") == 0:
+		_fail("paying arrears should restore the withdraw action"); return true
+
+	# --- the provisioner's band (#154) ----------------------------------------
+	# A newcomer's most useful fact about a commodity is what it can never be
+	# worth less than, and what nobody can corner it above. Inferring that from a
+	# suspiciously large resting order is not a UI.
+	var banded := Protocol.market_rules_default()
+	banded["provisioner"] = {"stone": {"floor": 1, "ceiling": 40}}
+	_market.set_market("order-banded", banded)
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	_market._watch("stone")
+	if not _body_text().contains("always buys at 1g and sells at 40g"):
+		_fail("the provisioner band should be stated, got: %s" % _body_text()); return true
+	# A commodity the provisioner doesn't back says nothing — silence, not a
+	# misleading zero band.
+	_market._watch("wood")
+	if _body_text().contains("always buys at"):
+		_fail("an unbacked commodity should show no band, got: %s" % _body_text()); return true
+	_market.set_market("order-abc2", Protocol.market_rules_default())
+	_market._watch("stone")
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+	], 1, 60)
+	_market.set_orders([
+		{"order_id": "o1", "side": "sell", "item_id": "wood", "unit_price": 9, "qty_total": 10, "qty_remaining": 4},
+	])
+	_market.set_listings([
+		{"listing_id": "L1", "item_id": "axe", "durability": 44, "max_durability": 50, "ask_price": 60, "seller_id": "x", "mine": false},
+	])
+
+	# --- retargeting between markets (#153) -----------------------------------
+	# Walking from one market to another must not carry the first one's state
+	# across. Warehouses, books, orders and listings are ALL per-market, so a
+	# panel that kept them would show a trader stock they don't have here and
+	# depth that isn't in this book — and they would act on it. The server
+	# re-sends everything on `market.open`, and this is what stops the gap
+	# between arriving and being told from being a lie.
+	_market.set_section(MarketPanel.Section.WAREHOUSE)
+	if not _body_text().contains("44/50"):
+		_fail("precondition: the first market's warehouse should be on screen, got: %s" % _body_text()); return true
+	_market.set_market("order-east", Protocol.market_rules_default())
+	if _body_text().contains("44/50"):
+		_fail("the previous market's warehouse survived the walk: %s" % _body_text()); return true
+	if not _body_text().contains("nothing stored here yet"):
+		_fail("the new market's warehouse should read empty, got: %s" % _body_text()); return true
+	_market.set_section(MarketPanel.Section.LISTINGS)
+	if not _body_text().contains("nothing listed"):
+		_fail("the previous market's listings survived the walk: %s" % _body_text()); return true
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	if not _body_text().contains("(none resting)"):
+		_fail("the previous market's resting orders survived the walk: %s" % _body_text()); return true
+	if _body_text().contains("best ask 9g") or _body_text().contains("last:"):
+		_fail("the previous market's depth or ticks survived the walk: %s" % _body_text()); return true
 
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.

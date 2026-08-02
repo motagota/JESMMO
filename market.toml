@@ -1,0 +1,231 @@
+# Market tuning for the Phase 1 capital (market phase 2 epic #151, issue #152).
+# Loaded at gateway boot by `rust_server::market_config::MarketConfigSet::load`.
+#
+# WHY THIS FILE EXISTS
+# Every value here used to be a Rust `const`, so trying a different sale tax
+# meant a rebuild and a restart. That friction is exactly what stops a balance
+# pass (#129) from happening, and #129 is open waiting on playtest data. Edit a
+# number here and restart the gateway.
+#
+# THIS FILE IS OPTIONAL. Delete it and the server runs the values #136-#143
+# shipped — every default in `MarketConfig::default()` equals the const it
+# replaced, asserted by `defaults_match_the_shipped_constants`. Config is an
+# override mechanism, not a required input.
+#
+# BUT A BROKEN FILE IS FATAL. A misspelled key or an out-of-range value refuses
+# to boot and names the offending key, rather than falling back to defaults.
+# Silently ignoring a typo is how a server ends up running numbers nobody chose,
+# and an economy misconfigured for a week can't be fixed by editing this file
+# afterwards — the trades already happened.
+#
+# NO HOT RELOAD. Restart the gateway to pick up a change. That's deliberate: it
+# avoids a whole class of question about orders placed under the old rates.
+#
+# THE CLIENT DOES NOT READ THIS FILE and must never be assumed to. The rates in
+# force at a market ride on `market.opened`, because the panel previews a fee
+# before you commit and a preview that disagrees with what the server charges is
+# a trust bug, not a cosmetic one. `Protocol.gd` keeps matching numbers only as
+# a fallback for a server too old to send them.
+
+# ---------------------------------------------------------------------------
+# Defaults: in force at every market that has no [districts.<id>] table below.
+# ---------------------------------------------------------------------------
+[defaults]
+
+# How close (world units) a player must stand to trade. The server's own check
+# in `market_at` is authoritative; the client mirrors this only to decide when
+# to show the panel.
+range = 60
+
+# Warehouse slots one player gets at one market. Per market, not global — that's
+# what stops deposited stock from following a player between markets, and what
+# makes hauling goods the gameplay rather than a menu action.
+warehouse_slots = 60
+
+# Order prices are whole gold and must be a multiple of this. A tick keeps the
+# book's price levels countable (and its depth broadcasts small) instead of
+# letting a thousand orders sit one copper apart.
+price_tick_gold = 1
+
+# Bounds on a single order's size. Below the floor is noise; above the cap is a
+# mis-click or an attempt to wedge the book.
+min_order_qty = 1
+max_order_qty = 10000
+
+# How long a resting order may hold its escrow before the sweep releases it. A
+# resting order holds goods or gold hostage, so "forever" is not on the list.
+# `default_order_hours` must be one of these — an unrecognised request falls
+# back to it, so a default outside the list would make the fallback invalid.
+order_durations_hours = [12, 24, 72, 168]
+default_order_hours = 24
+
+# Resting orders one player may hold at one market. Caps the cost of rebuilding
+# a book on boot, and stops one player papering it with hundreds of tiny orders.
+max_open_orders = 40
+
+# Sliding-window rate limit on market commands, per player (not per market).
+commands_per_minute = 60
+
+# Cap on one listing-board page.
+listing_page_limit = 100
+
+# --- Fees: the coin sink (#141) --------------------------------------------
+# Fees are BURNED, not paid to anyone. Together with build wages (#145) they are
+# the two halves of the economy: wages create gold, fees destroy it.
+#
+# Every fee rounds UP and is never zero on a nonzero amount. That is anti-abuse,
+# not greed: a fee rounding to zero on small trades would make a free lane, and
+# splitting one big order into a hundred tiny ones would dodge the sink
+# entirely. To turn a fee off you must zero BOTH the rate and the floor.
+#
+# These numbers are PLACEHOLDERS pending #129. The design doc's flat 5 *copper*
+# didn't translate to a currency that is whole gold in small numbers (a 20-wood
+# order is ~160 notional, a character starts with 500), so the shape was kept
+# and the scale adapted.
+
+# Charged to BOTH sides at placement, never refunded — that's what makes posting
+# an order you don't mean to honour cost something.
+# Fee = max(listing_fee_min_gold, ceil(notional * num / den)).
+listing_fee_min_gold = 1
+listing_fee_num = 1
+listing_fee_den = 100
+
+# Charged to the seller out of each fill's value.
+# Tax = max(1, ceil(value * num / den)).
+sale_tax_num = 3
+sale_tax_den = 100
+
+# --- Price history (#143) ---------------------------------------------------
+
+# Candle resolution the rollup materialises. One hour: fine enough to see a
+# price move within a play session, coarse enough that a month of history is a
+# few hundred rows per commodity.
+candle_interval_secs = 3600
+
+# How long candles are kept. The `market_trade` ledger they derive from is never
+# pruned, so pruning this only costs the CPU to rebuild.
+history_retain_days = 30
+
+# --- Warehouse storage: the holding cost (#155) -----------------------------
+#
+# SHIPS OFF. A rate of 0 means storage is free and none of the machinery ever
+# runs — no charge, no ledger row, nobody locked out. Nobody is hoarding yet,
+# and taxing players for using a feature they were just given is a bad first
+# impression. The mechanism exists so the lever can be pulled without a release
+# if hoarding becomes a real problem.
+#
+# Charged per OCCUPIED SLOT, not per item: the slot is the scarce resource, and
+# charging per item would punish stacking a commodity, which is the opposite of
+# the intent. Locked stock counts too, or "list it at an absurd price" would be
+# a free-storage loophole. Charges are burned like every other fee, landing on
+# `market_fee` with kind 'storage' and on `gold_ledger`.
+#
+# Offline days are never charged: a player is billed only if they have been seen
+# since the last charge, so this is a holding cost and not a punishment for
+# having a job. A returning player owes ONE day, not their whole absence.
+#
+# WHEN SOMEONE CANNOT PAY, THEIR GOODS ARE NEVER TOUCHED. What the purse can't
+# cover becomes debt, capped at `storage_arrears_cap_days` so it always stays
+# payable, and the warehouse locks — deposits and withdrawals refused — until it
+# is cleared. Confiscating stored items to settle a debt would be an
+# unrecoverable loss caused by not logging in, and unbounded debt is the same
+# thing wearing a different hat. Selling deliberately stays OPEN while in
+# arrears: it is how a player earns the gold to get out, and a lock that removed
+# the only way out would trap someone with their own goods hostage.
+storage_fee_per_slot_per_day = 0
+storage_arrears_cap_days = 7
+
+# --- NPC provisioner: the price floor and ceiling (#154) --------------------
+#
+# OPT-IN, per commodity. An item with no table here gets no NPC orders at all,
+# so adding something to the item registry never silently creates a gold faucet
+# for it. `plank` and `tool_kit` are deliberately absent: crafted goods should
+# find their price between players.
+#
+# WHAT THIS IS FOR. On a fresh server nobody has listed anything, so the first
+# player to reach the market sees an empty book — no bid to sell into, no ask to
+# buy from — and the whole feature looks broken at the moment it makes its first
+# impression. The provisioner rests ORDINARY orders (visible in the book, no
+# special case in the matching engine) so there is always something there.
+# Secondly, standing bounds mean a commodity with three sellers cannot be
+# cornered without limit.
+#
+# THE FLOOR IS A GOLD FAUCET. It buys without limit and MINTS the gold to do it,
+# because a bid with a finite budget stops being a floor exactly when it is
+# needed — during a crash. Every coin is recorded on `gold_ledger` (#154), which
+# is why that ledger had to exist before this feature could.
+#
+# THE CEILING SELLS FROM STOCK ONLY — the seed below plus whatever it has
+# bought. Unbounded selling would be an infinite ITEM faucet, and destroying
+# scarcity is worse than an uncapped price.
+#
+# THE SPREAD IS DELIBERATELY ENORMOUS. The provisioner should be the worst
+# counterparty in the market and still better than nobody. Wood trades between
+# players around 8-12g; a 1g floor is a safety net nobody would farm (build
+# wages pay 1g per unit and don't cost you the wood), and a 40g ceiling is far
+# above any honest price, so it caps a corner without competing with real
+# sellers. A test asserts round-tripping through it LOSES money.
+#
+# Placeholders pending #129, like everything else here.
+[defaults.provisioner.wood]
+floor = 1
+ceiling = 40
+bid_qty = 200
+seed_stock = 100
+
+# Stone is scarcer than wood — it comes from the Mt Coot-tha quarry rather than
+# a tree outside the gate — so the ceiling sits higher and the seed is smaller.
+[defaults.provisioner.stone]
+floor = 1
+ceiling = 60
+bid_qty = 120
+seed_stock = 60
+
+# ---------------------------------------------------------------------------
+# Per-district overrides.
+#
+# Keyed by DISTRICT, not market id, because a market's id is a `Uuid::new_v4()`
+# minted when its build order is inserted — not authorable here, and different
+# after every DB reseed. A rate pinned to a uuid would silently revert to the
+# defaults the next time the world was reseeded, which is the worst possible
+# failure mode for an economy tunable. Districts are authored in
+# `world::capital()` and stable forever.
+#
+# Known districts: market, suburbs, civic, craftworks, old_quarter. A table for
+# anything else is a boot failure — otherwise a typo would sit here looking
+# effective forever while changing nothing.
+#
+# A table only states what it CHANGES; everything else layers over [defaults]
+# above (the resolved ones, not the shipped ones).
+#
+# ---------------------------------------------------------------------------
+
+# The Market District's market (#153), 8.6km east of the town centre. Cheaper
+# than the capital's in exchange for the haul — that trade-off IS the content.
+# Warehouses are per-market, so stock deposited here does not follow a player
+# home; carrying goods between the two is the arbitrage the design doc treats
+# as core gameplay, and these numbers are what make the walk pay.
+#
+# Placeholders pending #129, like every other number in this file. The SHAPE is
+# what matters: a remote market undercuts the capital, so distance buys margin.
+[districts.market]
+
+# 1% sale tax against the capital's 3%. On a 200g sale that is 2g rather than
+# 6g — small in absolute terms, which is the point: it should reward routine
+# trade, not make the capital's market pointless to use.
+sale_tax_num = 1
+
+# Half the listing fee: 0.5% of notional against the capital's 1%. Note this
+# only bites on LARGE orders — a 1000g order costs 5g here and 10g there, but
+# anything under 100g still rounds up to the 1g floor at either market, because
+# fees round toward the house and are never zero. That is deliberate: the
+# discount rewards moving real volume, which is what a haul is for.
+#
+# (`listing_fee_min_gold` is left alone on purpose. Lowering it would change
+# nothing — at a 1% rate `ceil` already returns at least 1 for any nonzero
+# notional, so the floor never binds.)
+listing_fee_den = 200
+
+# Twice the storage. A trader who has hauled goods this far needs somewhere to
+# put them, and a cramped warehouse would make the trip not worth taking.
+warehouse_slots = 120

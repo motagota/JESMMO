@@ -92,29 +92,102 @@ const ROAD_MAX_POINTS: usize = 64;
 /// and built independently — see `cut_road_cells`.
 const ROAD_CELL_LEN_M: f64 = 5.0;
 
-/// How close a player must stand to a built Market to trade at it (market
-/// epic #136, issue #137). Enforced SERVER-side on every market command, not
-/// merely used to show the panel: the design is explicit that opening the UI
-/// out of range is refused, not just hidden.
-const MARKET_RANGE: i32 = 60;
+// The market's tunables — range, warehouse slots, rate limit, page size, order
+// bounds and every fee rate — moved to the repo-root `market.toml` in #152 (see
+// `mmo::market_config`). They are reached through `self.market_cfg(district)`,
+// never as consts, so no code path can charge one number while the panel
+// previews another.
+//
+// The two INTERVALS below stay consts on purpose: they're operational cadence,
+// not economy tuning. Nothing a player sees depends on them, an operator has no
+// reason to tune them per district, and making them per-market would be
+// meaningless for jobs that sweep every market at once.
 
-/// Warehouse capacity per player per market (#138), counted in SLOTS: one row
-/// is one slot, so a stack of 90 planks costs the same as a stack of 2, and
-/// each tool instance costs its own. Generous on purpose — the warehouse is
-/// working stock for trading, and a cramped one just means tedious trips.
-const WAREHOUSE_SLOTS: i64 = 60;
+/// A market the caller is standing at: its id, and the **district** that owns
+/// it. The district travels alongside because market tuning is keyed on it
+/// (#152) — a market's own id is a `Uuid::new_v4()` and so can't be named in a
+/// config file, while districts are authored and stable.
+struct MarketAt {
+    id: String,
+    district: String,
+    x: i64,
+    y: i64,
+}
 
-/// Market commands one player may issue per minute (#140). Placement makes the
-/// server sweep a book and write a row per fill, so it wants a ceiling — set
-/// far above anything a human trading by hand will reach.
-const MARKET_COMMANDS_PER_MINUTE: i64 = 60;
+/// Where market tuning is read from, unless overridden by `MARKET_CONFIG`.
+///
+/// Resolved at COMPILE TIME against this crate's manifest directory, not the
+/// process's cwd — exactly as `world::DEFAULT_TERRAIN_DIR` does, and for the
+/// same reason: the cwd varies. `start_servers.ps1` launches the proxy with its
+/// working directory set to `rust_server/`, while a workspace-wide
+/// `cargo run -p proxy` runs from the repo root. A cwd-relative path would have
+/// meant the dev server silently never finding the file while its boot log
+/// claimed it had loaded one — the precise quiet failure this config's
+/// strictness exists to prevent.
+const DEFAULT_MARKET_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../market.toml");
+
+/// Load the repo-root `market.toml` (#152), or **refuse to start**.
+///
+/// A MISSING file is fine and resolves to the values #136-#143 shipped — config
+/// is an override mechanism, not a required input, and a fresh clone must run
+/// the same economy.
+///
+/// A PRESENT but broken file is fatal. The operator wrote it expecting it to
+/// take effect; booting with silently-substituted defaults would run an economy
+/// nobody chose, and by the time anyone noticed the trades would already have
+/// happened. `panic!` here is the same reasoning as `book_health`'s below: a
+/// market that won't start beats a market quietly doing the wrong thing.
+fn load_market_config() -> mmo::market_config::MarketConfigSet {
+    let path =
+        std::env::var("MARKET_CONFIG").unwrap_or_else(|_| DEFAULT_MARKET_CONFIG.to_string());
+    match mmo::market_config::MarketConfigSet::load(std::path::Path::new(&path)) {
+        Ok(set) => {
+            let d = set.defaults();
+            let whence = if std::path::Path::new(&path).exists() {
+                path.clone()
+            } else {
+                // Never let "loaded" stand in for "absent". A missing file is
+                // legitimate (it means the shipped defaults), but an operator
+                // who thinks they edited a live file must be able to see that
+                // the server never read one.
+                format!("{path} (ABSENT — using shipped defaults)")
+            };
+            println!(
+                "[Proxy] Market config from {whence} — listing fee {}/{} (min {}g),                  sale tax {}/{}, {} slots, range {}",
+                d.listing_fee_num, d.listing_fee_den, d.listing_fee_min_gold,
+                d.sale_tax_num, d.sale_tax_den, d.warehouse_slots, d.range,
+            );
+            // Log what actually resolved, per district — an operator should be
+            // able to confirm the override landed without reading the file back.
+            for (district, cfg) in set.overrides() {
+                println!(
+                    "[Proxy]   district {district}: listing fee {}/{} (min {}g), sale tax {}/{}, {} slots",
+                    cfg.listing_fee_num, cfg.listing_fee_den, cfg.listing_fee_min_gold,
+                    cfg.sale_tax_num, cfg.sale_tax_den, cfg.warehouse_slots,
+                );
+            }
+            set
+        }
+        Err(e) => {
+            eprintln!("[Proxy] FATAL: {e}");
+            panic!("market config is unusable — refusing to start");
+        }
+    }
+}
+
 /// How often expired resting orders are swept and their escrow released.
 const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
-/// How many listings one browse of the board returns (#142).
-const LISTING_PAGE_LIMIT: i64 = 100;
 /// How often the trade ledger is rolled into candles (#143). A background
 /// cadence — aggregation must never sit in front of a trade.
 const CANDLE_ROLLUP_INTERVAL: Duration = Duration::from_secs(120);
+/// How often storage billing WAKES (#155). Whether anyone is actually charged
+/// is decided by `last_charged_at`, not by this — a job that relied on its own
+/// cadence for correctness would double-bill after every restart.
+const STORAGE_BILLING_INTERVAL: Duration = Duration::from_secs(600);
+/// How often the NPC provisioner re-posts its standing bid and ask (#154).
+/// Frequent enough that a swept-out floor comes back quickly, slow enough that
+/// it isn't rewriting the book under active traders.
+const PROVISIONER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
@@ -387,6 +460,10 @@ struct Proxy {
     /// District identity is keyed to world geometry, so the gateway can name the
     /// district owning any zone region regardless of how the sim is sharded.
     capital: mmo::world::Capital,
+    /// Market tuning from the repo-root `market.toml` (#152), resolved per
+    /// district. Loaded once at boot — there is no hot reload, so a rate can't
+    /// change underneath an order that's mid-flight.
+    market_cfg: mmo::market_config::MarketConfigSet,
     /// Unix-second timestamp of every rent reclaim (#16 ops counter, "reclaims in
     /// the last 24h"). In-memory only, like `dropped_frames` — a pure metric, not
     /// durable state (the reclaim itself is already durable via the DB).
@@ -600,12 +677,39 @@ fn rent_status_json(plot: &mmo::persistence::Plot, gold: i64) -> Value {
 }
 
 impl Proxy {
+    /// Construct with the SHIPPED market defaults. Test-only since #152 —
+    /// production goes through `new_with_market_config` with the set `main`
+    /// validated at startup, which is also why tests never touch the repo's real
+    /// `market.toml`: a suite whose expected fees moved when someone tuned a
+    /// live tuning file would be worse than no suite.
+    #[cfg(test)]
     fn new(
         host: &str,
         port: u16,
         registration_port: u16,
         admin_port: u16,
         db: Option<Arc<Db>>,
+    ) -> Arc<Self> {
+        Self::new_with_market_config(
+            host,
+            port,
+            registration_port,
+            admin_port,
+            db,
+            mmo::market_config::MarketConfigSet::default(),
+        )
+    }
+
+    /// The market config as an explicit argument (#152), so a gateway test can
+    /// prove a `[districts.<id>]` override is actually CHARGED rather than
+    /// merely reported. Also keeps file I/O out of the common constructor.
+    fn new_with_market_config(
+        host: &str,
+        port: u16,
+        registration_port: u16,
+        admin_port: u16,
+        db: Option<Arc<Db>>,
+        market_cfg: mmo::market_config::MarketConfigSet,
     ) -> Arc<Self> {
         Arc::new(Proxy {
             host: host.to_string(),
@@ -631,6 +735,7 @@ impl Proxy {
             db,
             sessions: Mutex::new(HashMap::new()),
             capital: mmo::world::capital(),
+            market_cfg,
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -2376,18 +2481,30 @@ impl Proxy {
     /// keyed by that id from day one: only the capital's market exists in v1,
     /// but per-market state is the whole point of the design (#136), and
     /// retrofitting a key later is worse than carrying one now.
-    async fn market_at(&self, db: &Db, pid: &str) -> Option<(String, i64, i64)> {
+    async fn market_at(&self, db: &Db, pid: &str) -> Option<MarketAt> {
         let (px, py) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y))?;
         let district = self.capital.district_at(px, py)?.id.to_string();
+        let range = self.market_cfg.for_district(&district).range;
         let orders = db.build_orders_for_district(&district).await.ok()?;
         orders.iter().find_map(|o| {
             if o.state != "completed" || o.structure_kind.as_deref() != Some("market") {
                 return None;
             }
             let (x, y) = (o.x?, o.y?);
-            (dist2(px, py, x as i32, y as i32) <= (MARKET_RANGE as i64).pow(2))
-                .then(|| (o.id.clone(), x, y))
+            (dist2(px, py, x as i32, y as i32) <= (range as i64).pow(2)).then(|| MarketAt {
+                id: o.id.clone(),
+                district: district.clone(),
+                x,
+                y,
+            })
         })
+    }
+
+    /// The tuning in force at `district` (#152). Every market command resolves
+    /// its rates through here rather than a const, so a district override and
+    /// the numbers the client was told in `market.opened` cannot disagree.
+    fn market_cfg(&self, district: &str) -> &mmo::market_config::MarketConfig {
+        self.market_cfg.for_district(district)
     }
 
     /// Apply `market.open` (#137): the client asking to trade at whatever
@@ -2403,9 +2520,20 @@ impl Proxy {
     async fn apply_market_open(&self, pid: &str) {
         let Some(db) = self.db.clone() else { return };
         match self.market_at(&db, pid).await {
-            Some((market_id, x, y)) => {
+            Some(at) => {
+                let market_id = at.id;
+                // The rules ride along (#152). They used to be compile-time
+                // consts the client mirrored; now that they're per-district
+                // data, a mirrored copy would be a LIE — the panel would
+                // preview a 3% tax while the server charged whatever
+                // `market.toml` said, and the player would find out by being
+                // short-changed. Anything the client shows as a number the
+                // server will charge has to come from here.
                 self.push_to_player(pid, json!({
-                    "type": "market.opened", "market_id": market_id, "x": x, "y": y,
+                    "type": "market.opened", "market_id": market_id,
+                    "x": at.x, "y": at.y,
+                    "district": at.district,
+                    "rules": self.market_cfg(&at.district).wire_rules(),
                 }));
                 // Hydrate what you're holding here, so the panel is useful the
                 // moment it opens rather than after a round trip (#138), plus
@@ -2428,6 +2556,14 @@ impl Proxy {
     async fn send_warehouse(&self, pid: &str, market_id: &str) {
         let Some(db) = self.db.clone() else { return };
         let Ok(rows) = db.warehouse_for_character(market_id, pid).await else { return };
+        // Resolve the district here rather than threading it through a dozen
+        // call sites (several of them background sweeps that have only a market
+        // id). One indexed lookup on a player-triggered UI push is cheap, and
+        // it keeps "which slot count applies" in one place.
+        let slots = match self.district_of_market(&db, market_id).await {
+            Some(d) => self.market_cfg(&d).warehouse_slots,
+            None => self.market_cfg.defaults().warehouse_slots,
+        };
         let items: Vec<Value> = rows
             .iter()
             .map(|r| {
@@ -2443,9 +2579,15 @@ impl Proxy {
                 v
             })
             .collect();
+        // Storage arrears (#155): 0 unless an operator has turned storage fees
+        // on. Sent with the warehouse rather than as an error, because it is a
+        // STATE of the warehouse — the panel should say why it's locked while
+        // showing the goods that are still safely there, not just refuse.
+        let arrears = db.warehouse_arrears(market_id, pid).await.unwrap_or(0);
         self.push_to_player(pid, json!({
             "type": "warehouse.state", "market_id": market_id,
-            "items": items, "used": rows.len(), "slots": WAREHOUSE_SLOTS,
+            "items": items, "used": rows.len(), "slots": slots,
+            "arrears": arrears,
         }));
     }
 
@@ -2465,15 +2607,41 @@ impl Proxy {
         if !persistent {
             return;
         }
-        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+        let Some(at) = self.market_at(&db, pid).await else {
             self.push_to_player(pid, json!({
                 "type": "market.error", "code": "out_of_range",
                 "detail": "stand at a built market to use its warehouse",
             }));
             return;
         };
+        let (market_id, slots) =
+            (at.id, self.market_cfg(&at.district).warehouse_slots);
+        // Storage arrears (#155). Settle first, so a player who has come back
+        // with gold is unlocked by the act of using the warehouse rather than
+        // having to wait for the next daily tick — being locked out is a nudge
+        // to pay, not a sentence to serve.
+        //
+        // Only DEPOSIT and WITHDRAW are gated. Selling stays open on purpose: a
+        // sell is how someone in arrears earns the gold to clear them, and a
+        // lock that removed the only way out would trap a player with their
+        // goods hostage — which is the outcome this whole design exists to
+        // avoid. Withdrawing is blocked because that is taking goods out
+        // without settling; selling pays the debt as a side effect.
+        let owed = db
+            .settle_warehouse_arrears(&market_id, pid, now_secs())
+            .await
+            .unwrap_or(0);
+        if owed > 0 {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": "storage_arrears",
+                "detail": format!(
+                    "you owe {owed}g in storage here — your goods are safe, but the warehouse                      is locked until it's paid (selling still works)"
+                ),
+            }));
+            return;
+        }
         let moved = match op {
-            "deposit" => db.warehouse_deposit(&market_id, pid, item_id, qty, WAREHOUSE_SLOTS).await,
+            "deposit" => db.warehouse_deposit(&market_id, pid, item_id, qty, slots).await,
             "withdraw" => db.warehouse_withdraw(&market_id, pid, item_id, qty).await,
             _ => Ok(0),
         };
@@ -2555,8 +2723,12 @@ impl Proxy {
         let item = data.get("item_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let min_dur = data.get("min_durability").and_then(|v| v.as_i64());
         let max_price = data.get("max_price").and_then(|v| v.as_i64());
+        let page_limit = match self.district_of_market(&db, market_id).await {
+            Some(d) => self.market_cfg(&d).listing_page_limit,
+            None => self.market_cfg.defaults().listing_page_limit,
+        };
         let Ok(rows) = db
-            .listings_for_market(market_id, item, min_dur, max_price, LISTING_PAGE_LIMIT)
+            .listings_for_market(market_id, item, min_dur, max_price, page_limit)
             .await
         else {
             return;
@@ -2607,10 +2779,12 @@ impl Proxy {
             reject(r.code(), r.detail());
             return;
         }
-        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+        let Some(at) = self.market_at(&db, pid).await else {
             reject("out_of_range", "stand at a built market to trade");
             return;
         };
+        let cfg = self.market_cfg(&at.district).clone();
+        let market_id = at.id;
         let command_id = data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
         let now = now_secs();
 
@@ -2618,7 +2792,7 @@ impl Proxy {
             "place" => {
                 let wh_id = data.get("warehouse_item_id").and_then(|v| v.as_str()).unwrap_or("");
                 let ask = data.get("ask_price").and_then(|v| v.as_i64()).unwrap_or(0);
-                let hours = mmo::world::order_duration_hours(
+                let hours = cfg.order_duration_hours(
                     data.get("duration_hours").and_then(|v| v.as_i64()).unwrap_or(0),
                 );
                 if ask <= 0 {
@@ -2627,13 +2801,13 @@ impl Proxy {
                     return;
                 }
                 match db
-                    .place_listing(&market_id, pid, wh_id, ask, now + hours * 3600, command_id, now)
+                    .place_listing(&market_id, pid, wh_id, ask, now + hours * 3600, &cfg, command_id, now)
                     .await
                 {
                     Ok(Some(l)) => {
                         self.push_to_player(pid, json!({
                             "type": "market.fees", "market_id": market_id,
-                            "listing_fee": mmo::world::listing_fee(l.ask_price), "sale_tax": 0,
+                            "listing_fee": cfg.listing_fee(l.ask_price), "sale_tax": 0,
                         }));
                         self.push_gold(pid, 0, "listing_placed").await;
                         self.send_warehouse(pid, &market_id).await;
@@ -2656,7 +2830,7 @@ impl Proxy {
                 // the listing, so afterwards there's nothing left to ask.
                 let seller = db.listing_by_id(&listing_id).await.ok().flatten().map(|l| l.seller_id);
                 match db
-                    .buy_listing(pid, &listing_id, expected, WAREHOUSE_SLOTS, command_id, now)
+                    .buy_listing(pid, &listing_id, expected, &cfg, command_id, now)
                     .await
                 {
                     Ok(Ok((l, tax))) => {
@@ -2728,18 +2902,15 @@ impl Proxy {
             reject(r.code(), r.detail());
             return;
         }
-        let Some((market_id, _, _)) = self.market_at(&db, pid).await else {
+        let Some(at) = self.market_at(&db, pid).await else {
             reject("out_of_range", "stand at a built market to trade");
             return;
         };
-        let district = self
-            .entity_state
-            .lock()
-            .unwrap()
-            .get(pid)
-            .map(|c| (c.x, c.y))
-            .and_then(|(x, y)| self.capital.district_at(x, y).map(|d| d.id.to_string()))
-            .unwrap_or_default();
+        // The district comes from `market_at`, which resolved it from the same
+        // position that passed the range gate — so the rates charged here are
+        // provably the ones this player was quoted in `market.opened` (#152).
+        let mcfg = self.market_cfg(&at.district).clone();
+        let (market_id, district) = (at.id, at.district);
         let command_id = data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
         let now = now_secs();
 
@@ -2760,20 +2931,20 @@ impl Proxy {
         let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let unit_price = data.get("unit_price").and_then(|v| v.as_i64()).unwrap_or(0);
         let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
-        if let Err(r) = mmo::world::validate_order(&item_id, unit_price, qty) {
+        if let Err(r) = mcfg.validate_order(&item_id, unit_price, qty) {
             reject(r.code(), r.detail());
             return;
         }
 
         // Either side may now rest (#140), so both go through one path.
-        let hours = mmo::world::order_duration_hours(
+        let hours = mcfg.order_duration_hours(
             data.get("duration_hours").and_then(|v| v.as_i64()).unwrap_or(0),
         );
         let expires_at = now + hours * 3600;
         match db
             .place_order(
                 &market_id, pid, op, &item_id, unit_price, qty, expires_at,
-                WAREHOUSE_SLOTS, mmo::world::MAX_OPEN_ORDERS_PER_MARKET, command_id, now,
+                &mcfg, command_id, now,
             )
             .await
         {
@@ -2857,11 +3028,110 @@ impl Proxy {
         let mut hits = self.market_rate.lock().unwrap();
         let stamps = hits.entry(pid.to_string()).or_default();
         stamps.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-        if stamps.len() as i64 >= MARKET_COMMANDS_PER_MINUTE {
+        if stamps.len() as i64 >= self.market_cfg.defaults().commands_per_minute {
             return false;
         }
         stamps.push(now);
         true
+    }
+
+    /// Charge daily warehouse storage at every built market (#155).
+    ///
+    /// **Does nothing on a stock server**: `storage_fee_per_slot_per_day` is 0
+    /// by default, and `charge_storage` returns immediately. The job runs anyway
+    /// so that turning the rate on in `market.toml` needs only a restart.
+    ///
+    /// The tick is far more frequent than a day because the DAY is enforced by
+    /// `last_charged_at`, not by the sleep — a job that relied on its own
+    /// cadence for correctness would double-bill after any restart.
+    async fn storage_billing(self: Arc<Self>) {
+        loop {
+            sleep(STORAGE_BILLING_INTERVAL).await;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            for d in &self.capital.districts {
+                let cfg = self.market_cfg(d.id);
+                if cfg.storage_fee_per_slot_per_day <= 0 {
+                    continue;
+                }
+                let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
+                for o in orders.iter().filter(|o| {
+                    o.state == "completed" && o.structure_kind.as_deref() == Some("market")
+                }) {
+                    match db.charge_storage(&o.id, cfg, now).await {
+                        Ok((0, 0)) => {}
+                        Ok((charged, accrued)) => println!(
+                            "[Proxy] MARKET: storage at {} — {charged}g burned, {accrued}g                              went unpaid into arrears",
+                            d.id
+                        ),
+                        Err(e) => eprintln!("[Proxy] storage billing at {}: {e}", d.id),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the NPC provisioner's standing bid and ask posted at every built
+    /// market (#154), and report trades that escaped the bounds.
+    ///
+    /// A background job like the expiry sweep and the candle rollup: the
+    /// provisioner rests ORDINARY orders, so nothing here sits in front of a
+    /// player's trade. Re-posting is idempotent, so a tick that lands while
+    /// nothing has changed leaves the book exactly as it was.
+    async fn provisioner_refresh(self: Arc<Self>) {
+        // One tick immediately, so a fresh server's book is tradable from the
+        // moment the market is built rather than after the first interval.
+        let mut first = true;
+        loop {
+            if !first {
+                sleep(PROVISIONER_REFRESH_INTERVAL).await;
+            }
+            first = false;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            for d in &self.capital.districts {
+                let cfg = self.market_cfg(d.id);
+                if cfg.provisioner.is_empty() {
+                    continue;
+                }
+                let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
+                for o in orders.iter().filter(|o| {
+                    o.state == "completed" && o.structure_kind.as_deref() == Some("market")
+                }) {
+                    match db.refresh_provisioner(&o.id, cfg, now).await {
+                        Ok(minted) if minted > 0 => println!(
+                            "[Proxy] MARKET: provisioner minted {minted}g to fund its floor at \
+                             {} ({})",
+                            d.id, o.id
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("[Proxy] provisioner refresh at {}: {e}", d.id);
+                            continue;
+                        }
+                    }
+                    // Balance telemetry (design doc §7). The provisioner rests
+                    // orders AT the bounds, so a trade beyond them means either
+                    // this job is lagging or the bounds no longer fit the
+                    // economy that grew around them. Both are worth knowing, and
+                    // neither is visible any other way — this is the data #129's
+                    // balance pass has never had.
+                    let since = now - PROVISIONER_REFRESH_INTERVAL.as_secs() as i64 * 2;
+                    match db.trades_outside_bounds(&o.id, cfg, since).await {
+                        Ok(rows) => {
+                            for (item, price, lo, hi) in rows {
+                                println!(
+                                    "[Proxy] MARKET TELEMETRY: {item} traded at {price}g outside \
+                                     the provisioner's {lo}-{hi}g band at {} — bounds may be stale",
+                                    d.id
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[Proxy] provisioner telemetry at {}: {e}", d.id),
+                    }
+                }
+            }
+        }
     }
 
     /// Roll the trade ledger into OHLCV candles and prune old ones (#143).
@@ -2875,7 +3145,12 @@ impl Proxy {
             sleep(CANDLE_ROLLUP_INTERVAL).await;
             let Some(db) = self.db.clone() else { continue };
             let now = now_secs();
-            let interval = mmo::world::CANDLE_INTERVAL_SECS;
+            // The defaults, not a district's: this job rolls up EVERY market in
+            // one pass, so there is only one interval it could use. That is why
+            // `market.toml` REFUSES these two keys in a district table (#152) —
+            // an override here would silently do nothing, which is exactly the
+            // failure mode config validation exists to prevent.
+            let interval = self.market_cfg.defaults().candle_interval_secs;
             // Two intervals back, so a late-arriving trade in the previous
             // bucket is still picked up.
             let from = mmo::world::candle_bucket(now, interval) - interval;
@@ -2884,7 +3159,7 @@ impl Proxy {
                 continue;
             }
             let cutoff = mmo::world::candle_bucket(
-                now - mmo::world::HISTORY_RETAIN_DAYS * 86_400,
+                now - self.market_cfg.defaults().history_retain_days * 86_400,
                 interval,
             );
             match db.prune_candles(cutoff).await {
@@ -2898,9 +3173,11 @@ impl Proxy {
     /// Answer `market.history_request` (#143) with a commodity's candles.
     async fn send_history(&self, pid: &str, market_id: &str, item_id: &str, days: i64) {
         let Some(db) = self.db.clone() else { return };
-        let interval = mmo::world::CANDLE_INTERVAL_SECS;
+        // Must match what `candle_rollup` materialised, so these read the same
+        // global values rather than this market's district.
+        let interval = self.market_cfg.defaults().candle_interval_secs;
         let now = now_secs();
-        let days = days.clamp(1, mmo::world::HISTORY_RETAIN_DAYS);
+        let days = days.clamp(1, self.market_cfg.defaults().history_retain_days);
         let from = mmo::world::candle_bucket(now - days * 86_400, interval);
         let Ok(candles) = db.candles(market_id, item_id, interval, from, now + interval).await else {
             return;
@@ -3248,6 +3525,14 @@ impl Proxy {
         }
 
         // Unlock dependents (authored orders gated behind this kind).
+        //
+        // A dependent can live in a DIFFERENT district than the order that
+        // unlocked it — the second market (#153) is exactly that: finishing the
+        // capital's market in `civic` opens `market_east` out in the Market
+        // District. So the announcement and the board refresh have to follow
+        // the dependent, not the completer. Announcing only to `district` would
+        // leave anyone standing where the new order actually appeared staring
+        // at a stale board until they happened to re-request it.
         let dependents: Vec<(&str, &str)> = self
             .capital
             .build_orders
@@ -3255,18 +3540,29 @@ impl Proxy {
             .filter(|o| o.prereq == Some(kind))
             .map(|o| (o.district, o.kind))
             .collect();
-        let mut unlocked_ids: Vec<String> = Vec::new();
+        let mut unlocked: Vec<(String, String)> = Vec::new(); // (district, order id)
         for (d, k) in dependents {
             if let Ok(Some(o)) = db.open_build_order(d, k).await {
-                unlocked_ids.push(o.id);
+                unlocked.push((d.to_string(), o.id));
             }
         }
-        if !unlocked_ids.is_empty() {
-            self.broadcast_to_district(district, json!({
-                "type": "build.unlocked", "order_ids": unlocked_ids,
-            }));
+        if !unlocked.is_empty() {
+            // Group by district so each one hears about its own new orders.
+            let mut by_district: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (d, id) in unlocked {
+                by_district.entry(d).or_default().push(id);
+            }
+            for (d, ids) in by_district {
+                self.broadcast_to_district(&d, json!({
+                    "type": "build.unlocked", "order_ids": ids,
+                }));
+                if d != district {
+                    self.broadcast_build_list(&d).await;
+                }
+            }
         }
-        // Refresh the board for the district (the newly opened orders now appear).
+        // Refresh the board for the completing order's district (it just changed
+        // state, and any same-district dependents now appear).
         self.broadcast_build_list(district).await;
     }
 
@@ -5368,7 +5664,7 @@ impl Proxy {
                     // `listing.list` (#142) is a stateless, filterable read.
                     if data.get("type").and_then(|v| v.as_str()) == Some("listing.list") {
                         if let Some(db) = self.db.clone() {
-                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                            if let Some(MarketAt { id: market_id, .. }) = self.market_at(&db, &player_id).await {
                                 self.send_listings(&player_id, &market_id, &data).await;
                             }
                         }
@@ -5380,7 +5676,7 @@ impl Proxy {
                         let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let days = data.get("days").and_then(|v| v.as_i64()).unwrap_or(7);
                         if let Some(db) = self.db.clone() {
-                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                            if let Some(MarketAt { id: market_id, .. }) = self.market_at(&db, &player_id).await {
                                 self.send_history(&player_id, &market_id, &item_id, days).await;
                             }
                         }
@@ -5392,7 +5688,7 @@ impl Proxy {
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.book_request") {
                         let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         if let Some(db) = self.db.clone() {
-                            if let Some((market_id, _, _)) = self.market_at(&db, &player_id).await {
+                            if let Some(MarketAt { id: market_id, .. }) = self.market_at(&db, &player_id).await {
                                 self.send_book(&player_id, &market_id, &item_id).await;
                             }
                         }
@@ -5664,6 +5960,17 @@ impl Proxy {
         let me = self.clone();
         tokio::spawn(async move { me.candle_rollup().await });
 
+        // NPC provisioner (#154): keeps a floor and a ceiling standing so a
+        // fresh server's book is never dead content, and reports trades that
+        // escaped the band.
+        let me = self.clone();
+        tokio::spawn(async move { me.provisioner_refresh().await });
+
+        // Warehouse storage billing (#155). A no-op unless an operator has set
+        // a rate — the mechanism ships, the policy doesn't.
+        let me = self.clone();
+        tokio::spawn(async move { me.storage_billing().await });
+
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
         // whichever comes first ends the process, but either way we get one
@@ -5781,6 +6088,13 @@ fn print_migration_help() {
 
 #[tokio::main]
 async fn main() {
+    // Market tuning FIRST (#152). It's the cheapest thing that can refuse the
+    // boot, so validating it before touching the database means a typo'd rate is
+    // reported in milliseconds instead of after migrations, capital seeding and
+    // book reconciliation have run. Nothing below depends on it, so this is
+    // purely about failing fast and legibly.
+    let market_cfg = load_market_config();
+
     // Durable store: SQLite file by default; override with DATABASE_URL (e.g. a
     // Postgres URL in staging/prod). If it can't be opened we run without
     // persistence so the demo still comes up (guests only).
@@ -5803,6 +6117,20 @@ async fn main() {
             // failure, not a warning: every violation here means goods or gold
             // have been duplicated or destroyed, and a market that has
             // silently minted stock is far worse than one that won't start.
+            // The money supply must equal purses plus escrow (#154). A gap
+            // means some path created or destroyed gold without telling the
+            // ledger — the precise class of bug the ledger exists to make
+            // impossible. A WARNING rather than a panic: unlike a crossed book
+            // this doesn't corrupt anyone's holdings, and a pre-#154 database
+            // legitimately starts with an unexplained supply (nobody was
+            // recording when those characters were created).
+            match db.gold_supply_gap().await {
+                Ok(0) => println!("[Proxy] Gold supply reconciled — ledger matches purses + escrow"),
+                Ok(gap) => println!(
+                    "[Proxy] NOTE: gold supply gap of {gap}g — expected on a database that                      predates the #154 ledger; new activity is fully recorded"
+                ),
+                Err(e) => eprintln!("[Proxy] gold supply check: {e}"),
+            }
             match db.book_health().await {
                 Ok(problems) if problems.is_empty() => {
                     println!("[Proxy] Market books reconciled — escrow matches the open book")
@@ -5836,7 +6164,8 @@ async fn main() {
         }
     };
 
-    let proxy = Proxy::new("127.0.0.1", 8766, 8764, 8767, db);
+    let proxy =
+        Proxy::new_with_market_config("127.0.0.1", 8766, 8764, 8767, db, market_cfg);
     proxy.start().await;
 }
 
@@ -5854,6 +6183,14 @@ mod tests {
     /// call `start()` (handlers are driven directly).
     fn test_proxy() -> Arc<Proxy> {
         Proxy::new("127.0.0.1", 0, 0, 0, None)
+    }
+
+    /// The market tuning these tests assert against (#152): the values #136-#143
+    /// shipped, matching what the test `Proxy` constructor installs. Deliberately
+    /// NOT the repo's `market.toml` — a suite whose expected fees moved when
+    /// someone tuned a live config file would be worse than no suite.
+    fn test_market_cfg() -> mmo::market_config::MarketConfig {
+        mmo::market_config::MarketConfig::default()
     }
 
     /// Proxy with a short ping interval so the liveness reaper fires fast.
@@ -5879,6 +6216,12 @@ mod tests {
             db: None,
             sessions: Mutex::new(HashMap::new()),
             capital: mmo::world::capital(),
+            // Tests get the shipped defaults, never the repo's `market.toml`:
+            // a suite whose expected fees changed when someone tuned a live
+            // config file would be worse than no suite. Config LOADING is
+            // covered by `market_config`'s own tests, and per-district
+            // resolution by `market_rules_ride_on_market_opened`.
+            market_cfg: mmo::market_config::MarketConfigSet::default(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -8742,9 +9085,17 @@ mod tests {
     /// Like `proxy_with_db`, but also hands back the Db so a test can seed
     /// terrain-delta rows before the client asks for them.
     async fn proxy_with_shared_db() -> (Arc<Proxy>, Arc<Db>, TestDb, FakeZone) {
+        proxy_with_market_config(mmo::market_config::MarketConfigSet::default()).await
+    }
+
+    /// `proxy_with_shared_db` with market tuning of the caller's choosing (#152).
+    async fn proxy_with_market_config(
+        cfg: mmo::market_config::MarketConfigSet,
+    ) -> (Arc<Proxy>, Arc<Db>, TestDb, FakeZone) {
         let dbf = TestDb::new();
         let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
-        let proxy = Proxy::new("127.0.0.1", 0, 0, 0, Some(db.clone()));
+        let proxy =
+            Proxy::new_with_market_config("127.0.0.1", 0, 0, 0, Some(db.clone()), cfg);
         let zone = spawn_fake_zone().await;
         proxy
             .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
@@ -10331,13 +10682,417 @@ mod tests {
         // Walk out of range: refused again, even though it's built. Range is
         // enforced here, not merely used to hide the panel.
         proxy.entity_state.lock().unwrap().insert(
-            pid.clone(), EntityCache { x: mx as i32 + MARKET_RANGE + 5, y: my as i32, hp: 100 },
+            pid.clone(), EntityCache { x: mx as i32 + test_market_cfg().range + 5, y: my as i32, hp: 100 },
         );
         ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
         let err = recv_until(&mut ws, "market.error").await;
         assert_eq!(err["code"].as_str().unwrap(), "out_of_range");
 
         drop(ws);
+    }
+
+    /// `market.opened` carries the rates in force, and a `[districts.<id>]`
+    /// override is actually CHARGED — not merely reported (#152).
+    ///
+    /// This is the test the whole issue exists for. The client previews a fee
+    /// before you commit; while the rates were compile-time consts, a mirrored
+    /// copy in `Protocol.gd` was sound. The moment they became per-district data
+    /// that mirror became a LIE, and a quiet one — the panel would quote 3%
+    /// while the server took 10%, and the player would only find out by being
+    /// short-changed. So it is not enough for the wire to carry *some* numbers:
+    /// what it carries has to be what the ledger records.
+    #[tokio::test]
+    async fn market_opened_carries_the_rates_that_are_actually_charged() {
+        // A sale tax an order of magnitude off the default, so a stale mirror
+        // couldn't coincidentally agree with it.
+        let cfg = mmo::market_config::MarketConfigSet::parse(
+            "[districts.civic]
+sale_tax_num = 10
+listing_fee_min_gold = 4
+",
+        )
+        .unwrap();
+        let (proxy, db, _dbf, zone) = proxy_with_market_config(cfg).await;
+
+        let market = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12800, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let email = format!("taxed_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Taxed"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        stand_at(&proxy, &pid, 12800, 12800);
+
+        // 1. The wire reports the OVERRIDE, not the shipped default.
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(opened["district"].as_str(), Some("civic"));
+        let rules = &opened["rules"];
+        assert_eq!(rules["sale_tax_num"].as_i64(), Some(10), "the override must be on the wire");
+        assert_eq!(rules["sale_tax_den"].as_i64(), Some(100));
+        assert_eq!(rules["listing_fee_min_gold"].as_i64(), Some(4));
+        // Unstated keys still come through, from the resolved defaults.
+        assert_eq!(rules["price_tick_gold"].as_i64(), Some(1));
+        assert_eq!(rules["max_open_orders"].as_i64(), Some(40));
+
+        // 2. And the ledger agrees. A seller rests 10 wood at 10g; a buyer
+        //    crosses it. Tax is 10% of the 100g fill, and the listing fee floor
+        //    is 4g, both per the override.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 10, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        // Loop until the payload reflects what WE caused: login pushes an
+        // empty inv.update of its own, and grabbing that one instead is a
+        // hydration race this suite has been bitten by repeatedly.
+        loop {
+            recv_until(&mut ws, "inv.update").await;
+            if qty_of_inventory(&db, &pid, "wood").await >= 10 { break; }
+        }
+        stand_at(&proxy, &pid, 12800, 12800);
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 10}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let st = recv_until(&mut ws, "warehouse.state").await;
+            if st["items"].as_array().map(|a| !a.is_empty()).unwrap_or(false) { break; }
+        }
+
+        let seller_before = db.character_gold(&pid).await.unwrap();
+        stand_at(&proxy, &pid, 12800, 12800);
+        ws.send(Message::Text(json!({
+            "type": "market.sell", "item_id": "wood", "unit_price": 10, "qty": 10,
+            "command_id": "cfg-sell-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "market.fees").await;
+
+        // Listing fee: 1% of 100 = 1, floored UP to the override's 4.
+        let after_listing = db.character_gold(&pid).await.unwrap();
+        assert_eq!(
+            seller_before - after_listing, 4,
+            "listing fee should be the override's 4g floor, not the default 1g"
+        );
+
+        // A second character crosses the ask.
+        let buyer_email = format!("buyer_{}@t.test", Uuid::new_v4().simple());
+        let mut bws = dial(&proxy).await;
+        bws.send(Message::Text(
+            json!({"type": "register", "email": buyer_email, "password": "pw12", "name": "Buyer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let bid = recv_until(&mut bws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        stand_at(&proxy, &bid, 12800, 12800);
+        bws.send(Message::Text(json!({
+            "type": "market.buy", "item_id": "wood", "unit_price": 10, "qty": 10,
+            "command_id": "cfg-buy-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut bws, "market.fees").await;
+
+        // The trade ledger is the authority: 10% of the 100g fill, not 3%.
+        let trades = db.recent_trades(&market.id, "wood", 10).await.unwrap();
+        let t = trades.first().expect("the cross should have traded");
+        assert_eq!(t.unit_price * t.qty, 100);
+        assert_eq!(
+            t.sale_tax_gold, 10,
+            "the ledger must record the override's 10% tax, not the shipped 3%"
+        );
+        // Seller nets the fill less that same tax.
+        let seller_end = db.character_gold(&pid).await.unwrap();
+        assert_eq!(seller_end, after_listing + 100 - 10);
+
+        drop(ws);
+        drop(bws);
+    }
+
+    /// Finishing the capital's market unlocks the Market District's (#153), and
+    /// the announcement reaches the district where the new order actually
+    /// APPEARED — not just the one where the build finished.
+    ///
+    /// This is a cross-district prereq, the first in the game: every earlier
+    /// dependent lived in the same district as its prerequisite, so
+    /// `build.completed` announcing only to the completing order's district was
+    /// indistinguishable from correct. Here it isn't — a player standing 8.6km
+    /// east would have been left staring at a board that never mentioned the
+    /// order that had just opened in front of them.
+    #[tokio::test]
+    async fn completing_the_capital_market_unlocks_the_market_district_one() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // The authored pair: the capital's opens, the Market District's is
+        // locked behind it.
+        let capital = db
+            .build_orders_for_district("civic")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market")
+            .expect("the capital market is authored");
+        assert_eq!(capital.state, "open");
+        let remote = db
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .expect("the Market District's market is authored");
+        assert_eq!(remote.state, "locked", "the second market starts gated behind the first");
+
+        let email = format!("unlocker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Unlocker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Build the capital's market through the ordinary contribution flow.
+        for (item, qty) in [("wood", 50), ("stone", 30)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "gather_yield", "player_id": pid,
+                    "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+                }).to_string()))
+                .unwrap();
+            recv_until(&mut ws, "inv.update").await;
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": capital.id, "item_id": item, "qty": qty,
+                }).to_string()))
+                .unwrap();
+        }
+        recv_until(&mut ws, "build.completed").await;
+
+        // Durably unlocked.
+        let remote_now = db
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .unwrap();
+        assert_eq!(remote_now.state, "open", "finishing the first market should open the second");
+
+        // And announced where it appeared: a board push carrying the Market
+        // District's order. Under the pre-#153 code only the civic board was
+        // refreshed, and civic's list never contains `market_east`.
+        let mut saw_remote_board = false;
+        for _ in 0..40 {
+            let msg = recv_until(&mut ws, "build.list").await;
+            if msg["orders"]
+                .as_array()
+                .map(|a| a.iter().any(|o| o["kind"].as_str() == Some("market_east")))
+                .unwrap_or(false)
+            {
+                saw_remote_board = true;
+                break;
+            }
+        }
+        assert!(
+            saw_remote_board,
+            "the Market District's board was never refreshed — its players would not see the \
+             order that just opened there"
+        );
+
+        drop(ws);
+    }
+
+    /// Two markets in one session (#153): walking from the capital's market to
+    /// the Market District's retargets the panel, and the rates that follow are
+    /// that market's own — the payoff for #152's per-district config.
+    ///
+    /// The rate limiter is deliberately checked here too. It's keyed on player
+    /// alone, and a second market is exactly the situation that would expose it
+    /// if it had ever been keyed on `(player, market)`: a trader could double
+    /// their command budget just by having somewhere else to stand.
+    #[tokio::test]
+    async fn walking_between_markets_retargets_and_charges_each_market_its_own_rates() {
+        // The capital keeps the shipped 3% tax; the Market District undercuts it
+        // at 1%, mirroring the shape of the committed market.toml.
+        let cfg = mmo::market_config::MarketConfigSet::parse(
+            "[districts.market]\nsale_tax_num = 1\nwarehouse_slots = 120\n",
+        )
+        .unwrap();
+        let (proxy, db, _dbf, zone) = proxy_with_market_config(cfg).await;
+
+        // Both markets built. Coordinates match the authored sites closely
+        // enough to land in the right districts.
+        let capital = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12900, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let remote = db
+            .insert_build_order(
+                "market", "market_east", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 20800, y: 9600, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(capital.id, remote.id);
+
+        let email = format!("hauler_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hauler"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // --- at the capital ---------------------------------------------------
+        stand_at(&proxy, &pid, 12900, 12800);
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(opened["market_id"].as_str(), Some(capital.id.as_str()));
+        assert_eq!(opened["district"].as_str(), Some("civic"));
+        assert_eq!(opened["rules"]["sale_tax_num"].as_i64(), Some(3), "capital keeps the default tax");
+        assert_eq!(opened["rules"]["warehouse_slots"].as_i64(), Some(60));
+
+        // --- walk 8.6km east and open the other one ---------------------------
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(
+            opened["market_id"].as_str(),
+            Some(remote.id.as_str()),
+            "the panel should retarget to the market actually stood at"
+        );
+        assert_eq!(opened["district"].as_str(), Some("market"));
+        assert_eq!(opened["rules"]["sale_tax_num"].as_i64(), Some(1), "the remote market undercuts");
+        assert_eq!(opened["rules"]["warehouse_slots"].as_i64(), Some(120));
+
+        // --- the warehouses are separate, and the panel says so ---------------
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        loop {
+            recv_until(&mut ws, "inv.update").await;
+            if qty_of_inventory(&db, &pid, "wood").await >= 20 { break; }
+        }
+
+        // Deposit at the REMOTE market.
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let st = recv_until(&mut ws, "warehouse.state").await;
+            if st["market_id"].as_str() == Some(remote.id.as_str())
+                && st["items"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
+            {
+                assert_eq!(st["slots"].as_i64(), Some(120), "the remote market's slot count");
+                break;
+            }
+        }
+        assert!(
+            db.warehouse_for_character(&capital.id, &pid).await.unwrap().is_empty(),
+            "goods deposited in the Market District turned up in the capital"
+        );
+
+        // --- the tax actually charged is the remote market's ------------------
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(json!({
+            "type": "market.sell", "item_id": "wood", "unit_price": 10, "qty": 20,
+            "command_id": "haul-sell-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "market.fees").await;
+
+        let buyer_email = format!("hbuyer_{}@t.test", Uuid::new_v4().simple());
+        let mut bws = dial(&proxy).await;
+        bws.send(Message::Text(
+            json!({"type": "register", "email": buyer_email, "password": "pw12", "name": "HBuyer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let bid = recv_until(&mut bws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        stand_at(&proxy, &bid, 20800, 9600);
+        bws.send(Message::Text(json!({
+            "type": "market.buy", "item_id": "wood", "unit_price": 10, "qty": 20,
+            "command_id": "haul-buy-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut bws, "market.fees").await;
+
+        // 1% of the 200g fill = 2g, not the capital's 3% = 6g. The ledger is
+        // the authority, not the message.
+        let trades = db.recent_trades(&remote.id, "wood", 10).await.unwrap();
+        let t = trades.first().expect("the cross should have traded at the remote market");
+        assert_eq!(t.unit_price * t.qty, 200);
+        assert_eq!(t.sale_tax_gold, 2, "the remote market's 1% tax should have been charged");
+        // And nothing landed on the capital's ledger.
+        assert!(
+            db.recent_trades(&capital.id, "wood", 10).await.unwrap().is_empty(),
+            "the trade was recorded against the wrong market"
+        );
+
+        drop(ws);
+        drop(bws);
+    }
+
+    /// The market command rate limit is per PLAYER, not per (player, market).
+    /// With one market the distinction was invisible; with two, keying it on the
+    /// market would hand anyone a second full budget just for walking east.
+    #[tokio::test]
+    async fn the_market_rate_limit_is_per_player_not_per_market() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+        let pid = format!("rate_{}", Uuid::new_v4().simple());
+        let budget = test_market_cfg().commands_per_minute;
+
+        // Spend the whole budget.
+        for i in 0..budget {
+            assert!(proxy.allow_market_command(&pid), "command {i} should be allowed");
+        }
+        assert!(!proxy.allow_market_command(&pid), "the budget should be spent");
+
+        // Standing at a different market changes nothing — the limiter never
+        // sees a market id, and this is the test that keeps it that way.
+        assert!(
+            !proxy.allow_market_command(&pid),
+            "the rate limit refilled — is it keyed on the market rather than the player?"
+        );
+        // A different player is unaffected.
+        let other = format!("rate_{}", Uuid::new_v4().simple());
+        assert!(proxy.allow_market_command(&other), "one player's spending throttled another");
     }
 
     /// The warehouse over the wire (#138): gated by the same server-side range
@@ -10390,7 +11145,7 @@ mod tests {
         let state = recv_until(&mut ws, "warehouse.state").await;
         assert_eq!(state["market_id"].as_str().unwrap(), market.id);
         assert!(state["items"].as_array().unwrap().is_empty());
-        assert_eq!(state["slots"].as_i64().unwrap(), WAREHOUSE_SLOTS);
+        assert_eq!(state["slots"].as_i64().unwrap(), test_market_cfg().warehouse_slots);
 
         // Deposit: state comes back with the stock, and carry drops.
         ws.send(Message::Text(
@@ -10541,14 +11296,14 @@ mod tests {
         assert_eq!((traded[0].unit_price, traded[0].qty), (8, 5), "executed at the resting 8");
         // Net of fees (#141): the buyer paid 40 plus a listing fee; the seller
         // received 40 minus sale tax.
-        let buy_fee = mmo::world::listing_fee(12 * 5);
+        let buy_fee = test_market_cfg().listing_fee(12 * 5);
         assert_eq!(
             db.character_gold(&bid_).await.unwrap(), buyer_gold - 40 - buy_fee,
             "5 x the resting 8, plus the listing fee"
         );
         assert_eq!(
             db.character_gold(&sid).await.unwrap(),
-            seller_gold + 40 - mmo::world::sale_tax(40),
+            seller_gold + 40 - test_market_cfg().sale_tax(40),
             "seller paid immediately, net of sale tax"
         );
 
@@ -10633,7 +11388,7 @@ mod tests {
         let mine = orders["orders"].as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["side"].as_str().unwrap(), "buy");
-        let bid_fee = mmo::world::listing_fee(9 * 10);
+        let bid_fee = test_market_cfg().listing_fee(9 * 10);
         assert_eq!(
             db.character_gold(&bid_).await.unwrap(), buyer_gold - 90 - bid_fee,
             "escrowed 10 x 9, plus the listing fee"
@@ -10683,7 +11438,7 @@ mod tests {
         assert_eq!((trades[0].unit_price, trades[0].qty), (9, 4), "paid the resting bid");
         assert_eq!(
             db.character_gold(&sid).await.unwrap(),
-            seller_gold + 36 - mmo::world::sale_tax(36) - mmo::world::listing_fee(6 * 4),
+            seller_gold + 36 - test_market_cfg().sale_tax(36) - test_market_cfg().listing_fee(6 * 4),
             "paid the resting bid of 9 not their own 6, net of sale tax and their listing fee"
         );
         // The buyer's escrow covered it — no further charge beyond the fee.
@@ -10698,7 +11453,7 @@ mod tests {
         // other frames, which makes the assertion about frame ordering
         // instead of about the limiter.
         let flooder = format!("flood-{}", Uuid::new_v4().simple());
-        for i in 0..MARKET_COMMANDS_PER_MINUTE {
+        for i in 0..test_market_cfg().commands_per_minute {
             assert!(proxy.allow_market_command(&flooder), "command {i} is within the limit");
         }
         assert!(!proxy.allow_market_command(&flooder), "one past the limit is refused");
@@ -10816,7 +11571,7 @@ mod tests {
         assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 75);
         assert_eq!(
             db.character_gold(&sid).await.unwrap(),
-            seller_gold + 75 - mmo::world::sale_tax(75),
+            seller_gold + 75 - test_market_cfg().sale_tax(75),
             "seller paid the ask net of sale tax"
         );
         assert!(db.listing_by_id(&listing_id).await.unwrap().is_none(), "the listing is gone");
@@ -10861,7 +11616,7 @@ mod tests {
         )).await.unwrap();
         let h = recv_until(&mut buyer, "market.history").await;
         assert_eq!(h["item_id"].as_str().unwrap(), "wood");
-        assert_eq!(h["interval_secs"].as_i64(), Some(mmo::world::CANDLE_INTERVAL_SECS));
+        assert_eq!(h["interval_secs"].as_i64(), Some(test_market_cfg().candle_interval_secs));
         assert!(h["candles"].as_array().unwrap().is_empty(), "no trades yet, so no candles");
 
         // Trade for real.
@@ -10899,7 +11654,7 @@ mod tests {
         // The rollup is a background job on a slow cadence, so drive it
         // directly rather than waiting minutes for the timer.
         let now = now_secs();
-        db.roll_up_candles(mmo::world::CANDLE_INTERVAL_SECS, 0, now + 1).await.unwrap();
+        db.roll_up_candles(test_market_cfg().candle_interval_secs, 0, now + 1).await.unwrap();
 
         stand_at(&proxy, &bid_, 12800, 12800);
         buyer.send(Message::Text(
@@ -10919,7 +11674,7 @@ mod tests {
         assert_eq!(c["v"].as_i64(), Some(7), "volume is units traded");
         assert_eq!(c["n"].as_i64(), Some(1), "one fill");
         assert_eq!(
-            c["t"].as_i64().unwrap() % mmo::world::CANDLE_INTERVAL_SECS, 0,
+            c["t"].as_i64().unwrap() % test_market_cfg().candle_interval_secs, 0,
             "a bucket start is always a multiple of the interval"
         );
 

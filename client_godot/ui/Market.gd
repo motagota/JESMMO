@@ -38,12 +38,22 @@ var _body: VBoxContainer
 var _tabs: HBoxContainer
 var _section: Section = Section.COMMODITIES
 var _market_id := ""
+## The tuning in force at THIS market, as `market.opened` sent it (#152): fee
+## rates, price tick, order bounds, durations. Seeded with the shipped fallbacks
+## so the panel is never previewing from nothing, but the server's values replace
+## them on arrival — the rates are per-district config, so a hardcoded copy would
+## quote a fee this market doesn't charge.
+var _rules: Dictionary = Protocol.market_rules_default()
 var _gold := 0
 ## The warehouse at THIS market (#138) — rows as the server sent them, plus
 ## slot usage. Locked rows are shown but never offered a Withdraw button.
 var _warehouse: Array = []
 var _used_slots := 0
 var _total_slots := 0
+## Unpaid storage debt here (#155) — 0 unless an operator turned storage fees
+## on. Nonzero LOCKS the warehouse: deposits and withdrawals are refused. The
+## goods are still shown, because they are still there and still yours.
+var _arrears := 0
 ## Carried inventory, so the warehouse section can offer Deposit per item.
 var _inventory: Array = []
 ## Order book state (#139): which commodity we're watching, its aggregated
@@ -121,13 +131,41 @@ func show_panel(show: bool) -> void:
 	visible = show
 
 ## The server acked that we're at a real market and may trade (#137). The id is
-## the completed build order's own id — every later market command is scoped to
-## it, even though only the capital's market exists in v1.
-func set_market(market_id: String) -> void:
-	if _market_id == market_id:
+## the completed build order's own id, and every later market command is scoped
+## to it. Since #153 there are two markets, so this id genuinely changes as a
+## player walks between them.
+func set_market(market_id: String, rules: Dictionary = {}) -> void:
+	# The rules can change without the id doing so (a config edit and restart),
+	# and on arrival at a market with different rates the id changes too — so
+	# both are compared before deciding this is a no-op.
+	var next_rules: Dictionary = rules if not rules.is_empty() else Protocol.market_rules_default()
+	if _market_id == market_id and _rules == next_rules:
 		return
+	var moved := _market_id != market_id
 	_market_id = market_id
+	_rules = next_rules
+	# EVERY market-scoped thing on screen belongs to the market we just left.
+	# Warehouses, books, orders and listings are all per-market, so carrying
+	# them over would show a trader stock they do not have here and depth that
+	# isn't in this book — and they'd act on it. The server re-sends all of it
+	# on `market.open`; this is what stops the gap between arriving and being
+	# told from being a lie. (#153 — with one market this could never happen.)
+	if moved:
+		_warehouse = []
+		_used_slots = 0
+		_total_slots = _rule("warehouse_slots")
+		_asks = []
+		_bids = []
+		_orders = []
+		_listings = []
+		_history = []
+		_last_trade = ""
+		_last_fees = ""
 	_rebuild()
+
+## An int from the market's rules, falling back to the shipped default.
+func _rule(key: String) -> int:
+	return int(_rules.get(key, Protocol.market_rules_default().get(key, 0)))
 
 ## The purse, mirrored from `gold.update` (#145) — you can't judge a price
 ## without it, and every section needs it.
@@ -275,7 +313,7 @@ func _rebuild_listings() -> void:
 	note.modulate = Color(0.6, 0.6, 0.65)
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	note.custom_minimum_size = Vector2(380, 0)
-	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee(_form_price)
+	note.text = "Tools are priced one at a time because their wear differs. Set the price on the Commodities tab; listing costs %dg and isn't refunded." % Protocol.listing_fee_with(_rules, _form_price)
 	_body.add_child(note)
 
 func _duration_label() -> String:
@@ -283,10 +321,11 @@ func _duration_label() -> String:
 	return "%dh" % h if h < 24 else "%dd" % (h / 24)
 
 ## Your warehouse at this market (#138), straight from `warehouse.state`.
-func set_warehouse(items: Array, used: int, slots: int) -> void:
+func set_warehouse(items: Array, used: int, slots: int, arrears: int = 0) -> void:
 	_warehouse = items
 	_used_slots = used
 	_total_slots = slots
+	_arrears = arrears
 	_rebuild()
 
 ## Carried inventory, so the warehouse section knows what you could deposit.
@@ -350,6 +389,19 @@ func _rebuild_book() -> void:
 	var ask_txt := "—" if _asks.is_empty() else str(best_ask)
 	spread.text = "%s — best bid %s / best ask %s" % [_watching, bid_txt, ask_txt]
 	_body.add_child(spread)
+	# The provisioner's standing band (#154), stated rather than left to be
+	# inferred from a suspiciously large resting order. For a newcomer this is
+	# the single most useful thing to know about a commodity: what it can never
+	# be worth less than, and what nobody can corner it above.
+	var band: Dictionary = _rules.get("provisioner", {})
+	if band.has(_watching):
+		var b: Dictionary = band[_watching]
+		var note := Label.new()
+		note.add_theme_font_size_override("font_size", 11)
+		note.modulate = Color(0.65, 0.75, 0.65)
+		note.text = "  the market always buys at %dg and sells at %dg while it has stock" % [
+			int(b.get("floor", 0)), int(b.get("ceiling", 0))]
+		_body.add_child(note)
 	if _last_trade != "":
 		var tick := Label.new()
 		tick.add_theme_font_size_override("font_size", 11)
@@ -403,11 +455,11 @@ func _rebuild_book() -> void:
 	price_lbl.text = "price"
 	form.add_child(price_lbl)
 	_price_field = SpinBox.new()
-	_price_field.min_value = Protocol.PRICE_TICK_GOLD
+	_price_field.min_value = _rule("price_tick_gold")
 	_price_field.max_value = 100000
-	_price_field.step = Protocol.PRICE_TICK_GOLD
+	_price_field.step = _rule("price_tick_gold")
 	if _form_price <= 0:
-		_form_price = maxi(best_ask, Protocol.PRICE_TICK_GOLD)
+		_form_price = maxi(best_ask, _rule("price_tick_gold"))
 	_price_field.value = _form_price
 	_price_field.value_changed.connect(func(v): _form_price = int(v))
 	form.add_child(_price_field)
@@ -415,8 +467,8 @@ func _rebuild_book() -> void:
 	qty_lbl.text = "qty"
 	form.add_child(qty_lbl)
 	_qty_field = SpinBox.new()
-	_qty_field.min_value = Protocol.MIN_ORDER_QTY
-	_qty_field.max_value = Protocol.MAX_ORDER_QTY
+	_qty_field.min_value = _rule("min_order_qty")
+	_qty_field.max_value = _rule("max_order_qty")
 	_qty_field.value = _form_qty
 	_qty_field.value_changed.connect(func(v): _form_qty = int(v))
 	form.add_child(_qty_field)
@@ -427,10 +479,11 @@ func _rebuild_book() -> void:
 	form.add_child(for_lbl)
 	_duration_field = OptionButton.new()
 	_duration_field.focus_mode = Control.FOCUS_NONE
-	for i in range(Protocol.ORDER_DURATIONS_HOURS.size()):
-		var h: int = Protocol.ORDER_DURATIONS_HOURS[i]
+	var durations: Array = _rules.get("order_durations_hours", Protocol.ORDER_DURATIONS_HOURS)
+	for i in range(durations.size()):
+		var h: int = int(durations[i])
 		_duration_field.add_item("%dh" % h if h < 24 else "%dd" % (h / 24), h)
-		if h == (_form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS):
+		if h == _duration():
 			_duration_field.select(i)
 	_duration_field.item_selected.connect(func(i): _form_hours = _duration_field.get_item_id(i))
 	form.add_child(_duration_field)
@@ -454,8 +507,10 @@ func _rebuild_book() -> void:
 	hint.text = "Either side fills against the book first, then rests for whatever's left. A sell escrows goods from your warehouse here; a buy escrows gold. You always trade at the RESTING order's price, so crossing the spread keeps you the difference."
 	_body.add_child(hint)
 
-	# What this order will cost to place, before committing to it (#141). The
-	# server charges its own number; this is the same formula so the two agree.
+	# What this order will cost to place, before committing to it (#141). Same
+	# formula as the server, driven by the rates the server told us are in force
+	# HERE (#152) — the rates are per-district config now, so previewing from a
+	# hardcoded copy would quietly quote a fee this market doesn't charge.
 	var notional := _form_price * _form_qty
 	var cost := Label.new()
 	cost.add_theme_font_size_override("font_size", 11)
@@ -463,8 +518,8 @@ func _rebuild_book() -> void:
 	cost.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	cost.custom_minimum_size = Vector2(380, 0)
 	cost.text = "listing fee %dg (charged either way, not refunded if you cancel) · a full sale would be taxed %dg, netting %dg" % [
-		Protocol.listing_fee(notional), Protocol.sale_tax(notional),
-		notional - Protocol.sale_tax(notional)]
+		Protocol.listing_fee_with(_rules, notional), Protocol.sale_tax_with(_rules, notional),
+		notional - Protocol.sale_tax_with(_rules, notional)]
 	_body.add_child(cost)
 	if _last_fees != "":
 		var paid := Label.new()
@@ -502,9 +557,10 @@ func _rebuild_book() -> void:
 		row.add_child(cancel)
 		_body.add_child(row)
 
-## The selected rest duration, in hours.
+## The selected rest duration, in hours. Falls back to this market's own default
+## rather than a compile-time one (#152).
 func _duration() -> int:
-	return _form_hours if _form_hours > 0 else Protocol.DEFAULT_ORDER_HOURS
+	return _form_hours if _form_hours > 0 else _rule("default_order_hours")
 
 ## Which commodity's book is on screen — Main seeds its depth on market.open.
 func watching() -> String:
@@ -530,6 +586,17 @@ func _rebuild_warehouse() -> void:
 	head.modulate = Color(0.8, 0.85, 0.95)
 	head.text = "Held here — %d/%d slots" % [_used_slots, _total_slots]
 	_body.add_child(head)
+	# Storage arrears (#155). Stated as a state of the warehouse, with the goods
+	# still listed below it — the whole design intent is that a debt never costs
+	# you your items, so the UI must not read like they're gone or at risk.
+	if _arrears > 0:
+		var owed := Label.new()
+		owed.add_theme_font_size_override("font_size", 11)
+		owed.modulate = Color(0.95, 0.75, 0.45)
+		owed.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		owed.custom_minimum_size = Vector2(380, 0)
+		owed.text = "  You owe %dg storage here. Your goods are safe and stay yours — but deposits and withdrawals are locked until it's paid. Selling still works, and any gold you have goes to the debt automatically." % _arrears
+		_body.add_child(owed)
 
 	if _warehouse.is_empty():
 		var empty := Label.new()
@@ -551,7 +618,9 @@ func _rebuild_warehouse() -> void:
 			lbl.text += "   🔒 on sale"
 			lbl.modulate = Color(0.6, 0.6, 0.65)
 		row.add_child(lbl)
-		if not locked:
+		# No button while in arrears (#155) — the server refuses it anyway, and
+		# offering an action that will be rejected is worse than not offering it.
+		if not locked and _arrears <= 0:
 			var qty := int(it.get("qty", 0))
 			var btn := Button.new()
 			btn.text = "Withdraw"
@@ -581,8 +650,9 @@ func _rebuild_warehouse() -> void:
 		else:
 			lbl.text = "  %s  x%d" % [item_id, qty]
 		row.add_child(lbl)
-		var btn := Button.new()
-		btn.text = "Deposit"
-		btn.pressed.connect(func(): do_deposit.emit(item_id, qty))
-		row.add_child(btn)
+		if _arrears <= 0:
+			var btn := Button.new()
+			btn.text = "Deposit"
+			btn.pressed.connect(func(): do_deposit.emit(item_id, qty))
+			row.add_child(btn)
 		_body.add_child(row)

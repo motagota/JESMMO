@@ -350,14 +350,14 @@ func _wire_signals() -> void:
         if delta > 0:
             _hud.flash_gain("gold", delta))
     # Market (#137): the server confirmed we're at a real one and may trade.
-    _net.market_opened.connect(func(market_id, _x, _y):
-        _market.set_market(market_id)
+    _net.market_opened.connect(func(market_id, _x, _y, rules):
+        _market.set_market(market_id, rules)
         _net.send_market_book_request(_market.watching()) # seed the depth we're looking at
         _net.send_market_history_request(_market.watching()))
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
     # Warehouse (#138): custody of goods held at this market.
-    _net.warehouse_state.connect(func(_market_id, items, used, slots):
-        _market.set_warehouse(items, used, slots))
+    _net.warehouse_state.connect(func(_market_id, items, used, slots, arrears):
+        _market.set_warehouse(items, used, slots, arrears))
     _market.do_deposit.connect(func(item_id, qty): _net.send_warehouse_deposit(item_id, qty))
     _market.do_withdraw.connect(func(item_id, qty): _net.send_warehouse_withdraw(item_id, qty))
     # Order book (#139).
