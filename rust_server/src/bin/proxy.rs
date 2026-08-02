@@ -8059,21 +8059,29 @@ mod tests {
         let (pid, bounds) = registered_with_plot(&proxy, &mut zone, &mut ws, "Smith").await;
         let (bx, by) = (bounds["x"].as_i64().unwrap() as i32, bounds["y"].as_i64().unwrap() as i32);
 
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "gather_yield", "player_id": pid,
-            "item_id": "wood", "qty": 2, "skill": "gathering", "xp": 1,
-        }).to_string())).unwrap();
-        zone.to_proxy.send(Message::Text(json!({
-            "type": "gather_yield", "player_id": pid,
-            "item_id": "stone", "qty": 3, "skill": "gathering", "xp": 1,
-        }).to_string())).unwrap();
-        let (mut saw_wood, mut saw_stone) = (false, false);
-        while !(saw_wood && saw_stone) {
+        // Stock exactly what the recipe asks for, read from the registry — a
+        // balance pass (#129) retunes the costs without turning this test into a
+        // false failure about ingredient amounts it isn't testing.
+        let recipe = mmo::world::recipes()
+            .into_iter()
+            .find(|r| r.output_item == "pickaxe")
+            .expect("the pickaxe recipe");
+        for (item, qty) in recipe.inputs {
+            zone.to_proxy.send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+            }).to_string())).unwrap();
+        }
+        loop {
             let v = recv_frame(&mut ws).await.expect("expected the stocking pushes");
             if v["type"] == "inv.update" {
                 let items = v["items"].as_array().cloned().unwrap_or_default();
-                saw_wood = items.iter().any(|it| it["item_id"] == "wood" && it["qty"] == 2);
-                saw_stone = items.iter().any(|it| it["item_id"] == "stone" && it["qty"] == 3);
+                let stocked = recipe.inputs.iter().all(|(item, qty)| {
+                    items.iter().any(|it| it["item_id"] == *item && it["qty"] == *qty)
+                });
+                if stocked {
+                    break;
+                }
             }
         }
 
@@ -8139,8 +8147,9 @@ mod tests {
                     saw_inv = true;
                     let items = frame["items"].as_array().unwrap();
                     let pick = items.iter().find(|i| i["item_id"] == "pickaxe").expect("granted pickaxe");
-                    assert_eq!(pick["durability"], 50, "fresh instance starts at max durability");
-                    assert_eq!(pick["max_durability"], 50);
+                    let fresh = mmo::world::tool_max_durability("pickaxe").unwrap();
+                    assert_eq!(pick["durability"], fresh, "fresh instance starts at max durability");
+                    assert_eq!(pick["max_durability"], fresh);
                     instance_id = pick["id"].as_str().unwrap().to_string();
                 }
                 Some("skill.update") => saw_skill = true,
@@ -8153,12 +8162,21 @@ mod tests {
             .unwrap();
         let update = recv_until(&mut ws, "equip.update").await;
         assert_eq!(update["tool"], "pickaxe");
-        assert_eq!(update["durability"], 50);
-        assert_eq!(update["max_durability"], 50);
+        let fresh = mmo::world::tool_max_durability("pickaxe").unwrap();
+        assert_eq!(update["durability"], fresh);
+        assert_eq!(update["max_durability"], fresh);
         let abilities = update["abilities"].as_array().unwrap();
         assert_eq!(abilities.len(), 1);
         assert_eq!(abilities[0]["id"], "pick");
-        assert_eq!(abilities[0]["cooldown_ms"], 2000 - 80 * 5, "level 5 shaves the swing cooldown");
+        assert_eq!(
+            abilities[0]["cooldown_ms"],
+            mmo::world::ability_cooldown_ms("pick", 5),
+            "level 5 shaves the swing cooldown"
+        );
+        assert!(
+            mmo::world::ability_cooldown_ms("pick", 5) < mmo::world::ability_cooldown_ms("pick", 0),
+            "and levelling must actually make it faster"
+        );
 
         // Unequip clears the slot and the granted abilities with it.
         ws.send(Message::Text(json!({"type": "unequip"}).to_string())).await.unwrap();
@@ -8191,8 +8209,8 @@ mod tests {
     /// swing sends it) drives `apply_gather_yield`'s wear-down, which pushes
     /// both an `inv.update` showing the broken husk and an `equip.update`
     /// with the ability gone. Wears it down directly against the shared DB
-    /// first (49 of 50) so the test doesn't need 50 real round trips — only
-    /// the LAST, breaking swing goes through the real wire.
+    /// first (all but one) so the test doesn't need a full tool's worth of real
+    /// round trips — only the LAST, breaking swing goes through the real wire.
     #[tokio::test]
     async fn a_tool_swing_wears_it_down_and_breaking_auto_unequips() {
         let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
@@ -8228,14 +8246,17 @@ mod tests {
             }
         }
 
-        // 49 direct wears (bypassing the wire — this is gateway-side plumbing,
-        // not re-proving the swing pipeline the earlier ability tests cover).
-        for _ in 0..49 {
+        // All-but-one direct wears (bypassing the wire — this is gateway-side
+        // plumbing, not re-proving the swing pipeline the earlier ability tests
+        // cover). Count derived from the registry so a balance pass can retune
+        // durability without breaking this.
+        let fresh = mmo::world::tool_max_durability("pickaxe").unwrap();
+        for _ in 0..(fresh - 1) {
             db.wear_equipped_tool(&pid, "tool", 1).await.unwrap();
         }
         assert_eq!(db.equipped(&pid, "tool").await.unwrap().as_deref(), Some("pickaxe"), "not broken yet");
 
-        // The 50th, breaking swing — through the real internal message a
+        // The last, breaking swing — through the real internal message a
         // zone's apply_ability_swing actually sends.
         zone.to_proxy.send(Message::Text(json!({
             "type": "gather_yield", "player_id": pid,
@@ -8288,14 +8309,22 @@ mod tests {
         let instance_id = db.inventory_for_character(&pid).await.unwrap()
             .into_iter().find(|i| i.item_id == "pickaxe").unwrap().id;
         db.equip_instance(&pid, &instance_id).await.unwrap();
-        for _ in 0..38 {
+        // Wear and cost both derived from the registry, so a balance pass
+        // (#129) retunes durability and recipes without turning this into a
+        // false failure about numbers it isn't testing.
+        let fresh = mmo::world::tool_max_durability("pickaxe").unwrap();
+        let missing = fresh * 2 / 3;
+        for _ in 0..missing {
             db.wear_equipped_tool(&pid, "tool", 1).await.unwrap();
         }
-        db.add_to_inventory(&pid, "wood", 2).await.unwrap();
-        db.add_to_inventory(&pid, "stone", 3).await.unwrap();
+        let cost = mmo::world::repair_cost("pickaxe", missing, fresh).unwrap();
+        for (item, qty) in &cost {
+            db.add_to_inventory(&pid, item, *qty).await.unwrap();
+        }
+        let want_wood = cost.iter().find(|(i, _)| *i == "wood").map(|(_, q)| *q).unwrap_or(0);
         while recv_frame(&mut ws).await.is_some() {
             // drain hydration/setup housekeeping — nothing here is asserted on.
-            if db.inventory_qty(&pid, "wood").await.unwrap() == 2 { break; }
+            if db.inventory_qty(&pid, "wood").await.unwrap() == want_wood { break; }
         }
 
         ws.send(Message::Text(json!({"type": "repair", "instance_id": instance_id}).to_string()))
@@ -8303,13 +8332,14 @@ mod tests {
             .unwrap();
         let done = recv_until(&mut ws, "repair.done").await;
         assert_eq!(done["item_id"], "pickaxe");
-        assert_eq!(done["cost"]["wood"], 2);
-        assert_eq!(done["cost"]["stone"], 3);
+        for (item, qty) in &cost {
+            assert_eq!(done["cost"][item], *qty, "repair cost for {item}");
+        }
         assert_eq!(db.inventory_qty(&pid, "wood").await.unwrap(), 0);
         assert_eq!(db.inventory_qty(&pid, "stone").await.unwrap(), 0);
         let repaired = db.inventory_for_character(&pid).await.unwrap()
             .into_iter().find(|i| i.id == instance_id).unwrap();
-        assert_eq!(repaired.durability, Some(50));
+        assert_eq!(repaired.durability, Some(fresh));
 
         drop(ws);
     }
@@ -11508,6 +11538,9 @@ listing_fee_min_gold = 4
             .find(|i| i["item_id"] == "pickaxe").unwrap()["id"].as_str().unwrap().to_string();
         db.equip_instance(&sid, &instance).await.unwrap();
         db.wear_equipped_tool(&sid, "tool", 8).await.unwrap();
+        // Derived, so a durability retune (#129) doesn't fail a test about
+        // instance identity surviving a sale.
+        let worn = mmo::world::tool_max_durability("pickaxe").unwrap() - 8;
 
         // Bank it, then list it.
         stand_at(&proxy, &sid, 12800, 12800);
@@ -11521,7 +11554,7 @@ listing_fee_min_gold = 4
             }
         };
         let wh_id = state["items"].as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
-        assert_eq!(state["items"].as_array().unwrap()[0]["durability"].as_i64(), Some(42));
+        assert_eq!(state["items"].as_array().unwrap()[0]["durability"].as_i64(), Some(worn));
 
         stand_at(&proxy, &sid, 12800, 12800);
         seller.send(Message::Text(json!({
@@ -11536,7 +11569,7 @@ listing_fee_min_gold = 4
         };
         let listed = &page["listings"].as_array().unwrap()[0];
         assert_eq!(listed["ask_price"].as_i64(), Some(75));
-        assert_eq!(listed["durability"].as_i64(), Some(42), "the board advertises real wear");
+        assert_eq!(listed["durability"].as_i64(), Some(worn), "the board advertises real wear");
         assert_eq!(listed["mine"].as_bool(), Some(true));
         let listing_id = listed["listing_id"].as_str().unwrap().to_string();
 
@@ -11566,7 +11599,7 @@ listing_fee_min_gold = 4
         }
         assert_eq!(held.len(), 1, "the buyer received it");
         assert_eq!(held[0].id, wh_id, "the SAME instance that was advertised");
-        assert_eq!(held[0].durability, Some(42), "with its wear intact");
+        assert_eq!(held[0].durability, Some(worn), "with its wear intact");
         assert_eq!(held[0].state, "available", "and collectable");
         assert_eq!(db.character_gold(&bid_).await.unwrap(), buyer_gold - 75);
         assert_eq!(

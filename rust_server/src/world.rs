@@ -206,12 +206,17 @@ pub fn recipes() -> Vec<Recipe> {
             id: "tool_kit", name: "Tool Kit", inputs: &[("wood", 1), ("stone", 1)],
             output_item: "tool_kit", output_qty: 1,
         },
+        // Tool costs were raised by the #129 balance pass so that upkeep is a
+        // real share of what a tool gathers (~27% for the pickaxe, ~17% for the
+        // axe) rather than the old ~8%. The pickaxe stays the dearer of the two
+        // deliberately: mining is the high-effort track, and it is priced in the
+        // resource it produces so a miner funds their own upkeep.
         Recipe {
-            id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 2), ("stone", 3)],
+            id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 3), ("stone", 5)],
             output_item: "pickaxe", output_qty: 1,
         },
         Recipe {
-            id: "axe", name: "Axe", inputs: &[("wood", 2), ("stone", 1)],
+            id: "axe", name: "Axe", inputs: &[("wood", 3), ("stone", 2)],
             output_item: "axe", output_qty: 1,
         },
     ]
@@ -356,15 +361,29 @@ pub fn ability_target_item(ability_id: &str) -> Option<&'static str> {
 }
 
 /// An ability's swing/use cooldown (ms) at a given level of its governing
-/// skill (0 if ungoverned or the wielder hasn't trained it). Each ability
-/// hardcodes its own curve — Chop mirrors Pick's for now, a starting point
-/// for the balance-pass backlog item, not a claim they must stay identical
-/// forever — but this is the single place both the gateway (enforcement)
-/// and `equip.update` (display) compute it, so they can never disagree.
+/// skill (0 if ungoverned or the wielder hasn't trained it).
+///
+/// Each ability owns its curve, and since the #129 balance pass they DIVERGE.
+/// This is the single place both the gateway (enforcement) and `equip.update`
+/// (display) compute it, so the two can never disagree.
+///
+/// **Chop is the accessible track, Pick the high-effort one.** Woodcutting is
+/// where a new player starts — the foreman is a short walk from spawn and the
+/// trees ring the town centre — so it swings faster at every level. Mining
+/// means a trek to the Mt Coot-tha quarry for a resource that costs more to
+/// tool up for, so it swings slower and pays out in the scarcer good.
+///
+/// Both reach their floor around level 7 (~409 swings, ~9 minutes of swinging)
+/// rather than the old level 10 / 834 swings / ~21 minutes. The old curve's
+/// payoff sat beyond a single session, which is a long time to wait to feel a
+/// skill improve; the steeper slope puts it inside one.
 pub fn ability_cooldown_ms(ability_id: &str, skill_level: i64) -> i64 {
     match ability_id {
-        // 2000ms at level 0, -80ms per level, floors at 1200ms (~level 10+).
-        "pick" | "chop" => (2000 - 80 * skill_level).max(1200),
+        // 1800ms at level 0, -120ms per level, floors at 1000ms (level 7+).
+        "chop" => (1800 - 120 * skill_level).max(1000),
+        // Slower at every level than Chop, and floors higher: mining is the
+        // deliberate high-effort track (#129).
+        "pick" => (2200 - 120 * skill_level).max(1300),
         _ => 1000,
     }
 }
@@ -386,10 +405,16 @@ pub fn ability_xp_per_swing(ability_id: &str) -> i64 {
 /// Max durability (swings before it breaks) for an equippable tool, or
 /// `None` for anything that isn't one — also doubles as "is this item
 /// instanced rather than stacked" (see `persistence::add_inventory_in_tx`).
-/// A placeholder number for now; #129's balance pass owns the real curve.
+///
+/// Cut from 50 to 30 by the #129 balance pass, together with a rise in recipe
+/// costs. At 50 durability a tool returned ~92% profit over its life and paid
+/// back its own-resource cost in 3 of 50 swings — durability existed
+/// mechanically (#128) but had no economic weight at all. Upkeep is now roughly
+/// a quarter of what a tool gathers, which makes replacing one a decision and
+/// gives the crafting loop and the market something real to trade.
 pub fn tool_max_durability(item_id: &str) -> Option<i64> {
     match item_id {
-        "pickaxe" | "axe" => Some(50),
+        "pickaxe" | "axe" => Some(30),
         _ => None,
     }
 }
@@ -406,25 +431,40 @@ pub fn governing_tool(ability_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Repair cost for a tool missing `missing` of its `max` durability:
-/// `ceil(missing / 10)` "repair units" out of `ceil(max / 10)` total units,
-/// applied proportionally to each of the tool's craft-recipe ingredients
-/// (minimum 1 of each so a nearly-full repair is never free). `None` if
+/// Repair cost for a tool missing `missing` of its `max` durability: each of
+/// the craft recipe's ingredients, scaled by the fraction worn away and rounded
+/// up, with a minimum of 1 of each so a token repair is never free. `None` if
 /// `item_id` has no matching recipe (shouldn't happen for a real tool) or
 /// nothing is actually missing.
+///
+/// **Repair is always cheaper than crafting new, right up until the tool is
+/// entirely spent.** It used to bucket `missing` into 10-durability chunks,
+/// which made the cost saturate at the full recipe from 40/50 worn onward — so
+/// repairing was strictly pointless exactly when a tool most needed it, and the
+/// top half of the curve was dead. Scaling directly on `missing / max` is both
+/// simpler and monotone: it only reaches the full craft cost at 100% worn,
+/// which is the one point where "just make a new one" is genuinely the same
+/// deal. That matters more since #129 made upkeep a real cost — repair is the
+/// decision the wear system is supposed to pose, and a dominated option is not
+/// a decision.
 pub fn repair_cost(item_id: &str, missing: i64, max: i64) -> Option<Vec<(&'static str, i64)>> {
     if missing <= 0 || max <= 0 {
         return None;
     }
     let recipe = recipes().into_iter().find(|r| r.output_item == item_id)?;
-    let total_units = (max + 9) / 10; // ceil(max / 10), >= 1 since max > 0
-    let repair_units = ((missing + 9) / 10).min(total_units); // ceil(missing / 10), capped
+    let worn = missing.min(max);
     Some(
         recipe
             .inputs
             .iter()
             .map(|(ingredient, full_qty)| {
-                let cost = ((full_qty * repair_units) + total_units - 1) / total_units; // ceil
+                // Rounds DOWN, floored at 1. Down rather than up is what makes
+                // "repair beats a fresh craft" provable rather than merely
+                // usually-true: `floor(q * worn / max) < q` for every `worn <
+                // max`, so every ingredient — and therefore the total — is
+                // strictly under the full recipe until the tool is completely
+                // spent, at which point it lands exactly on it.
+                let cost = (full_qty * worn) / max;
                 (*ingredient, cost.max(1))
             })
             .collect(),
@@ -1493,21 +1533,206 @@ mod tests {
 
     // --- Tool durability & repair (mining/abilities epic #123 backlog, #128) ------
 
+    // --- balance model (#129) ------------------------------------------------
+    //
+    // These pin the DERIVED consequences of the tuning constants, not the
+    // constants themselves. Anyone can change a number; the point of this block
+    // is that changing one immediately shows what it did to the loop, in the
+    // units the design actually cares about — how much of a tool's yield goes on
+    // upkeep, how long until a skill stops improving, whether repairing is worth
+    // it. Rediscovering those by hand was the expensive part of #129.
+    //
+    // A failure here is not necessarily a bug. It means a tuning change moved
+    // something the balance pass deliberately chose, and the new numbers need a
+    // decision rather than a rubber stamp.
+
+    /// One tool's whole life, in the terms the design cares about.
+    fn tool_economics(tool: &str) -> (i64, i64, i64, f64) {
+        let max = tool_max_durability(tool).expect("a tool");
+        let recipe = recipes().into_iter().find(|r| r.output_item == tool).expect("a recipe");
+        let cost: i64 = recipe.inputs.iter().map(|(_, q)| *q).sum();
+        // One unit harvested per swing, so a tool's lifetime yield is its
+        // durability.
+        (max, cost, max - cost, cost as f64 / max as f64)
+    }
+
+    /// Upkeep is a real share of what a tool gathers. Before #129 it was ~8% —
+    /// durability existed mechanically (#128) but had no economic weight, and a
+    /// free replacement was available from an NPC anyway. Tools should be a
+    /// running cost, not a rounding error.
+    #[test]
+    fn tool_upkeep_is_a_real_share_of_what_it_gathers() {
+        for tool in ["pickaxe", "axe"] {
+            let (durability, cost, net, share) = tool_economics(tool);
+            assert!(
+                (0.12..0.40).contains(&share),
+                "{tool}: upkeep is {:.0}% of its {durability}-swing yield ({cost} units) — \
+                 outside the 12-40% band #129 chose. Under it, wear is a rounding error; \
+                 over it, gathering stops paying for itself.",
+                share * 100.0
+            );
+            assert!(net > 0, "{tool} costs more than it can ever gather — the loop is broken");
+        }
+
+        // Mining is deliberately the dearer track (#129), and is priced in the
+        // resource it produces so a miner funds their own upkeep.
+        let (_, pick_cost, _, pick_share) = tool_economics("pickaxe");
+        let (_, axe_cost, _, axe_share) = tool_economics("axe");
+        assert!(
+            pick_cost > axe_cost && pick_share > axe_share,
+            "the pickaxe should cost more than the axe — mining is the high-effort track"
+        );
+    }
+
+    /// A tool must pay for itself out of the resource it harvests, or the
+    /// gathering loop needs an external subsidy to run at all.
+    #[test]
+    fn each_tool_funds_itself_from_what_it_harvests() {
+        for (tool, ability) in [("pickaxe", "pick"), ("axe", "chop")] {
+            let harvested = ability_target_item(ability).expect("a harvest target");
+            let max = tool_max_durability(tool).unwrap();
+            let recipe = recipes().into_iter().find(|r| r.output_item == tool).unwrap();
+            let own: i64 = recipe
+                .inputs
+                .iter()
+                .filter(|(i, _)| *i == harvested)
+                .map(|(_, q)| *q)
+                .sum();
+            assert!(own > 0, "{tool} doesn't cost any of the {harvested} it harvests");
+            assert!(
+                own < max,
+                "{tool} costs {own} {harvested} but only harvests {max} — it can't fund itself"
+            );
+        }
+    }
+
+    /// Both curves reach their floor inside a single session. The old shared
+    /// curve took 834 swings (~21 minutes of uninterrupted swinging) to stop
+    /// improving, which is a long time to wait to feel a skill get better.
+    #[test]
+    fn a_skill_reaches_its_cooldown_floor_inside_one_session() {
+        for ability in ["pick", "chop"] {
+            let floor = ability_cooldown_ms(ability, 100);
+            let floor_level = (0..=40)
+                .find(|l| ability_cooldown_ms(ability, *l) == floor)
+                .expect("the curve must reach its floor");
+            assert!(
+                (5..=8).contains(&floor_level),
+                "{ability} floors at level {floor_level}; #129 targeted ~7 so the payoff lands \
+                 inside one session"
+            );
+
+            // Swings to get there, and the wall-clock they take.
+            let xp_needed = 100 * floor_level * floor_level;
+            let per_swing = ability_xp_per_swing(ability);
+            let mut xp = 0i64;
+            let mut swings = 0i64;
+            let mut ms = 0i64;
+            while xp < xp_needed {
+                ms += ability_cooldown_ms(ability, crate::persistence::level_for_xp(xp));
+                xp += per_swing;
+                swings += 1;
+            }
+            let minutes = ms as f64 / 60_000.0;
+            assert!(
+                (4.0..15.0).contains(&minutes),
+                "{ability} takes {minutes:.1} min ({swings} swings) to stop improving — \
+                 outside the single-session window #129 chose"
+            );
+        }
+    }
+
+    /// Chop is the accessible track and Pick the high-effort one (#129), so
+    /// Chop swings faster at every level. Before the balance pass the two were
+    /// literally the same curve.
+    #[test]
+    fn chop_is_faster_than_pick_at_every_level() {
+        for level in 0..=20 {
+            let chop = ability_cooldown_ms("chop", level);
+            let pick = ability_cooldown_ms("pick", level);
+            assert!(
+                chop < pick,
+                "at level {level} chop is {chop}ms and pick {pick}ms — mining should be slower"
+            );
+        }
+        // And both improve monotonically, never getting worse with practice.
+        for ability in ["pick", "chop"] {
+            for level in 1..=20 {
+                assert!(
+                    ability_cooldown_ms(ability, level) <= ability_cooldown_ms(ability, level - 1),
+                    "{ability} got SLOWER from level {} to {level}",
+                    level - 1
+                );
+            }
+        }
+    }
+
+    /// Repairing must beat crafting new at every wear level short of totally
+    /// spent, or the wear system poses no decision at all. It used to saturate
+    /// at the full recipe from 40/50 worn onward, so the top half of the curve
+    /// was dominated and dead.
+    #[test]
+    fn repairing_always_beats_crafting_new_until_the_tool_is_spent() {
+        for tool in ["pickaxe", "axe"] {
+            let max = tool_max_durability(tool).unwrap();
+            let recipe = recipes().into_iter().find(|r| r.output_item == tool).unwrap();
+            let full: i64 = recipe.inputs.iter().map(|(_, q)| *q).sum();
+
+            let mut last = 0i64;
+            for missing in 1..max {
+                let cost: i64 =
+                    repair_cost(tool, missing, max).unwrap().iter().map(|(_, q)| *q).sum();
+                assert!(
+                    cost < full,
+                    "{tool} missing {missing}/{max} costs {cost} to repair vs {full} to craft \
+                     new — repair is dominated and nobody would ever choose it"
+                );
+                assert!(
+                    cost >= last,
+                    "{tool} repair got CHEAPER as it wore further ({last} -> {cost})"
+                );
+                last = cost;
+            }
+            // Entirely spent is the one point where rebuilding is the same deal.
+            let spent: i64 = repair_cost(tool, max, max).unwrap().iter().map(|(_, q)| *q).sum();
+            assert_eq!(spent, full, "a fully spent {tool} should cost exactly a fresh craft");
+        }
+    }
+
+    /// A swing is worth more than the old multi-tick channel's per-unit rate,
+    /// and both abilities pay the same for the same effort — the divergence
+    /// #129 chose is in SPEED and TOOL COST, not in xp.
+    #[test]
+    fn both_abilities_pay_the_same_xp_per_swing() {
+        assert_eq!(ability_xp_per_swing("pick"), ability_xp_per_swing("chop"));
+        assert!(
+            ability_xp_per_swing("pick") >= 10,
+            "a swing should be worth at least the old channel's 10/unit"
+        );
+    }
+
     #[test]
     fn repair_cost_scales_with_missing_durability_and_floors_at_one() {
-        // Pickaxe: 2 wood + 3 stone, max 50 -> 5 total units (ceil(50/10)).
-        assert_eq!(repair_cost("pickaxe", 0, 50), None, "nothing missing -> nothing to repair");
-        // Missing 10 -> 1 unit/5 -> wood ceil(2/5)=1, stone ceil(3/5)=1.
-        assert_eq!(repair_cost("pickaxe", 10, 50), Some(vec![("wood", 1), ("stone", 1)]));
-        // Missing 38 -> 4 units/5 -> wood ceil(8/5)=2, stone ceil(12/5)=3.
-        assert_eq!(repair_cost("pickaxe", 38, 50), Some(vec![("wood", 2), ("stone", 3)]));
-        // Fully broken -> the full recipe (never less than crafting fresh).
-        assert_eq!(repair_cost("pickaxe", 50, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // Pickaxe since #129: 3 wood + 5 stone, max durability 30. Cost is each
+        // ingredient scaled by the fraction worn away, rounded DOWN, floored at
+        // 1 so a token repair is never free.
+        let max = tool_max_durability("pickaxe").unwrap();
+        assert_eq!(repair_cost("pickaxe", 0, max), None, "nothing missing -> nothing to repair");
+        // Barely worn: the floor, not the proportion (3*1/30 and 5*1/30 are 0).
+        assert_eq!(repair_cost("pickaxe", 1, max), Some(vec![("wood", 1), ("stone", 1)]));
+        // A third worn: wood 3*10/30 = 1, stone 5*10/30 = 1.
+        assert_eq!(repair_cost("pickaxe", 10, max), Some(vec![("wood", 1), ("stone", 1)]));
+        // Two thirds: wood 3*20/30 = 2, stone 5*20/30 = 3.
+        assert_eq!(repair_cost("pickaxe", 20, max), Some(vec![("wood", 2), ("stone", 3)]));
+        // Nearly spent, and still strictly cheaper than the 8-unit fresh craft.
+        assert_eq!(repair_cost("pickaxe", 29, max), Some(vec![("wood", 2), ("stone", 4)]));
+        // Entirely spent -> exactly the full recipe, never more.
+        assert_eq!(repair_cost("pickaxe", max, max), Some(vec![("wood", 3), ("stone", 5)]));
         // Missing far more than max (shouldn't happen, but must not go
-        // negative/overflow) clamps to the same as fully broken.
-        assert_eq!(repair_cost("pickaxe", 999, 50), Some(vec![("wood", 2), ("stone", 3)]));
+        // negative/overflow) clamps to the same as fully spent.
+        assert_eq!(repair_cost("pickaxe", 999, max), Some(vec![("wood", 3), ("stone", 5)]));
         // Not a real tool/recipe -> None, not a panic.
-        assert_eq!(repair_cost("wood", 5, 50), None);
+        assert_eq!(repair_cost("wood", 5, max), None);
     }
 
     #[test]
