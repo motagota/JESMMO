@@ -3684,6 +3684,20 @@ impl Db {
         Ok(result)
     }
 
+    /// Whether any build order of this `kind` has been completed, anywhere in
+    /// the world. Used by seeding to decide whether a newly-authored dependent's
+    /// prerequisite is already satisfied — deliberately world-wide rather than
+    /// per-district, because a prereq names a KIND, not a place.
+    pub async fn is_build_kind_completed(&self, kind: &str) -> Result<bool, DbError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM build_order WHERE kind = ? AND state = 'completed'",
+        )
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
+
     /// Unlock a `locked` build order (a tech-tree dependent) by flipping it to `open`.
     /// Idempotent: returns the now-open order, or `None` if there was no locked order
     /// of that `(district, kind)` (already open/completed, or absent).
@@ -4002,7 +4016,21 @@ impl Db {
             if !existing.iter().any(|b| b.kind == o.kind) {
                 // Root orders (no prereq) open at boot; tech-tree dependents seed
                 // `locked` and are opened when their prerequisite completes.
-                let state = if o.prereq.is_none() { "open" } else { "locked" };
+                //
+                // ...UNLESS that prerequisite is ALREADY complete. The unlock
+                // fires on the completion *event* (`build.completed` walks the
+                // authored dependents), so an order added to a world that
+                // finished its prerequisite before this order existed would seed
+                // `locked` and stay that way forever, with nothing left to
+                // trigger it. That is not hypothetical: the second market (#153)
+                // was authored into worlds whose capital market was already
+                // built. Seeding is the only place with the whole picture, so it
+                // resolves the edge here rather than leaving dead content.
+                let prereq_done = match o.prereq {
+                    None => true,
+                    Some(kind) => self.is_build_kind_completed(kind).await?,
+                };
+                let state = if prereq_done { "open" } else { "locked" };
                 let placement = Some(BuildPlacement {
                     structure_kind: o.structure_kind.to_string(),
                     x: o.structure_x as i64,
@@ -5028,6 +5056,17 @@ mod tests {
             .id
     }
 
+    /// A second market, in the Market District (#153). Distinct `market_id`,
+    /// which is the only thing separating the two — so these tests are exactly
+    /// the ones that decide whether the keying that has existed since #137 is
+    /// real or merely untested.
+    async fn another_market(db: &Db) -> String {
+        db.insert_build_order("market", "market_east", r#"{"wood":1}"#, "completed", 0, None, 0, None, None)
+            .await
+            .unwrap()
+            .id
+    }
+
     /// #139-shaped shims over #140's unified `place_order`, so the tests that
     /// pinned the original sell-rests / buy-crosses behaviour keep guarding it
     /// verbatim. `NO_EXPIRY` keeps them out of the sweep's way.
@@ -5972,6 +6011,308 @@ mod tests {
 
     /// The epic's headline invariant (#136 §12) over the whole trading loop:
     /// across sells, buys and cancels, goods and gold are both conserved. This
+    /// Two markets, one commodity, two books. Every market table has been keyed
+    /// by `market_id` since #137, but until #153 that keying had only ever been
+    /// exercised with a single market — and untested generality is not
+    /// generality. This is where it either holds or turns out to have had a
+    /// hardcoded assumption in it all along.
+    #[tokio::test]
+    async fn two_markets_keep_separate_books() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+        assert_ne!(a, b);
+
+        // A seller stocked and resting at A only.
+        let sa = a_seller(&db, &a, "wood", 30).await;
+        sell(&db, &a, &sa, "wood", 9, 10).await;
+        let sa_gold = db.character_gold(&sa).await.unwrap();
+
+        // A's book has depth; B's is empty. If any query fetched "the" book
+        // rather than this market's, B would be showing A's asks.
+        assert_eq!(db.book_for(&a, "wood", "sell").await.unwrap().len(), 1);
+        assert!(
+            db.book_for(&b, "wood", "sell").await.unwrap().is_empty(),
+            "market B is showing market A's asks"
+        );
+
+        // A buy at B that WOULD cross A's ask must not match it — it rests,
+        // because there is nothing here to trade with.
+        let buyer = a_character(&db).await;
+        let out = buy(&db, &b, &buyer, "wood", 20, 10).await;
+        assert_eq!(out.filled, 0, "a bid at B matched an ask at A");
+        assert!(out.resting_order_id.is_some(), "it should rest at B instead");
+        assert_eq!(
+            db.book_for(&a, "wood", "sell").await.unwrap()[0].qty, 10,
+            "A's ask was consumed by a trade at B"
+        );
+        assert_eq!(
+            db.character_gold(&sa).await.unwrap(), sa_gold,
+            "A's seller was paid for a trade that happened at B"
+        );
+
+        // The same bid at A does cross, so the setup was genuinely tradable.
+        let out = buy(&db, &a, &buyer, "wood", 20, 10).await;
+        assert_eq!(out.filled, 10, "the same bid at A should sweep A's ask");
+    }
+
+    /// Warehouses are per-market, and that is the whole gameplay of #153:
+    /// deposited stock does not follow a player, so moving goods between markets
+    /// means CARRYING them. If stock were visible at both, the haul — and the
+    /// arbitrage it exists to create — would evaporate.
+    #[tokio::test]
+    async fn warehouse_stock_does_not_follow_a_player_between_markets() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+        let who = a_character(&db).await;
+
+        db.add_to_inventory(&who, "wood", 20).await.unwrap();
+        db.warehouse_deposit(&a, &who, "wood", 20, 60).await.unwrap();
+
+        assert_eq!(
+            db.warehouse_for_character(&a, &who).await.unwrap().iter().map(|r| r.qty).sum::<i64>(),
+            20
+        );
+        assert!(
+            db.warehouse_for_character(&b, &who).await.unwrap().is_empty(),
+            "stock deposited at A is visible at B — the haul would be meaningless"
+        );
+
+        // Can't sell at B what is stored at A: there is nothing here to escrow.
+        let out = sell(&db, &b, &who, "wood", 9, 20).await;
+        assert_eq!(out.resting_order_id, None, "sold stock that is held at another market");
+
+        // The full haul: withdraw at A, carry, deposit at B — and now it sells.
+        assert_eq!(db.warehouse_withdraw(&a, &who, "wood", 20).await.unwrap(), 20);
+        assert_eq!(qty_of(&db.inventory_for_character(&who).await.unwrap(), "wood"), 20);
+        db.warehouse_deposit(&b, &who, "wood", 20, 60).await.unwrap();
+        let out = sell(&db, &b, &who, "wood", 9, 20).await;
+        assert!(out.resting_order_id.is_some(), "the hauled goods should be sellable at B");
+        assert!(
+            db.warehouse_for_character(&a, &who).await.unwrap().is_empty(),
+            "the goods should have LEFT A"
+        );
+    }
+
+    /// A bid at one market above an ask at another is NOT a crossed book — it is
+    /// precisely the arbitrage #153 exists to create, and the boot invariant has
+    /// to say so. `book_health` panics the gateway on any violation, so a false
+    /// positive here would mean a server that refuses to start *because* the
+    /// feature is working.
+    #[tokio::test]
+    async fn a_bid_at_one_market_above_an_ask_at_another_is_not_a_crossed_book() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+
+        let seller = a_seller(&db, &b, "wood", 20).await;
+        sell(&db, &b, &seller, "wood", 5, 10).await; // cheap ask, remote market
+        let buyer = a_character(&db).await;
+        buy(&db, &a, &buyer, "wood", 12, 10).await; // rich bid, capital
+
+        let problems = db.book_health().await.unwrap();
+        assert!(
+            problems.is_empty(),
+            "cross-market price divergence reported as a fault: {problems:?}"
+        );
+
+        // Negative control: the check must not have simply stopped looking. A
+        // genuine same-market cross CANNOT be produced through `place_order` —
+        // the engine would match it on the spot — which is the whole reason the
+        // invariant exists: it catches corruption, not normal operation. So the
+        // corruption is injected directly, the way a real bug would leave it.
+        let s2 = a_seller(&db, &a, "wood", 20).await;
+        sqlx::query(
+            "INSERT INTO market_order (id, market_id, character_id, side, item_id, unit_price,              qty_total, qty_remaining, created_seq, created_at, expires_at)              VALUES (?, ?, ?, 'sell', 'wood', 5, 10, 10, 9999, 0, 0)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&a)
+        .bind(&s2)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let problems = db.book_health().await.unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("crossed book")),
+            "a genuine same-market cross should still be caught: {problems:?}"
+        );
+    }
+
+    /// A trade at one market must not show up in another's price history.
+    /// Candles are what a player reads a market's prices off, so leakage would
+    /// paint the capital's prices onto the remote market's chart and destroy the
+    /// very signal that makes hauling a decision worth making.
+    #[tokio::test]
+    async fn candles_and_trades_do_not_leak_between_markets() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+        let interval = test_cfg().candle_interval_secs;
+
+        // One fill at each market, at deliberately different prices.
+        let sa = a_seller(&db, &a, "wood", 10).await;
+        sell(&db, &a, &sa, "wood", 12, 5).await;
+        let ba = a_character(&db).await;
+        buy(&db, &a, &ba, "wood", 12, 5).await;
+
+        let sb = a_seller(&db, &b, "wood", 10).await;
+        sell(&db, &b, &sb, "wood", 4, 5).await;
+        let bb = a_character(&db).await;
+        buy(&db, &b, &bb, "wood", 4, 5).await;
+
+        let now = now_secs();
+        db.roll_up_candles(interval, 0, now + 1).await.unwrap();
+
+        let ca = db.candles(&a, "wood", interval, 0, now + interval).await.unwrap();
+        let cb = db.candles(&b, "wood", interval, 0, now + interval).await.unwrap();
+        assert_eq!(ca.len(), 1, "capital should have exactly its own candle");
+        assert_eq!(cb.len(), 1, "the remote market should have exactly its own candle");
+        assert_eq!((ca[0].close, ca[0].volume), (12, 5), "capital's candle");
+        assert_eq!((cb[0].close, cb[0].volume), (4, 5), "remote market's candle");
+
+        // And the trade ledger reads are likewise scoped.
+        let ta = db.recent_trades(&a, "wood", 10).await.unwrap();
+        let tb = db.recent_trades(&b, "wood", 10).await.unwrap();
+        assert_eq!(ta.len(), 1);
+        assert_eq!(tb.len(), 1);
+        assert_eq!(ta[0].unit_price, 12);
+        assert_eq!(tb[0].unit_price, 4);
+    }
+
+    /// The open-order cap counts `market_id = ? AND character_id = ?`, so a
+    /// second market genuinely doubles a player's resting capacity. That IS the
+    /// intent — the cap exists to bound one book's size, not a player's total
+    /// ambition — but it only becomes true once a second market exists, so it's
+    /// worth pinning deliberately rather than discovering later.
+    #[tokio::test]
+    async fn the_open_order_cap_is_per_market_not_global() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+        let who = a_character(&db).await;
+        db.add_to_inventory(&who, "wood", 40).await.unwrap();
+        db.warehouse_deposit(&a, &who, "wood", 20, 60).await.unwrap();
+        db.warehouse_deposit(&b, &who, "wood", 20, 60).await.unwrap();
+        let capped = MarketConfig { max_open_orders: 2, ..test_cfg() };
+
+        for i in 0..2 {
+            let o = db
+                .place_order(&a, &who, "sell", "wood", 5 + i, 2, NO_EXPIRY, &capped, "", 0)
+                .await
+                .unwrap();
+            assert!(o.resting_order_id.is_some(), "order {i} should rest at A");
+        }
+        let o = db
+            .place_order(&a, &who, "sell", "wood", 9, 2, NO_EXPIRY, &capped, "", 0)
+            .await
+            .unwrap();
+        assert!(o.resting_order_id.is_none(), "the cap should bind at A");
+        let o = db
+            .place_order(&b, &who, "sell", "wood", 9, 2, NO_EXPIRY, &capped, "", 0)
+            .await
+            .unwrap();
+        assert!(o.resting_order_id.is_some(), "the cap must not be global");
+    }
+
+    /// Conservation still holds when the goods and gold are spread across two
+    /// markets. The invariant was written against one; with two, a leak would
+    /// most plausibly show up as stock or escrow being attributed to the wrong
+    /// market, which a single-market sum would never notice.
+    #[tokio::test]
+    async fn two_markets_conserve_goods_and_gold_between_them() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+
+        let hauler = a_character(&db).await;
+        db.add_to_inventory(&hauler, "wood", 40).await.unwrap();
+        let buyer_a = a_character(&db).await;
+        let buyer_b = a_character(&db).await;
+        let who = [hauler.as_str(), buyer_a.as_str(), buyer_b.as_str()];
+
+        let total_wood = 40i64;
+        let total_gold: i64 = {
+            let mut g = 0;
+            for w in who {
+                g += db.character_gold(w).await.unwrap();
+            }
+            g
+        };
+
+        async fn wood_everywhere(db: &Db, markets: &[&str], who: &[&str]) -> i64 {
+            let mut n = 0i64;
+            for w in who {
+                n += qty_of(&db.inventory_for_character(w).await.unwrap(), "wood");
+                for m in markets {
+                    n += db
+                        .warehouse_for_character(m, w)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.item_id == "wood")
+                        .map(|r| r.qty)
+                        .sum::<i64>();
+                }
+            }
+            n
+        }
+
+        async fn gold_everywhere(db: &Db, who: &[&str]) -> i64 {
+            let mut g = 0i64;
+            for w in who {
+                g += db.character_gold(w).await.unwrap();
+            }
+            g
+        }
+
+        /// Escrowed gold is simply absent from purses, with the open buy book
+        /// as its only record — so the books of BOTH markets are part of the
+        /// accounting, not outside it.
+        async fn escrow_everywhere(db: &Db, markets: &[&str], who: &[&str]) -> i64 {
+            let mut g = 0i64;
+            for m in markets {
+                for w in who {
+                    g += db
+                        .open_orders_for_character(m, w)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .filter(|o| o.side == "buy")
+                        .map(|o| o.unit_price * o.qty_remaining)
+                        .sum::<i64>();
+                }
+            }
+            g
+        }
+
+        // Split the stock across both markets, trade at both, and haul between.
+        db.warehouse_deposit(&a, &hauler, "wood", 20, 60).await.unwrap();
+        db.warehouse_deposit(&b, &hauler, "wood", 20, 60).await.unwrap();
+        sell(&db, &a, &hauler, "wood", 10, 10).await;
+        sell(&db, &b, &hauler, "wood", 4, 10).await;
+        buy(&db, &a, &buyer_a, "wood", 10, 6).await;
+        buy(&db, &b, &buyer_b, "wood", 4, 10).await;
+        db.warehouse_withdraw(&b, &buyer_b, "wood", 5).await.unwrap();
+        db.warehouse_deposit(&a, &buyer_b, "wood", 5, 60).await.unwrap();
+        sell(&db, &a, &buyer_b, "wood", 11, 5).await;
+
+        let markets = [a.as_str(), b.as_str()];
+        assert_eq!(
+            wood_everywhere(&db, &markets, &who).await,
+            total_wood,
+            "wood was created or destroyed across the two markets"
+        );
+        assert_eq!(
+            gold_everywhere(&db, &who).await
+                + escrow_everywhere(&db, &markets, &who).await
+                + db.total_fees_burned().await.unwrap(),
+            total_gold,
+            "gold was created or destroyed across the two markets"
+        );
+        assert!(db.book_health().await.unwrap().is_empty(), "both books stay healthy");
+    }
+
     /// is the test that matters most — duplication kills economies.
     #[tokio::test]
     async fn trading_conserves_goods_and_gold() {
@@ -6430,6 +6771,60 @@ mod tests {
         assert!(db.cancel_road_order(&order.id).await.unwrap());
         assert!(db.road_cells_for_order(&order.id).await.unwrap().is_empty());
         assert!(db.build_order_by_id(&order.id).await.unwrap().is_none());
+    }
+
+    /// Seeding a NEW prereq'd order into a world that already finished its
+    /// prerequisite must open it, not lock it forever.
+    ///
+    /// The unlock normally fires on the completion *event* — `build.completed`
+    /// walks the authored dependents. An order authored after that event has
+    /// already passed has nothing left to trigger it, so it would seed `locked`
+    /// and stay dead content permanently. That is not hypothetical: the second
+    /// market (#153) was authored into worlds whose capital market was already
+    /// built, including the dev database, where it seeded locked and could never
+    /// have opened. Seeding is the only place with the whole picture.
+    #[tokio::test]
+    async fn seeding_opens_a_dependent_whose_prerequisite_is_already_done() {
+        let (db, _t) = TempDb::open().await;
+
+        // A world where the capital's market is already finished.
+        db.insert_build_order(
+            "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0, None, None,
+        )
+        .await
+        .unwrap();
+
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+
+        let remote = db
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .expect("the second market should be seeded");
+        assert_eq!(
+            remote.state, "open",
+            "a dependent whose prerequisite is already complete must seed open, or it is \
+             permanently dead content"
+        );
+
+        // The converse still holds: on a fresh world it seeds locked, because
+        // the completion event is still ahead of it.
+        let (fresh, _t2) = TempDb::open().await;
+        fresh.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let remote = fresh
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .unwrap();
+        assert_eq!(remote.state, "locked", "on a fresh world the second market is still gated");
+        assert!(
+            !fresh.is_build_kind_completed("market").await.unwrap(),
+            "nothing is built on a fresh world"
+        );
     }
 
     #[tokio::test]

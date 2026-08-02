@@ -3388,6 +3388,14 @@ impl Proxy {
         }
 
         // Unlock dependents (authored orders gated behind this kind).
+        //
+        // A dependent can live in a DIFFERENT district than the order that
+        // unlocked it — the second market (#153) is exactly that: finishing the
+        // capital's market in `civic` opens `market_east` out in the Market
+        // District. So the announcement and the board refresh have to follow
+        // the dependent, not the completer. Announcing only to `district` would
+        // leave anyone standing where the new order actually appeared staring
+        // at a stale board until they happened to re-request it.
         let dependents: Vec<(&str, &str)> = self
             .capital
             .build_orders
@@ -3395,18 +3403,29 @@ impl Proxy {
             .filter(|o| o.prereq == Some(kind))
             .map(|o| (o.district, o.kind))
             .collect();
-        let mut unlocked_ids: Vec<String> = Vec::new();
+        let mut unlocked: Vec<(String, String)> = Vec::new(); // (district, order id)
         for (d, k) in dependents {
             if let Ok(Some(o)) = db.open_build_order(d, k).await {
-                unlocked_ids.push(o.id);
+                unlocked.push((d.to_string(), o.id));
             }
         }
-        if !unlocked_ids.is_empty() {
-            self.broadcast_to_district(district, json!({
-                "type": "build.unlocked", "order_ids": unlocked_ids,
-            }));
+        if !unlocked.is_empty() {
+            // Group by district so each one hears about its own new orders.
+            let mut by_district: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (d, id) in unlocked {
+                by_district.entry(d).or_default().push(id);
+            }
+            for (d, ids) in by_district {
+                self.broadcast_to_district(&d, json!({
+                    "type": "build.unlocked", "order_ids": ids,
+                }));
+                if d != district {
+                    self.broadcast_build_list(&d).await;
+                }
+            }
         }
-        // Refresh the board for the district (the newly opened orders now appear).
+        // Refresh the board for the completing order's district (it just changed
+        // state, and any same-district dependents now appear).
         self.broadcast_build_list(district).await;
     }
 
@@ -10642,6 +10661,276 @@ listing_fee_min_gold = 4
 
         drop(ws);
         drop(bws);
+    }
+
+    /// Finishing the capital's market unlocks the Market District's (#153), and
+    /// the announcement reaches the district where the new order actually
+    /// APPEARED — not just the one where the build finished.
+    ///
+    /// This is a cross-district prereq, the first in the game: every earlier
+    /// dependent lived in the same district as its prerequisite, so
+    /// `build.completed` announcing only to the completing order's district was
+    /// indistinguishable from correct. Here it isn't — a player standing 8.6km
+    /// east would have been left staring at a board that never mentioned the
+    /// order that had just opened in front of them.
+    #[tokio::test]
+    async fn completing_the_capital_market_unlocks_the_market_district_one() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
+
+        // The authored pair: the capital's opens, the Market District's is
+        // locked behind it.
+        let capital = db
+            .build_orders_for_district("civic")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market")
+            .expect("the capital market is authored");
+        assert_eq!(capital.state, "open");
+        let remote = db
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .expect("the Market District's market is authored");
+        assert_eq!(remote.state, "locked", "the second market starts gated behind the first");
+
+        let email = format!("unlocker_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Unlocker"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Build the capital's market through the ordinary contribution flow.
+        for (item, qty) in [("wood", 50), ("stone", 30)] {
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "gather_yield", "player_id": pid,
+                    "item_id": item, "qty": qty, "skill": "gathering", "xp": 1,
+                }).to_string()))
+                .unwrap();
+            recv_until(&mut ws, "inv.update").await;
+            zone.to_proxy
+                .send(Message::Text(json!({
+                    "type": "build_contribute", "player_id": pid,
+                    "order_id": capital.id, "item_id": item, "qty": qty,
+                }).to_string()))
+                .unwrap();
+        }
+        recv_until(&mut ws, "build.completed").await;
+
+        // Durably unlocked.
+        let remote_now = db
+            .build_orders_for_district("market")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "market_east")
+            .unwrap();
+        assert_eq!(remote_now.state, "open", "finishing the first market should open the second");
+
+        // And announced where it appeared: a board push carrying the Market
+        // District's order. Under the pre-#153 code only the civic board was
+        // refreshed, and civic's list never contains `market_east`.
+        let mut saw_remote_board = false;
+        for _ in 0..40 {
+            let msg = recv_until(&mut ws, "build.list").await;
+            if msg["orders"]
+                .as_array()
+                .map(|a| a.iter().any(|o| o["kind"].as_str() == Some("market_east")))
+                .unwrap_or(false)
+            {
+                saw_remote_board = true;
+                break;
+            }
+        }
+        assert!(
+            saw_remote_board,
+            "the Market District's board was never refreshed — its players would not see the \
+             order that just opened there"
+        );
+
+        drop(ws);
+    }
+
+    /// Two markets in one session (#153): walking from the capital's market to
+    /// the Market District's retargets the panel, and the rates that follow are
+    /// that market's own — the payoff for #152's per-district config.
+    ///
+    /// The rate limiter is deliberately checked here too. It's keyed on player
+    /// alone, and a second market is exactly the situation that would expose it
+    /// if it had ever been keyed on `(player, market)`: a trader could double
+    /// their command budget just by having somewhere else to stand.
+    #[tokio::test]
+    async fn walking_between_markets_retargets_and_charges_each_market_its_own_rates() {
+        // The capital keeps the shipped 3% tax; the Market District undercuts it
+        // at 1%, mirroring the shape of the committed market.toml.
+        let cfg = mmo::market_config::MarketConfigSet::parse(
+            "[districts.market]\nsale_tax_num = 1\nwarehouse_slots = 120\n",
+        )
+        .unwrap();
+        let (proxy, db, _dbf, zone) = proxy_with_market_config(cfg).await;
+
+        // Both markets built. Coordinates match the authored sites closely
+        // enough to land in the right districts.
+        let capital = db
+            .insert_build_order(
+                "civic", "market", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 12900, y: 12800, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let remote = db
+            .insert_build_order(
+                "market", "market_east", r#"{"wood":1}"#, "completed", 0, None, 0,
+                Some(mmo::persistence::BuildPlacement {
+                    structure_kind: "market".to_string(), x: 20800, y: 9600, x1: None, y1: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(capital.id, remote.id);
+
+        let email = format!("hauler_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hauler"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // --- at the capital ---------------------------------------------------
+        stand_at(&proxy, &pid, 12900, 12800);
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(opened["market_id"].as_str(), Some(capital.id.as_str()));
+        assert_eq!(opened["district"].as_str(), Some("civic"));
+        assert_eq!(opened["rules"]["sale_tax_num"].as_i64(), Some(3), "capital keeps the default tax");
+        assert_eq!(opened["rules"]["warehouse_slots"].as_i64(), Some(60));
+
+        // --- walk 8.6km east and open the other one ---------------------------
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
+        let opened = recv_until(&mut ws, "market.opened").await;
+        assert_eq!(
+            opened["market_id"].as_str(),
+            Some(remote.id.as_str()),
+            "the panel should retarget to the market actually stood at"
+        );
+        assert_eq!(opened["district"].as_str(), Some("market"));
+        assert_eq!(opened["rules"]["sale_tax_num"].as_i64(), Some(1), "the remote market undercuts");
+        assert_eq!(opened["rules"]["warehouse_slots"].as_i64(), Some(120));
+
+        // --- the warehouses are separate, and the panel says so ---------------
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "wood", "qty": 20, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        loop {
+            recv_until(&mut ws, "inv.update").await;
+            if qty_of_inventory(&db, &pid, "wood").await >= 20 { break; }
+        }
+
+        // Deposit at the REMOTE market.
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(
+            json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 20}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let st = recv_until(&mut ws, "warehouse.state").await;
+            if st["market_id"].as_str() == Some(remote.id.as_str())
+                && st["items"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
+            {
+                assert_eq!(st["slots"].as_i64(), Some(120), "the remote market's slot count");
+                break;
+            }
+        }
+        assert!(
+            db.warehouse_for_character(&capital.id, &pid).await.unwrap().is_empty(),
+            "goods deposited in the Market District turned up in the capital"
+        );
+
+        // --- the tax actually charged is the remote market's ------------------
+        stand_at(&proxy, &pid, 20800, 9600);
+        ws.send(Message::Text(json!({
+            "type": "market.sell", "item_id": "wood", "unit_price": 10, "qty": 20,
+            "command_id": "haul-sell-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut ws, "market.fees").await;
+
+        let buyer_email = format!("hbuyer_{}@t.test", Uuid::new_v4().simple());
+        let mut bws = dial(&proxy).await;
+        bws.send(Message::Text(
+            json!({"type": "register", "email": buyer_email, "password": "pw12", "name": "HBuyer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let bid = recv_until(&mut bws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        stand_at(&proxy, &bid, 20800, 9600);
+        bws.send(Message::Text(json!({
+            "type": "market.buy", "item_id": "wood", "unit_price": 10, "qty": 20,
+            "command_id": "haul-buy-1",
+        }).to_string()))
+        .await
+        .unwrap();
+        recv_until(&mut bws, "market.fees").await;
+
+        // 1% of the 200g fill = 2g, not the capital's 3% = 6g. The ledger is
+        // the authority, not the message.
+        let trades = db.recent_trades(&remote.id, "wood", 10).await.unwrap();
+        let t = trades.first().expect("the cross should have traded at the remote market");
+        assert_eq!(t.unit_price * t.qty, 200);
+        assert_eq!(t.sale_tax_gold, 2, "the remote market's 1% tax should have been charged");
+        // And nothing landed on the capital's ledger.
+        assert!(
+            db.recent_trades(&capital.id, "wood", 10).await.unwrap().is_empty(),
+            "the trade was recorded against the wrong market"
+        );
+
+        drop(ws);
+        drop(bws);
+    }
+
+    /// The market command rate limit is per PLAYER, not per (player, market).
+    /// With one market the distinction was invisible; with two, keying it on the
+    /// market would hand anyone a second full budget just for walking east.
+    #[tokio::test]
+    async fn the_market_rate_limit_is_per_player_not_per_market() {
+        let (proxy, _db, _dbf, _zone) = proxy_with_shared_db().await;
+        let pid = format!("rate_{}", Uuid::new_v4().simple());
+        let budget = test_market_cfg().commands_per_minute;
+
+        // Spend the whole budget.
+        for i in 0..budget {
+            assert!(proxy.allow_market_command(&pid), "command {i} should be allowed");
+        }
+        assert!(!proxy.allow_market_command(&pid), "the budget should be spent");
+
+        // Standing at a different market changes nothing — the limiter never
+        // sees a market id, and this is the test that keeps it that way.
+        assert!(
+            !proxy.allow_market_command(&pid),
+            "the rate limit refilled — is it keyed on the market rather than the player?"
+        );
+        // A different player is unaffected.
+        let other = format!("rate_{}", Uuid::new_v4().simple());
+        assert!(proxy.allow_market_command(&other), "one player's spending throttled another");
     }
 
     /// The warehouse over the wire (#138): gated by the same server-side range

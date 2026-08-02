@@ -57,6 +57,24 @@ func _process(_delta: float) -> bool:
 	if _entities.nearest_market(SITE, Protocol.MARKET_RANGE) != "structure_market":
 		_fail("the storehouse was matched as a market"); return true
 
+	# --- two markets (#153) ---------------------------------------------------
+	# The Market District's market means `nearest_market` finally has to CHOOSE.
+	# It always picked the closest, but with one market that was untestable, and
+	# untested generality is not generality: Main fires `market.open` on the id
+	# changing, so picking the wrong one would open the wrong panel.
+	var second := SITE + Vector2(Protocol.MARKET_RANGE - 10.0, 0)
+	_entities.upsert("structure_market_east", "zone_a", _structure("market", second))
+	if _entities.nearest_market(SITE, Protocol.MARKET_RANGE) != "structure_market":
+		_fail("standing at the capital's market picked the other one"); return true
+	if _entities.nearest_market(second, Protocol.MARKET_RANGE) != "structure_market_east":
+		_fail("standing at the second market picked the capital's"); return true
+	# Walking away from both still finds nothing — two markets must not widen
+	# the range that opens a panel.
+	var between := SITE + Vector2(0, Protocol.MARKET_RANGE + 5.0)
+	if _entities.nearest_market(between, Protocol.MARKET_RANGE) != "":
+		_fail("a second market widened the proximity gate"); return true
+	_entities.remove("structure_market_east")
+
 	# --- panel shell ----------------------------------------------------------
 	_market.show_panel(false)
 	if _market.visible:
@@ -383,6 +401,30 @@ func _process(_delta: float) -> bool:
 	_press("List")
 	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
 		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
+
+	# --- retargeting between markets (#153) -----------------------------------
+	# Walking from one market to another must not carry the first one's state
+	# across. Warehouses, books, orders and listings are ALL per-market, so a
+	# panel that kept them would show a trader stock they don't have here and
+	# depth that isn't in this book — and they would act on it. The server
+	# re-sends everything on `market.open`, and this is what stops the gap
+	# between arriving and being told from being a lie.
+	_market.set_section(MarketPanel.Section.WAREHOUSE)
+	if not _body_text().contains("44/50"):
+		_fail("precondition: the first market's warehouse should be on screen, got: %s" % _body_text()); return true
+	_market.set_market("order-east", Protocol.market_rules_default())
+	if _body_text().contains("44/50"):
+		_fail("the previous market's warehouse survived the walk: %s" % _body_text()); return true
+	if not _body_text().contains("nothing stored here yet"):
+		_fail("the new market's warehouse should read empty, got: %s" % _body_text()); return true
+	_market.set_section(MarketPanel.Section.LISTINGS)
+	if not _body_text().contains("nothing listed"):
+		_fail("the previous market's listings survived the walk: %s" % _body_text()); return true
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	if not _body_text().contains("(none resting)"):
+		_fail("the previous market's resting orders survived the walk: %s" % _body_text()); return true
+	if _body_text().contains("best ask 9g") or _body_text().contains("last:"):
+		_fail("the previous market's depth or ticks survived the walk: %s" % _body_text()); return true
 
 	# Walking away drops the trading state, so a stale market id can never
 	# outlive being there.

@@ -123,10 +123,34 @@ history_retain_days = 30
 # A table only states what it CHANGES; everything else layers over [defaults]
 # above (the resolved ones, not the shipped ones).
 #
-# Nothing is overridden yet. The second market (#153) lands in the `market`
-# district and is where a cheaper-but-remote market becomes a real trade-off:
-#
-#   [districts.market]
-#   sale_tax_num = 1        # cheaper to sell at, but it's a long haul
-#   warehouse_slots = 120   # and worth storing at
 # ---------------------------------------------------------------------------
+
+# The Market District's market (#153), 8.6km east of the town centre. Cheaper
+# than the capital's in exchange for the haul — that trade-off IS the content.
+# Warehouses are per-market, so stock deposited here does not follow a player
+# home; carrying goods between the two is the arbitrage the design doc treats
+# as core gameplay, and these numbers are what make the walk pay.
+#
+# Placeholders pending #129, like every other number in this file. The SHAPE is
+# what matters: a remote market undercuts the capital, so distance buys margin.
+[districts.market]
+
+# 1% sale tax against the capital's 3%. On a 200g sale that is 2g rather than
+# 6g — small in absolute terms, which is the point: it should reward routine
+# trade, not make the capital's market pointless to use.
+sale_tax_num = 1
+
+# Half the listing fee: 0.5% of notional against the capital's 1%. Note this
+# only bites on LARGE orders — a 1000g order costs 5g here and 10g there, but
+# anything under 100g still rounds up to the 1g floor at either market, because
+# fees round toward the house and are never zero. That is deliberate: the
+# discount rewards moving real volume, which is what a haul is for.
+#
+# (`listing_fee_min_gold` is left alone on purpose. Lowering it would change
+# nothing — at a 1% rate `ceil` already returns at least 1 for any nonzero
+# notional, so the floor never binds.)
+listing_fee_den = 200
+
+# Twice the storage. A trader who has hauled goods this far needs somewhere to
+# put them, and a cramped warehouse would make the trip not worth taking.
+warehouse_slots = 120

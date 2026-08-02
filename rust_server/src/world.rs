@@ -811,17 +811,62 @@ pub fn capital() -> Capital {
     // of the storehouse (12830, 12810) and build board (12770, 12810) by more
     // than their interaction ranges, so their panels don't all stack open at
     // once.
-    let build_orders: Vec<SeedBuildOrder> = vec![SeedBuildOrder {
-        district: "civic",
-        kind: "market",
-        required_json: r#"{"wood":50,"stone":30}"#,
-        prereq: None,
-        structure_kind: "market",
-        structure_x: tcx + 100,
-        structure_y: tcy,
-        required_skill: None,
-        required_level: 0,
-    }];
+    // The second market (market phase 2 epic #151, issue #153) sits in the
+    // **Market District** — the east band, which has carried that name since the
+    // districts were authored and until now contained no market.
+    //
+    // Every market table has been keyed by `market_id` since #137, and
+    // `market_at` resolves by district + range, so this needed no new
+    // machinery. What it adds is *gameplay*: warehouses are per-market, so
+    // deposited stock does not follow a player. Two markets means two books,
+    // two supplies, two prices — and moving goods between them means carrying
+    // them 8.6km. That gap is the arbitrage the design doc treats as core
+    // content, and the topology creates it rather than a mechanic.
+    //
+    // Site (20800, 9600) was chosen by surveying the district against the bake
+    // rather than by eye: 4.3m elevation with 0.29m of spread across a 120m
+    // footprint (flat, and clear of the water mask — the east band reaches the
+    // river mouth and Moreton Bay, so "somewhere east" is not automatically
+    // land), 1600 units inside the band's western edge so a trader standing at
+    // it is unambiguously in this district, ~2.9km from the nearest resource
+    // node, and reachable from spawn without crossing water. Pinned by
+    // `the_second_market_is_sited_on_dry_reachable_ground`.
+    //
+    // `prereq` makes it the REWARD for finishing the capital's market rather
+    // than a parallel option that would split a small player base's effort
+    // across two 80-unit builds. Cost is deliberately IDENTICAL to the first:
+    // the difficulty here is the 8.6km haul (at `MAX_CARRY` 50 that is three
+    // round trips), and charging more on top of that would be punishing rather
+    // than interesting.
+    let build_orders: Vec<SeedBuildOrder> = vec![
+        SeedBuildOrder {
+            district: "civic",
+            kind: "market",
+            required_json: r#"{"wood":50,"stone":30}"#,
+            prereq: None,
+            structure_kind: "market",
+            structure_x: tcx + 100,
+            structure_y: tcy,
+            required_skill: None,
+            required_level: 0,
+        },
+        SeedBuildOrder {
+            district: "market",
+            // A distinct `kind` — the prereq edge is keyed on kind, and the
+            // build board renders it raw, so a second order also called
+            // "market" would be ambiguous in both. `structure_kind` stays
+            // "market", which is what `market_at` and the client's
+            // `nearest_market` actually match on.
+            kind: "market_east",
+            required_json: r#"{"wood":50,"stone":30}"#,
+            prereq: Some("market"),
+            structure_kind: "market",
+            structure_x: 20800,
+            structure_y: 9600,
+            required_skill: None,
+            required_level: 0,
+        },
+    ];
 
     // Gatherable nodes. A grove of trees ringing the town centre (so a fresh
     // spawn finds wood immediately) plus wood/stone spread through every
@@ -1137,21 +1182,117 @@ mod tests {
     }
 
     #[test]
-    fn capital_authors_only_the_market_build_order() {
+    fn capital_authors_only_the_two_markets() {
         let c = capital();
         // Roads and most city work are commissioned at runtime by the mayor,
-        // not authored. The Market (#137) is the deliberate exception: trading
-        // needs a fixed, findable place to hang off, so it's authored — but
-        // still player-BUILT, seeding `open` rather than pre-placed.
-        assert_eq!(c.build_orders.len(), 1, "only the market is authored");
-        let m = &c.build_orders[0];
-        assert_eq!((m.kind, m.structure_kind), ("market", "market"));
-        assert!(m.prereq.is_none(), "nothing gates the market — it's the root of the trade tree");
-        assert_eq!(m.required_level, 0, "and no skill gate keeps newcomers out of the economy");
-        // Sited inside its own district, within a short walk of spawn.
+        // not authored. The markets (#137, #153) are the deliberate exception:
+        // trading needs a fixed, findable place to hang off, so they're authored
+        // — but still player-BUILT, seeding `open`/`locked` rather than
+        // pre-placed. Anything else appearing here should be a deliberate
+        // decision, not a drive-by addition.
+        assert_eq!(c.build_orders.len(), 2, "only the two markets are authored");
+        for o in &c.build_orders {
+            assert_eq!(o.structure_kind, "market", "{} is not a market", o.kind);
+            assert_eq!(o.required_level, 0, "no skill gate keeps newcomers out of the economy");
+            assert_eq!(
+                c.district_at(o.structure_x, o.structure_y).map(|d| d.id),
+                Some(o.district),
+                "{} is sited outside the district that owns it",
+                o.kind
+            );
+        }
+
+        // The capital's, at the root of the trade tree.
         let (tcx, tcy) = c.town_centre;
-        assert_eq!(c.district_at(m.structure_x, m.structure_y).map(|d| d.id), Some(m.district));
-        assert!((m.structure_x - tcx).pow(2) + (m.structure_y - tcy).pow(2) < 200 * 200);
+        let first = c.build_orders.iter().find(|o| o.kind == "market").unwrap();
+        assert_eq!(first.district, "civic");
+        assert!(first.prereq.is_none(), "the first market gates on nothing");
+        assert!((first.structure_x - tcx).pow(2) + (first.structure_y - tcy).pow(2) < 200 * 200,
+            "the first market should be a short walk from spawn");
+
+        // The Market District's (#153), gated behind the first so a small
+        // player base finishes one before starting the other.
+        let second = c.build_orders.iter().find(|o| o.kind == "market_east").unwrap();
+        assert_eq!(second.district, "market", "the Market District finally has a market");
+        assert_eq!(second.prereq, Some("market"), "the second market is the reward for the first");
+        assert_eq!(
+            second.required_json, first.required_json,
+            "the second market costs the same — the 8.6km haul is the difficulty, not the bill"
+        );
+        // Distinct kinds: the prereq edge is keyed on kind, and the build board
+        // renders it raw. Two orders both called "market" would be ambiguous in
+        // both places.
+        assert_ne!(first.kind, second.kind);
+
+        // Far enough that hauling between them is a real journey — that
+        // distance IS the arbitrage, so a future re-site must not quietly
+        // shorten it.
+        let d2 = ((second.structure_x - first.structure_x) as i64).pow(2)
+            + ((second.structure_y - first.structure_y) as i64).pow(2);
+        assert!(d2 > 5000i64.pow(2), "the two markets are too close to be worth hauling between");
+    }
+
+    /// The east band reaches the Brisbane river mouth and Moreton Bay, so
+    /// "somewhere east" is emphatically not automatically land. This pins the
+    /// survey that picked (20800, 9600) — dry, flat, well inside its district,
+    /// clear of the resource nodes, and walkable from spawn without swimming —
+    /// so a future rebake or re-site can't silently drop a market in the water
+    /// or somewhere a player can't reach on foot.
+    #[test]
+    fn the_second_market_is_sited_on_dry_reachable_ground() {
+        let c = capital();
+        let t = loaded_terrain();
+        let m = c.build_orders.iter().find(|o| o.kind == "market_east").unwrap();
+        let (mx, my) = (m.structure_x, m.structure_y);
+
+        // Dry across the whole footprint a trader stands in, not just the pin.
+        for (ox, oy) in [(0, 0), (-60, -60), (60, -60), (-60, 60), (60, 60)] {
+            assert!(
+                !t.is_water((mx + ox) as f32, (my + oy) as f32),
+                "the second market is in the water at ({},{})",
+                mx + ox,
+                my + oy
+            );
+        }
+
+        // Flat enough to be a plaza rather than a cliff face.
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for (ox, oy) in [(-60, -60), (60, -60), (-60, 60), (60, 60), (0, 0)] {
+            let h = t.sample_height((mx + ox) as f32, (my + oy) as f32);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+        assert!(hi - lo < 3.0, "the second market's site is not level (spread {:.2}m)", hi - lo);
+        assert!(lo > 1.0, "the second market sits barely above the waterline ({lo:.2}m)");
+
+        // Well inside its district: a trader standing anywhere in range must
+        // resolve to `market`, or `market_at` would look up the wrong config.
+        let region = c.districts.iter().find(|d| d.id == "market").unwrap().region;
+        let margin = 600;
+        assert!(
+            mx - region.x0 > margin && region.x1 - mx > margin
+                && my - region.y0 > margin && region.y1 - my > margin,
+            "the second market is too close to its district edge"
+        );
+
+        // Clear of every resource node by far more than any interaction range,
+        // so the market panel and a gather prompt never fight for the screen.
+        for n in &c.resource_nodes {
+            let d2 = ((n.x - mx) as i64).pow(2) + ((n.y - my) as i64).pow(2);
+            assert!(d2 > 500i64.pow(2), "resource node {} is on top of the second market", n.id);
+        }
+
+        // Reachable on foot: the straight line from spawn never crosses water.
+        // Drowning is a real hazard (#83), so a market you can only swim to
+        // would be a trap rather than a destination.
+        let (sx, sy) = c.town_centre;
+        for i in 0..=400 {
+            let f = i as f32 / 400.0;
+            let x = sx as f32 + (mx - sx) as f32 * f;
+            let y = sy as f32 + (my - sy) as f32 * f;
+            assert!(!t.is_water(x, y), "the walk to the second market crosses water at ({x:.0},{y:.0})");
+        }
     }
 
     #[test]

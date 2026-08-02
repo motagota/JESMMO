@@ -127,8 +127,9 @@ func show_panel(show: bool) -> void:
 	visible = show
 
 ## The server acked that we're at a real market and may trade (#137). The id is
-## the completed build order's own id — every later market command is scoped to
-## it, even though only the capital's market exists in v1.
+## the completed build order's own id, and every later market command is scoped
+## to it. Since #153 there are two markets, so this id genuinely changes as a
+## player walks between them.
 func set_market(market_id: String, rules: Dictionary = {}) -> void:
 	# The rules can change without the id doing so (a config edit and restart),
 	# and on arrival at a market with different rates the id changes too — so
@@ -136,8 +137,26 @@ func set_market(market_id: String, rules: Dictionary = {}) -> void:
 	var next_rules: Dictionary = rules if not rules.is_empty() else Protocol.market_rules_default()
 	if _market_id == market_id and _rules == next_rules:
 		return
+	var moved := _market_id != market_id
 	_market_id = market_id
 	_rules = next_rules
+	# EVERY market-scoped thing on screen belongs to the market we just left.
+	# Warehouses, books, orders and listings are all per-market, so carrying
+	# them over would show a trader stock they do not have here and depth that
+	# isn't in this book — and they'd act on it. The server re-sends all of it
+	# on `market.open`; this is what stops the gap between arriving and being
+	# told from being a lie. (#153 — with one market this could never happen.)
+	if moved:
+		_warehouse = []
+		_used_slots = 0
+		_total_slots = _rule("warehouse_slots")
+		_asks = []
+		_bids = []
+		_orders = []
+		_listings = []
+		_history = []
+		_last_trade = ""
+		_last_fees = ""
 	_rebuild()
 
 ## An int from the market's rules, falling back to the shipped default.
