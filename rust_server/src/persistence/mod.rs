@@ -5995,14 +5995,18 @@ mod tests {
         let (db, _t) = TempDb::open().await;
         let m = a_market(&db).await;
         let (seller, wh_id, wear) = a_seller_with_a_worn_tool(&db, &m).await;
-        assert_eq!(wear, 37, "50 - 13");
+        // Derived from the registry: a balance pass (#129) retunes durability
+        // without invalidating what this test is actually about (instance
+        // identity surviving a sale).
+        let fresh = crate::world::tool_max_durability("pickaxe").unwrap();
+        assert_eq!(wear, fresh - 13, "worn by 13 from full");
 
         let listing = db
             .place_listing(&m, &seller, &wh_id, 60, NO_EXPIRY, &test_cfg(), "", 0)
             .await
             .unwrap()
             .expect("the listing should be accepted");
-        assert_eq!(listing.durability, Some(37), "the board advertises its actual wear");
+        assert_eq!(listing.durability, Some(wear), "the board advertises its actual wear");
         // Escrowed, not merely flagged: it can't be withdrawn while listed.
         assert_eq!(db.warehouse_withdraw(&m, &seller, "pickaxe", 1).await.unwrap(), 0);
 
@@ -6014,11 +6018,11 @@ mod tests {
             .expect("the purchase should go through");
         assert_eq!(sold.id, listing.id);
 
-        // The SAME row, now the buyer's, still worn to 37 — not a fresh tool.
+        // The SAME row, now the buyer's, still worn — not a fresh tool.
         let buyer_held = db.warehouse_for_character(&m, &buyer).await.unwrap();
         assert_eq!(buyer_held.len(), 1);
         assert_eq!(buyer_held[0].id, wh_id, "the very instance that was advertised");
-        assert_eq!(buyer_held[0].durability, Some(37));
+        assert_eq!(buyer_held[0].durability, Some(wear));
         assert_eq!(buyer_held[0].state, "available", "and collectable");
         assert!(db.warehouse_for_character(&m, &seller).await.unwrap().is_empty());
 
@@ -6026,7 +6030,7 @@ mod tests {
         assert_eq!(db.warehouse_withdraw(&m, &buyer, "pickaxe", 1).await.unwrap(), 1);
         let back = db.inventory_for_character(&buyer).await.unwrap()
             .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
-        assert_eq!((back.id, back.durability), (wh_id, Some(37)));
+        assert_eq!((back.id, back.durability), (wh_id, Some(wear)));
         assert!(tax > 0, "the sale was taxed (#141)");
     }
 
@@ -7679,21 +7683,24 @@ mod tests {
         db.add_to_inventory(&cid, "pickaxe", 1).await.unwrap();
         let inv = db.inventory_for_character(&cid).await.unwrap();
         let pick = inv.iter().find(|i| i.item_id == "pickaxe").unwrap().clone();
-        assert_eq!(pick.durability, Some(50));
+        assert_eq!(pick.durability, crate::world::tool_max_durability("pickaxe"));
 
         // Wear it, so "the same instance" is actually falsifiable.
         db.equip_instance(&cid, &pick.id).await.unwrap();
         db.wear_equipped_tool(&cid, "tool", 7).await.unwrap();
         let worn = db.inventory_for_character(&cid).await.unwrap()
             .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
-        assert_eq!(worn.durability, Some(43));
+        assert_eq!(
+            worn.durability,
+            crate::world::tool_max_durability("pickaxe").map(|m| m - 7)
+        );
 
         // Deposit: same row id, same wear, one slot.
         assert_eq!(db.warehouse_deposit(&m, &cid, "pickaxe", 1, 60).await.unwrap(), 1);
         let held = db.warehouse_for_character(&m, &cid).await.unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].id, worn.id, "the SAME instance, not a fresh tool");
-        assert_eq!((held[0].durability, held[0].qty), (Some(43), 1));
+        assert_eq!((held[0].durability, held[0].qty), (worn.durability, 1));
         assert!(db.inventory_for_character(&cid).await.unwrap().iter().all(|i| i.item_id != "pickaxe"));
         // Stowing the tool you're holding takes it out of your hand, rather
         // than refusing the deposit or leaving a dangling equipment row.
@@ -7703,7 +7710,7 @@ mod tests {
         assert_eq!(db.warehouse_withdraw(&m, &cid, "pickaxe", 1).await.unwrap(), 1);
         let back = db.inventory_for_character(&cid).await.unwrap()
             .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
-        assert_eq!((back.id, back.durability), (worn.id, Some(43)));
+        assert_eq!((back.id, back.durability), (worn.id.clone(), worn.durability));
         assert!(db.warehouse_for_character(&m, &cid).await.unwrap().is_empty());
     }
 
@@ -8170,7 +8177,8 @@ mod tests {
         let items = db.inventory_for_character(&cid).await.unwrap();
         let picks: Vec<_> = items.iter().filter(|i| i.item_id == "pickaxe").collect();
         assert_eq!(picks.len(), 2, "two grants -> two separate instance rows");
-        assert!(picks.iter().all(|p| p.qty == 1 && p.durability == Some(50)), "each a fresh instance: {picks:?}");
+        let fresh = crate::world::tool_max_durability("pickaxe").unwrap();
+        assert!(picks.iter().all(|p| p.qty == 1 && p.durability == Some(fresh)), "each a fresh instance: {picks:?}");
         assert_ne!(picks[0].id, picks[1].id, "distinct instance ids");
 
         let wood: Vec<_> = items.iter().filter(|i| i.item_id == "wood").collect();
@@ -8202,8 +8210,9 @@ mod tests {
         assert_eq!(db.equipped(&owner, "tool").await.unwrap().as_deref(), Some("pickaxe"));
         let tool = db.equipped_tool(&owner, "tool").await.unwrap().unwrap();
         assert_eq!(tool.instance_id, *pick_id);
-        assert_eq!(tool.durability, 50);
-        assert_eq!(tool.max_durability, 50);
+        let fresh = crate::world::tool_max_durability("pickaxe").unwrap();
+        assert_eq!(tool.durability, fresh);
+        assert_eq!(tool.max_durability, fresh);
     }
 
     /// A swing spends durability on whichever instance is equipped; hitting
@@ -8217,12 +8226,13 @@ mod tests {
         let instance_id = db.inventory_for_character(&cid).await.unwrap()[0].id.clone();
         db.equip_instance(&cid, &instance_id).await.unwrap();
 
+        let fresh = crate::world::tool_max_durability("pickaxe").unwrap();
         let outcome = db.wear_equipped_tool(&cid, "tool", 1).await.unwrap().unwrap();
-        assert_eq!((outcome.remaining, outcome.broke), (49, false));
+        assert_eq!((outcome.remaining, outcome.broke), (fresh - 1, false));
         assert_eq!(db.equipped(&cid, "tool").await.unwrap().as_deref(), Some("pickaxe"), "still equipped");
 
         // Drive it to the brink, then break it with a loss bigger than what's left.
-        for _ in 0..48 {
+        for _ in 0..(fresh - 2) {
             db.wear_equipped_tool(&cid, "tool", 1).await.unwrap();
         }
         let broke = db.wear_equipped_tool(&cid, "tool", 5).await.unwrap().unwrap();
@@ -8250,30 +8260,38 @@ mod tests {
         // Fully healthy: nothing to repair.
         assert_eq!(db.repair_instance(&cid, &instance_id).await.unwrap(), None);
 
-        // Wear it to 12/50 (missing 38) — repair_cost(pickaxe, 38, 50) with
-        // the pickaxe recipe (2 wood + 3 stone): total_units=5, repair_units=4
-        // -> wood ceil(2*4/5)=2, stone ceil(3*4/5)=3.
+        // Wear it two thirds of the way down. Derived from the registry rather
+        // than hardcoded, so a balance pass (#129) retunes the numbers without
+        // silently invalidating what this test is checking.
+        let max = crate::world::tool_max_durability("pickaxe").unwrap();
+        let missing = max * 2 / 3;
         db.equip_instance(&cid, &instance_id).await.unwrap();
-        for _ in 0..38 {
+        for _ in 0..missing {
             db.wear_equipped_tool(&cid, "tool", 1).await.unwrap();
         }
+        let want: Vec<(String, i64)> = crate::world::repair_cost("pickaxe", missing, max)
+            .unwrap()
+            .into_iter()
+            .map(|(i, q)| (i.to_string(), q))
+            .collect();
 
         // Can't afford it yet.
         assert_eq!(db.repair_instance(&cid, &instance_id).await.unwrap(), None, "no ingredients at all");
 
-        db.add_to_inventory(&cid, "wood", 2).await.unwrap();
-        db.add_to_inventory(&cid, "stone", 3).await.unwrap();
+        for (item, qty) in &want {
+            db.add_to_inventory(&cid, item, *qty).await.unwrap();
+        }
         let outcome = db.repair_instance(&cid, &instance_id).await.unwrap().expect("affordable now");
         assert_eq!(outcome.item_id, "pickaxe");
         assert_eq!(
             outcome.cost.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
-            [("wood".to_string(), 2), ("stone".to_string(), 3)].into_iter().collect(),
+            want.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
         );
         assert_eq!(db.inventory_qty(&cid, "wood").await.unwrap(), 0, "ingredients consumed");
         assert_eq!(db.inventory_qty(&cid, "stone").await.unwrap(), 0);
         let repaired = db.inventory_for_character(&cid).await.unwrap()
             .into_iter().find(|i| i.id == instance_id).unwrap();
-        assert_eq!(repaired.durability, Some(50), "restored to full");
+        assert_eq!(repaired.durability, Some(max), "restored to full");
 
         // A stranger can't repair someone else's instance.
         let stranger = a_character(&db).await;
