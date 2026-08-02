@@ -402,6 +402,34 @@ func _process(_delta: float) -> bool:
 	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
 		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
 
+	# --- the provisioner's band (#154) ----------------------------------------
+	# A newcomer's most useful fact about a commodity is what it can never be
+	# worth less than, and what nobody can corner it above. Inferring that from a
+	# suspiciously large resting order is not a UI.
+	var banded := Protocol.market_rules_default()
+	banded["provisioner"] = {"stone": {"floor": 1, "ceiling": 40}}
+	_market.set_market("order-banded", banded)
+	_market.set_section(MarketPanel.Section.COMMODITIES)
+	_market._watch("stone")
+	if not _body_text().contains("always buys at 1g and sells at 40g"):
+		_fail("the provisioner band should be stated, got: %s" % _body_text()); return true
+	# A commodity the provisioner doesn't back says nothing — silence, not a
+	# misleading zero band.
+	_market._watch("wood")
+	if _body_text().contains("always buys at"):
+		_fail("an unbacked commodity should show no band, got: %s" % _body_text()); return true
+	_market.set_market("order-abc2", Protocol.market_rules_default())
+	_market._watch("stone")
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+	], 1, 60)
+	_market.set_orders([
+		{"order_id": "o1", "side": "sell", "item_id": "wood", "unit_price": 9, "qty_total": 10, "qty_remaining": 4},
+	])
+	_market.set_listings([
+		{"listing_id": "L1", "item_id": "axe", "durability": 44, "max_durability": 50, "ask_price": 60, "seller_id": "x", "mine": false},
+	])
+
 	# --- retargeting between markets (#153) -----------------------------------
 	# Walking from one market to another must not carry the first one's state
 	# across. Warehouses, books, orders and listings are ALL per-market, so a

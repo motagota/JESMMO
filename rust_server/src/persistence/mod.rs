@@ -374,15 +374,88 @@ async fn burn_fee_in_tx(
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    // ...and on the supply ledger (#154), because a burned fee is gold leaving
+    // the world. `market_fee` keeps the market-side detail; this keeps the
+    // count. `fee_ledgers_agree` pins the two together.
+    ledger_gold_in_tx(tx, character_id, -gold, "market_fee", now).await?;
     Ok(())
 }
 
-/// Mint `amount` gold into a character's purse, inside a caller-owned
-/// transaction (build wages, #145 — the game's first gold faucet). Kept as an
-/// in-tx helper on purpose: wages MUST commit together with the contribution
-/// that earned them, or a crash between the two either loses the wage or pays
-/// it twice on retry. `amount <= 0` is a no-op, so callers can pass a wage of
-/// zero (demolition orders) without branching.
+/// The balance a just-inserted character was given by the schema's DEFAULT.
+///
+/// Read back rather than hardcoded: the starting balance lives in migration
+/// 0006, and a ledger that assumed 500 would quietly stop matching the moment
+/// anyone tuned it. The ledger's job is to record what actually happened.
+async fn starting_gold_in_tx(tx: &mut Tx<'_>, character_id: &str) -> Result<i64, DbError> {
+    let gold: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+        .bind(character_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(gold)
+}
+
+/// Record a change to the MONEY SUPPLY on the append-only `gold_ledger`
+/// (#154): positive creates gold, negative destroys it.
+///
+/// Always called in the same transaction as the balance change it describes, so
+/// a mint that isn't recorded cannot commit. That is the whole point — gold was
+/// previously created by a bare UPDATE that recorded nothing, which made "how
+/// much gold exists and where did it come from" unanswerable.
+async fn ledger_gold_in_tx(
+    tx: &mut Tx<'_>,
+    character_id: &str,
+    amount: i64,
+    reason: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    if amount == 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO gold_ledger (id, character_id, amount, reason, created_at)          VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(character_id)
+    .bind(amount)
+    .bind(reason)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// CREATE gold and credit it to a purse, recording it on the ledger in the same
+/// transaction (#154).
+///
+/// Distinct from [`grant_gold_in_tx`], and the distinction is the entire reason
+/// the ledger works: most credits MOVE gold that already exists (a refund of
+/// escrow, a seller's proceeds out of a buyer's escrow) and must NOT be
+/// recorded as creation, or the supply would appear to balloon with every
+/// trade. Only genuine faucets come through here — a new character's starting
+/// balance, build wages (#145), and the provisioner's float (#154).
+async fn mint_gold_in_tx(
+    tx: &mut Tx<'_>,
+    character_id: &str,
+    amount: i64,
+    reason: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    if amount <= 0 {
+        return Ok(());
+    }
+    grant_gold_in_tx(tx, character_id, amount).await?;
+    ledger_gold_in_tx(tx, character_id, amount, reason, now).await
+}
+
+/// MOVE gold into a character's purse, inside a caller-owned transaction.
+///
+/// Deliberately does NOT touch the ledger: every caller here is paying out gold
+/// that already exists (escrow being refunded, a seller collecting a buyer's
+/// escrow). Use [`mint_gold_in_tx`] when gold is genuinely being created —
+/// getting this wrong in either direction breaks the supply identity, which is
+/// why they are two functions rather than one with a flag.
+///
+/// `amount <= 0` is a no-op, so callers can pass zero without branching.
 async fn grant_gold_in_tx(tx: &mut Tx<'_>, character_id: &str, amount: i64) -> Result<(), DbError> {
     if amount <= 0 {
         return Ok(());
@@ -576,6 +649,12 @@ impl Db {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        // The starting balance is a column DEFAULT, which means it is gold
+        // created out of nothing — the game's oldest and largest faucet, and
+        // one nothing recorded until #154. Ledger it so the supply identity
+        // closes; without this every new character silently widens the gap.
+        let start = starting_gold_in_tx(&mut tx, &char_id).await?;
+        ledger_gold_in_tx(&mut tx, &char_id, start, "character_start", now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -620,6 +699,9 @@ impl Db {
         .bind(ts)
         .execute(&mut *tx)
         .await?;
+        // See the sibling path above: the DEFAULT starting balance is a mint.
+        let start = starting_gold_in_tx(&mut tx, &char_id).await?;
+        ledger_gold_in_tx(&mut tx, &char_id, start, "character_start", ts).await?;
         tx.commit().await?;
 
         Ok((
@@ -2531,6 +2613,223 @@ impl Db {
         Ok(total.unwrap_or(0))
     }
 
+    // --- NPC provisioner (market phase 2 epic #151, issue #154) -------------
+    //
+    // Standing bounds on a commodity's price, implemented as ORDINARY resting
+    // orders owned by a system character rather than a special case in the
+    // matching engine. That choice is the whole design: price-time priority,
+    // partial fills, self-match prevention, escrow and the trade ledger all work
+    // on them unmodified, and the bounds are VISIBLE in the book — a player can
+    // see the floor instead of discovering it. A backstop consulted after a
+    // failed match would be more code, less reuse, and invisible.
+
+    /// The system character that owns the provisioner's orders, created on first
+    /// use and returned thereafter.
+    ///
+    /// A real character with a real purse, because everything downstream —
+    /// escrow, warehouses, fills, the gold ledger — is keyed on one. It is
+    /// reached only by this id: the account's password hash is a fixed
+    /// non-verifying placeholder, so nobody can log in as the market.
+    pub async fn ensure_provisioner(&self) -> Result<String, DbError> {
+        const EMAIL: &str = "provisioner@system.invalid";
+        if let Some(acct) = self.find_account_by_email(EMAIL).await? {
+            if let Some(c) = self.character_for_account(&acct.id).await? {
+                return Ok(c.id);
+            }
+        }
+        let (_, c) = self
+            .create_account_with_character(EMAIL, "!no-login!", "Provisioner", 0, 0, 100)
+            .await?;
+        Ok(c.id)
+    }
+
+    /// Re-post the provisioner's standing bid and ask at one market (#154).
+    ///
+    /// Idempotent by construction: it cancels whatever it had resting for the
+    /// commodity and posts fresh orders, so running it twice in a row leaves the
+    /// same book rather than doubling the depth.
+    ///
+    /// Returns how much gold was newly MINTED to fund the bid — the number the
+    /// caller logs, because a faucet nobody is watching is how an economy gets
+    /// away from you.
+    pub async fn refresh_provisioner(
+        &self,
+        market_id: &str,
+        cfg: &MarketConfig,
+        now: i64,
+    ) -> Result<i64, DbError> {
+        if cfg.provisioner.is_empty() {
+            return Ok(0);
+        }
+        let npc = self.ensure_provisioner().await?;
+        // The provisioner's own placements are free. It re-posts on a timer, so
+        // charging it a listing fee every cycle would churn the ledger with a
+        // burn-and-mint cycle that means nothing. (It still pays SALE TAX when a
+        // player lifts its ask, because that is charged from the taker's config
+        // in the fill path — a real sink, properly recorded, and not worth a
+        // special case in the hot loop.)
+        let npc_cfg = MarketConfig {
+            listing_fee_min_gold: 0,
+            listing_fee_num: 0,
+            max_open_orders: i64::MAX,
+            ..cfg.clone()
+        };
+
+        let mut minted = 0i64;
+        for (item, bounds) in &cfg.provisioner {
+            // Seed stock, once per (market, commodity), so the CEILING exists on
+            // a brand-new server before the provisioner has bought anything.
+            // Deduped through `market_command`, which already exists to make
+            // exactly this kind of operation happen-once — no new table, and it
+            // survives restarts.
+            if bounds.seed_stock > 0 {
+                let mut tx = self.pool.begin().await?;
+                let seed_id = format!("provisioner-seed:{market_id}:{item}");
+                if Self::claim_command_in_tx(&mut tx, &seed_id, &npc, now).await? {
+                    warehouse_credit_in_tx(
+                        &mut tx, market_id, &npc, item, bounds.seed_stock, i64::MAX,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+            }
+
+            // Clear what it had resting, so this is a refresh rather than an
+            // accumulation. Escrow (gold for the bid, goods for the ask) comes
+            // back in the process, which is what makes the sizing below simple.
+            for o in self.open_orders_for_character(market_id, &npc).await? {
+                if o.item_id == *item {
+                    self.cancel_order(&npc, &o.id).await?;
+                }
+            }
+
+            // --- the floor -------------------------------------------------
+            // Unbounded by design: a bid with a finite budget stops being a
+            // floor exactly when it is needed, during a crash. So the shortfall
+            // is MINTED. This is the game's second faucet, and the reason #154
+            // built the ledger first.
+            let want = bounds.floor * bounds.bid_qty;
+            let purse = self.character_gold(&npc).await?;
+            if want > purse {
+                let short = want - purse;
+                let mut tx = self.pool.begin().await?;
+                mint_gold_in_tx(&mut tx, &npc, short, "provisioner", now).await?;
+                tx.commit().await?;
+                minted += short;
+            }
+            // `0` = never expires (migration 0018). The provisioner's orders
+            // must not be swept: a floor that vanished after 24h would be a
+            // floor exactly until someone needed it.
+            self.place_order(
+                market_id, &npc, "buy", item, bounds.floor, bounds.bid_qty,
+                0, &npc_cfg, "", now,
+            )
+            .await?;
+
+            // --- the ceiling -----------------------------------------------
+            // Sells from STOCK ONLY — whatever it has bought, plus the seed.
+            // Unbounded selling would be an infinite item faucet, and destroying
+            // scarcity is worse than an uncapped price.
+            let stock: i64 = self
+                .warehouse_for_character(market_id, &npc)
+                .await?
+                .iter()
+                .filter(|r| r.item_id == *item && r.state == "available")
+                .map(|r| r.qty)
+                .sum();
+            if stock > 0 {
+                self.place_order(
+                    market_id, &npc, "sell", item, bounds.ceiling, stock,
+                    0, &npc_cfg, "", now,
+                )
+                .await?;
+            }
+        }
+        Ok(minted)
+    }
+
+    /// Trades at `market_id` since `since` that executed OUTSIDE the configured
+    /// bounds, as `(item, price, bound_low, bound_high)`.
+    ///
+    /// The design doc's §7 balance telemetry. Since the provisioner rests orders
+    /// at exactly these prices, a trade beyond them means either the refresh job
+    /// is lagging or the bounds are wrong for the economy that has grown around
+    /// them — both worth knowing, and both otherwise invisible. This is the data
+    /// #129's balance pass has never had.
+    pub async fn trades_outside_bounds(
+        &self,
+        market_id: &str,
+        cfg: &MarketConfig,
+        since: i64,
+    ) -> Result<Vec<(String, i64, i64, i64)>, DbError> {
+        let mut out = Vec::new();
+        for (item, b) in &cfg.provisioner {
+            let rows = sqlx::query_as::<_, (i64,)>(
+                "SELECT unit_price FROM market_trade \
+                 WHERE market_id = ? AND item_id = ? AND created_at >= ? \
+                   AND (unit_price < ? OR unit_price > ?)",
+            )
+            .bind(market_id)
+            .bind(item)
+            .bind(since)
+            .bind(b.floor)
+            .bind(b.ceiling)
+            .fetch_all(&self.pool)
+            .await?;
+            for (price,) in rows {
+                out.push((item.clone(), price, b.floor, b.ceiling));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The money supply: every gold ever created minus every gold ever
+    /// destroyed, straight off the append-only ledger (#154).
+    ///
+    /// This is the number that makes "is the economy balanced?" answerable. It
+    /// must always equal purses plus escrowed gold — see
+    /// [`Db::gold_supply_gap`], which is what a boot check and the tests
+    /// actually assert.
+    pub async fn gold_supply(&self) -> Result<i64, DbError> {
+        let total: Option<i64> = sqlx::query_scalar("SELECT SUM(amount) FROM gold_ledger")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// Gold created, grouped by why — the faucet breakdown a balance pass
+    /// (#129) needs and could not previously get at all.
+    pub async fn gold_by_reason(&self) -> Result<Vec<(String, i64)>, DbError> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT reason, SUM(amount) FROM gold_ledger GROUP BY reason ORDER BY reason",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// `ledger - (purses + escrow)`. **Zero, always.**
+    ///
+    /// Escrowed gold is deducted from a purse and held by an open buy order, so
+    /// it is absent from `character.gold` but very much still in the world — the
+    /// open buy book is its only record, which is why the book is part of the
+    /// accounting rather than outside it.
+    ///
+    /// A nonzero result means gold was created or destroyed by a path that
+    /// didn't tell the ledger. That is exactly the class of bug #154 exists to
+    /// make impossible, so it is worth checking rather than assuming.
+    pub async fn gold_supply_gap(&self) -> Result<i64, DbError> {
+        let purses: Option<i64> = sqlx::query_scalar("SELECT SUM(gold) FROM character")
+            .fetch_one(&self.pool)
+            .await?;
+        let escrow: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(unit_price * qty_remaining) FROM market_order WHERE side = 'buy'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(self.gold_supply().await? - purses.unwrap_or(0) - escrow.unwrap_or(0))
+    }
+
     /// Fees burned at one market, split by kind — what a Phase 2 city treasury
     /// (#144) would be crediting instead, and the balance telemetry for
     /// whether the sink is sized sanely.
@@ -2919,6 +3218,11 @@ impl Db {
             .bind(character_id)
             .execute(&mut *tx)
             .await?;
+        // Rent is paid to the city, which is to say to nobody — the gold is
+        // destroyed. That made it a silent sink until #154; ledgered here it
+        // becomes the counterweight to the faucets, and the supply identity
+        // closes over rent as well as fees.
+        ledger_gold_in_tx(&mut tx, character_id, -cost, "rent", now).await?;
         let updated = pay_rent_in_tx(&mut tx, p, rent_period_secs, now).await?;
         tx.commit().await?;
         Ok(Some(updated))
@@ -3649,9 +3953,11 @@ impl Db {
         .bind(moved)
         .execute(&mut *tx)
         .await?;
-        // Wages (#145), in this same transaction — see `grant_gold_in_tx`.
+        // Wages (#145), in this same transaction — see `mint_gold_in_tx`. This
+        // is a genuine faucet: the city creates the coin it pays with, so it
+        // goes on the supply ledger (#154), not merely into a purse.
         result.wages = moved * wage_per_unit.max(0);
-        grant_gold_in_tx(&mut tx, character_id, result.wages).await?;
+        mint_gold_in_tx(&mut tx, character_id, result.wages, "build_wage", now_secs()).await?;
 
         let order_required = parse_cost(&order.required_json);
         let order_completed = !order_required.is_empty()
@@ -3832,7 +4138,9 @@ impl Db {
             .await?;
             // Wages (#145), in this same transaction — see `grant_gold_in_tx`.
             result.wages = moved * wage_per_unit.max(0);
-            grant_gold_in_tx(&mut tx, character_id, result.wages).await?;
+            // A genuine faucet — the city creates the coin it pays with — so it
+            // goes on the supply ledger (#154), not merely into a purse.
+            mint_gold_in_tx(&mut tx, character_id, result.wages, "build_wage", now_secs()).await?;
         }
 
         // Completion: every required item met (an order with no requirements never
@@ -6011,6 +6319,397 @@ mod tests {
 
     /// The epic's headline invariant (#136 §12) over the whole trading loop:
     /// across sells, buys and cancels, goods and gold are both conserved. This
+    // --- NPC provisioner (#154) ---------------------------------------------
+
+    /// A config with the provisioner switched on for wood. Floor well under
+    /// ceiling: it should be the worst counterparty available and still better
+    /// than nobody.
+    fn provisioned_cfg() -> MarketConfig {
+        let mut c = test_cfg();
+        c.provisioner.insert(
+            "wood".to_string(),
+            crate::market_config::ProvisionerBounds {
+                floor: 2,
+                ceiling: 20,
+                bid_qty: 100,
+                seed_stock: 50,
+            },
+        );
+        c
+    }
+
+    /// The bootstrapping problem, which is live right now: on a fresh server
+    /// nobody has listed anything, so the first player to reach the market sees
+    /// an empty book and the feature looks broken at the moment it makes its
+    /// first impression. With the provisioner on, they can sell and buy
+    /// immediately.
+    #[tokio::test]
+    async fn a_fresh_market_is_tradable_the_moment_it_opens() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = provisioned_cfg();
+        assert!(db.book_for(&m, "wood", "buy").await.unwrap().is_empty(), "dead book");
+
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+
+        // There is now a bid to sell into and an ask to buy from.
+        let bids = db.book_for(&m, "wood", "buy").await.unwrap();
+        let asks = db.book_for(&m, "wood", "sell").await.unwrap();
+        assert_eq!(bids[0].unit_price, 2, "the floor should be standing");
+        assert_eq!(bids[0].qty, 100);
+        assert_eq!(asks[0].unit_price, 20, "the ceiling should be standing");
+        assert_eq!(asks[0].qty, 50, "the ceiling sells the seeded stock");
+
+        // A brand-new player can immediately turn goods into gold...
+        let who = a_seller(&db, &m, "wood", 10).await;
+        let before = db.character_gold(&who).await.unwrap();
+        let out = db
+            .place_order(&m, &who, "sell", "wood", 2, 10, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 10, "the floor should have absorbed it");
+        assert!(db.character_gold(&who).await.unwrap() > before);
+
+        // ...and gold into goods.
+        let buyer = a_character(&db).await;
+        let out = db
+            .place_order(&m, &buyer, "buy", "wood", 20, 5, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 5, "the ceiling should have supplied it");
+    }
+
+    /// The floor must hold under a dump far larger than any player's purse —
+    /// that is what makes it a floor rather than a bid. It is funded by minting,
+    /// which is exactly why #154 built the ledger first.
+    #[tokio::test]
+    async fn the_floor_holds_under_a_dump_and_every_coin_is_ledgered() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let mut cfg = provisioned_cfg();
+        cfg.provisioner.get_mut("wood").unwrap().bid_qty = 500;
+
+        let minted = db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+        assert!(minted > 0, "funding a standing bid should have minted gold");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "minting must be ledgered");
+
+        // A whale dumps 400 wood — far more than any player could have paid for.
+        // Stocked in trips, because `MAX_CARRY` caps what one player can hold at
+        // once; the warehouse is what accumulates.
+        let whale = a_character(&db).await;
+        for _ in 0..8 {
+            db.add_to_inventory(&whale, "wood", 50).await.unwrap();
+            db.warehouse_deposit(&m, &whale, "wood", 50, 60).await.unwrap();
+        }
+        let before = db.character_gold(&whale).await.unwrap();
+        let out = db
+            .place_order(&m, &whale, "sell", "wood", 2, 400, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 400, "the floor buckled under a dump");
+        assert_eq!(db.character_gold(&whale).await.unwrap(), before + 800 - out.sale_tax - out.listing_fee);
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "the dump broke the supply identity");
+
+        // And the provisioner now holds the goods, which become its ceiling
+        // stock on the next refresh — it is a conduit, not a black hole.
+        db.refresh_provisioner(&m, &cfg, 1).await.unwrap();
+        let asks = db.book_for(&m, "wood", "sell").await.unwrap();
+        assert_eq!(asks[0].qty, 450, "bought stock should be re-offered at the ceiling");
+    }
+
+    /// The ceiling sells from STOCK ONLY. Unbounded selling would be an
+    /// infinite item faucet — worse than an uncapped price, because it would
+    /// destroy scarcity itself.
+    #[tokio::test]
+    async fn the_ceiling_is_bounded_by_stock_and_never_goes_negative() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let mut cfg = provisioned_cfg();
+        cfg.provisioner.get_mut("wood").unwrap().seed_stock = 10;
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+
+        // Try to buy far more than it holds.
+        let buyer = a_character(&db).await;
+        let out = db
+            .place_order(&m, &buyer, "buy", "wood", 20, 25, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 10, "it sold more than it had");
+
+        // Sold out: no ask at all, rather than an ask it cannot honour.
+        db.refresh_provisioner(&m, &cfg, 1).await.unwrap();
+        assert!(
+            db.book_for(&m, "wood", "sell").await.unwrap().is_empty(),
+            "a sold-out provisioner must not advertise stock it doesn't have"
+        );
+        let npc = db.ensure_provisioner().await.unwrap();
+        let held: i64 = db
+            .warehouse_for_character(&m, &npc)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.item_id == "wood")
+            .map(|r| r.qty)
+            .sum();
+        assert!(held >= 0, "negative stock");
+    }
+
+    /// Round-tripping through the provisioner must LOSE money. This is the
+    /// property that makes it a safety net rather than a farm: if buying at the
+    /// ceiling and selling back at the floor were profitable, it would be an
+    /// infinite gold fountain limited only by clicking speed.
+    #[tokio::test]
+    async fn round_tripping_through_the_provisioner_loses_money() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = provisioned_cfg();
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+
+        let farmer = a_character(&db).await;
+        let start = db.character_gold(&farmer).await.unwrap();
+        // Buy 10 at the ceiling...
+        let out = db
+            .place_order(&m, &farmer, "buy", "wood", 20, 10, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 10);
+        // ...and sell the same 10 straight back at the floor.
+        let out = db
+            .place_order(&m, &farmer, "sell", "wood", 2, 10, NO_EXPIRY, &cfg, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, 10);
+        assert!(
+            db.character_gold(&farmer).await.unwrap() < start,
+            "the provisioner is a money printer — round-tripping through it turned a profit"
+        );
+    }
+
+    /// Refreshing is idempotent: it re-posts, it does not accumulate. A job on a
+    /// timer that doubled the book every tick would be a slow-motion outage.
+    #[tokio::test]
+    async fn refreshing_the_provisioner_is_idempotent() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = provisioned_cfg();
+
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+        let bids = db.book_for(&m, "wood", "buy").await.unwrap();
+        let asks = db.book_for(&m, "wood", "sell").await.unwrap();
+
+        for t in 1..4 {
+            db.refresh_provisioner(&m, &cfg, t).await.unwrap();
+        }
+        assert_eq!(db.book_for(&m, "wood", "buy").await.unwrap(), bids, "the bid multiplied");
+        assert_eq!(db.book_for(&m, "wood", "sell").await.unwrap(), asks, "the ask multiplied");
+
+        // The seed is granted ONCE, however many times the job runs.
+        let npc = db.ensure_provisioner().await.unwrap();
+        let held: i64 = db
+            .warehouse_for_character(&m, &npc)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.item_id == "wood")
+            .map(|r| r.qty)
+            .sum();
+        assert_eq!(held, 50, "seed stock was granted more than once");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// Opt-in, and only for real commodities. Adding an item to the registry
+    /// must never silently create a gold faucet for it.
+    #[tokio::test]
+    async fn a_commodity_without_bounds_gets_no_provisioner_orders() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+
+        // Nothing configured at all: no orders, no minting, no system character
+        // conjured for nothing.
+        assert_eq!(db.refresh_provisioner(&m, &test_cfg(), 0).await.unwrap(), 0);
+        assert!(db.book_for(&m, "wood", "buy").await.unwrap().is_empty());
+        assert_eq!(db.gold_supply().await.unwrap(), 0, "an unconfigured provisioner minted gold");
+
+        // Wood configured, stone not: stone stays untouched.
+        let cfg = provisioned_cfg();
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+        assert!(!db.book_for(&m, "wood", "buy").await.unwrap().is_empty());
+        assert!(
+            db.book_for(&m, "stone", "buy").await.unwrap().is_empty(),
+            "an unconfigured commodity got a floor anyway"
+        );
+    }
+
+    /// The provisioner never trades with itself. Its own bid at the floor and
+    /// ask at the ceiling coexist in one book, and self-match prevention plus a
+    /// validated spread both have to hold for that to be safe.
+    #[tokio::test]
+    async fn the_provisioner_never_matches_its_own_orders() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = provisioned_cfg();
+        db.refresh_provisioner(&m, &cfg, 0).await.unwrap();
+        db.refresh_provisioner(&m, &cfg, 1).await.unwrap();
+
+        assert!(db.recent_trades(&m, "wood", 10).await.unwrap().is_empty(), "it traded with itself");
+        assert!(db.book_health().await.unwrap().is_empty(), "the provisioner broke a book invariant");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// The §7 balance telemetry: a trade outside the bounds means either the
+    /// refresh job is lagging or the bounds are wrong for the economy that grew
+    /// around them. Both are worth knowing, and both are otherwise invisible.
+    #[tokio::test]
+    async fn trades_outside_the_bounds_are_reported() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = provisioned_cfg();
+
+        // A trade well inside the bounds: nothing to report.
+        let s = a_seller(&db, &m, "wood", 20).await;
+        sell(&db, &m, &s, "wood", 9, 5).await;
+        let b = a_character(&db).await;
+        buy(&db, &m, &b, "wood", 9, 5).await;
+        assert!(db.trades_outside_bounds(&m, &cfg, 0).await.unwrap().is_empty());
+
+        // A trade above the ceiling — only possible with the provisioner absent
+        // or lagging, which is exactly the condition worth surfacing.
+        let s2 = a_seller(&db, &m, "wood", 20).await;
+        sell(&db, &m, &s2, "wood", 50, 5).await;
+        let b2 = a_character(&db).await;
+        buy(&db, &m, &b2, "wood", 50, 5).await;
+        let flagged = db.trades_outside_bounds(&m, &cfg, 0).await.unwrap();
+        assert_eq!(flagged.len(), 1, "an out-of-bounds trade went unreported: {flagged:?}");
+        assert_eq!(flagged[0], ("wood".to_string(), 50, 2, 20));
+    }
+
+    // --- the money supply ledger (#154) --------------------------------------
+
+    /// The identity the whole ledger exists for: everything ever minted, minus
+    /// everything ever burned, equals what is in purses plus what is escrowed.
+    ///
+    /// Driven through every path that touches gold — creating characters,
+    /// earning wages, trading, paying fees, resting and cancelling orders, and
+    /// paying rent — because a ledger that only balances on the paths someone
+    /// remembered to wire up is worth nothing.
+    #[tokio::test]
+    async fn gold_is_conserved_against_the_ledger() {
+        let (db, _t) = TempDb::open().await;
+        assert_eq!(db.gold_supply().await.unwrap(), 0, "an empty world has no money");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 40).await;
+        let buyer = a_character(&db).await;
+        assert_eq!(
+            db.gold_supply().await.unwrap(),
+            db.character_gold(&seller).await.unwrap() + db.character_gold(&buyer).await.unwrap(),
+            "creating characters is the game's oldest faucet and must be recorded"
+        );
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+
+        // Wages: a genuine mint, so the supply GROWS.
+        let before = db.gold_supply().await.unwrap();
+        let order = db
+            .insert_build_order("civic", "town_well", r#"{"wood":20}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+        db.add_to_inventory(&seller, "wood", 20).await.unwrap();
+        let res = db.contribute(&seller, &order.id, "wood", 20, 1).await.unwrap();
+        assert!(res.wages > 0, "the city should have paid something");
+        assert_eq!(
+            db.gold_supply().await.unwrap(),
+            before + res.wages,
+            "wages must show up as newly created gold"
+        );
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+
+        // Trading moves gold and burns fees; it must never MINT any.
+        let after_wages = db.gold_supply().await.unwrap();
+        sell(&db, &m, &seller, "wood", 9, 10).await;
+        buy(&db, &m, &buyer, "wood", 12, 10).await;
+        buy(&db, &m, &buyer, "wood", 3, 5).await; // rests, escrowing gold
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "escrowed gold went missing");
+        let burned = db.total_fees_burned().await.unwrap();
+        assert!(burned > 0);
+        assert_eq!(
+            db.gold_supply().await.unwrap(),
+            after_wages - burned,
+            "trading created gold — only fees should have moved the supply, downward"
+        );
+
+        // Cancelling returns escrow without minting.
+        let supply = db.gold_supply().await.unwrap();
+        let open = db.open_orders_for_character(&m, &buyer).await.unwrap();
+        for o in open.iter().filter(|o| o.side == "buy") {
+            db.cancel_order(&buyer, &o.id).await.unwrap();
+        }
+        assert_eq!(db.gold_supply().await.unwrap(), supply, "a refund is not a mint");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+
+        // Rent destroys gold, and the ledger has to see that too or the
+        // faucets would look unopposed.
+        db.insert_unowned_plot("suburbs", 0, 0, 80, 80, 0).await.unwrap();
+        let plot = db.claim_plot(&buyer, "suburbs", 3600, 0).await.unwrap().unwrap();
+        let supply = db.gold_supply().await.unwrap();
+        assert!(db.pay_rent_with_gold(&buyer, &plot.id, 25, 3600, 100).await.unwrap().is_some());
+        assert_eq!(
+            db.gold_supply().await.unwrap(),
+            supply - 25,
+            "rent paid to the city is gold destroyed, and must be recorded as such"
+        );
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// `market_fee` and `gold_ledger` are written in the same transaction and
+    /// must never disagree. Two tables recording the same burn is a deliberate
+    /// redundancy — one answers "what did this market take from whom", the other
+    /// "how much gold exists" — and this is what stops them drifting apart.
+    #[tokio::test]
+    async fn fee_ledgers_agree() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let seller = a_seller(&db, &m, "wood", 40).await;
+        let buyer = a_character(&db).await;
+        sell(&db, &m, &seller, "wood", 9, 20).await;
+        buy(&db, &m, &buyer, "wood", 12, 20).await;
+
+        let by_reason = db.gold_by_reason().await.unwrap();
+        let ledger_fees: i64 = by_reason
+            .iter()
+            .filter(|(r, _)| r == "market_fee")
+            .map(|(_, g)| *g)
+            .sum();
+        assert!(ledger_fees < 0, "burns are negative on the supply ledger");
+        assert_eq!(
+            -ledger_fees,
+            db.total_fees_burned().await.unwrap(),
+            "the fee table and the supply ledger disagree about what was burned"
+        );
+    }
+
+    /// The faucet breakdown a balance pass (#129) needs: which sources created
+    /// the gold in this world. Previously unanswerable at any price.
+    #[tokio::test]
+    async fn the_ledger_names_every_faucet() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let who = a_seller(&db, &m, "wood", 40).await;
+        let order = db
+            .insert_build_order("civic", "town_well", r#"{"wood":20}"#, "open", 0, None, 0, None, None)
+            .await
+            .unwrap();
+        db.add_to_inventory(&who, "wood", 20).await.unwrap();
+        db.contribute(&who, &order.id, "wood", 20, 1).await.unwrap();
+        sell(&db, &m, &who, "wood", 9, 10).await;
+
+        let reasons: Vec<String> =
+            db.gold_by_reason().await.unwrap().into_iter().map(|(r, _)| r).collect();
+        assert!(reasons.contains(&"character_start".to_string()), "{reasons:?}");
+        assert!(reasons.contains(&"build_wage".to_string()), "{reasons:?}");
+        assert!(reasons.contains(&"market_fee".to_string()), "{reasons:?}");
+    }
+
     /// Two markets, one commodity, two books. Every market table has been keyed
     /// by `market_id` since #137, but until #153 that keying had only ever been
     /// exercised with a single market — and untested generality is not

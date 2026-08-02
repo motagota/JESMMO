@@ -384,6 +384,19 @@ func _rebuild_book() -> void:
 	var ask_txt := "—" if _asks.is_empty() else str(best_ask)
 	spread.text = "%s — best bid %s / best ask %s" % [_watching, bid_txt, ask_txt]
 	_body.add_child(spread)
+	# The provisioner's standing band (#154), stated rather than left to be
+	# inferred from a suspiciously large resting order. For a newcomer this is
+	# the single most useful thing to know about a commodity: what it can never
+	# be worth less than, and what nobody can corner it above.
+	var band: Dictionary = _rules.get("provisioner", {})
+	if band.has(_watching):
+		var b: Dictionary = band[_watching]
+		var note := Label.new()
+		note.add_theme_font_size_override("font_size", 11)
+		note.modulate = Color(0.65, 0.75, 0.65)
+		note.text = "  the market always buys at %dg and sells at %dg while it has stock" % [
+			int(b.get("floor", 0)), int(b.get("ceiling", 0))]
+		_body.add_child(note)
 	if _last_trade != "":
 		var tick := Label.new()
 		tick.add_theme_font_size_override("font_size", 11)

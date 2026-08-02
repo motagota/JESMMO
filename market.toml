@@ -106,6 +106,52 @@ candle_interval_secs = 3600
 # pruned, so pruning this only costs the CPU to rebuild.
 history_retain_days = 30
 
+# --- NPC provisioner: the price floor and ceiling (#154) --------------------
+#
+# OPT-IN, per commodity. An item with no table here gets no NPC orders at all,
+# so adding something to the item registry never silently creates a gold faucet
+# for it. `plank` and `tool_kit` are deliberately absent: crafted goods should
+# find their price between players.
+#
+# WHAT THIS IS FOR. On a fresh server nobody has listed anything, so the first
+# player to reach the market sees an empty book — no bid to sell into, no ask to
+# buy from — and the whole feature looks broken at the moment it makes its first
+# impression. The provisioner rests ORDINARY orders (visible in the book, no
+# special case in the matching engine) so there is always something there.
+# Secondly, standing bounds mean a commodity with three sellers cannot be
+# cornered without limit.
+#
+# THE FLOOR IS A GOLD FAUCET. It buys without limit and MINTS the gold to do it,
+# because a bid with a finite budget stops being a floor exactly when it is
+# needed — during a crash. Every coin is recorded on `gold_ledger` (#154), which
+# is why that ledger had to exist before this feature could.
+#
+# THE CEILING SELLS FROM STOCK ONLY — the seed below plus whatever it has
+# bought. Unbounded selling would be an infinite ITEM faucet, and destroying
+# scarcity is worse than an uncapped price.
+#
+# THE SPREAD IS DELIBERATELY ENORMOUS. The provisioner should be the worst
+# counterparty in the market and still better than nobody. Wood trades between
+# players around 8-12g; a 1g floor is a safety net nobody would farm (build
+# wages pay 1g per unit and don't cost you the wood), and a 40g ceiling is far
+# above any honest price, so it caps a corner without competing with real
+# sellers. A test asserts round-tripping through it LOSES money.
+#
+# Placeholders pending #129, like everything else here.
+[defaults.provisioner.wood]
+floor = 1
+ceiling = 40
+bid_qty = 200
+seed_stock = 100
+
+# Stone is scarcer than wood — it comes from the Mt Coot-tha quarry rather than
+# a tree outside the gate — so the ceiling sits higher and the seed is smaller.
+[defaults.provisioner.stone]
+floor = 1
+ceiling = 60
+bid_qty = 120
+seed_stock = 60
+
 # ---------------------------------------------------------------------------
 # Per-district overrides.
 #

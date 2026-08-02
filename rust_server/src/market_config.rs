@@ -79,6 +79,10 @@ pub struct MarketConfig {
     pub candle_interval_secs: i64,
     /// How long candles are kept. The ledger they derive from is never pruned.
     pub history_retain_days: i64,
+    /// Standing price bounds per commodity (#154), empty by default — the
+    /// provisioner is opt-in, so a server that configures nothing gets no NPC
+    /// orders and no second gold faucet.
+    pub provisioner: BTreeMap<String, ProvisionerBounds>,
 }
 
 impl Default for MarketConfig {
@@ -104,6 +108,7 @@ impl Default for MarketConfig {
             sale_tax_den: 100,
             candle_interval_secs: 3600,
             history_retain_days: 30,
+            provisioner: BTreeMap::new(),
         }
     }
 }
@@ -196,6 +201,24 @@ impl MarketConfig {
             "sale_tax_num": self.sale_tax_num,
             "sale_tax_den": self.sale_tax_den,
             "candle_interval_secs": self.candle_interval_secs,
+            // The provisioner's standing bounds (#154), as
+            // `{item: {floor, ceiling}}`. Sent so the panel can SAY what the
+            // band is instead of leaving a player to infer it from a
+            // suspiciously large resting order — the bounds are the most
+            // useful thing a newcomer can know about a commodity, and they are
+            // public information by construction (the orders are right there in
+            // the book).
+            //
+            // Sizes are deliberately omitted: how much the NPC will buy is a
+            // depth question the book already answers, and quoting a number
+            // that goes stale between refreshes would be worse than silence.
+            "provisioner": self
+                .provisioner
+                .iter()
+                .map(|(k, b)| {
+                    (k.clone(), serde_json::json!({"floor": b.floor, "ceiling": b.ceiling}))
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
         })
     }
 
@@ -276,6 +299,85 @@ impl MarketConfig {
         if self.history_retain_days <= 0 {
             return bad("history_retain_days", "must be positive");
         }
+        for (item, bounds) in &self.provisioner {
+            // Only real commodities: a typo'd item id would otherwise sit in the
+            // file looking like a price floor while backing nothing, and uniques
+            // are sold on the listing board and have no book to stand orders in.
+            if !crate::world::is_commodity(item) {
+                return Err(ConfigError::Invalid {
+                    whence: whence.to_string(),
+                    key: format!("provisioner.{item}"),
+                    why: "is not a tradable commodity — check the spelling, and note that                           unique items are sold on the listing board and have no order book"
+                        .to_string(),
+                });
+            }
+            bounds.validate(whence, item)?;
+        }
+        Ok(())
+    }
+}
+
+/// The NPC provisioner's standing bounds for one commodity (#154).
+///
+/// **Opt-in.** A commodity with no entry gets no provisioner orders at all, so
+/// adding an item to the registry never silently creates a gold faucet for it.
+///
+/// The floor and ceiling are deliberately far apart. The provisioner should be
+/// the worst counterparty in the market and still better than nobody: it exists
+/// so a fresh server's book isn't dead content and so a commodity can't be
+/// cornered without limit, not to be a place anyone chooses to trade. A test
+/// asserts round-tripping goods through it LOSES money.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionerBounds {
+    /// What it will always pay. The bid is refreshed back to `bid_qty` forever,
+    /// minting the gold to do it — a floor with a finite budget stops being a
+    /// floor exactly when it is needed, during a crash.
+    pub floor: i64,
+    /// What it will sell at, **from stock only**. Unbounded selling would be an
+    /// infinite item faucet, and destroying scarcity is worse than an uncapped
+    /// price.
+    pub ceiling: i64,
+    /// How much the standing bid is topped back up to on each refresh.
+    pub bid_qty: i64,
+    /// Stock the provisioner is seeded with at each market the first time it
+    /// appears, so the ceiling exists on a brand-new server before it has
+    /// bought anything. Everything after that comes from what it buys.
+    #[serde(default)]
+    pub seed_stock: i64,
+}
+
+impl ProvisionerBounds {
+    fn validate(&self, whence: &str, item: &str) -> Result<(), ConfigError> {
+        let bad = |key: &str, why: &str| {
+            Err(ConfigError::Invalid {
+                whence: format!("{whence}.provisioner.{item}"),
+                key: key.to_string(),
+                why: why.to_string(),
+            })
+        };
+        if self.floor <= 0 {
+            return bad("floor", "must be positive");
+        }
+        if self.ceiling <= 0 {
+            return bad("ceiling", "must be positive");
+        }
+        // An inverted or touching spread would let a player buy from the
+        // provisioner and immediately sell back to it at a profit — an infinite
+        // gold fountain limited only by how fast they can click.
+        if self.ceiling <= self.floor {
+            return bad(
+                "ceiling",
+                "must be strictly above floor, or buying from the provisioner and selling \
+                 straight back to it prints money",
+            );
+        }
+        if self.bid_qty <= 0 {
+            return bad("bid_qty", "must be positive");
+        }
+        if self.seed_stock < 0 {
+            return bad("seed_stock", "must not be negative");
+        }
         Ok(())
     }
 }
@@ -307,6 +409,11 @@ pub struct MarketPatch {
     pub sale_tax_den: Option<i64>,
     pub candle_interval_secs: Option<i64>,
     pub history_retain_days: Option<i64>,
+    /// Per-commodity provisioner bounds. Stated in a district table, this
+    /// REPLACES the defaults' map wholesale rather than merging key by key: a
+    /// market that names its own commodities means exactly those, and a
+    /// half-inherited set of price bounds would be very hard to reason about.
+    pub provisioner: Option<BTreeMap<String, ProvisionerBounds>>,
 }
 
 impl MarketPatch {
@@ -337,6 +444,10 @@ impl MarketPatch {
                 .candle_interval_secs
                 .unwrap_or(base.candle_interval_secs),
             history_retain_days: self.history_retain_days.unwrap_or(base.history_retain_days),
+            provisioner: self
+                .provisioner
+                .clone()
+                .unwrap_or_else(|| base.provisioner.clone()),
         }
     }
 }
@@ -677,6 +788,101 @@ mod tests {
 candle_interval_secs = 7200
 ").unwrap();
         assert_eq!(set.defaults().candle_interval_secs, 7200);
+    }
+
+    /// The provisioner is OPT-IN and validated: a typo'd item id, an inverted
+    /// spread, or a nonsense size must all refuse the boot. An inverted spread
+    /// especially — buying from the provisioner and selling straight back to it
+    /// at a profit would be an infinite gold fountain limited only by clicking.
+    #[test]
+    fn provisioner_bounds_are_validated() {
+        let ok = MarketConfigSet::parse(
+            "[defaults.provisioner.wood]
+floor = 1
+ceiling = 40
+bid_qty = 200
+seed_stock = 10
+",
+        )
+        .unwrap();
+        let b = ok.defaults().provisioner.get("wood").unwrap();
+        assert_eq!((b.floor, b.ceiling, b.bid_qty, b.seed_stock), (1, 40, 200, 10));
+        // Absent by default: no configuration, no faucet.
+        assert!(MarketConfig::default().provisioner.is_empty());
+
+        let cases = [
+            ("floor = 0
+ceiling = 40
+bid_qty = 5", "floor"),
+            ("floor = 5
+ceiling = 0
+bid_qty = 5", "ceiling"),
+            ("floor = 40
+ceiling = 40
+bid_qty = 5", "ceiling"), // touching = free money
+            ("floor = 40
+ceiling = 10
+bid_qty = 5", "ceiling"), // inverted
+            ("floor = 1
+ceiling = 40
+bid_qty = 0", "bid_qty"),
+            ("floor = 1
+ceiling = 40
+bid_qty = 5
+seed_stock = -1", "seed_stock"),
+        ];
+        for (body, key) in cases {
+            let text = format!("[defaults.provisioner.wood]
+{body}
+");
+            let err = MarketConfigSet::parse(&text)
+                .unwrap_err_or_panic(&format!("`{body}` should have been refused"));
+            assert!(err.to_string().contains(key), "error for `{body}` should name `{key}`: {err}");
+        }
+
+        // A misspelled or non-commodity item is refused rather than silently
+        // backing nothing.
+        for item in ["wodo", "pickaxe"] {
+            let text = format!("[defaults.provisioner.{item}]
+floor = 1
+ceiling = 9
+bid_qty = 5
+");
+            let err = MarketConfigSet::parse(&text).unwrap_err_or_panic("should be refused");
+            assert!(err.to_string().contains(item), "{err}");
+        }
+    }
+
+    /// A district stating its own provisioner REPLACES the defaults' map rather
+    /// than merging key by key — a half-inherited set of price bounds would be
+    /// very hard to reason about, and "this market backs exactly these goods" is
+    /// the useful reading.
+    #[test]
+    fn a_district_provisioner_replaces_rather_than_merges() {
+        let set = MarketConfigSet::parse(
+            "[defaults.provisioner.wood]
+floor = 1
+ceiling = 40
+bid_qty = 200
+
+             [defaults.provisioner.stone]
+floor = 1
+ceiling = 60
+bid_qty = 100
+
+             [districts.market.provisioner.wood]
+floor = 2
+ceiling = 30
+bid_qty = 50
+",
+        )
+        .unwrap();
+        let remote = set.for_district("market");
+        assert_eq!(remote.provisioner.len(), 1, "the district's map should stand alone");
+        assert_eq!(remote.provisioner.get("wood").unwrap().ceiling, 30);
+        assert!(remote.provisioner.get("stone").is_none());
+        // The capital keeps both.
+        assert_eq!(set.for_district("civic").provisioner.len(), 2);
     }
 
     /// A bad value inside a district table must be caught too, and blamed on

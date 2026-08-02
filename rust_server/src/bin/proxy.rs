@@ -180,6 +180,10 @@ const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the trade ledger is rolled into candles (#143). A background
 /// cadence — aggregation must never sit in front of a trade.
 const CANDLE_ROLLUP_INTERVAL: Duration = Duration::from_secs(120);
+/// How often the NPC provisioner re-posts its standing bid and ask (#154).
+/// Frequent enough that a swept-out floor comes back quickly, slow enough that
+/// it isn't rewriting the book under active traders.
+const PROVISIONER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Build wages (#145): gold the city pays per UNIT actually contributed to a
 /// city build order — the game's first gold faucet. Before this, gold was
@@ -2995,6 +2999,69 @@ impl Proxy {
         }
         stamps.push(now);
         true
+    }
+
+    /// Keep the NPC provisioner's standing bid and ask posted at every built
+    /// market (#154), and report trades that escaped the bounds.
+    ///
+    /// A background job like the expiry sweep and the candle rollup: the
+    /// provisioner rests ORDINARY orders, so nothing here sits in front of a
+    /// player's trade. Re-posting is idempotent, so a tick that lands while
+    /// nothing has changed leaves the book exactly as it was.
+    async fn provisioner_refresh(self: Arc<Self>) {
+        // One tick immediately, so a fresh server's book is tradable from the
+        // moment the market is built rather than after the first interval.
+        let mut first = true;
+        loop {
+            if !first {
+                sleep(PROVISIONER_REFRESH_INTERVAL).await;
+            }
+            first = false;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            for d in &self.capital.districts {
+                let cfg = self.market_cfg(d.id);
+                if cfg.provisioner.is_empty() {
+                    continue;
+                }
+                let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
+                for o in orders.iter().filter(|o| {
+                    o.state == "completed" && o.structure_kind.as_deref() == Some("market")
+                }) {
+                    match db.refresh_provisioner(&o.id, cfg, now).await {
+                        Ok(minted) if minted > 0 => println!(
+                            "[Proxy] MARKET: provisioner minted {minted}g to fund its floor at \
+                             {} ({})",
+                            d.id, o.id
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("[Proxy] provisioner refresh at {}: {e}", d.id);
+                            continue;
+                        }
+                    }
+                    // Balance telemetry (design doc §7). The provisioner rests
+                    // orders AT the bounds, so a trade beyond them means either
+                    // this job is lagging or the bounds no longer fit the
+                    // economy that grew around them. Both are worth knowing, and
+                    // neither is visible any other way — this is the data #129's
+                    // balance pass has never had.
+                    let since = now - PROVISIONER_REFRESH_INTERVAL.as_secs() as i64 * 2;
+                    match db.trades_outside_bounds(&o.id, cfg, since).await {
+                        Ok(rows) => {
+                            for (item, price, lo, hi) in rows {
+                                println!(
+                                    "[Proxy] MARKET TELEMETRY: {item} traded at {price}g outside \
+                                     the provisioner's {lo}-{hi}g band at {} — bounds may be stale",
+                                    d.id
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[Proxy] provisioner telemetry at {}: {e}", d.id),
+                    }
+                }
+            }
+        }
     }
 
     /// Roll the trade ledger into OHLCV candles and prune old ones (#143).
@@ -5823,6 +5890,12 @@ impl Proxy {
         let me = self.clone();
         tokio::spawn(async move { me.candle_rollup().await });
 
+        // NPC provisioner (#154): keeps a floor and a ceiling standing so a
+        // fresh server's book is never dead content, and reports trades that
+        // escaped the band.
+        let me = self.clone();
+        tokio::spawn(async move { me.provisioner_refresh().await });
+
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —
         // whichever comes first ends the process, but either way we get one
@@ -5969,6 +6042,20 @@ async fn main() {
             // failure, not a warning: every violation here means goods or gold
             // have been duplicated or destroyed, and a market that has
             // silently minted stock is far worse than one that won't start.
+            // The money supply must equal purses plus escrow (#154). A gap
+            // means some path created or destroyed gold without telling the
+            // ledger — the precise class of bug the ledger exists to make
+            // impossible. A WARNING rather than a panic: unlike a crossed book
+            // this doesn't corrupt anyone's holdings, and a pre-#154 database
+            // legitimately starts with an unexplained supply (nobody was
+            // recording when those characters were created).
+            match db.gold_supply_gap().await {
+                Ok(0) => println!("[Proxy] Gold supply reconciled — ledger matches purses + escrow"),
+                Ok(gap) => println!(
+                    "[Proxy] NOTE: gold supply gap of {gap}g — expected on a database that                      predates the #154 ledger; new activity is fully recorded"
+                ),
+                Err(e) => eprintln!("[Proxy] gold supply check: {e}"),
+            }
             match db.book_health().await {
                 Ok(problems) if problems.is_empty() => {
                     println!("[Proxy] Market books reconciled — escrow matches the open book")
