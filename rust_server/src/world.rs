@@ -171,6 +171,14 @@ pub fn items() -> Vec<Item> {
         Item { id: "stone", name: "Stone", stack_size: 100, category: "stone" },
         Item { id: "plank", name: "Plank", stack_size: 100, category: "crafted" },
         Item { id: "tool_kit", name: "Tool Kit", stack_size: 100, category: "crafted" },
+        // Dropped by wild dogs (#157/#159) and the currency of the bounty
+        // (#161). An ORDINARY stackable commodity on purpose: it carries,
+        // stores, warehouses and trades like wood does, so someone who hates
+        // combat can buy pelts from someone who loves it and still turn them
+        // in. That emergent market costs nothing to allow — the book already
+        // handles any commodity — and a bounty item that couldn't be sold would
+        // be a strange exception in a game that just spent an epic on trading.
+        Item { id: "dog_pelt", name: "Dog Pelt", stack_size: 100, category: "trophy" },
         // Equippable tool (mining/abilities epic #123): arming one in the tool
         // slot puts the Pick ability on the hotbar. stack_size 1 — it's worn,
         // not stacked, though nothing stops carrying spares unequipped.
@@ -801,6 +809,20 @@ impl Capital {
 /// registry, the wire and the client all name the same thing without three
 /// definitions to keep in step.
 pub const SPECIES_WILD_DOG: &str = "wild_dog";
+
+/// What a creature leaves behind when killed (#159), or `None` for one that
+/// drops nothing.
+///
+/// Only AUTHORED creatures drop. Ambient mobs deliberately don't: the bounty
+/// should send you to the authored pack, and a dropping ambient mob would turn
+/// every zone in the world into a farm — which is also why they stay
+/// speciesless (#158), since this looks up by species.
+pub fn creature_drop(species: &str) -> Option<&'static str> {
+    match species {
+        SPECIES_WILD_DOG => Some("dog_pelt"),
+        _ => None,
+    }
+}
 
 /// How far an authored creature may stray from where it was authored (#158).
 ///

@@ -200,6 +200,13 @@ struct Entity {
     /// and walks back — see that constant for why. `None` for players and
     /// ambient mobs, which roam their whole region freely as they always have.
     home: Option<(i32, i32)>,
+    /// Who struck the blow that took this creature from alive to dead (#159).
+    ///
+    /// Set ONLY by the hit that crosses hp from `> 0` to `<= 0`, never by a
+    /// later one landing on a corpse in the same tick — otherwise two players
+    /// swinging together would credit whoever the iteration order happened to
+    /// reach last, rather than whoever actually killed it.
+    killed_by: Option<String>,
 }
 
 impl Entity {
@@ -222,6 +229,7 @@ impl Entity {
             poisoned: false,
             species: None,
             home: None,
+            killed_by: None,
         }
     }
 
@@ -253,6 +261,7 @@ impl Entity {
             poisoned: false,
             species: None,
             home: None,
+            killed_by: None,
         }
     }
 }
@@ -1106,6 +1115,10 @@ impl ZoneServer {
             let mut changed: HashSet<String> = HashSet::new();
             let mut despawns: Vec<String> = Vec::new();
             let mut died: Vec<(String, i32)> = Vec::new(); // (player_id, respawn max_hp)
+            // (killer, item, species) for creatures that died with a killer this
+            // tick (#159). Collected while the entity lock is held and flushed
+            // with the rest of the packets below, like every other outcome.
+            let mut loot: Vec<(String, &'static str, &'static str)> = Vec::new();
             let mut packets: Vec<String> = Vec::new();
 
             {
@@ -1285,7 +1298,15 @@ impl ZoneServer {
                         .collect();
                     for hid in hits {
                         if let Some(m) = entities.get_mut(&hid) {
+                            let was_alive = m.hp > 0;
                             m.hp -= MELEE_DAMAGE;
+                            // Credit the KILLING blow, and only it (#159). The
+                            // `was_alive` guard is what makes this exactly-once
+                            // when two swings land in the same tick: the second
+                            // hits a corpse and changes nothing.
+                            if was_alive && m.hp <= 0 {
+                                m.killed_by = Some(sid.clone());
+                            }
                             changed.insert(hid);
                         }
                     }
@@ -1302,6 +1323,21 @@ impl ZoneServer {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in dead_mobs {
+                    // The drop (#159), read off the corpse before it goes.
+                    // Species is what gates it: only authored creatures carry
+                    // one, so ambient mobs drop nothing and the bounty sends you
+                    // to the pack rather than turning every zone into a farm.
+                    //
+                    // No killer means no drop, and that is the normal case for
+                    // an environmental death — a dog that drowns or is poisoned
+                    // was killed by the world, and nobody earned anything.
+                    if let Some(e) = entities.get(&id) {
+                        if let (Some(species), Some(killer)) = (e.species, e.killed_by.clone()) {
+                            if let Some(item) = mmo::world::creature_drop(species) {
+                                loot.push((killer, item, species));
+                            }
+                        }
+                    }
                     entities.remove(&id);
                     changed.remove(&id);
                     // An authored creature (#158) is remembered rather than
@@ -1468,6 +1504,24 @@ impl ZoneServer {
 
             for id in &despawns {
                 packets.push(json!({"type": "despawn", "player_id": id}).to_string());
+            }
+            // Loot (#159) rides the existing `gather_yield` path rather than a
+            // second, parallel one: it already carries an item from a zone event
+            // into a player's durable inventory through the gateway, already
+            // respects MAX_CARRY, and already refuses guests. A kill is a
+            // different WAY to earn an item, not a different kind of item.
+            //
+            // No `ability_id`: that field is what wears a tool down, and a kill
+            // is not a tool swing. Weapon wear is #160's business.
+            for (killer, item, species) in &loot {
+                packets.push(
+                    json!({
+                        "type": "gather_yield", "player_id": killer,
+                        "item_id": item, "qty": 1, "skill": "", "xp": 0,
+                        "source": "kill", "species": species,
+                    })
+                    .to_string(),
+                );
             }
             // Order matters: `you_died` must reach the gateway while the dead
             // player's client still points at THIS zone (see the death block
@@ -1780,6 +1834,159 @@ mod tests {
         );
         assert_eq!(back.hp, MOB_MAX_HP, "and at full health");
         assert_eq!(back.species, Some(mmo::world::SPECIES_WILD_DOG));
+    }
+
+    // --- kill credit and the drop (#159) ------------------------------------
+
+    /// Killing an authored creature credits the killer, and the loot rides the
+    /// existing `gather_yield` path rather than a second parallel one.
+    #[tokio::test]
+    async fn killing_a_dog_credits_the_killer_with_a_pelt() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        // A player right on top of it, and the dog one hit from death.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            // One dog in reach, for the same reason as above: a swing cleaves.
+            let others: Vec<String> = es
+                .iter()
+                .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+                .map(|(oid, _)| oid.clone())
+                .collect();
+            for oid in others {
+                es.remove(&oid);
+            }
+            // Stand BACK from the target, facing it. Standing on top of it is
+            // flaky: the arc is ±90°, mobs wander up to 2 units on the tick the
+            // swing resolves, and a dog that drifts behind you is a clean miss —
+            // with `swinging` consumed, there is no second chance. 30 units back
+            // is well inside the 60 reach and far enough that a 2-unit wander
+            // can't flip the angle.
+            es.insert(
+                "hunter".to_string(),
+                Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP),
+            );
+            es.get_mut(&id).unwrap().hp = 1;
+            es.get_mut("hunter").unwrap().facing = (1, 0);
+        }
+        zone.entities.lock().unwrap().get_mut("hunter").unwrap().swinging = true;
+
+        let packets = drive_until(zone.clone(), |p| p.contains("dog_pelt")).await;
+        let loot: Vec<&String> = packets
+            .iter()
+            .filter(|p| p.contains("\"gather_yield\"") && p.contains("dog_pelt"))
+            .collect();
+        assert_eq!(loot.len(), 1, "expected exactly one pelt, got {loot:?}");
+        let v: serde_json::Value = serde_json::from_str(loot[0]).unwrap();
+        assert_eq!(v["player_id"], "hunter", "the wrong player was credited");
+        assert_eq!(v["qty"], 1);
+        assert_eq!(v["source"], "kill");
+        // No ability id: a kill is not a tool swing, so nothing wears down here.
+        assert!(v["ability_id"].is_null(), "a kill must not wear a gathering tool");
+    }
+
+    /// Two hunters swinging in the same tick produce exactly ONE pelt, to
+    /// whoever landed the fatal blow. A creature can't die twice, and the second
+    /// swing hits a corpse.
+    #[tokio::test]
+    async fn two_hunters_in_one_tick_produce_exactly_one_pelt() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        {
+            let mut es = zone.entities.lock().unwrap();
+            // Isolate the target. The pack is clustered inside ~65 units and a
+            // swing reaches 60 in a ±90° arc, so leaving the others in place
+            // means the swings cleave through several dogs at once — correct
+            // behaviour, but it would make this test about arcs rather than
+            // about credit.
+            let others: Vec<String> = es
+                .iter()
+                .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+                .map(|(oid, _)| oid.clone())
+                .collect();
+            for oid in others {
+                es.remove(&oid);
+            }
+            es.get_mut(&id).unwrap().hp = 1;
+            // Back from the target and facing it, for the same reason as above.
+            for who in ["h1", "h2"] {
+                es.insert(who.to_string(), Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP));
+                es.get_mut(who).unwrap().facing = (1, 0);
+            }
+        }
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.get_mut("h1").unwrap().swinging = true;
+            es.get_mut("h2").unwrap().swinging = true;
+        }
+
+        let packets = drive_until(zone.clone(), |p| p.contains("dog_pelt")).await;
+        let loot: Vec<&String> = packets
+            .iter()
+            .filter(|p| p.contains("\"gather_yield\"") && p.contains("dog_pelt"))
+            .collect();
+        assert_eq!(
+            loot.len(),
+            1,
+            "a creature died once but paid out {} times: {loot:?}",
+            loot.len()
+        );
+    }
+
+    /// A creature killed by the world — drowning, poison — has no killer, so
+    /// nobody earns anything and nothing panics looking for someone.
+    #[tokio::test]
+    async fn an_environmental_death_drops_nothing_and_credits_nobody() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let id = zone.authored_mobs.lock().unwrap().keys().next().unwrap().clone();
+        // Killed outright with no attacker, the way drowning/poison does it.
+        zone.entities.lock().unwrap().get_mut(&id).unwrap().hp = 0;
+
+        // Wait for the DESPAWN (the outcome that does happen), then assert the
+        // pelt isn't among what was emitted — waiting on an absence directly
+        // would just be a sleep with extra steps.
+        let packets = drive_until(zone.clone(), |p| p.contains("\"despawn\"")).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("dog_pelt")),
+            "the world killed it, but somebody got paid"
+        );
+        assert!(
+            packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(&id)),
+            "it should still have died"
+        );
+    }
+
+    /// Ambient mobs drop nothing. The bounty should send you to the authored
+    /// pack; a dropping ambient mob would turn every zone in the world into a
+    /// farm — which is also why they stay speciesless (#158).
+    #[tokio::test]
+    async fn an_ambient_mob_drops_nothing() {
+        let zone = zone_for_region(CIVIC);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("mob_ambient".to_string(), Entity::mob(9000, 9000));
+            es.get_mut("mob_ambient").unwrap().hp = 1;
+            es.insert("hunter".to_string(), Entity::player(9000, 9000, PLAYER_MAX_HP));
+            es.get_mut("hunter").unwrap().facing = (1, 0);
+        }
+        zone.entities.lock().unwrap().get_mut("hunter").unwrap().swinging = true;
+
+        let packets = drive_until(zone.clone(), |p| p.contains("\"despawn\"")).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("\"gather_yield\"")),
+            "an anonymous mob paid out loot: {packets:?}"
+        );
     }
 
     /// An authored creature never strays far from its ground (#158). Mob wander
@@ -2237,6 +2444,35 @@ mod tests {
     }
 
     /// Run the game loop for `ticks` and return every text packet the zone emitted.
+    /// Drive the sim until `want` matches one of the emitted packets, or a
+    /// generous deadline passes, and return everything seen.
+    ///
+    /// A fixed `drive(n)` sleeps wall-clock time and ASSUMES n ticks elapsed —
+    /// which is fine alone and flaky under the full suite's parallel load, where
+    /// the sim task may not be scheduled that often. Same trap `poll_progress_json`
+    /// was added for on the gateway side. Anything asserting on a specific
+    /// outcome should wait for that outcome, not for the clock.
+    async fn drive_until(
+        zone: Arc<ZoneServer>,
+        want: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *zone.proxy_tx.lock().unwrap() = Some(tx);
+        let runner = zone.clone();
+        tokio::spawn(runner.game_loop());
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            sleep(Duration::from_millis(TICK_MS * 2)).await;
+            while let Ok(Message::Text(t)) = rx.try_recv() {
+                out.push(t);
+            }
+            if out.iter().any(|p| want(p)) {
+                break;
+            }
+        }
+        out
+    }
+
     async fn drive(zone: Arc<ZoneServer>, ticks: u32) -> Vec<String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *zone.proxy_tx.lock().unwrap() = Some(tx);

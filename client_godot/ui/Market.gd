@@ -76,7 +76,10 @@ var _listings: Array = []
 ## The commodities a v1 book can hold — the stackable items. Tools are
 ## excluded by the server too (they go to the listing board, #142); listing
 ## them here would just be an invitation to a rejection.
-const TRADABLE := ["wood", "stone", "plank", "tool_kit"]
+## Dog pelts (#159) are on the book on purpose: someone who hates combat can buy
+## them from someone who loves it and still turn in the bounty. The market
+## already handles any commodity, so the emergent trade costs nothing to allow.
+const TRADABLE := ["wood", "stone", "plank", "tool_kit", "dog_pelt"]
 var _price_field: SpinBox
 var _qty_field: SpinBox
 var _duration_field: OptionButton

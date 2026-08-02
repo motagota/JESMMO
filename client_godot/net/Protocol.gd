@@ -360,6 +360,12 @@ static func sale_tax_with(rules: Dictionary, value: int) -> int:
 ## The server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0
 
+## `loot.lost {item_id, qty, detail}` — a kill's drop that a full pack couldn't
+## take (#159). Gathering stays quiet about a full pack (you're at the node and
+## can see the count refuse to move), but a creature is GONE: doing the work for
+## nothing with no explanation is the version of this that reads as broken.
+const S_LOOT_LOST := "loot.lost"
+
 # --- gameplay: gold balance (build wages, #145) -------------------------------
 ## `{gold, delta, reason}` — the authoritative balance after it changed, what
 ## moved, and why. Until #145 gold only ever changed at rent time, so

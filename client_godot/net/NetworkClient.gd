@@ -118,6 +118,8 @@ signal home_respawn_set(bed_id: String)
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
 ## time and rode `rent_status`; it now moves during ordinary play.
 signal gold_update(gold: int, delta: int, reason: String)
+## A kill's loot that wouldn't fit (#159). See `Protocol.S_LOOT_LOST`.
+signal loot_lost(item_id: String, qty: int, detail: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -376,6 +378,11 @@ func _handle_text(text: String) -> void:
                 int(msg.get("gold", 0)),
                 int(msg.get("delta", 0)),
                 String(msg.get("reason", "")))
+        Protocol.S_LOOT_LOST:
+            loot_lost.emit(
+                String(msg.get("item_id", "")),
+                int(msg.get("qty", 0)),
+                String(msg.get("detail", "your pack is full")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:

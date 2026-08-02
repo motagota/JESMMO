@@ -341,6 +341,10 @@ func _wire_signals() -> void:
     _net.craft_recipes.connect(func(recipes): _craft.set_recipes(recipes))
     _net.craft_made.connect(func(_recipe_id, item_id, qty): _hud.flash_gain(item_id, qty))
     _net.home_respawn_set.connect(func(_bed_id): _hud.flash_announce("Respawn point set!"))
+    # A kill's loot that wouldn't fit (#159). Announced rather than swallowed:
+    # the creature is gone, so this is the only chance to say what happened.
+    _net.loot_lost.connect(func(item_id, qty, detail):
+        _hud.flash_announce("%s x%d — %s" % [item_id, qty, detail]))
     # Build wages (#145): the balance readout tracks every change, and an
     # earned delta flashes like any other gain so the faucet is felt, not
     # just tallied.

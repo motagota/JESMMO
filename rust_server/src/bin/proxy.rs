@@ -1181,7 +1181,15 @@ impl Proxy {
                         let skill = data.get("skill").and_then(|v| v.as_str()).unwrap_or("gathering");
                         let xp = data.get("xp").and_then(|v| v.as_i64()).unwrap_or(0);
                         let ability_id = data.get("ability_id").and_then(|v| v.as_str()).map(str::to_string);
-                        self.apply_gather_yield(pid, item, qty, skill, xp, ability_id.as_deref()).await;
+                        // `source` (#159) distinguishes a kill's loot from a
+                        // gather swing, so a drop that a full bag couldn't take
+                        // can say so — a player who did the work and got nothing
+                        // must never be left guessing.
+                        let source = data.get("source").and_then(|v| v.as_str()).map(str::to_string);
+                        self.apply_gather_yield(
+                            pid, item, qty, skill, xp, ability_id.as_deref(), source.as_deref(),
+                        )
+                        .await;
                     }
                 }
                 Some("store_op") => {
@@ -5303,7 +5311,17 @@ impl Proxy {
     /// that atomically); either way the client needs a fresh `equip.update`
     /// afterward since its cooldown display or the armed tool itself may
     /// have just changed.
-    async fn apply_gather_yield(&self, pid: &str, item_id: &str, qty: i64, skill: &str, xp: i64, ability_id: Option<&str>) {
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_gather_yield(
+        &self,
+        pid: &str,
+        item_id: &str,
+        qty: i64,
+        skill: &str,
+        xp: i64,
+        ability_id: Option<&str>,
+        source: Option<&str>,
+    ) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let persistent = self
             .clients
@@ -5315,8 +5333,20 @@ impl Proxy {
         if !persistent {
             return; // guests gather visually (gather.result) but nothing is persisted
         }
-        if db.add_to_inventory(pid, item_id, qty).await.is_err() {
+        let Ok(added) = db.add_to_inventory(pid, item_id, qty).await else {
             return;
+        };
+        // A full bag must not silently eat a kill's loot (#159). Gathering can
+        // afford to be quiet about it — you're standing at the node and can see
+        // the count refuse to move — but a creature is GONE, and doing the work
+        // for nothing with no explanation is the version of this that feels
+        // broken. `MAX_CARRY` is the cap; the storehouse and the warehouse are
+        // the answer, so say so.
+        if added < qty && source == Some("kill") {
+            self.push_to_player(pid, json!({
+                "type": "loot.lost", "item_id": item_id, "qty": qty - added,
+                "detail": "your pack is full — the kill's loot was left behind",
+            }));
         }
         self.send_inventory(pid).await;
         if let Ok(gain) = db.grant_skill_xp(pid, skill, xp).await {
@@ -10947,6 +10977,127 @@ listing_fee_min_gold = 4
              order that just opened there"
         );
 
+        drop(ws);
+    }
+
+    /// A kill's loot lands in a real inventory, as a real stackable item — the
+    /// same shape build orders and the market already deal in. A hidden kill
+    /// counter would be the one system in this game where the thing you earned
+    /// isn't a thing.
+    #[tokio::test]
+    async fn a_kills_loot_lands_in_the_inventory_as_a_real_item() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("hunter_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hunter"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "dog_pelt", "qty": 1, "skill": "", "xp": 0,
+                "source": "kill", "species": "wild_dog",
+            }).to_string()))
+            .unwrap();
+        loop {
+            recv_until(&mut ws, "inv.update").await;
+            if qty_of_inventory(&db, &pid, "dog_pelt").await >= 1 {
+                break;
+            }
+        }
+        assert_eq!(qty_of_inventory(&db, &pid, "dog_pelt").await, 1);
+        drop(ws);
+    }
+
+    /// A full pack must not silently eat a kill's loot. Gathering can afford to
+    /// be quiet — you're at the node and can watch the count refuse to move —
+    /// but the creature is GONE, and doing the work for nothing with no
+    /// explanation is the version of this that reads as broken.
+    #[tokio::test]
+    async fn a_full_pack_says_so_rather_than_eating_the_loot() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("laden_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Laden"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Fill the pack to MAX_CARRY, in trips (one add is itself capped).
+        while qty_of_inventory(&db, &pid, "wood").await < mmo::persistence::MAX_CARRY {
+            let before = qty_of_inventory(&db, &pid, "wood").await;
+            db.add_to_inventory(&pid, "wood", mmo::persistence::MAX_CARRY).await.unwrap();
+            if qty_of_inventory(&db, &pid, "wood").await == before {
+                break;
+            }
+        }
+        assert_eq!(qty_of_inventory(&db, &pid, "wood").await, mmo::persistence::MAX_CARRY);
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "dog_pelt", "qty": 1, "skill": "", "xp": 0,
+                "source": "kill", "species": "wild_dog",
+            }).to_string()))
+            .unwrap();
+
+        let lost = recv_until(&mut ws, "loot.lost").await;
+        assert_eq!(lost["item_id"], "dog_pelt");
+        assert_eq!(lost["qty"], 1);
+        assert!(
+            lost["detail"].as_str().unwrap().contains("full"),
+            "the reason should be legible: {lost:?}"
+        );
+        assert_eq!(
+            qty_of_inventory(&db, &pid, "dog_pelt").await,
+            0,
+            "nothing should have been persisted"
+        );
+        drop(ws);
+    }
+
+    /// Gathering with a full pack stays quiet — the `loot.lost` nudge is for
+    /// kills specifically, where the thing you earned no longer exists to try
+    /// again on.
+    #[tokio::test]
+    async fn a_full_pack_stays_quiet_about_ordinary_gathering() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("gatherer_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Gath"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        while qty_of_inventory(&db, &pid, "wood").await < mmo::persistence::MAX_CARRY {
+            let before = qty_of_inventory(&db, &pid, "wood").await;
+            db.add_to_inventory(&pid, "wood", mmo::persistence::MAX_CARRY).await.unwrap();
+            if qty_of_inventory(&db, &pid, "wood").await == before {
+                break;
+            }
+        }
+
+        // No `source`, i.e. an ordinary gather swing.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 1, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        // Drain what's queued; none of it should be a loot.lost.
+        for _ in 0..20 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            assert_ne!(v["type"], "loot.lost", "gathering shouldn't nag about a full pack");
+        }
         drop(ws);
     }
 
