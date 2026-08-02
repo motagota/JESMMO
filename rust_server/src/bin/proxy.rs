@@ -180,6 +180,10 @@ const ORDER_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the trade ledger is rolled into candles (#143). A background
 /// cadence — aggregation must never sit in front of a trade.
 const CANDLE_ROLLUP_INTERVAL: Duration = Duration::from_secs(120);
+/// How often storage billing WAKES (#155). Whether anyone is actually charged
+/// is decided by `last_charged_at`, not by this — a job that relied on its own
+/// cadence for correctness would double-bill after every restart.
+const STORAGE_BILLING_INTERVAL: Duration = Duration::from_secs(600);
 /// How often the NPC provisioner re-posts its standing bid and ask (#154).
 /// Frequent enough that a swept-out floor comes back quickly, slow enough that
 /// it isn't rewriting the book under active traders.
@@ -2575,9 +2579,15 @@ impl Proxy {
                 v
             })
             .collect();
+        // Storage arrears (#155): 0 unless an operator has turned storage fees
+        // on. Sent with the warehouse rather than as an error, because it is a
+        // STATE of the warehouse — the panel should say why it's locked while
+        // showing the goods that are still safely there, not just refuse.
+        let arrears = db.warehouse_arrears(market_id, pid).await.unwrap_or(0);
         self.push_to_player(pid, json!({
             "type": "warehouse.state", "market_id": market_id,
             "items": items, "used": rows.len(), "slots": slots,
+            "arrears": arrears,
         }));
     }
 
@@ -2606,6 +2616,30 @@ impl Proxy {
         };
         let (market_id, slots) =
             (at.id, self.market_cfg(&at.district).warehouse_slots);
+        // Storage arrears (#155). Settle first, so a player who has come back
+        // with gold is unlocked by the act of using the warehouse rather than
+        // having to wait for the next daily tick — being locked out is a nudge
+        // to pay, not a sentence to serve.
+        //
+        // Only DEPOSIT and WITHDRAW are gated. Selling stays open on purpose: a
+        // sell is how someone in arrears earns the gold to clear them, and a
+        // lock that removed the only way out would trap a player with their
+        // goods hostage — which is the outcome this whole design exists to
+        // avoid. Withdrawing is blocked because that is taking goods out
+        // without settling; selling pays the debt as a side effect.
+        let owed = db
+            .settle_warehouse_arrears(&market_id, pid, now_secs())
+            .await
+            .unwrap_or(0);
+        if owed > 0 {
+            self.push_to_player(pid, json!({
+                "type": "market.error", "code": "storage_arrears",
+                "detail": format!(
+                    "you owe {owed}g in storage here — your goods are safe, but the warehouse                      is locked until it's paid (selling still works)"
+                ),
+            }));
+            return;
+        }
         let moved = match op {
             "deposit" => db.warehouse_deposit(&market_id, pid, item_id, qty, slots).await,
             "withdraw" => db.warehouse_withdraw(&market_id, pid, item_id, qty).await,
@@ -2999,6 +3033,42 @@ impl Proxy {
         }
         stamps.push(now);
         true
+    }
+
+    /// Charge daily warehouse storage at every built market (#155).
+    ///
+    /// **Does nothing on a stock server**: `storage_fee_per_slot_per_day` is 0
+    /// by default, and `charge_storage` returns immediately. The job runs anyway
+    /// so that turning the rate on in `market.toml` needs only a restart.
+    ///
+    /// The tick is far more frequent than a day because the DAY is enforced by
+    /// `last_charged_at`, not by the sleep — a job that relied on its own
+    /// cadence for correctness would double-bill after any restart.
+    async fn storage_billing(self: Arc<Self>) {
+        loop {
+            sleep(STORAGE_BILLING_INTERVAL).await;
+            let Some(db) = self.db.clone() else { continue };
+            let now = now_secs();
+            for d in &self.capital.districts {
+                let cfg = self.market_cfg(d.id);
+                if cfg.storage_fee_per_slot_per_day <= 0 {
+                    continue;
+                }
+                let Ok(orders) = db.build_orders_for_district(d.id).await else { continue };
+                for o in orders.iter().filter(|o| {
+                    o.state == "completed" && o.structure_kind.as_deref() == Some("market")
+                }) {
+                    match db.charge_storage(&o.id, cfg, now).await {
+                        Ok((0, 0)) => {}
+                        Ok((charged, accrued)) => println!(
+                            "[Proxy] MARKET: storage at {} — {charged}g burned, {accrued}g                              went unpaid into arrears",
+                            d.id
+                        ),
+                        Err(e) => eprintln!("[Proxy] storage billing at {}: {e}", d.id),
+                    }
+                }
+            }
+        }
     }
 
     /// Keep the NPC provisioner's standing bid and ask posted at every built
@@ -5895,6 +5965,11 @@ impl Proxy {
         // escaped the band.
         let me = self.clone();
         tokio::spawn(async move { me.provisioner_refresh().await });
+
+        // Warehouse storage billing (#155). A no-op unless an operator has set
+        // a rate — the mechanism ships, the policy doesn't.
+        let me = self.clone();
+        tokio::spawn(async move { me.storage_billing().await });
 
         // Run the stdin command loop on the main task, alongside a listener for
         // an OS shutdown signal (Ctrl+C, or SIGTERM from a process manager) —

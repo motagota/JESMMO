@@ -106,6 +106,35 @@ candle_interval_secs = 3600
 # pruned, so pruning this only costs the CPU to rebuild.
 history_retain_days = 30
 
+# --- Warehouse storage: the holding cost (#155) -----------------------------
+#
+# SHIPS OFF. A rate of 0 means storage is free and none of the machinery ever
+# runs — no charge, no ledger row, nobody locked out. Nobody is hoarding yet,
+# and taxing players for using a feature they were just given is a bad first
+# impression. The mechanism exists so the lever can be pulled without a release
+# if hoarding becomes a real problem.
+#
+# Charged per OCCUPIED SLOT, not per item: the slot is the scarce resource, and
+# charging per item would punish stacking a commodity, which is the opposite of
+# the intent. Locked stock counts too, or "list it at an absurd price" would be
+# a free-storage loophole. Charges are burned like every other fee, landing on
+# `market_fee` with kind 'storage' and on `gold_ledger`.
+#
+# Offline days are never charged: a player is billed only if they have been seen
+# since the last charge, so this is a holding cost and not a punishment for
+# having a job. A returning player owes ONE day, not their whole absence.
+#
+# WHEN SOMEONE CANNOT PAY, THEIR GOODS ARE NEVER TOUCHED. What the purse can't
+# cover becomes debt, capped at `storage_arrears_cap_days` so it always stays
+# payable, and the warehouse locks — deposits and withdrawals refused — until it
+# is cleared. Confiscating stored items to settle a debt would be an
+# unrecoverable loss caused by not logging in, and unbounded debt is the same
+# thing wearing a different hat. Selling deliberately stays OPEN while in
+# arrears: it is how a player earns the gold to get out, and a lock that removed
+# the only way out would trap someone with their own goods hostage.
+storage_fee_per_slot_per_day = 0
+storage_arrears_cap_days = 7
+
 # --- NPC provisioner: the price floor and ceiling (#154) --------------------
 #
 # OPT-IN, per commodity. An item with no table here gets no NPC orders at all,

@@ -79,6 +79,20 @@ pub struct MarketConfig {
     pub candle_interval_secs: i64,
     /// How long candles are kept. The ledger they derive from is never pruned.
     pub history_retain_days: i64,
+    /// Daily holding cost per OCCUPIED WAREHOUSE SLOT (#155). **0 by default,
+    /// so storage is free unless an operator turns it on.**
+    ///
+    /// Per slot rather than per item because the slot is the scarce resource
+    /// (`warehouse_slots`); charging per item would punish stacking a commodity,
+    /// which is the opposite of the intent. Charged on locked stock as well as
+    /// available, or "list it at an absurd price" would be a free-storage
+    /// loophole.
+    pub storage_fee_per_slot_per_day: i64,
+    /// How many days of storage fees may accumulate as unpaid debt before the
+    /// meter stops (#155). Bounded on purpose: a player returning to a bill they
+    /// can never clear has effectively lost the goods, which is the outcome the
+    /// whole arrears design exists to avoid.
+    pub storage_arrears_cap_days: i64,
     /// Standing price bounds per commodity (#154), empty by default — the
     /// provisioner is opt-in, so a server that configures nothing gets no NPC
     /// orders and no second gold faucet.
@@ -108,6 +122,9 @@ impl Default for MarketConfig {
             sale_tax_den: 100,
             candle_interval_secs: 3600,
             history_retain_days: 30,
+            // Off. The mechanism ships; the policy does not (#155).
+            storage_fee_per_slot_per_day: 0,
+            storage_arrears_cap_days: 7,
             provisioner: BTreeMap::new(),
         }
     }
@@ -299,6 +316,15 @@ impl MarketConfig {
         if self.history_retain_days <= 0 {
             return bad("history_retain_days", "must be positive");
         }
+        if self.storage_fee_per_slot_per_day < 0 {
+            return bad("storage_fee_per_slot_per_day", "must not be negative — 0 disables it");
+        }
+        if self.storage_arrears_cap_days <= 0 {
+            return bad(
+                "storage_arrears_cap_days",
+                "must be positive, or unpaid storage debt would be unbounded and                  a returning player could never clear it",
+            );
+        }
         for (item, bounds) in &self.provisioner {
             // Only real commodities: a typo'd item id would otherwise sit in the
             // file looking like a price floor while backing nothing, and uniques
@@ -409,6 +435,8 @@ pub struct MarketPatch {
     pub sale_tax_den: Option<i64>,
     pub candle_interval_secs: Option<i64>,
     pub history_retain_days: Option<i64>,
+    pub storage_fee_per_slot_per_day: Option<i64>,
+    pub storage_arrears_cap_days: Option<i64>,
     /// Per-commodity provisioner bounds. Stated in a district table, this
     /// REPLACES the defaults' map wholesale rather than merging key by key: a
     /// market that names its own commodities means exactly those, and a
@@ -444,6 +472,12 @@ impl MarketPatch {
                 .candle_interval_secs
                 .unwrap_or(base.candle_interval_secs),
             history_retain_days: self.history_retain_days.unwrap_or(base.history_retain_days),
+            storage_fee_per_slot_per_day: self
+                .storage_fee_per_slot_per_day
+                .unwrap_or(base.storage_fee_per_slot_per_day),
+            storage_arrears_cap_days: self
+                .storage_arrears_cap_days
+                .unwrap_or(base.storage_arrears_cap_days),
             provisioner: self
                 .provisioner
                 .clone()

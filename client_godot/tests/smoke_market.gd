@@ -402,6 +402,38 @@ func _process(_delta: float) -> bool:
 	if listed.is_empty() or listed[0][0] != "w1" or listed[0][1] != 55:
 		_fail("listing should offer the available unique at the form price, got %s" % [listed]); return true
 
+	# --- storage arrears (#155) -----------------------------------------------
+	# A debt must never READ as "your goods are gone". It locks the actions and
+	# says so, while the items stay listed and visibly still yours — that is the
+	# entire point of capping arrears instead of confiscating.
+	_market.set_section(MarketPanel.Section.WAREHOUSE)
+	var owed_before := _buttons("Withdraw")
+	if owed_before == 0:
+		_fail("precondition: something should be withdrawable"); return true
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+		{"id": "w2", "item_id": "stone", "qty": 30, "state": "available"},
+	], 2, 60, 12)
+	var owed_text := _body_text()
+	if not owed_text.contains("You owe 12g storage here"):
+		_fail("arrears should be stated, got: %s" % owed_text); return true
+	if not owed_text.contains("goods are safe"):
+		_fail("arrears must reassure, not alarm, got: %s" % owed_text); return true
+	if not owed_text.contains("Selling still works"):
+		_fail("the way OUT of the debt must be stated, got: %s" % owed_text); return true
+	if not owed_text.contains("stone"):
+		_fail("the goods must still be listed while locked, got: %s" % owed_text); return true
+	if _buttons("Withdraw") != 0 or _buttons("Deposit") != 0:
+		_fail("locked warehouse should offer no deposit/withdraw actions"); return true
+	# Paid off: the actions come back.
+	_market.set_warehouse([
+		{"id": "w1", "item_id": "axe", "qty": 1, "state": "available", "durability": 44, "max_durability": 50},
+	], 1, 60, 0)
+	if _body_text().contains("You owe"):
+		_fail("a cleared debt should stop being mentioned"); return true
+	if _buttons("Withdraw") == 0:
+		_fail("paying arrears should restore the withdraw action"); return true
+
 	# --- the provisioner's band (#154) ----------------------------------------
 	# A newcomer's most useful fact about a commodity is what it can never be
 	# worth less than, and what nobody can corner it above. Inferring that from a

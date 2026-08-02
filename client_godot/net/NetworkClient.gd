@@ -93,7 +93,11 @@ signal market_opened(market_id: String, x: int, y: int, rules: Dictionary)
 signal market_error(code: String, detail: String)
 ## Your warehouse at one market (#138): every row, available and locked alike,
 ## plus slot usage. Pushed on `market.open` and after every deposit/withdraw.
-signal warehouse_state(market_id: String, items: Array, used: int, slots: int)
+## `arrears` (#155) is unpaid storage debt at this market — 0 unless an operator
+## has turned storage fees on. Nonzero means the warehouse is LOCKED: deposits
+## and withdrawals are refused until it's paid. The goods are safe and are still
+## listed; selling still works, which is how the debt gets paid.
+signal warehouse_state(market_id: String, items: Array, used: int, slots: int, arrears: int)
 ## Order book (#139): aggregated depth for one commodity, your own resting
 ## orders, and the trade ticker.
 signal market_book(market_id: String, item_id: String, asks: Array, bids: Array)
@@ -332,7 +336,8 @@ func _handle_text(text: String) -> void:
                 String(msg.get("market_id", "")),
                 msg.get("items", []),
                 int(msg.get("used", 0)),
-                int(msg.get("slots", 0)))
+                int(msg.get("slots", 0)),
+                int(msg.get("arrears", 0)))
         Protocol.S_MARKET_BOOK:
             market_book.emit(
                 String(msg.get("market_id", "")),

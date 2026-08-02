@@ -2613,6 +2613,200 @@ impl Db {
         Ok(total.unwrap_or(0))
     }
 
+    // --- warehouse storage fees (#155) --------------------------------------
+
+    /// Unpaid storage debt at this market, and whether that locks the warehouse.
+    /// Zero for everyone unless an operator has turned storage fees on.
+    pub async fn warehouse_arrears(
+        &self,
+        market_id: &str,
+        character_id: &str,
+    ) -> Result<i64, DbError> {
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT arrears FROM market_warehouse_account WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Pay down storage arrears from the purse, as far as it stretches, and
+    /// return what is still owed.
+    ///
+    /// Called both by the daily job and at the start of every warehouse
+    /// operation, so a player who returns with gold is unlocked the moment they
+    /// try to use the warehouse rather than having to wait for the next tick.
+    /// Being locked out is a nudge to pay, not a punishment to serve.
+    pub async fn settle_warehouse_arrears(
+        &self,
+        market_id: &str,
+        character_id: &str,
+        now: i64,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let owed: Option<i64> = sqlx::query_scalar(
+            "SELECT arrears FROM market_warehouse_account WHERE market_id = ? AND character_id = ?",
+        )
+        .bind(market_id)
+        .bind(character_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let owed = owed.unwrap_or(0);
+        if owed <= 0 {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let pay = owed.min(purse.max(0));
+        if pay > 0 {
+            burn_fee_in_tx(&mut tx, market_id, character_id, "storage", pay, None, None, now)
+                .await?;
+            sqlx::query(
+                "UPDATE market_warehouse_account SET arrears = arrears - ? \
+                 WHERE market_id = ? AND character_id = ?",
+            )
+            .bind(pay)
+            .bind(market_id)
+            .bind(character_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(owed - pay)
+    }
+
+    /// Charge one day's storage at `market_id` to everyone holding stock there.
+    ///
+    /// Returns `(charged, arrears_added)` in gold.
+    ///
+    /// Properties that matter more than the arithmetic:
+    ///
+    /// * **Rate 0 is a total no-op** — no rows written, nobody locked. That is
+    ///   the shipped configuration.
+    /// * **Idempotent within a day.** `last_charged_at` gates it, so a restart
+    ///   loop cannot bill anyone twice.
+    /// * **Offline days are free.** A player is only charged if they have been
+    ///   seen since their last charge. Billing for days someone wasn't there
+    ///   turns a holding cost into a punishment for having a job.
+    /// * **Goods are never confiscated.** What the purse can't cover becomes
+    ///   capped arrears and locks the warehouse until paid. Deleting someone's
+    ///   stored items to settle a debt is an unrecoverable loss caused by not
+    ///   logging in.
+    pub async fn charge_storage(
+        &self,
+        market_id: &str,
+        cfg: &MarketConfig,
+        now: i64,
+    ) -> Result<(i64, i64), DbError> {
+        if cfg.storage_fee_per_slot_per_day <= 0 {
+            return Ok((0, 0));
+        }
+        const DAY: i64 = 86_400;
+        // One row per slot, both states — locked stock is still occupying the
+        // warehouse, and exempting it would make "list it at an absurd price" a
+        // free-storage loophole.
+        let holders = sqlx::query_as::<_, (String, i64)>(
+            "SELECT character_id, COUNT(*) FROM market_warehouse_item \
+             WHERE market_id = ? GROUP BY character_id",
+        )
+        .bind(market_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let cap = cfg.storage_arrears_cap_days * cfg.storage_fee_per_slot_per_day;
+        let (mut charged, mut accrued) = (0i64, 0i64);
+        for (character_id, slots) in holders {
+            let mut tx = self.pool.begin().await?;
+            let row = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT last_charged_at, arrears FROM market_warehouse_account \
+                 WHERE market_id = ? AND character_id = ?",
+            )
+            .bind(market_id)
+            .bind(&character_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (last_charged, arrears) = row.unwrap_or((0, 0));
+
+            // Not a new day yet.
+            if last_charged > 0 && now - last_charged < DAY {
+                tx.commit().await?;
+                continue;
+            }
+            let last_seen: i64 = sqlx::query_scalar("SELECT last_seen FROM character WHERE id = ?")
+                .bind(&character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            // Never charged before: start the clock rather than billing for
+            // however long the goods happened to have been sitting there.
+            if last_charged == 0 {
+                sqlx::query(
+                    "INSERT INTO market_warehouse_account \
+                     (market_id, character_id, last_charged_at, arrears) VALUES (?, ?, ?, 0)",
+                )
+                .bind(market_id)
+                .bind(&character_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                continue;
+            }
+            // Offline for the whole period: no charge, and the clock moves on so
+            // the unbilled days never pile up into a surprise.
+            if last_seen <= last_charged {
+                sqlx::query(
+                    "UPDATE market_warehouse_account SET last_charged_at = ? \
+                     WHERE market_id = ? AND character_id = ?",
+                )
+                .bind(now)
+                .bind(market_id)
+                .bind(&character_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                continue;
+            }
+
+            // Exactly one day's fee per run, however long the gap — a player
+            // returning after a month owes a day, not a month.
+            let due = slots * cfg.storage_fee_per_slot_per_day;
+            let purse: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+                .bind(&character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let pay = due.min(purse.max(0));
+            if pay > 0 {
+                burn_fee_in_tx(&mut tx, market_id, &character_id, "storage", pay, None, None, now)
+                    .await?;
+                charged += pay;
+            }
+            // Whatever the purse couldn't cover becomes debt, capped so it stays
+            // payable. Past the cap the meter simply stops: the warehouse is
+            // already locked, the point has been made, and a bigger number
+            // helps nobody.
+            let unpaid = (due - pay).max(0);
+            let new_arrears = (arrears + unpaid).min(cap.max(0));
+            accrued += (new_arrears - arrears).max(0);
+            sqlx::query(
+                "UPDATE market_warehouse_account SET last_charged_at = ?, arrears = ? \
+                 WHERE market_id = ? AND character_id = ?",
+            )
+            .bind(now)
+            .bind(new_arrears)
+            .bind(market_id)
+            .bind(&character_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        Ok((charged, accrued))
+    }
+
     // --- NPC provisioner (market phase 2 epic #151, issue #154) -------------
     //
     // Standing bounds on a commodity's price, implemented as ORDINARY resting
@@ -6319,6 +6513,293 @@ mod tests {
 
     /// The epic's headline invariant (#136 §12) over the whole trading loop:
     /// across sells, buys and cancels, goods and gold are both conserved. This
+    // --- warehouse storage fees (#155) --------------------------------------
+
+    const DAY: i64 = 86_400;
+
+    /// A config with storage billing switched on. The shipped one has it OFF —
+    /// see `storage_is_off_by_default`.
+    fn charged_cfg(per_slot: i64) -> MarketConfig {
+        MarketConfig {
+            storage_fee_per_slot_per_day: per_slot,
+            storage_arrears_cap_days: 3,
+            ..test_cfg()
+        }
+    }
+
+    /// Mark a character as having been active at `when`, which is what makes
+    /// them billable — see `offline_days_are_free`.
+    async fn seen_at(db: &Db, cid: &str, when: i64) {
+        sqlx::query("UPDATE character SET last_seen = ? WHERE id = ?")
+            .bind(when)
+            .bind(cid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    /// The shipped configuration. Nobody is hoarding yet, and taxing players for
+    /// using a feature they were just given is a bad first impression — so the
+    /// mechanism ships and the policy does not. Nothing is charged, no rows are
+    /// written, and nobody is locked out.
+    #[tokio::test]
+    async fn storage_is_off_by_default() {
+        assert_eq!(MarketConfig::default().storage_fee_per_slot_per_day, 0);
+
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let who = a_seller(&db, &m, "wood", 30).await;
+        seen_at(&db, &who, DAY * 10).await;
+        let before = db.character_gold(&who).await.unwrap();
+
+        for day in 1..5 {
+            assert_eq!(db.charge_storage(&m, &test_cfg(), DAY * day).await.unwrap(), (0, 0));
+        }
+        assert_eq!(db.character_gold(&who).await.unwrap(), before, "free storage charged rent");
+        assert_eq!(db.warehouse_arrears(&m, &who).await.unwrap(), 0);
+        assert_eq!(db.total_fees_burned().await.unwrap(), 0, "a disabled fee wrote a ledger row");
+    }
+
+    /// Charged per OCCUPIED SLOT, counting locked stock as well as available.
+    /// Per slot because the slot is the scarce resource — charging per item
+    /// would punish stacking, the opposite of the intent. Locked stock counts
+    /// because otherwise "list it at an absurd price" would be free storage.
+    #[tokio::test]
+    async fn storage_is_charged_per_occupied_slot_including_locked() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(2);
+        let who = a_character(&db).await;
+        // Three slots: two commodity rows and a tool instance.
+        db.add_to_inventory(&who, "wood", 40).await.unwrap();
+        db.warehouse_deposit(&m, &who, "wood", 40, 60).await.unwrap();
+        db.add_to_inventory(&who, "stone", 10).await.unwrap();
+        db.warehouse_deposit(&m, &who, "stone", 10, 60).await.unwrap();
+        // Escrow one row against a resting sell, so it is `locked`.
+        sell(&db, &m, &who, "wood", 9, 40).await;
+        let rows = db.warehouse_for_character(&m, &who).await.unwrap();
+        assert!(rows.iter().any(|r| r.state == "locked"), "precondition: something is escrowed");
+        let slots = rows.len() as i64;
+
+        seen_at(&db, &who, 1).await;
+        // First run only starts the clock — it must not bill for however long
+        // the goods happened to have been sitting there already.
+        assert_eq!(db.charge_storage(&m, &cfg, DAY).await.unwrap(), (0, 0));
+        let before = db.character_gold(&who).await.unwrap();
+
+        seen_at(&db, &who, DAY + 1).await;
+        // Measured as a DELTA: resting the sell above burned a listing fee too,
+        // so the running total isn't the storage charge.
+        let burned_before = db.total_fees_burned().await.unwrap();
+        let (charged, arrears) = db.charge_storage(&m, &cfg, DAY * 2).await.unwrap();
+        assert_eq!(charged, slots * 2, "should be per slot, locked rows included");
+        assert_eq!(arrears, 0);
+        assert_eq!(db.character_gold(&who).await.unwrap(), before - slots * 2);
+        assert_eq!(
+            db.total_fees_burned().await.unwrap() - burned_before,
+            slots * 2,
+            "storage should be burned"
+        );
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "the burn broke the supply identity");
+    }
+
+    /// Idempotent within a day. The job wakes far more often than daily, and a
+    /// restart loop must not bill anyone twice.
+    #[tokio::test]
+    async fn charging_twice_in_one_day_charges_once() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(5);
+        let who = a_seller(&db, &m, "wood", 20).await;
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&m, &cfg, DAY).await.unwrap(); // starts the clock
+
+        seen_at(&db, &who, DAY + 1).await;
+        let (first, _) = db.charge_storage(&m, &cfg, DAY * 2).await.unwrap();
+        assert!(first > 0);
+        for _ in 0..5 {
+            assert_eq!(
+                db.charge_storage(&m, &cfg, DAY * 2 + 60).await.unwrap(),
+                (0, 0),
+                "billed twice in the same day"
+            );
+        }
+    }
+
+    /// A player who wasn't there isn't billed. Charging for days someone was
+    /// offline turns a holding cost into a punishment for having a job.
+    #[tokio::test]
+    async fn offline_days_are_free() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(5);
+        let who = a_seller(&db, &m, "wood", 20).await;
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&m, &cfg, DAY).await.unwrap(); // clock starts
+        let before = db.character_gold(&who).await.unwrap();
+
+        // A month passes with no logins at all.
+        for day in 2..32 {
+            assert_eq!(db.charge_storage(&m, &cfg, DAY * day).await.unwrap(), (0, 0));
+        }
+        assert_eq!(db.character_gold(&who).await.unwrap(), before, "billed while away");
+        assert_eq!(db.warehouse_arrears(&m, &who).await.unwrap(), 0, "debt accrued while away");
+
+        // They come back: ONE day's charge, not a month of them.
+        seen_at(&db, &who, DAY * 32).await;
+        let (charged, _) = db.charge_storage(&m, &cfg, DAY * 33).await.unwrap();
+        assert_eq!(charged, 5, "a returning player owes a day, not the whole absence");
+    }
+
+    /// **Goods are never confiscated.** An empty purse produces capped arrears
+    /// and a locked warehouse, and the stock is untouched — deleting someone's
+    /// stored items to settle a debt is an unrecoverable loss caused by not
+    /// logging in, and the fastest way to make players distrust the warehouse.
+    #[tokio::test]
+    async fn an_empty_purse_never_costs_you_your_goods() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(10);
+        let who = a_seller(&db, &m, "wood", 30).await;
+        // Spend every coin.
+        sqlx::query("UPDATE character SET gold = 0 WHERE id = ?")
+            .bind(&who)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let held: i64 =
+            db.warehouse_for_character(&m, &who).await.unwrap().iter().map(|r| r.qty).sum();
+        assert!(held > 0);
+
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&m, &cfg, DAY).await.unwrap();
+        for day in 2..10 {
+            seen_at(&db, &who, DAY * day - 1).await;
+            db.charge_storage(&m, &cfg, DAY * day).await.unwrap();
+        }
+
+        let still_held: i64 =
+            db.warehouse_for_character(&m, &who).await.unwrap().iter().map(|r| r.qty).sum();
+        assert_eq!(still_held, held, "goods were confiscated to settle a debt");
+        assert!(db.character_gold(&who).await.unwrap() >= 0, "purse went negative");
+
+        // The debt is capped, so it stays payable however long they were away.
+        let owed = db.warehouse_arrears(&m, &who).await.unwrap();
+        assert!(owed > 0, "nothing accrued at all");
+        assert_eq!(
+            owed,
+            cfg.storage_arrears_cap_days * cfg.storage_fee_per_slot_per_day,
+            "arrears must stop at the cap — an unpayable bill is the same as losing the goods"
+        );
+    }
+
+    /// Arrears lock the warehouse and paying clears the lock, with the payment
+    /// burned like any other fee.
+    #[tokio::test]
+    async fn paying_arrears_unlocks_the_warehouse() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(10);
+        let who = a_seller(&db, &m, "wood", 30).await;
+        sqlx::query("UPDATE character SET gold = 0 WHERE id = ?")
+            .bind(&who)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&m, &cfg, DAY).await.unwrap();
+        seen_at(&db, &who, DAY + 1).await;
+        db.charge_storage(&m, &cfg, DAY * 2).await.unwrap();
+        let owed = db.warehouse_arrears(&m, &who).await.unwrap();
+        assert!(owed > 0, "precondition: they owe something");
+
+        // Broke: settling changes nothing and they stay locked.
+        assert_eq!(db.settle_warehouse_arrears(&m, &who, DAY * 2).await.unwrap(), owed);
+
+        // Partially able to pay: the debt shrinks, the lock stays.
+        sqlx::query("UPDATE character SET gold = ? WHERE id = ?")
+            .bind(owed - 1)
+            .bind(&who)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.settle_warehouse_arrears(&m, &who, DAY * 2).await.unwrap(), 1);
+        assert_eq!(db.character_gold(&who).await.unwrap(), 0);
+
+        // Paid in full: unlocked, and the payment was burned.
+        let burned_before = db.total_fees_burned().await.unwrap();
+        sqlx::query("UPDATE character SET gold = 50 WHERE id = ?")
+            .bind(&who)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // This test pokes gold directly to set up a broke player, which is
+        // itself an unledgered change — so the supply identity is checked as a
+        // DELTA across the settle rather than absolutely. That still catches a
+        // settle that creates or destroys gold without recording it.
+        let gap_before = db.gold_supply_gap().await.unwrap();
+        assert_eq!(db.settle_warehouse_arrears(&m, &who, DAY * 2).await.unwrap(), 0);
+        assert_eq!(db.warehouse_arrears(&m, &who).await.unwrap(), 0);
+        assert_eq!(db.character_gold(&who).await.unwrap(), 49);
+        assert_eq!(db.total_fees_burned().await.unwrap(), burned_before + 1);
+        assert_eq!(
+            db.gold_supply_gap().await.unwrap(),
+            gap_before,
+            "settling arrears moved gold without telling the ledger"
+        );
+    }
+
+    /// Per-market rates charge independently — a remote market can be cheaper to
+    /// store at, which with #153's second market is a real trade-off: a long
+    /// haul in exchange for cheap storage.
+    #[tokio::test]
+    async fn storage_rates_are_per_market() {
+        let (db, _t) = TempDb::open().await;
+        let a = a_market(&db).await;
+        let b = another_market(&db).await;
+        let dear = charged_cfg(10);
+        let cheap = charged_cfg(1);
+
+        let who = a_character(&db).await;
+        db.add_to_inventory(&who, "wood", 20).await.unwrap();
+        db.warehouse_deposit(&a, &who, "wood", 20, 60).await.unwrap();
+        db.add_to_inventory(&who, "wood", 20).await.unwrap();
+        db.warehouse_deposit(&b, &who, "wood", 20, 60).await.unwrap();
+
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&a, &dear, DAY).await.unwrap();
+        db.charge_storage(&b, &cheap, DAY).await.unwrap();
+        seen_at(&db, &who, DAY + 1).await;
+
+        let (dear_charged, _) = db.charge_storage(&a, &dear, DAY * 2).await.unwrap();
+        let (cheap_charged, _) = db.charge_storage(&b, &cheap, DAY * 2).await.unwrap();
+        assert_eq!(dear_charged, 10, "the capital's rate");
+        assert_eq!(cheap_charged, 1, "the remote market's rate");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// Storage lands on the existing fee ledger with its own kind, so the
+    /// holding cost is measurable next to the listing fee and the sale tax
+    /// rather than in a parallel universe.
+    #[tokio::test]
+    async fn storage_fees_join_the_existing_fee_ledger() {
+        let (db, _t) = TempDb::open().await;
+        let m = a_market(&db).await;
+        let cfg = charged_cfg(4);
+        let who = a_seller(&db, &m, "wood", 30).await;
+        sell(&db, &m, &who, "wood", 9, 10).await; // a listing fee, for contrast
+        seen_at(&db, &who, 1).await;
+        db.charge_storage(&m, &cfg, DAY).await.unwrap();
+        seen_at(&db, &who, DAY + 1).await;
+        db.charge_storage(&m, &cfg, DAY * 2).await.unwrap();
+
+        let kinds = db.fees_by_kind(&m).await.unwrap();
+        let storage: i64 =
+            kinds.iter().filter(|(k, _)| k == "storage").map(|(_, g)| *g).sum();
+        assert!(storage > 0, "storage should appear as its own fee kind: {kinds:?}");
+        assert!(kinds.iter().any(|(k, _)| k == "listing"), "and alongside the others: {kinds:?}");
+    }
+
     // --- NPC provisioner (#154) ---------------------------------------------
 
     /// A config with the provisioner switched on for wood. Floor well under

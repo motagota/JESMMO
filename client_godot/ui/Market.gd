@@ -50,6 +50,10 @@ var _gold := 0
 var _warehouse: Array = []
 var _used_slots := 0
 var _total_slots := 0
+## Unpaid storage debt here (#155) — 0 unless an operator turned storage fees
+## on. Nonzero LOCKS the warehouse: deposits and withdrawals are refused. The
+## goods are still shown, because they are still there and still yours.
+var _arrears := 0
 ## Carried inventory, so the warehouse section can offer Deposit per item.
 var _inventory: Array = []
 ## Order book state (#139): which commodity we're watching, its aggregated
@@ -317,10 +321,11 @@ func _duration_label() -> String:
 	return "%dh" % h if h < 24 else "%dd" % (h / 24)
 
 ## Your warehouse at this market (#138), straight from `warehouse.state`.
-func set_warehouse(items: Array, used: int, slots: int) -> void:
+func set_warehouse(items: Array, used: int, slots: int, arrears: int = 0) -> void:
 	_warehouse = items
 	_used_slots = used
 	_total_slots = slots
+	_arrears = arrears
 	_rebuild()
 
 ## Carried inventory, so the warehouse section knows what you could deposit.
@@ -581,6 +586,17 @@ func _rebuild_warehouse() -> void:
 	head.modulate = Color(0.8, 0.85, 0.95)
 	head.text = "Held here — %d/%d slots" % [_used_slots, _total_slots]
 	_body.add_child(head)
+	# Storage arrears (#155). Stated as a state of the warehouse, with the goods
+	# still listed below it — the whole design intent is that a debt never costs
+	# you your items, so the UI must not read like they're gone or at risk.
+	if _arrears > 0:
+		var owed := Label.new()
+		owed.add_theme_font_size_override("font_size", 11)
+		owed.modulate = Color(0.95, 0.75, 0.45)
+		owed.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		owed.custom_minimum_size = Vector2(380, 0)
+		owed.text = "  You owe %dg storage here. Your goods are safe and stay yours — but deposits and withdrawals are locked until it's paid. Selling still works, and any gold you have goes to the debt automatically." % _arrears
+		_body.add_child(owed)
 
 	if _warehouse.is_empty():
 		var empty := Label.new()
@@ -602,7 +618,9 @@ func _rebuild_warehouse() -> void:
 			lbl.text += "   🔒 on sale"
 			lbl.modulate = Color(0.6, 0.6, 0.65)
 		row.add_child(lbl)
-		if not locked:
+		# No button while in arrears (#155) — the server refuses it anyway, and
+		# offering an action that will be rejected is worse than not offering it.
+		if not locked and _arrears <= 0:
 			var qty := int(it.get("qty", 0))
 			var btn := Button.new()
 			btn.text = "Withdraw"
@@ -632,8 +650,9 @@ func _rebuild_warehouse() -> void:
 		else:
 			lbl.text = "  %s  x%d" % [item_id, qty]
 		row.add_child(lbl)
-		var btn := Button.new()
-		btn.text = "Deposit"
-		btn.pressed.connect(func(): do_deposit.emit(item_id, qty))
-		row.add_child(btn)
+		if _arrears <= 0:
+			var btn := Button.new()
+			btn.text = "Deposit"
+			btn.pressed.connect(func(): do_deposit.emit(item_id, qty))
+			row.add_child(btn)
 		_body.add_child(row)

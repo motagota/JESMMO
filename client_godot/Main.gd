@@ -356,8 +356,8 @@ func _wire_signals() -> void:
         _net.send_market_history_request(_market.watching()))
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
     # Warehouse (#138): custody of goods held at this market.
-    _net.warehouse_state.connect(func(_market_id, items, used, slots):
-        _market.set_warehouse(items, used, slots))
+    _net.warehouse_state.connect(func(_market_id, items, used, slots, arrears):
+        _market.set_warehouse(items, used, slots, arrears))
     _market.do_deposit.connect(func(item_id, qty): _net.send_warehouse_deposit(item_id, qty))
     _market.do_withdraw.connect(func(item_id, qty): _net.send_warehouse_withdraw(item_id, qty))
     # Order book (#139).
