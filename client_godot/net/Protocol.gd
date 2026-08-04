@@ -114,6 +114,9 @@ static func is_equippable(item_id: String) -> bool:
 static func item_icon(item_id: String) -> String:
     match item_id:
         "pickaxe": return "⛏"
+        "axe": return "🪓"
+        "sword": return "🗡"
+        "dog_pelt": return "🐺"
         _: return "✦"
 
 ## The resource-node item an ability targets, mirroring the server's

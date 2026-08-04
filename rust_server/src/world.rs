@@ -179,6 +179,9 @@ pub fn items() -> Vec<Item> {
         // handles any commodity — and a bounty item that couldn't be sold would
         // be a strange exception in a game that just spent an epic on trading.
         Item { id: "dog_pelt", name: "Dog Pelt", stack_size: 100, category: "trophy" },
+        // The game's first WEAPON (#160). stack_size 1, like the tools: it's an
+        // instance with its own wear, not a stack.
+        Item { id: "sword", name: "Sword", stack_size: 1, category: "weapon" },
         // Equippable tool (mining/abilities epic #123): arming one in the tool
         // slot puts the Pick ability on the hotbar. stack_size 1 — it's worn,
         // not stacked, though nothing stops carrying spares unequipped.
@@ -222,6 +225,17 @@ pub fn recipes() -> Vec<Recipe> {
         Recipe {
             id: "pickaxe", name: "Pickaxe", inputs: &[("wood", 3), ("stone", 5)],
             output_item: "pickaxe", output_qty: 1,
+        },
+        // A sword costs more than either gathering tool (#160). It has to: a
+        // tool's upkeep is priced against what it gathers (#129), and a sword
+        // gathers nothing — it earns pelts, and through them the bounty (#161).
+        // At 30 durability it clears ~30 dogs, so ~9 units of materials stand
+        // behind three bounties' worth of gold. That keeps combat's upkeep in
+        // the same ~30% band #129 chose for gathering, rather than making the
+        // most lucrative activity in the game the only free one.
+        Recipe {
+            id: "sword", name: "Sword", inputs: &[("wood", 3), ("stone", 6)],
+            output_item: "sword", output_qty: 1,
         },
         Recipe {
             id: "axe", name: "Axe", inputs: &[("wood", 3), ("stone", 2)],
@@ -323,6 +337,15 @@ impl OrderReject {
 pub fn equippable_slot(item_id: &str) -> Option<&'static str> {
     match item_id {
         "pickaxe" | "axe" => Some("tool"),
+        // The weapon slot (#160), which migration 0013 anticipated by comment
+        // ("tool" | ... future: "weapon", "head") and which `equipment`'s
+        // `(character_id, slot)` key has always supported.
+        //
+        // A SEPARATE slot from the tool on purpose: a player carries a pickaxe
+        // and a sword at once. Forcing a choice would make the walk to the
+        // quarry a chore rather than a risk — you'd arrive unable to mine, or
+        // mine unable to defend yourself.
+        "sword" => Some("weapon"),
         _ => None,
     }
 }
@@ -423,6 +446,11 @@ pub fn ability_xp_per_swing(ability_id: &str) -> i64 {
 pub fn tool_max_durability(item_id: &str) -> Option<i64> {
     match item_id {
         "pickaxe" | "axe" => Some(30),
+        // A sword wears on swings that CONNECT (#160), so 30 is ~30 kills —
+        // three bounties' worth. Same number as the tools deliberately: there
+        // is no reason for equipment to age at different rates, and one number
+        // is one thing to tune.
+        "sword" => Some(30),
         _ => None,
     }
 }
@@ -612,6 +640,25 @@ pub fn npc_spawns() -> Vec<NpcSpawn> {
             lines_repeat: &[
                 "Let the axe do the work — don't force the swing.",
                 "Practice sharpens more than the edge — you'll swing faster with time.",
+            ],
+        },
+        // The weapon master (#160). Same "safety net, not a farm" contract the
+        // foremen have: he hands over a blade only when you have none at all, so
+        // losing yours is never a dead end and dropping one is never a farm.
+        NpcSpawn {
+            id: "npc_weapon_master",
+            name: "Bram",
+            district: "civic",
+            x: WEAPON_MASTER_AT.0,
+            y: WEAPON_MASTER_AT.1,
+            grants_item: Some("sword"),
+            lines_granted: &[
+                "Unarmed, and headed that way? Take this. It's plain, but it bites.",
+                "There's a pack west of here that's been at the herds. Bring me ten pelts.",
+            ],
+            lines_repeat: &[
+                "Ten pelts is the standing price. The dogs keep coming back.",
+                "Mind the pack — take them one at a time and you'll keep your skin.",
             ],
         },
     ]
@@ -805,6 +852,16 @@ impl Capital {
     }
 }
 
+/// Where the weapon master stands (#160): 250 units from the town centre, on
+/// the way south-west toward the pack.
+///
+/// Sited so a player meets him BEFORE the dogs — he's a short walk from spawn,
+/// and roughly on the line to the pack rather than past it. Crucially he is 506
+/// units from the nearest dog, comfortably outside their 430-unit threat radius
+/// (`the_pack_cannot_reach_the_town_centre` enforces that for every NPC), so the
+/// man who hands out swords is never himself being mauled.
+pub const WEAPON_MASTER_AT: (i32, i32) = (12600, 12650);
+
 /// Species id for the wild dogs (#158). A string rather than an enum so the
 /// registry, the wire and the client all name the same thing without three
 /// definitions to keep in step.
@@ -840,6 +897,36 @@ pub fn creature_drop(species: &str) -> Option<&'static str> {
 /// which is what makes "a dog can never wander onto something else" true by
 /// construction rather than by luck.
 pub const AUTHORED_MOB_LEASH: i32 = 250;
+
+/// Melee damage per connecting swing with nothing in hand.
+///
+/// Unarmed combat stays exactly what it always was — a player between swords
+/// still has to be able to defend themselves, and several tests predate weapons
+/// entirely.
+pub const MELEE_DAMAGE_BARE: i64 = 20;
+
+/// Melee damage for the equipped weapon in the `weapon` slot, or
+/// [`MELEE_DAMAGE_BARE`] with an empty slot (#160).
+///
+/// **A sword one-shots a wild dog** (40 hp), where bare hands need two swings.
+/// That is the whole point of the number: at anything between 21 and 39 the
+/// swing count against the game's only creature is unchanged, so the weapon
+/// would be a stat with no consequence. Halving time-to-kill also halves the
+/// damage taken clearing the pack, which is the difference between the sword
+/// being a nice-to-have and being the thing that makes the encounter yours.
+///
+/// Raw damage rather than a combat ABILITY, deliberately. Pick and Chop are
+/// abilities because harvesting needed a targeted, cooldown-gated action built
+/// from nothing; melee already exists as its own path with its own arc, reach
+/// and cooldown. Rebuilding it on the ability system would be a large change to
+/// combat, and #160's job is to make the weapon slot exist — not to rewrite how
+/// swinging works.
+pub fn melee_damage(weapon_item: Option<&str>) -> i64 {
+    match weapon_item {
+        Some("sword") => 40,
+        _ => MELEE_DAMAGE_BARE,
+    }
+}
 
 /// The authored wild-dog pack (#158): five dogs on the flat ground southwest of
 /// the town centre.

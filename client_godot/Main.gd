@@ -418,6 +418,11 @@ func _wire_signals() -> void:
     _net.equip_update.connect(func(tool, durability, max_durability, abilities):
         _hud.set_tool(tool, durability, max_durability)
         _hotbar.set_abilities(abilities))
+    # The weapon slot (#160) is its own HUD line, not a second writer to the
+    # tool line — a pickaxe and a sword are held at once, and one overwriting
+    # the other's readout is exactly the clobbering two slots exist to avoid.
+    _net.weapon_update.connect(func(weapon, durability, max_durability, melee_damage):
+        _hud.set_weapon(weapon, durability, max_durability, melee_damage))
     _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
     _net.ability_result.connect(func(id, ok, cooldown_ms, reason, item_id, qty):
         _hotbar.on_ability_result(id, ok, cooldown_ms)

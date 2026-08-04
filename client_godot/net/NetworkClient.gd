@@ -36,6 +36,11 @@ signal craft_made(recipe_id: String, item_id: String, qty: int)
 ## nothing's armed, in which case `durability`/`max_durability` are 0.
 ## `abilities` mirrors the server's `equip.update` shape.
 signal equip_update(tool: String, durability: int, max_durability: int, abilities: Array)
+## The weapon slot (#160), carried alongside the tool on the same `equip.update`
+## — two slots, neither clobbering the other. `melee_damage` is what a swing is
+## actually worth, resolved server-side; the HUD shows it so "is this sword
+## doing anything" is answerable without a spreadsheet.
+signal weapon_update(weapon: String, durability: int, max_durability: int, melee_damage: int)
 signal equip_error(message: String)
 ## A repair (#128) went through — `cost` is `{item_id: qty, ...}` consumed.
 signal repair_done(instance_id: String, item_id: String, cost: Dictionary)
@@ -414,6 +419,14 @@ func _handle_text(text: String) -> void:
                 int(durability_v) if durability_v != null else 0,
                 int(max_durability_v) if max_durability_v != null else 0,
                 msg.get("abilities", []))
+            var weapon_v: Variant = msg.get("weapon")
+            var wdur_v: Variant = msg.get("weapon_durability")
+            var wmax_v: Variant = msg.get("weapon_max_durability")
+            weapon_update.emit(
+                String(weapon_v) if weapon_v != null else "",
+                int(wdur_v) if wdur_v != null else 0,
+                int(wmax_v) if wmax_v != null else 0,
+                int(msg.get("melee_damage", 0)))
         Protocol.S_EQUIP_ERROR:
             equip_error.emit(String(msg.get("message", "couldn't equip that")))
         Protocol.S_REPAIR_DONE:

@@ -44,7 +44,10 @@ const MOB_ATTACK_COOLDOWN: i32 = 8; // ticks between a mob's hits (~0.4s)
 
 const MELEE_RANGE: i32 = 60; // how far a swing reaches
 const MELEE_ARC_COS: f64 = 0.0; // cos(90deg): hit within +/-90deg of facing
-const MELEE_DAMAGE: i32 = 20;
+// Melee damage moved to `world::melee_damage` in #160: it depends on the
+// equipped weapon, which lives in the gateway's DB, so the zone is told rather
+// than deciding. `world::MELEE_DAMAGE_BARE` is the unarmed value and the
+// default a freshly created entity carries.
 const PLAYER_ATTACK_COOLDOWN: i32 = 6; // ticks between swings (~0.3s)
 
 // --- Territory control (capture bar) ------------------------------------------
@@ -207,6 +210,15 @@ struct Entity {
     /// swinging together would credit whoever the iteration order happened to
     /// reach last, rather than whoever actually killed it.
     killed_by: Option<String>,
+    /// Damage this player's swing deals (#160), as the gateway most recently
+    /// reported it — the gateway owns equipment, this zone just stores the
+    /// verdict, exactly like `submerged` and `poison_sources` before it.
+    ///
+    /// Defaults to bare-handed, which is also the correct value for a recreated
+    /// entity until the gateway's next push: a migrated player briefly punching
+    /// instead of slashing is a far better failure than one briefly swinging a
+    /// sword they no longer own.
+    melee_damage: i64,
 }
 
 impl Entity {
@@ -230,6 +242,7 @@ impl Entity {
             species: None,
             home: None,
             killed_by: None,
+            melee_damage: mmo::world::MELEE_DAMAGE_BARE,
         }
     }
 
@@ -262,6 +275,7 @@ impl Entity {
             species: None,
             home: None,
             killed_by: None,
+            melee_damage: mmo::world::MELEE_DAMAGE_BARE,
         }
     }
 }
@@ -631,6 +645,15 @@ impl ZoneServer {
         }
     }
 
+    /// Store the gateway's verdict on what this player's swing is worth (#160).
+    /// Mirrors [`ZoneServer::apply_env_state`] exactly: the gateway owns the
+    /// equipment, this zone owns the hit resolution, and the two meet here.
+    fn apply_loadout(&self, player_id: &str, melee_damage: i64) {
+        if let Some(e) = self.entities.lock().unwrap().get_mut(player_id) {
+            e.melee_damage = melee_damage.max(0);
+        }
+    }
+
     /// Report our current entity count to the proxy (feeds the admin count).
     fn send_zone_stats(&self) {
         if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
@@ -962,6 +985,18 @@ impl ZoneServer {
                     let poison_sources = data.get("poison_sources").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     self.apply_env_state(&player_id, submerged, poison_sources);
                 }
+                "loadout" => {
+                    // What this player is holding, computed gateway-side (#160)
+                    // — same contract as `env_state` above. Pushed on every
+                    // equipment change for immediacy AND on the periodic sweep,
+                    // so a migrated or respawned entity self-heals rather than
+                    // staying stuck at whatever it was recreated with.
+                    let dmg = data
+                        .get("melee_damage")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(mmo::world::MELEE_DAMAGE_BARE);
+                    self.apply_loadout(&player_id, dmg);
+                }
                 "attack" => {
                     // Flag the swing; damage is resolved authoritatively in the tick.
                     let dx = data.get("dx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -1119,6 +1154,9 @@ impl ZoneServer {
             // tick (#159). Collected while the entity lock is held and flushed
             // with the rest of the packets below, like every other outcome.
             let mut loot: Vec<(String, &'static str, &'static str)> = Vec::new();
+            // Players whose swing connected this tick (#160); the gateway owns
+            // durability, so it does the wearing.
+            let mut weapon_used: Vec<String> = Vec::new();
             let mut packets: Vec<String> = Vec::new();
 
             {
@@ -1303,19 +1341,20 @@ impl ZoneServer {
                     .filter_map(|id| entities.get(id).map(|e| (id.clone(), e.x, e.y)))
                     .collect();
                 for sid in &swingers {
-                    let (px, py, fx, fy) = {
+                    let (px, py, fx, fy, dmg) = {
                         let e = entities.get(sid).unwrap();
-                        (e.x, e.y, e.facing.0, e.facing.1)
+                        (e.x, e.y, e.facing.0, e.facing.1, e.melee_damage as i32)
                     };
                     let hits: Vec<String> = mob_positions
                         .iter()
                         .filter(|(_, mx, my)| in_melee_arc(px, py, fx, fy, *mx, *my))
                         .map(|(id, _, _)| id.clone())
                         .collect();
+                    let connected = !hits.is_empty();
                     for hid in hits {
                         if let Some(m) = entities.get_mut(&hid) {
                             let was_alive = m.hp > 0;
-                            m.hp -= MELEE_DAMAGE;
+                            m.hp -= dmg;
                             // Credit the KILLING blow, and only it (#159). The
                             // `was_alive` guard is what makes this exactly-once
                             // when two swings land in the same tick: the second
@@ -1325,6 +1364,13 @@ impl ZoneServer {
                             }
                             changed.insert(hid);
                         }
+                    }
+                    // A swing that CONNECTED wears the blade (#160) — once, not
+                    // once per victim. A cleave through five dogs is one swing
+                    // and one notch; charging five would make the arc a
+                    // liability instead of a reward. A whiff costs nothing.
+                    if connected {
+                        weapon_used.push(sid.clone());
                     }
                     let e = entities.get_mut(sid).unwrap();
                     e.swinging = false;
@@ -1529,6 +1575,11 @@ impl ZoneServer {
             //
             // No `ability_id`: that field is what wears a tool down, and a kill
             // is not a tool swing. Weapon wear is #160's business.
+            for pid in &weapon_used {
+                packets.push(
+                    json!({"type": "weapon_used", "player_id": pid}).to_string(),
+                );
+            }
             for (killer, item, species) in &loot {
                 packets.push(
                     json!({
@@ -1719,6 +1770,175 @@ mod tests {
 
     fn zone_for_region(region: Region) -> Arc<ZoneServer> {
         ZoneServer::new("test".to_string(), 0, None, region, 1)
+    }
+
+    // --- the weapon slot (#160) ---------------------------------------------
+
+    /// Put a lone dog in front of a hunter, standing back and facing it — see
+    /// `killing_a_dog_credits_the_killer_with_a_pelt` for why standing on top of
+    /// a target is flaky.
+    fn stage_duel(zone: &Arc<ZoneServer>) -> (String, (i32, i32)) {
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        let mut es = zone.entities.lock().unwrap();
+        let others: Vec<String> = es
+            .iter()
+            .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+            .map(|(oid, _)| oid.clone())
+            .collect();
+        for oid in others {
+            es.remove(&oid);
+        }
+        es.insert("duellist".to_string(), Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP));
+        es.get_mut("duellist").unwrap().facing = (1, 0);
+        (id, home)
+    }
+
+    /// An armed swing hits harder than a bare-handed one, resolved server-side.
+    /// A sword that didn't change how combat resolves would be a cosmetic item.
+    #[tokio::test]
+    async fn an_armed_swing_hits_harder_than_a_bare_one() {
+        // Bare-handed: the shipped default a fresh entity carries.
+        let bare = zone_for_region(CIVIC);
+        let (bare_id, _) = stage_duel(&bare);
+        bare.entities.lock().unwrap().get_mut("duellist").unwrap().swinging = true;
+        drive(bare.clone(), 3).await;
+        let bare_hp = bare.entities.lock().unwrap().get(&bare_id).map(|e| e.hp).unwrap();
+
+        // Armed: the gateway's verdict, applied by the zone.
+        let armed = zone_for_region(CIVIC);
+        let (armed_id, _) = stage_duel(&armed);
+        {
+            let mut es = armed.entities.lock().unwrap();
+            let d = es.get_mut("duellist").unwrap();
+            d.melee_damage = mmo::world::melee_damage(Some("sword"));
+            d.swinging = true;
+        }
+        drive(armed.clone(), 3).await;
+        let armed_hp = armed.entities.lock().unwrap().get(&armed_id).map(|e| e.hp);
+
+        assert!(
+            bare_hp > 0,
+            "bare hands should NOT one-shot a dog — that's the whole point of the sword"
+        );
+        assert!(
+            armed_hp.is_none() || armed_hp.unwrap() <= 0,
+            "a sword should drop a wild dog in one clean swing, got {armed_hp:?}"
+        );
+    }
+
+    /// Bare-handed combat is unchanged. It's the current combat, several tests
+    /// predate weapons entirely, and a player between swords still has to be
+    /// able to defend themselves.
+    #[test]
+    fn an_empty_weapon_slot_still_swings() {
+        assert_eq!(mmo::world::melee_damage(None), mmo::world::MELEE_DAMAGE_BARE);
+        assert_eq!(mmo::world::melee_damage(Some("pickaxe")), mmo::world::MELEE_DAMAGE_BARE,
+            "a gathering tool is not a weapon");
+        assert!(mmo::world::melee_damage(Some("sword")) > mmo::world::MELEE_DAMAGE_BARE);
+        // A fresh entity swings bare-handed until the gateway says otherwise —
+        // briefly punching is a far better failure than briefly swinging a sword
+        // you no longer own.
+        assert_eq!(Entity::player(0, 0, 100).melee_damage, mmo::world::MELEE_DAMAGE_BARE);
+    }
+
+    /// The gateway's `loadout` push is what arms a swing, and it reconverges a
+    /// recreated entity — the same contract `env_state` has.
+    #[tokio::test]
+    async fn the_loadout_push_arms_and_disarms_a_swing() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities
+            .lock()
+            .unwrap()
+            .insert("p1".to_string(), Entity::player(12800, 12800, PLAYER_MAX_HP));
+
+        zone.apply_loadout("p1", mmo::world::melee_damage(Some("sword")));
+        assert_eq!(
+            zone.entities.lock().unwrap().get("p1").unwrap().melee_damage,
+            mmo::world::melee_damage(Some("sword"))
+        );
+
+        // Sword breaks: the gateway re-pushes, and the very next swing is worth
+        // bare-handed damage again.
+        zone.apply_loadout("p1", mmo::world::MELEE_DAMAGE_BARE);
+        assert_eq!(
+            zone.entities.lock().unwrap().get("p1").unwrap().melee_damage,
+            mmo::world::MELEE_DAMAGE_BARE
+        );
+    }
+
+    /// A connecting swing wears the blade ONCE, not once per victim. A cleave
+    /// through five dogs is one swing and one notch; charging five would make
+    /// the arc a liability instead of a reward.
+    #[tokio::test]
+    async fn a_cleave_wears_the_blade_once_not_once_per_victim() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let home = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let m = a.values().next().unwrap();
+            (m.x, m.y)
+        };
+        // Line the dogs up east of the swinger, all inside the 60-unit reach and
+        // the ±90° arc. Positioned EXPLICITLY rather than relying on the authored
+        // layout: the anchor dog comes out of a HashMap, so which way the rest of
+        // the pack lies relative to the swing varies run to run — and the pack is
+        // wider than a swing reaches anyway, so "hits all five" was never true.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            let ids: Vec<String> = es
+                .iter()
+                .filter(|(_, e)| e.species.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert!(ids.len() >= 3, "precondition: a pack to cleave");
+            for (i, id) in ids.iter().take(3).enumerate() {
+                let d = es.get_mut(id).unwrap();
+                d.x = home.0 + 20 + (i as i32 * 12);
+                d.y = home.1;
+            }
+            for id in ids.iter().skip(3) {
+                es.remove(id);
+            }
+            es.insert("cleaver".to_string(), Entity::player(home.0, home.1, PLAYER_MAX_HP));
+            let c = es.get_mut("cleaver").unwrap();
+            c.facing = (1, 0);
+            c.melee_damage = mmo::world::melee_damage(Some("sword"));
+            c.swinging = true;
+        }
+
+        let packets = drive_until(zone.clone(), |p| p.contains("weapon_used")).await;
+        let wears = packets.iter().filter(|p| p.contains("weapon_used")).count();
+        assert_eq!(wears, 1, "one swing should be one notch, got {wears}: {packets:?}");
+        // ...and it really did hit several of them.
+        let killed = packets.iter().filter(|p| p.contains("dog_pelt")).count();
+        assert_eq!(killed, 3, "one armed swing should have felled all three, got {killed}");
+    }
+
+    /// A whiff costs nothing. Wearing a blade on air would make missing doubly
+    /// punishing and turn every fight into a durability calculation.
+    #[tokio::test]
+    async fn a_missed_swing_does_not_wear_the_blade() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        // Far from every dog, swinging at nothing.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("whiffer".to_string(), Entity::player(18000, 18000, PLAYER_MAX_HP));
+            let w = es.get_mut("whiffer").unwrap();
+            w.facing = (1, 0);
+            w.melee_damage = mmo::world::melee_damage(Some("sword"));
+            w.swinging = true;
+        }
+        let packets = drive(zone.clone(), 6).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("weapon_used")),
+            "swinging at air wore the blade: {packets:?}"
+        );
     }
 
     // --- authored creatures (wild dogs epic #157, issue #158) ---------------
