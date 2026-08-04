@@ -1332,6 +1332,57 @@ mod tests {
         assert_eq!(ids.len(), before, "duplicate authored mob id");
     }
 
+    /// Wild dogs bite (#159), so their siting stops being merely tidy and starts
+    /// being a safety property: a player at the town centre must never be
+    /// reachable by the pack.
+    ///
+    /// The territory is bounded by geometry rather than by a rule that could be
+    /// forgotten — a dog aggros within `AGGRO_RADIUS` of itself and is leashed to
+    /// `AUTHORED_MOB_LEASH` of its home, so it can threaten a point at most the
+    /// sum of the two away. `AGGRO_RADIUS` lives in the zone, so it is restated
+    /// here as the value this siting was chosen against; if it ever grows past
+    /// this, the pack needs moving and this test is where that conversation
+    /// starts.
+    #[test]
+    fn the_pack_cannot_reach_the_town_centre() {
+        const ZONE_AGGRO_RADIUS: i32 = 180;
+        let c = capital();
+        let (tcx, tcy) = c.town_centre;
+        let threat = (AUTHORED_MOB_LEASH + ZONE_AGGRO_RADIUS) as f64;
+
+        for d in c.mobs.iter().filter(|m| m.species == SPECIES_WILD_DOG) {
+            let dist = (((d.x - tcx) as f64).powi(2) + ((d.y - tcy) as f64).powi(2)).sqrt();
+            assert!(
+                dist > threat * 1.5,
+                "{} sits {dist:.0} from spawn but can threaten out to {threat:.0} — a fresh                  character would be mauled at the storehouse",
+                d.id
+            );
+        }
+
+        // The same guarantee for everywhere else a player is made to stand: the
+        // storehouse, the build board, the markets, the NPCs who hand out tools.
+        for sp in &c.storage_points {
+            for d in &c.mobs {
+                let g = (((sp.x - d.x) as f64).powi(2) + ((sp.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > threat, "{} can reach a storage point ({g:.0})", d.id);
+            }
+        }
+        for n in &c.npcs {
+            for d in &c.mobs {
+                let g = (((n.x - d.x) as f64).powi(2) + ((n.y - d.y) as f64).powi(2)).sqrt();
+                assert!(g > threat, "{} can reach NPC {} ({g:.0})", d.id, n.id);
+            }
+        }
+        for o in &c.build_orders {
+            for d in &c.mobs {
+                let g = (((o.structure_x - d.x) as f64).powi(2)
+                    + ((o.structure_y - d.y) as f64).powi(2))
+                .sqrt();
+                assert!(g > threat, "{} can reach the {} site ({g:.0})", d.id, o.kind);
+            }
+        }
+    }
+
     /// Region filtering is what makes a zone split safe: each half must derive
     /// exactly the creatures inside it, with none duplicated into both and none
     /// lost from both. Same contract `resource_nodes_in` already honours.

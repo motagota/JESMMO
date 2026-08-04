@@ -1148,15 +1148,28 @@ impl ZoneServer {
                 let aggro2 = (AGGRO_RADIUS as i64) * (AGGRO_RADIUS as i64);
                 let atk2 = (MOB_ATTACK_RANGE as i64) * (MOB_ATTACK_RANGE as i64);
                 for mid in &mob_ids {
-                    let (mx, my, ready) = {
+                    let (mx, my, ready, authored) = {
                         let e = entities.get(mid).unwrap();
-                        (e.x, e.y, e.attack_cooldown == 0)
+                        (e.x, e.y, e.attack_cooldown == 0, e.home.is_some())
                     };
-                    // Nearest player within aggro range. In a safe zone mobs never
-                    // target players — they only wander (friendly wildlife) — so no
-                    // contact damage is ever produced.
+                    // Nearest player within aggro range.
+                    //
+                    // A safe district makes AMBIENT mobs harmless — they only
+                    // wander, friendly wildlife, and produce no contact damage.
+                    // **Authored creatures are exempt (#159): wild dogs bite.**
+                    // A pack you can stand in the middle of unharmed isn't
+                    // something that "needs clearing", and a sword is a poor
+                    // reward when nothing can hurt you.
+                    //
+                    // Their reach is bounded by geometry rather than by a second
+                    // rule: a dog aggros within `AGGRO_RADIUS` of itself and is
+                    // leashed to `AUTHORED_MOB_LEASH` of its home (#158), so its
+                    // territory is exactly that sum and no larger. The pack is
+                    // sited 806 from the town centre precisely so this can never
+                    // reach spawn — see
+                    // `the_pack_cannot_reach_the_town_centre`.
                     let mut best: Option<(String, i32, i32, i64)> = None;
-                    if !safe {
+                    if !safe || authored {
                         for (pid, px, py) in &players {
                             let d2 = dist2(mx, my, *px, *py);
                             if d2 <= aggro2 && best.as_ref().map_or(true, |b| d2 < b.3) {
@@ -1213,15 +1226,18 @@ impl ZoneServer {
                     changed.insert(mid.clone());
                 }
 
-                // Apply mob contact damage to players. Never in a safe zone — the
-                // map is empty there, but the guard makes "no player takes damage in
-                // the capital" an explicit, enforced invariant.
-                if !safe {
-                    for (pid, dmg) in player_damage {
-                        if let Some(e) = entities.get_mut(&pid) {
-                            e.hp -= dmg;
-                            changed.insert(pid);
-                        }
+                // Apply mob contact damage to players.
+                //
+                // No blanket safe-zone guard here any more (#159): TARGET
+                // SELECTION above is the authority, and it is the precise place
+                // to express the rule — an ambient mob in a safe district never
+                // acquires a target, so it can never contribute damage, while an
+                // authored creature can. Re-checking `safe` here would silently
+                // undo the exception and leave the dogs toothless.
+                for (pid, dmg) in player_damage {
+                    if let Some(e) = entities.get_mut(&pid) {
+                        e.hp -= dmg;
+                        changed.insert(pid);
                     }
                 }
 
@@ -1834,6 +1850,56 @@ mod tests {
         );
         assert_eq!(back.hp, MOB_MAX_HP, "and at full health");
         assert_eq!(back.species, Some(mmo::world::SPECIES_WILD_DOG));
+    }
+
+    /// Wild dogs bite, even though the whole capital is a safe district (#159).
+    /// A pack you can stand in the middle of unharmed isn't something that
+    /// "needs clearing", and a sword is a poor reward when nothing can hurt you.
+    #[tokio::test]
+    async fn wild_dogs_bite_inside_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        assert!(zone.is_safe(), "precondition: the capital is a safe district");
+        zone.spawn_authored_mobs();
+        let home = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let m = a.values().next().unwrap();
+            (m.x, m.y)
+        };
+        // Standing in the middle of the pack.
+        zone.entities
+            .lock()
+            .unwrap()
+            .insert("prey".to_string(), Entity::player(home.0, home.1, PLAYER_MAX_HP));
+
+        drive_until(zone.clone(), |p| p.contains("\"prey\"") && p.contains("\"hp\"")).await;
+        // Give the dogs a few attack cooldowns' worth of contact.
+        drive(zone.clone(), (MOB_ATTACK_COOLDOWN * 4) as u32).await;
+
+        let hp = zone.entities.lock().unwrap().get("prey").map(|e| e.hp).unwrap_or(0);
+        assert!(
+            hp < PLAYER_MAX_HP,
+            "the pack never touched a player standing in the middle of it (hp {hp})"
+        );
+    }
+
+    /// The exception is precisely scoped: ambient mobs stay harmless in a safe
+    /// district exactly as before. Only authored creatures are exempt.
+    #[tokio::test]
+    async fn ambient_mobs_are_still_harmless_in_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("bystander".to_string(), Entity::player(9000, 9000, PLAYER_MAX_HP));
+            for i in 0..4 {
+                es.insert(format!("mob_amb_{i}"), Entity::mob(9000, 9000));
+            }
+        }
+        drive(zone.clone(), (MOB_ATTACK_COOLDOWN * 6) as u32).await;
+        let hp = zone.entities.lock().unwrap().get("bystander").map(|e| e.hp).unwrap_or(0);
+        assert_eq!(
+            hp, PLAYER_MAX_HP,
+            "an anonymous mob drew blood in the capital — the #159 exception leaked"
+        );
     }
 
     // --- kill credit and the drop (#159) ------------------------------------
