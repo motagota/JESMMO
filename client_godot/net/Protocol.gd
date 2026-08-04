@@ -369,6 +369,17 @@ const MARKET_RANGE := 60.0
 ## nothing with no explanation is the version of this that reads as broken.
 const S_LOOT_LOST := "loot.lost"
 
+## The creature bounty (wild dogs epic #157, issue #161).
+## `bounty.turn_in {command_id}` hands trophies over; the server re-checks the
+## range and the count, and `command_id` makes it exactly-once — a resent frame
+## must not mint a second reward.
+## `bounty.state {item_id, required, gold, held, paid}` answers EITHER WAY, paid
+## or refused, because the panel has to show progress regardless and a silent
+## refusal is indistinguishable from a dropped frame.
+const C_BOUNTY_TURN_IN := "bounty.turn_in"
+const S_BOUNTY_STATE := "bounty.state"
+const S_BOUNTY_ERROR := "bounty.error"
+
 # --- gameplay: gold balance (build wages, #145) -------------------------------
 ## `{gold, delta, reason}` — the authoritative balance after it changed, what
 ## moved, and why. Until #145 gold only ever changed at rent time, so

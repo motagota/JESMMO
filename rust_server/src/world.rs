@@ -862,6 +862,17 @@ impl Capital {
 /// man who hands out swords is never himself being mauled.
 pub const WEAPON_MASTER_AT: (i32, i32) = (12600, 12650);
 
+/// How close a player must stand to the weapon master to claim the bounty
+/// (#161).
+///
+/// Deliberately looser than the zone's 10-unit `NPC_TALK_RANGE`. The gateway
+/// gates this from its own position cache, which lags the zone's authoritative
+/// position by up to a movement tick — matching the talk radius exactly would
+/// randomly refuse a player who is plainly standing there. Still unmistakably
+/// "with him" rather than "in the district", and the same shape as the market's
+/// own range gate.
+pub const BOUNTY_RANGE: i32 = 40;
+
 /// Species id for the wild dogs (#158). A string rather than an enum so the
 /// registry, the wire and the client all name the same thing without three
 /// definitions to keep in step.

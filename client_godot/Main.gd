@@ -435,10 +435,22 @@ func _wire_signals() -> void:
     _net.repair_done.connect(func(_instance_id, item_id, _cost): _hud.flash_announce("Repaired your %s" % item_id))
     _hud.unequip_pressed.connect(func(): _net.send_unequip())
     _hotbar.use_pressed.connect(_on_hotbar_use)
-    _net.npc_dialogue.connect(func(_npc_id, npc_name, lines, granted):
+    _net.npc_dialogue.connect(func(npc_id, npc_name, lines, granted):
         _npc_dialogue.show_dialogue(npc_name, lines, granted)
+        # The server volunteers `bounty.state` when you talk to someone who pays
+        # one (#161) — the client never asks, and never counts its own
+        # inventory, because the server's number is the one that gets paid.
+        # Anyone else: no offer on screen at all.
+        if npc_id != "npc_weapon_master":
+            _npc_dialogue.clear_bounty()
         if granted:
             _hud.flash_gain("pickaxe", 1))
+    _npc_dialogue.do_bounty_turn_in.connect(func(): _net.send_bounty_turn_in())
+    _net.bounty_state.connect(func(item_id, required, gold, held, paid):
+        _npc_dialogue.set_bounty(item_id, required, gold, held)
+        if paid > 0:
+            _hud.flash_announce("Bounty paid: +%dg" % paid))
+    _net.bounty_error.connect(func(_code, detail): _hud.flash_announce(detail))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))

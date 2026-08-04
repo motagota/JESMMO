@@ -4311,6 +4311,64 @@ impl Proxy {
         self.send_equipment(pid).await;
     }
 
+    /// Whether `pid` is standing close enough to the weapon master to deal with
+    /// him (#161) — the same shape as `market_at`: resolved from the gateway's
+    /// own position cache, so a client can't claim to be somewhere it isn't.
+    fn at_weapon_master(&self, pid: &str) -> bool {
+        let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else {
+            return false;
+        };
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        dist2(px, py, wx, wy) <= (mmo::world::BOUNTY_RANGE as i64).pow(2)
+    }
+
+    /// Hand in trophies for the bounty (#161).
+    ///
+    /// Answers with `bounty.state` either way — paid or not — because the panel
+    /// needs to show progress ("7 of 10") regardless, and a refusal that says
+    /// nothing is indistinguishable from a dropped frame.
+    async fn apply_bounty_turn_in(&self, pid: &str, command_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return; // guests have no durable inventory or purse
+        }
+        if !self.at_weapon_master(pid) {
+            self.push_to_player(pid, json!({
+                "type": "bounty.error", "code": "out_of_range",
+                "detail": "stand with the weapon master to claim the bounty",
+            }));
+            return;
+        }
+        let cfg = self.market_cfg.bounty();
+        match db.turn_in_bounty(pid, cfg, command_id, now_secs()).await {
+            Ok((paid, held)) => {
+                if paid > 0 {
+                    println!("[Proxy] BOUNTY: paid {paid}g for {} {}", cfg.required, cfg.item_id);
+                    self.send_inventory(pid).await;
+                    self.push_gold(pid, paid, "bounty").await;
+                }
+                self.push_to_player(pid, json!({
+                    "type": "bounty.state", "item_id": cfg.item_id,
+                    "required": cfg.required, "gold": cfg.gold,
+                    "held": held, "paid": paid,
+                }));
+            }
+            Err(e) => {
+                eprintln!("[Proxy] bounty.turn_in: {e}");
+                self.push_to_player(pid, json!({
+                    "type": "server_error", "detail": "the bounty could not be paid",
+                }));
+            }
+        }
+    }
+
     /// Tell the zone that owns `pid` what their swing is worth (#160).
     ///
     /// The zone resolves melee — arc, reach, who got hit — but cannot see
@@ -4475,6 +4533,22 @@ impl Proxy {
     /// safety net, not a farm) a character has none at all, in inventory or
     /// in hand; otherwise (or for an NPC with no `grants_item`) just talks.
     /// Unknown NPC ids are a silent no-op.
+    /// Tell `pid` where they stand against the bounty (#161), WITHOUT paying it.
+    ///
+    /// Talking to the weapon master reports the offer; claiming it is a separate,
+    /// deliberate act. Conflating the two would mean walking up to him silently
+    /// spends ten pelts the moment you have them.
+    async fn send_bounty_state(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let cfg = self.market_cfg.bounty();
+        let held = db.inventory_qty(pid, &cfg.item_id).await.unwrap_or(0);
+        self.push_to_player(pid, json!({
+            "type": "bounty.state", "item_id": cfg.item_id,
+            "required": cfg.required, "gold": cfg.gold,
+            "held": held, "paid": 0,
+        }));
+    }
+
     async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let Some(npc) = mmo::world::npc(npc_id) else { return };
@@ -4496,6 +4570,12 @@ impl Proxy {
             "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
             "lines": lines, "granted": granted,
         }));
+        // Talking to the weapon master reports the bounty (#161); claiming it is
+        // a separate, deliberate act. Conflating the two would mean walking up
+        // to him silently spends ten pelts the moment you have them.
+        if npc.grants_item == Some("sword") {
+            self.send_bounty_state(pid).await;
+        }
     }
 
     /// Apply a `craft_make` reported by a zone (which validated only that the
@@ -5749,6 +5829,16 @@ impl Proxy {
                     // zone — same as `build_contribute`'s own proximity gate.
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
                         self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // The creature bounty (#161). Range-gated here on the
+                    // gateway's position cache, exactly like `market.open` —
+                    // standing next to the man who pays is a server-side fact,
+                    // not something a client asserts.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("bounty.turn_in") {
+                        let command_id =
+                            data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
+                        self.apply_bounty_turn_in(&player_id, command_id).await;
                         continue;
                     }
                     // `listing.*` (#142) share market.open's range gate.
@@ -11048,6 +11138,118 @@ listing_fee_min_gold = 4
              order that just opened there"
         );
 
+        drop(ws);
+    }
+
+    /// The bounty over the wire (#161): range-gated server-side, paid, and
+    /// reported either way.
+    #[tokio::test]
+    async fn the_bounty_is_range_gated_and_pays_over_the_wire() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let email = format!("bounty_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Claimer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let cfg = mmo::market_config::BountyConfig::default();
+        db.add_to_inventory(&pid, &cfg.item_id, cfg.required).await.unwrap();
+
+        // Standing anywhere else: refused server-side, and nothing is consumed.
+        stand_at(&proxy, &pid, 12800, 12800);
+        ws.send(Message::Text(
+            json!({"type": "bounty.turn_in", "command_id": "far"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "bounty.error").await;
+        assert_eq!(err["code"], "out_of_range");
+        assert_eq!(
+            qty_of_inventory(&db, &pid, &cfg.item_id).await,
+            cfg.required,
+            "a refused turn-in took the trophies anyway"
+        );
+
+        // Standing with him: paid.
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        stand_at(&proxy, &pid, wx, wy);
+        let purse = db.character_gold(&pid).await.unwrap();
+        ws.send(Message::Text(
+            json!({"type": "bounty.turn_in", "command_id": "near"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let state = recv_until(&mut ws, "bounty.state").await;
+        assert_eq!(state["paid"], cfg.gold);
+        assert_eq!(state["held"], 0);
+        assert_eq!(state["required"], cfg.required);
+        assert_eq!(db.character_gold(&pid).await.unwrap(), purse + cfg.gold);
+        assert_eq!(qty_of_inventory(&db, &pid, &cfg.item_id).await, 0);
+        drop(ws);
+    }
+
+    /// Talking to the weapon master REPORTS the bounty; it never claims it.
+    /// Conflating the two would mean walking up to him silently spends ten pelts
+    /// the moment you have them.
+    #[tokio::test]
+    async fn talking_to_the_weapon_master_reports_but_never_claims() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("chat_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Chatter"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let cfg = mmo::market_config::BountyConfig::default();
+        // Deliberately holding MORE than enough: if talking claimed, it would.
+        db.add_to_inventory(&pid, &cfg.item_id, cfg.required).await.unwrap();
+        let purse = db.character_gold(&pid).await.unwrap();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_weapon_master",
+            }).to_string()))
+            .unwrap();
+
+        let state = recv_until(&mut ws, "bounty.state").await;
+        assert_eq!(state["held"], cfg.required, "the offer should show what they hold");
+        assert_eq!(state["paid"], 0, "talking must not pay");
+        assert_eq!(db.character_gold(&pid).await.unwrap(), purse, "talking minted gold");
+        assert_eq!(
+            qty_of_inventory(&db, &pid, &cfg.item_id).await,
+            cfg.required,
+            "talking consumed trophies"
+        );
+        drop(ws);
+    }
+
+    /// An ordinary NPC advertises no bounty at all.
+    #[tokio::test]
+    async fn an_ordinary_npc_offers_no_bounty() {
+        let (proxy, _db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("plain_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Plain"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "npc.dialogue").await;
+        for _ in 0..15 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            assert_ne!(v["type"], "bounty.state", "the logging foreman offered a dog bounty");
+        }
         drop(ws);
     }
 

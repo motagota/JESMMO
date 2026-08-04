@@ -12,6 +12,16 @@ extends CanvasLayer
 
 var _name_label: Label
 var _lines_label: Label
+## The bounty offer (#161): where you are against it, and the button to claim.
+## Hidden entirely for an NPC who pays no bounty, so an ordinary foreman's
+## dialogue is exactly what it always was.
+var _bounty_label: Label
+var _bounty_button: Button
+var _bounty_ready := false
+
+## The player asked to hand in trophies. Main sends it; the server re-checks
+## range and the count, so this is a request, not a claim.
+signal do_bounty_turn_in
 
 func _init() -> void:
 	layer = 9 # above the hotbar (6) and HUD (5) — never hidden mid-conversation
@@ -51,6 +61,19 @@ func _init() -> void:
 	_lines_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_lines_label)
 
+	_bounty_label = Label.new()
+	_bounty_label.add_theme_font_size_override("font_size", 13)
+	_bounty_label.modulate = Color(1.0, 0.9, 0.6)
+	_bounty_label.visible = false
+	col.add_child(_bounty_label)
+
+	_bounty_button = Button.new()
+	_bounty_button.text = "Hand over the pelts"
+	_bounty_button.focus_mode = Control.FOCUS_NONE
+	_bounty_button.visible = false
+	_bounty_button.pressed.connect(func(): do_bounty_turn_in.emit())
+	col.add_child(_bounty_button)
+
 	var hint := Label.new()
 	hint.add_theme_font_size_override("font_size", 12)
 	hint.modulate = Color(0.7, 0.7, 0.75)
@@ -70,6 +93,29 @@ func show_dialogue(npc_name: String, lines: Array, granted: bool) -> void:
 		text += "\n\n+1 pickaxe"
 	_lines_label.text = text
 	visible = true
+
+## Where the player stands against the bounty (#161). Called whenever the server
+## reports it — on arrival and after every turn-in — so the count is never the
+## client's own arithmetic.
+##
+## The button appears only when the turn-in would actually succeed: offering an
+## action the server is going to refuse is worse than not offering it, and the
+## label already says how many more are needed.
+func set_bounty(item_id: String, required: int, gold: int, held: int) -> void:
+	_bounty_ready = held >= required and required > 0
+	_bounty_label.visible = true
+	_bounty_button.visible = _bounty_ready
+	if _bounty_ready:
+		_bounty_label.text = "Bounty: %d %s for %dg — you have %d" % [
+			required, item_id, gold, held]
+	else:
+		_bounty_label.text = "Bounty: %d %s for %dg — you have %d (%d more)" % [
+			required, item_id, gold, held, required - held]
+
+## Hide the bounty offer entirely, for an NPC who pays none.
+func clear_bounty() -> void:
+	_bounty_label.visible = false
+	_bounty_button.visible = false
 
 func close() -> void:
 	visible = false
