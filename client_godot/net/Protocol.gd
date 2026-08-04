@@ -114,6 +114,9 @@ static func is_equippable(item_id: String) -> bool:
 static func item_icon(item_id: String) -> String:
     match item_id:
         "pickaxe": return "⛏"
+        "axe": return "🪓"
+        "sword": return "🗡"
+        "dog_pelt": return "🐺"
         _: return "✦"
 
 ## The resource-node item an ability targets, mirroring the server's
@@ -359,6 +362,23 @@ static func sale_tax_with(rules: Dictionary, value: int) -> int:
 ## before any `rules` have arrived there is by definition nothing better to use.
 ## The server's own check is what actually gates trading.
 const MARKET_RANGE := 60.0
+
+## `loot.lost {item_id, qty, detail}` — a kill's drop that a full pack couldn't
+## take (#159). Gathering stays quiet about a full pack (you're at the node and
+## can see the count refuse to move), but a creature is GONE: doing the work for
+## nothing with no explanation is the version of this that reads as broken.
+const S_LOOT_LOST := "loot.lost"
+
+## The creature bounty (wild dogs epic #157, issue #161).
+## `bounty.turn_in {command_id}` hands trophies over; the server re-checks the
+## range and the count, and `command_id` makes it exactly-once — a resent frame
+## must not mint a second reward.
+## `bounty.state {item_id, required, gold, held, paid}` answers EITHER WAY, paid
+## or refused, because the panel has to show progress regardless and a silent
+## refusal is indistinguishable from a dropped frame.
+const C_BOUNTY_TURN_IN := "bounty.turn_in"
+const S_BOUNTY_STATE := "bounty.state"
+const S_BOUNTY_ERROR := "bounty.error"
 
 # --- gameplay: gold balance (build wages, #145) -------------------------------
 ## `{gold, delta, reason}` — the authoritative balance after it changed, what

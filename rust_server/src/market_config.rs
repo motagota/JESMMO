@@ -408,6 +408,64 @@ impl ProvisionerBounds {
     }
 }
 
+/// The repeatable bounty an NPC pays for creature trophies (#161).
+///
+/// Lives in this file because it is an ECONOMY tunable, and this is where the
+/// economy's numbers are: the fees that burn gold, the provisioner that mints
+/// it, the storage cost. A bounty is the largest faucet of the three, so it is
+/// the last thing that should need a rebuild to adjust — which was the whole
+/// argument for #152. (The file is still named `market.toml`; its scope widened
+/// past markets before its name did.)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BountyConfig {
+    /// What the NPC accepts.
+    pub item_id: String,
+    /// How many, per turn-in. A partial hand-in is refused outright rather than
+    /// part-paid — see `turn_in_bounty`.
+    pub required: i64,
+    /// Gold MINTED per turn-in. Recorded on `gold_ledger` (#154) under its own
+    /// reason, so this faucet is measurable next to build wages and the
+    /// provisioner rather than being an unexplained rise in the money supply.
+    pub gold: i64,
+}
+
+impl Default for BountyConfig {
+    fn default() -> Self {
+        // Ten pelts for a hundred gold, repeatable, as specified.
+        //
+        // For scale: this pays roughly 4x what building pays per minute, and the
+        // dogs respawn forever, so it is unbounded. That is a deliberate choice
+        // rather than an accident — combat SHOULD out-earn hauling logs — and it
+        // is checkable rather than assumed, because every coin lands on the
+        // ledger. The counterweight is the sword's upkeep (#160): ~9 units of
+        // material stand behind roughly three turn-ins.
+        BountyConfig { item_id: "dog_pelt".to_string(), required: 10, gold: 100 }
+    }
+}
+
+impl BountyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, why: &str| {
+            Err(ConfigError::Invalid {
+                whence: "bounty".to_string(),
+                key: key.to_string(),
+                why: why.to_string(),
+            })
+        };
+        if self.required <= 0 {
+            return bad("required", "must be positive, or the bounty pays for nothing");
+        }
+        if self.gold < 0 {
+            return bad("gold", "must not be negative");
+        }
+        if crate::world::item(&self.item_id).is_none() {
+            return bad("item_id", "is not a real item — check the spelling");
+        }
+        Ok(())
+    }
+}
+
 /// One TOML table's worth of overrides: every field optional, so `[defaults]`
 /// and `[districts.<id>]` share a shape and a district only states what it
 /// changes.
@@ -496,6 +554,11 @@ struct MarketToml {
     /// `market`, `suburbs`, `craftworks`, `old_quarter`.
     #[serde(default)]
     districts: BTreeMap<String, MarketPatch>,
+    /// The creature bounty (#161). One table, not per-district: it is paid by a
+    /// specific NPC standing in a specific place, so "which market" never
+    /// applies.
+    #[serde(default)]
+    bounty: Option<BountyConfig>,
 }
 
 /// Every market's resolved tuning: the defaults, plus a per-district table for
@@ -504,6 +567,7 @@ struct MarketToml {
 pub struct MarketConfigSet {
     defaults: MarketConfig,
     districts: BTreeMap<String, MarketConfig>,
+    bounty: BountyConfig,
 }
 
 impl Default for MarketConfigSet {
@@ -511,6 +575,7 @@ impl Default for MarketConfigSet {
         MarketConfigSet {
             defaults: MarketConfig::default(),
             districts: BTreeMap::new(),
+            bounty: BountyConfig::default(),
         }
     }
 }
@@ -520,6 +585,11 @@ impl MarketConfigSet {
     /// defaults, so a district with no table needs no entry.
     pub fn for_district(&self, district: &str) -> &MarketConfig {
         self.districts.get(district).unwrap_or(&self.defaults)
+    }
+
+    /// What the creature bounty pays (#161).
+    pub fn bounty(&self) -> &BountyConfig {
+        &self.bounty
     }
 
     /// The defaults, for the background jobs that aren't standing at a market
@@ -573,7 +643,9 @@ impl MarketConfigSet {
             resolved.validate(&format!("districts.{id}"))?;
             districts.insert(id.clone(), resolved);
         }
-        Ok(MarketConfigSet { defaults, districts })
+        let bounty = raw.bounty.unwrap_or_default();
+        bounty.validate()?;
+        Ok(MarketConfigSet { defaults, districts, bounty })
     }
 
     /// Load from `path`. **A missing file is not an error** — it resolves to the

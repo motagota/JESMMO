@@ -17,6 +17,10 @@ var _skill: Label
 var _build_hint: Label
 var _rent_hint: Label
 var _tool: Button
+## The weapon slot's own line (#160). Separate from `_tool` because a pickaxe
+## and a sword are held at the same time — one line writing over the other is
+## the clobbering two slots exist to avoid.
+var _weapon: Label
 var _gain: Label
 var _levelup: Label
 var _announce: Label
@@ -74,6 +78,14 @@ func _ready() -> void:
 	_tool.mouse_filter = Control.MOUSE_FILTER_IGNORE # nothing armed yet: not a click target
 	_tool.pressed.connect(func(): unequip_pressed.emit())
 	box.add_child(_tool)
+
+	# Weapon line (#160). A plain label, not a button: the tool line's click is
+	# an unequip affordance for the ability hotbar, and a sword grants no
+	# ability — there'd be nothing for a click to usefully do.
+	_weapon = Label.new()
+	_weapon.add_theme_font_size_override("font_size", 14)
+	_weapon.add_theme_color_override("font_color", Color(1.0, 0.85, 0.8))
+	box.add_child(_weapon)
 
 	# Floating gain feedback, centred-ish on screen.
 	_gain = Label.new()
@@ -195,6 +207,17 @@ func set_tool(item_id: String, durability: int, max_durability: int) -> void:
 		_tool.text = "In hand: %s %s (%d/%d)   (click to unequip)" % [
 			Protocol.item_icon(item_id), item_id, durability, max_durability]
 		_tool.mouse_filter = Control.MOUSE_FILTER_STOP
+
+## The weapon slot (#160), including what a swing is actually worth — resolved
+## server-side, shown here so "is this sword doing anything" is answerable
+## without a spreadsheet, and so a blade wearing down is visible before it
+## breaks mid-fight.
+func set_weapon(item_id: String, durability: int, max_durability: int, melee_damage: int) -> void:
+	if item_id == "":
+		_weapon.text = "Unarmed — %d damage a swing" % melee_damage if melee_damage > 0 else ""
+	else:
+		_weapon.text = "Armed: %s %s (%d/%d) — %d damage a swing" % [
+			Protocol.item_icon(item_id), item_id, durability, max_durability, melee_damage]
 
 func set_skill(skill_id: String, xp: int, level: int) -> void:
 	# Track each skill independently so a building-XP gain doesn't overwrite the

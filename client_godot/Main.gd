@@ -341,6 +341,10 @@ func _wire_signals() -> void:
     _net.craft_recipes.connect(func(recipes): _craft.set_recipes(recipes))
     _net.craft_made.connect(func(_recipe_id, item_id, qty): _hud.flash_gain(item_id, qty))
     _net.home_respawn_set.connect(func(_bed_id): _hud.flash_announce("Respawn point set!"))
+    # A kill's loot that wouldn't fit (#159). Announced rather than swallowed:
+    # the creature is gone, so this is the only chance to say what happened.
+    _net.loot_lost.connect(func(item_id, qty, detail):
+        _hud.flash_announce("%s x%d — %s" % [item_id, qty, detail]))
     # Build wages (#145): the balance readout tracks every change, and an
     # earned delta flashes like any other gain so the faucet is felt, not
     # just tallied.
@@ -414,6 +418,11 @@ func _wire_signals() -> void:
     _net.equip_update.connect(func(tool, durability, max_durability, abilities):
         _hud.set_tool(tool, durability, max_durability)
         _hotbar.set_abilities(abilities))
+    # The weapon slot (#160) is its own HUD line, not a second writer to the
+    # tool line — a pickaxe and a sword are held at once, and one overwriting
+    # the other's readout is exactly the clobbering two slots exist to avoid.
+    _net.weapon_update.connect(func(weapon, durability, max_durability, melee_damage):
+        _hud.set_weapon(weapon, durability, max_durability, melee_damage))
     _net.equip_error.connect(func(message): _hud.flash_announce("Equip: %s" % message))
     _net.ability_result.connect(func(id, ok, cooldown_ms, reason, item_id, qty):
         _hotbar.on_ability_result(id, ok, cooldown_ms)
@@ -426,10 +435,22 @@ func _wire_signals() -> void:
     _net.repair_done.connect(func(_instance_id, item_id, _cost): _hud.flash_announce("Repaired your %s" % item_id))
     _hud.unequip_pressed.connect(func(): _net.send_unequip())
     _hotbar.use_pressed.connect(_on_hotbar_use)
-    _net.npc_dialogue.connect(func(_npc_id, npc_name, lines, granted):
+    _net.npc_dialogue.connect(func(npc_id, npc_name, lines, granted):
         _npc_dialogue.show_dialogue(npc_name, lines, granted)
+        # The server volunteers `bounty.state` when you talk to someone who pays
+        # one (#161) — the client never asks, and never counts its own
+        # inventory, because the server's number is the one that gets paid.
+        # Anyone else: no offer on screen at all.
+        if npc_id != "npc_weapon_master":
+            _npc_dialogue.clear_bounty()
         if granted:
             _hud.flash_gain("pickaxe", 1))
+    _npc_dialogue.do_bounty_turn_in.connect(func(): _net.send_bounty_turn_in())
+    _net.bounty_state.connect(func(item_id, required, gold, held, paid):
+        _npc_dialogue.set_bounty(item_id, required, gold, held)
+        if paid > 0:
+            _hud.flash_announce("Bounty paid: +%dg" % paid))
+    _net.bounty_error.connect(func(_code, detail): _hud.flash_announce(detail))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))

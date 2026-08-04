@@ -182,6 +182,34 @@ bid_qty = 120
 seed_stock = 60
 
 # ---------------------------------------------------------------------------
+# The creature bounty (wild dogs epic #157, issue #161).
+#
+# A repeatable turn-in: bring the weapon master this many trophies, get this
+# much gold, as often as you like.
+#
+# THIS IS THE GAME'S LARGEST GOLD FAUCET, and unbounded — the dogs respawn
+# forever. At these numbers it pays roughly 4x what building pays per minute.
+# That is a deliberate choice rather than an accident: combat SHOULD out-earn
+# hauling logs, and the game had no reason to fight anything before it. It is
+# also checkable rather than assumed, because every coin minted here lands on
+# `gold_ledger` under the reason "bounty" (#154) — `gold_by_reason` will tell
+# you exactly what this tap has produced, next to build wages and the
+# provisioner.
+#
+# The counterweight is the sword (#160): 30 durability is ~30 kills, so about
+# three turn-ins stand behind 3 wood + 6 stone of upkeep. Combat pays for its
+# own equipment rather than being the one free activity.
+#
+# It lives in this file because this is where the economy's numbers are — the
+# fees that burn gold, the provisioner that mints it, the storage cost. The file
+# is still named `market.toml`; its scope widened past markets before its name
+# did.
+[bounty]
+item_id = "dog_pelt"
+required = 10
+gold = 100
+
+# ---------------------------------------------------------------------------
 # Per-district overrides.
 #
 # Keyed by DISTRICT, not market id, because a market's id is a `Uuid::new_v4()`

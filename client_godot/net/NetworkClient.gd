@@ -36,6 +36,11 @@ signal craft_made(recipe_id: String, item_id: String, qty: int)
 ## nothing's armed, in which case `durability`/`max_durability` are 0.
 ## `abilities` mirrors the server's `equip.update` shape.
 signal equip_update(tool: String, durability: int, max_durability: int, abilities: Array)
+## The weapon slot (#160), carried alongside the tool on the same `equip.update`
+## — two slots, neither clobbering the other. `melee_damage` is what a swing is
+## actually worth, resolved server-side; the HUD shows it so "is this sword
+## doing anything" is answerable without a spreadsheet.
+signal weapon_update(weapon: String, durability: int, max_durability: int, melee_damage: int)
 signal equip_error(message: String)
 ## A repair (#128) went through — `cost` is `{item_id: qty, ...}` consumed.
 signal repair_done(instance_id: String, item_id: String, cost: Dictionary)
@@ -118,6 +123,12 @@ signal home_respawn_set(bed_id: String)
 ## is a short tag ("build_wages"). Until wages existed gold only moved at rent
 ## time and rode `rent_status`; it now moves during ordinary play.
 signal gold_update(gold: int, delta: int, reason: String)
+## A kill's loot that wouldn't fit (#159). See `Protocol.S_LOOT_LOST`.
+signal loot_lost(item_id: String, qty: int, detail: String)
+## Where you stand against the creature bounty (#161), and what the last
+## turn-in paid (0 when it was refused).
+signal bounty_state(item_id: String, required: int, gold: int, held: int, paid: int)
+signal bounty_error(code: String, detail: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -376,6 +387,22 @@ func _handle_text(text: String) -> void:
                 int(msg.get("gold", 0)),
                 int(msg.get("delta", 0)),
                 String(msg.get("reason", "")))
+        Protocol.S_BOUNTY_STATE:
+            bounty_state.emit(
+                String(msg.get("item_id", "")),
+                int(msg.get("required", 0)),
+                int(msg.get("gold", 0)),
+                int(msg.get("held", 0)),
+                int(msg.get("paid", 0)))
+        Protocol.S_BOUNTY_ERROR:
+            bounty_error.emit(
+                String(msg.get("code", "")),
+                String(msg.get("detail", "the bounty was refused")))
+        Protocol.S_LOOT_LOST:
+            loot_lost.emit(
+                String(msg.get("item_id", "")),
+                int(msg.get("qty", 0)),
+                String(msg.get("detail", "your pack is full")))
         Protocol.S_HOME_RESPAWN_SET:
             home_respawn_set.emit(String(msg.get("bed_id", "")))
         Protocol.S_RENT_STATUS:
@@ -407,6 +434,14 @@ func _handle_text(text: String) -> void:
                 int(durability_v) if durability_v != null else 0,
                 int(max_durability_v) if max_durability_v != null else 0,
                 msg.get("abilities", []))
+            var weapon_v: Variant = msg.get("weapon")
+            var wdur_v: Variant = msg.get("weapon_durability")
+            var wmax_v: Variant = msg.get("weapon_max_durability")
+            weapon_update.emit(
+                String(weapon_v) if weapon_v != null else "",
+                int(wdur_v) if wdur_v != null else 0,
+                int(wmax_v) if wmax_v != null else 0,
+                int(msg.get("melee_damage", 0)))
         Protocol.S_EQUIP_ERROR:
             equip_error.emit(String(msg.get("message", "couldn't equip that")))
         Protocol.S_REPAIR_DONE:
@@ -655,6 +690,11 @@ func send_repair(instance_id: String) -> void:
 
 ## Talk to an NPC (validated server-side by proximity). Answered with
 ## `npc.dialogue` (mining/abilities epic #123, #121).
+## Hand trophies to the weapon master (#161). `command_id` makes it
+## exactly-once: a resent frame must not mint a second reward.
+func send_bounty_turn_in() -> void:
+    _send({"type": Protocol.C_BOUNTY_TURN_IN, "command_id": _command_id()})
+
 func send_npc_talk(npc_id: String) -> void:
     _send({"type": Protocol.C_NPC_TALK, "npc_id": npc_id})
 

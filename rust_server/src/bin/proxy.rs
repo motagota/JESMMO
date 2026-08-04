@@ -1168,6 +1168,15 @@ impl Proxy {
                         self.broadcast_partition();
                     }
                 }
+                Some("weapon_used") => {
+                    // Internal: a zone reported a swing that CONNECTED (#160).
+                    // Durability lives here, so the wearing does too — the same
+                    // split as a gathering swing, which the zone also reports
+                    // rather than resolving.
+                    if let Some(pid) = target_player.as_deref() {
+                        self.wear_weapon(pid).await;
+                    }
+                }
                 Some("gather_yield") => {
                     // Internal: a zone yielded a gathered unit. Persist it and push
                     // the authoritative inventory/skill to the client (not forwarded).
@@ -1181,7 +1190,15 @@ impl Proxy {
                         let skill = data.get("skill").and_then(|v| v.as_str()).unwrap_or("gathering");
                         let xp = data.get("xp").and_then(|v| v.as_i64()).unwrap_or(0);
                         let ability_id = data.get("ability_id").and_then(|v| v.as_str()).map(str::to_string);
-                        self.apply_gather_yield(pid, item, qty, skill, xp, ability_id.as_deref()).await;
+                        // `source` (#159) distinguishes a kill's loot from a
+                        // gather swing, so a drop that a full bag couldn't take
+                        // can say so — a player who did the work and got nothing
+                        // must never be left guessing.
+                        let source = data.get("source").and_then(|v| v.as_str()).map(str::to_string);
+                        self.apply_gather_yield(
+                            pid, item, qty, skill, xp, ability_id.as_deref(), source.as_deref(),
+                        )
+                        .await;
                     }
                 }
                 Some("store_op") => {
@@ -4277,6 +4294,105 @@ impl Proxy {
     /// level-scaled via [`mmo::world::ability_cooldown_ms`], so the hotbar
     /// always shows exactly what the gateway will enforce on `ability.use`
     /// (#117).
+    /// Wear the equipped weapon by one notch after a connecting swing (#160),
+    /// and re-push what changed.
+    ///
+    /// A no-op bare-handed: fists don't wear out, and a player between swords
+    /// must not be silently punished for having none. On a break, #128's
+    /// auto-unequip applies exactly as it does for a tool, and the zone is told
+    /// at once so the very next swing is worth bare-handed damage rather than
+    /// the sword's.
+    async fn wear_weapon(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(_)) = db.wear_equipped_tool(pid, "weapon", 1).await else { return };
+        // `send_equipment` re-pushes durability AND re-pushes the loadout, which
+        // is what makes a broken sword stop hitting like one immediately.
+        self.send_inventory(pid).await;
+        self.send_equipment(pid).await;
+    }
+
+    /// Whether `pid` is standing close enough to the weapon master to deal with
+    /// him (#161) — the same shape as `market_at`: resolved from the gateway's
+    /// own position cache, so a client can't claim to be somewhere it isn't.
+    fn at_weapon_master(&self, pid: &str) -> bool {
+        let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else {
+            return false;
+        };
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        dist2(px, py, wx, wy) <= (mmo::world::BOUNTY_RANGE as i64).pow(2)
+    }
+
+    /// Hand in trophies for the bounty (#161).
+    ///
+    /// Answers with `bounty.state` either way — paid or not — because the panel
+    /// needs to show progress ("7 of 10") regardless, and a refusal that says
+    /// nothing is indistinguishable from a dropped frame.
+    async fn apply_bounty_turn_in(&self, pid: &str, command_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let persistent = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|i| i.persistent)
+            .unwrap_or(false);
+        if !persistent {
+            return; // guests have no durable inventory or purse
+        }
+        if !self.at_weapon_master(pid) {
+            self.push_to_player(pid, json!({
+                "type": "bounty.error", "code": "out_of_range",
+                "detail": "stand with the weapon master to claim the bounty",
+            }));
+            return;
+        }
+        let cfg = self.market_cfg.bounty();
+        match db.turn_in_bounty(pid, cfg, command_id, now_secs()).await {
+            Ok((paid, held)) => {
+                if paid > 0 {
+                    println!("[Proxy] BOUNTY: paid {paid}g for {} {}", cfg.required, cfg.item_id);
+                    self.send_inventory(pid).await;
+                    self.push_gold(pid, paid, "bounty").await;
+                }
+                self.push_to_player(pid, json!({
+                    "type": "bounty.state", "item_id": cfg.item_id,
+                    "required": cfg.required, "gold": cfg.gold,
+                    "held": held, "paid": paid,
+                }));
+            }
+            Err(e) => {
+                eprintln!("[Proxy] bounty.turn_in: {e}");
+                self.push_to_player(pid, json!({
+                    "type": "server_error", "detail": "the bounty could not be paid",
+                }));
+            }
+        }
+    }
+
+    /// Tell the zone that owns `pid` what their swing is worth (#160).
+    ///
+    /// The zone resolves melee — arc, reach, who got hit — but cannot see
+    /// equipment, which lives in this gateway's database. Same split as
+    /// `env_state` (#87): the gateway computes the verdict, the zone stores it
+    /// and applies it. Sent on every equipment change and again on the periodic
+    /// sweep, so a migrated entity reconverges rather than staying stuck.
+    fn push_loadout_to_zone(&self, pid: &str, weapon_item: Option<&str>) {
+        let zone_id = match self.clients.lock().unwrap().get(pid) {
+            Some(i) => i.current_zone.clone(),
+            None => return,
+        };
+        let tx = self.zones.lock().unwrap().get(&zone_id).map(|z| z.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(Message::Text(
+                json!({
+                    "type": "loadout", "player_id": pid,
+                    "melee_damage": mmo::world::melee_damage(weapon_item),
+                })
+                .to_string(),
+            ));
+        }
+    }
+
     async fn send_equipment(&self, pid: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let equipped = db.equipped_tool(pid, "tool").await.ok().flatten();
@@ -4293,13 +4409,26 @@ impl Proxy {
                 }));
             }
         }
+        // The weapon slot (#160) rides the same message as the tool, in its own
+        // fields. Two slots means the wire has to carry both without either
+        // clobbering the other — a client reading `tool` and a client reading
+        // `weapon` are looking at different equipment.
+        let weapon = db.equipped_tool(pid, "weapon").await.ok().flatten();
         self.push_to_player(pid, json!({
             "type": "equip.update", "player_id": pid,
             "tool": equipped.as_ref().map(|t| t.item_id.clone()),
             "durability": equipped.as_ref().map(|t| t.durability),
             "max_durability": equipped.as_ref().map(|t| t.max_durability),
             "abilities": abilities,
+            "weapon": weapon.as_ref().map(|w| w.item_id.clone()),
+            "weapon_durability": weapon.as_ref().map(|w| w.durability),
+            "weapon_max_durability": weapon.as_ref().map(|w| w.max_durability),
+            "melee_damage": mmo::world::melee_damage(weapon.as_ref().map(|w| w.item_id.as_str())),
         }));
+        // ...and the zone is told immediately, so a sword drawn is a sword that
+        // hits harder on the very next swing rather than up to a second later
+        // when the periodic sweep catches up.
+        self.push_loadout_to_zone(pid, weapon.as_ref().map(|w| w.item_id.as_str()));
     }
 
     /// Arm a SPECIFIC owned tool instance (#128 — "the pickaxe" stopped
@@ -4404,6 +4533,22 @@ impl Proxy {
     /// safety net, not a farm) a character has none at all, in inventory or
     /// in hand; otherwise (or for an NPC with no `grants_item`) just talks.
     /// Unknown NPC ids are a silent no-op.
+    /// Tell `pid` where they stand against the bounty (#161), WITHOUT paying it.
+    ///
+    /// Talking to the weapon master reports the offer; claiming it is a separate,
+    /// deliberate act. Conflating the two would mean walking up to him silently
+    /// spends ten pelts the moment you have them.
+    async fn send_bounty_state(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let cfg = self.market_cfg.bounty();
+        let held = db.inventory_qty(pid, &cfg.item_id).await.unwrap_or(0);
+        self.push_to_player(pid, json!({
+            "type": "bounty.state", "item_id": cfg.item_id,
+            "required": cfg.required, "gold": cfg.gold,
+            "held": held, "paid": 0,
+        }));
+    }
+
     async fn apply_npc_interact(&self, pid: &str, npc_id: &str) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let Some(npc) = mmo::world::npc(npc_id) else { return };
@@ -4425,6 +4570,12 @@ impl Proxy {
             "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
             "lines": lines, "granted": granted,
         }));
+        // Talking to the weapon master reports the bounty (#161); claiming it is
+        // a separate, deliberate act. Conflating the two would mean walking up
+        // to him silently spends ten pelts the moment you have them.
+        if npc.grants_item == Some("sword") {
+            self.send_bounty_state(pid).await;
+        }
     }
 
     /// Apply a `craft_make` reported by a zone (which validated only that the
@@ -4682,6 +4833,14 @@ impl Proxy {
                     dx * dx + dy * dy <= radius2
                 })
                 .count() as i64;
+            // The loadout rides the same sweep (#160). Equipment changes push
+            // immediately; this is the backstop that heals an entity recreated
+            // by a migration or a respawn, exactly as the env flags do.
+            let weapon = match &self.db {
+                Some(db) => db.equipped_tool(&pid, "weapon").await.ok().flatten(),
+                None => None,
+            };
+            self.push_loadout_to_zone(&pid, weapon.as_ref().map(|w| w.item_id.as_str()));
             let tx = self.zones.lock().unwrap().get(&zone_id).map(|z| z.tx.clone());
             if let Some(tx) = tx {
                 let _ = tx.send(Message::Text(
@@ -5303,7 +5462,17 @@ impl Proxy {
     /// that atomically); either way the client needs a fresh `equip.update`
     /// afterward since its cooldown display or the armed tool itself may
     /// have just changed.
-    async fn apply_gather_yield(&self, pid: &str, item_id: &str, qty: i64, skill: &str, xp: i64, ability_id: Option<&str>) {
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_gather_yield(
+        &self,
+        pid: &str,
+        item_id: &str,
+        qty: i64,
+        skill: &str,
+        xp: i64,
+        ability_id: Option<&str>,
+        source: Option<&str>,
+    ) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let persistent = self
             .clients
@@ -5315,8 +5484,20 @@ impl Proxy {
         if !persistent {
             return; // guests gather visually (gather.result) but nothing is persisted
         }
-        if db.add_to_inventory(pid, item_id, qty).await.is_err() {
+        let Ok(added) = db.add_to_inventory(pid, item_id, qty).await else {
             return;
+        };
+        // A full bag must not silently eat a kill's loot (#159). Gathering can
+        // afford to be quiet about it — you're standing at the node and can see
+        // the count refuse to move — but a creature is GONE, and doing the work
+        // for nothing with no explanation is the version of this that feels
+        // broken. `MAX_CARRY` is the cap; the storehouse and the warehouse are
+        // the answer, so say so.
+        if added < qty && source == Some("kill") {
+            self.push_to_player(pid, json!({
+                "type": "loot.lost", "item_id": item_id, "qty": qty - added,
+                "detail": "your pack is full — the kill's loot was left behind",
+            }));
         }
         self.send_inventory(pid).await;
         if let Ok(gain) = db.grant_skill_xp(pid, skill, xp).await {
@@ -5648,6 +5829,16 @@ impl Proxy {
                     // zone — same as `build_contribute`'s own proximity gate.
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
                         self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // The creature bounty (#161). Range-gated here on the
+                    // gateway's position cache, exactly like `market.open` —
+                    // standing next to the man who pays is a server-side fact,
+                    // not something a client asserts.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("bounty.turn_in") {
+                        let command_id =
+                            data.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
+                        self.apply_bounty_turn_in(&player_id, command_id).await;
                         continue;
                     }
                     // `listing.*` (#142) share market.open's range gate.
@@ -10947,6 +11138,460 @@ listing_fee_min_gold = 4
              order that just opened there"
         );
 
+        drop(ws);
+    }
+
+    /// The bounty over the wire (#161): range-gated server-side, paid, and
+    /// reported either way.
+    #[tokio::test]
+    async fn the_bounty_is_range_gated_and_pays_over_the_wire() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let email = format!("bounty_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Claimer"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let cfg = mmo::market_config::BountyConfig::default();
+        db.add_to_inventory(&pid, &cfg.item_id, cfg.required).await.unwrap();
+
+        // Standing anywhere else: refused server-side, and nothing is consumed.
+        stand_at(&proxy, &pid, 12800, 12800);
+        ws.send(Message::Text(
+            json!({"type": "bounty.turn_in", "command_id": "far"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let err = recv_until(&mut ws, "bounty.error").await;
+        assert_eq!(err["code"], "out_of_range");
+        assert_eq!(
+            qty_of_inventory(&db, &pid, &cfg.item_id).await,
+            cfg.required,
+            "a refused turn-in took the trophies anyway"
+        );
+
+        // Standing with him: paid.
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        stand_at(&proxy, &pid, wx, wy);
+        let purse = db.character_gold(&pid).await.unwrap();
+        ws.send(Message::Text(
+            json!({"type": "bounty.turn_in", "command_id": "near"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let state = recv_until(&mut ws, "bounty.state").await;
+        assert_eq!(state["paid"], cfg.gold);
+        assert_eq!(state["held"], 0);
+        assert_eq!(state["required"], cfg.required);
+        assert_eq!(db.character_gold(&pid).await.unwrap(), purse + cfg.gold);
+        assert_eq!(qty_of_inventory(&db, &pid, &cfg.item_id).await, 0);
+        drop(ws);
+    }
+
+    /// Talking to the weapon master REPORTS the bounty; it never claims it.
+    /// Conflating the two would mean walking up to him silently spends ten pelts
+    /// the moment you have them.
+    #[tokio::test]
+    async fn talking_to_the_weapon_master_reports_but_never_claims() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("chat_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Chatter"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let cfg = mmo::market_config::BountyConfig::default();
+        // Deliberately holding MORE than enough: if talking claimed, it would.
+        db.add_to_inventory(&pid, &cfg.item_id, cfg.required).await.unwrap();
+        let purse = db.character_gold(&pid).await.unwrap();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_weapon_master",
+            }).to_string()))
+            .unwrap();
+
+        let state = recv_until(&mut ws, "bounty.state").await;
+        assert_eq!(state["held"], cfg.required, "the offer should show what they hold");
+        assert_eq!(state["paid"], 0, "talking must not pay");
+        assert_eq!(db.character_gold(&pid).await.unwrap(), purse, "talking minted gold");
+        assert_eq!(
+            qty_of_inventory(&db, &pid, &cfg.item_id).await,
+            cfg.required,
+            "talking consumed trophies"
+        );
+        drop(ws);
+    }
+
+    /// An ordinary NPC advertises no bounty at all.
+    #[tokio::test]
+    async fn an_ordinary_npc_offers_no_bounty() {
+        let (proxy, _db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("plain_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Plain"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_logging_foreman",
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "npc.dialogue").await;
+        for _ in 0..15 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            assert_ne!(v["type"], "bounty.state", "the logging foreman offered a dog bounty");
+        }
+        drop(ws);
+    }
+
+    /// Both slots on the wire at once (#160). Two slots means `equip.update` has
+    /// to carry both without either clobbering the other — a client reading
+    /// `tool` and one reading `weapon` are looking at different equipment.
+    #[tokio::test]
+    async fn a_tool_and_a_weapon_occupy_separate_slots() {
+        let (proxy, db, _dbf, _zone) = proxy_with_shared_db().await;
+        let email = format!("armed_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Armed"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        db.add_to_inventory(&pid, "sword", 1).await.unwrap();
+        let inv = db.inventory_for_character(&pid).await.unwrap();
+        let pick = inv.iter().find(|i| i.item_id == "pickaxe").unwrap().id.clone();
+        let sword = inv.iter().find(|i| i.item_id == "sword").unwrap().id.clone();
+
+        // Equipping one must not disturb the other, in either order.
+        db.equip_instance(&pid, &pick).await.unwrap();
+        db.equip_instance(&pid, &sword).await.unwrap();
+        assert_eq!(db.equipped(&pid, "tool").await.unwrap().as_deref(), Some("pickaxe"));
+        assert_eq!(db.equipped(&pid, "weapon").await.unwrap().as_deref(), Some("sword"));
+
+        ws.send(Message::Text(json!({"type": "equip", "instance_id": sword}).to_string()))
+            .await
+            .unwrap();
+        let update = loop {
+            let v = recv_until(&mut ws, "equip.update").await;
+            if v["weapon"] == "sword" {
+                break v;
+            }
+        };
+        assert_eq!(update["tool"], "pickaxe", "arming a sword unequipped the pickaxe");
+        assert_eq!(update["weapon"], "sword");
+        let fresh = mmo::world::tool_max_durability("sword").unwrap();
+        assert_eq!(update["weapon_durability"], fresh);
+        assert_eq!(update["weapon_max_durability"], fresh);
+        assert_eq!(update["melee_damage"], mmo::world::melee_damage(Some("sword")));
+        // The tool's own ability is untouched by the weapon in the other hand.
+        assert_eq!(update["abilities"][0]["id"], "pick");
+        drop(ws);
+    }
+
+    /// A connecting swing wears the blade, and breaking it auto-unequips (#128's
+    /// contract) AND drops the swing back to bare-handed damage — a broken sword
+    /// must stop hitting like one immediately, not at the next periodic sweep.
+    #[tokio::test]
+    async fn a_sword_wears_on_connecting_swings_and_breaking_disarms_you() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("blunt_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Blunt"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        db.add_to_inventory(&pid, "sword", 1).await.unwrap();
+        let sword = db
+            .inventory_for_character(&pid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.item_id == "sword")
+            .unwrap()
+            .id;
+        db.equip_instance(&pid, &sword).await.unwrap();
+        let fresh = mmo::world::tool_max_durability("sword").unwrap();
+
+        // One connecting swing, as the zone reports it.
+        zone.to_proxy
+            .send(Message::Text(
+                json!({"type": "weapon_used", "player_id": pid}).to_string(),
+            ))
+            .unwrap();
+        loop {
+            let v = recv_until(&mut ws, "equip.update").await;
+            if v["weapon_durability"] == fresh - 1 {
+                break;
+            }
+        }
+
+        // Wear it to the brink directly, then break it over the wire.
+        for _ in 0..(fresh - 2) {
+            db.wear_equipped_tool(&pid, "weapon", 1).await.unwrap();
+        }
+        assert_eq!(
+            db.equipped(&pid, "weapon").await.unwrap().as_deref(),
+            Some("sword"),
+            "not broken yet"
+        );
+        zone.to_proxy
+            .send(Message::Text(
+                json!({"type": "weapon_used", "player_id": pid}).to_string(),
+            ))
+            .unwrap();
+
+        let broken = loop {
+            let v = recv_until(&mut ws, "equip.update").await;
+            if v["weapon"].is_null() {
+                break v;
+            }
+        };
+        assert_eq!(db.equipped(&pid, "weapon").await.unwrap(), None, "auto-unequipped");
+        assert_eq!(
+            broken["melee_damage"],
+            mmo::world::MELEE_DAMAGE_BARE,
+            "a broken sword must stop hitting like a sword at once"
+        );
+        // The husk survives, repairable, exactly as a broken tool does (#128).
+        let husk = db
+            .inventory_for_character(&pid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == sword)
+            .expect("the broken sword should still exist");
+        assert_eq!(husk.durability, Some(0));
+        drop(ws);
+    }
+
+    /// Bare-handed swings wear nothing. Fists don't blunt, and a player between
+    /// swords must not be silently punished for having none.
+    #[tokio::test]
+    async fn a_bare_handed_swing_wears_nothing() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("fists_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Fists"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        // A sword in the pack but NOT in hand: wearing must key on the slot, not
+        // on ownership.
+        db.add_to_inventory(&pid, "sword", 1).await.unwrap();
+
+        for _ in 0..5 {
+            zone.to_proxy
+                .send(Message::Text(
+                    json!({"type": "weapon_used", "player_id": pid}).to_string(),
+                ))
+                .unwrap();
+        }
+        // Give the gateway a chance to do the wrong thing.
+        for _ in 0..10 {
+            let _ = recv_frame(&mut ws).await;
+        }
+        let carried = db
+            .inventory_for_character(&pid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.item_id == "sword")
+            .unwrap();
+        assert_eq!(
+            carried.durability,
+            mmo::world::tool_max_durability("sword"),
+            "an unequipped sword was worn down by punching"
+        );
+        drop(ws);
+    }
+
+    /// The weapon master hands over a blade only when you have none at all —
+    /// the same "safety net, not a farm" contract the foremen have, so losing
+    /// your sword is never a dead end and dropping one is never a farm.
+    #[tokio::test]
+    async fn the_weapon_master_arms_you_only_when_you_have_nothing() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("bram_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Pupil"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        stand_at(&proxy, &pid, wx, wy);
+
+        // The ZONE range-gates `npc.talk` and forwards `npc_interact`; the fake
+        // zone here can't, so drive the internal message the real one sends.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_weapon_master",
+            }).to_string()))
+            .unwrap();
+        loop {
+            recv_until(&mut ws, "npc.dialogue").await;
+            if qty_of_inventory(&db, &pid, "sword").await >= 1 {
+                break;
+            }
+        }
+        assert_eq!(qty_of_inventory(&db, &pid, "sword").await, 1);
+
+        // Talking again while armed hands over nothing.
+        stand_at(&proxy, &pid, wx, wy);
+        // The ZONE range-gates `npc.talk` and forwards `npc_interact`; the fake
+        // zone here can't, so drive the internal message the real one sends.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "npc_interact", "player_id": pid, "npc_id": "npc_weapon_master",
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "npc.dialogue").await;
+        for _ in 0..10 {
+            let _ = recv_frame(&mut ws).await;
+        }
+        assert_eq!(
+            qty_of_inventory(&db, &pid, "sword").await,
+            1,
+            "the weapon master is a safety net, not a sword dispenser"
+        );
+        drop(ws);
+    }
+
+    /// A kill's loot lands in a real inventory, as a real stackable item — the
+    /// same shape build orders and the market already deal in. A hidden kill
+    /// counter would be the one system in this game where the thing you earned
+    /// isn't a thing.
+    #[tokio::test]
+    async fn a_kills_loot_lands_in_the_inventory_as_a_real_item() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("hunter_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Hunter"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "dog_pelt", "qty": 1, "skill": "", "xp": 0,
+                "source": "kill", "species": "wild_dog",
+            }).to_string()))
+            .unwrap();
+        loop {
+            recv_until(&mut ws, "inv.update").await;
+            if qty_of_inventory(&db, &pid, "dog_pelt").await >= 1 {
+                break;
+            }
+        }
+        assert_eq!(qty_of_inventory(&db, &pid, "dog_pelt").await, 1);
+        drop(ws);
+    }
+
+    /// A full pack must not silently eat a kill's loot. Gathering can afford to
+    /// be quiet — you're at the node and can watch the count refuse to move —
+    /// but the creature is GONE, and doing the work for nothing with no
+    /// explanation is the version of this that reads as broken.
+    #[tokio::test]
+    async fn a_full_pack_says_so_rather_than_eating_the_loot() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("laden_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Laden"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        // Fill the pack to MAX_CARRY, in trips (one add is itself capped).
+        while qty_of_inventory(&db, &pid, "wood").await < mmo::persistence::MAX_CARRY {
+            let before = qty_of_inventory(&db, &pid, "wood").await;
+            db.add_to_inventory(&pid, "wood", mmo::persistence::MAX_CARRY).await.unwrap();
+            if qty_of_inventory(&db, &pid, "wood").await == before {
+                break;
+            }
+        }
+        assert_eq!(qty_of_inventory(&db, &pid, "wood").await, mmo::persistence::MAX_CARRY);
+
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "dog_pelt", "qty": 1, "skill": "", "xp": 0,
+                "source": "kill", "species": "wild_dog",
+            }).to_string()))
+            .unwrap();
+
+        let lost = recv_until(&mut ws, "loot.lost").await;
+        assert_eq!(lost["item_id"], "dog_pelt");
+        assert_eq!(lost["qty"], 1);
+        assert!(
+            lost["detail"].as_str().unwrap().contains("full"),
+            "the reason should be legible: {lost:?}"
+        );
+        assert_eq!(
+            qty_of_inventory(&db, &pid, "dog_pelt").await,
+            0,
+            "nothing should have been persisted"
+        );
+        drop(ws);
+    }
+
+    /// Gathering with a full pack stays quiet — the `loot.lost` nudge is for
+    /// kills specifically, where the thing you earned no longer exists to try
+    /// again on.
+    #[tokio::test]
+    async fn a_full_pack_stays_quiet_about_ordinary_gathering() {
+        let (proxy, db, _dbf, zone) = proxy_with_shared_db().await;
+        let email = format!("gatherer_{}@t.test", Uuid::new_v4().simple());
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": email, "password": "pw12", "name": "Gath"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        while qty_of_inventory(&db, &pid, "wood").await < mmo::persistence::MAX_CARRY {
+            let before = qty_of_inventory(&db, &pid, "wood").await;
+            db.add_to_inventory(&pid, "wood", mmo::persistence::MAX_CARRY).await.unwrap();
+            if qty_of_inventory(&db, &pid, "wood").await == before {
+                break;
+            }
+        }
+
+        // No `source`, i.e. an ordinary gather swing.
+        zone.to_proxy
+            .send(Message::Text(json!({
+                "type": "gather_yield", "player_id": pid,
+                "item_id": "stone", "qty": 1, "skill": "gathering", "xp": 1,
+            }).to_string()))
+            .unwrap();
+        recv_until(&mut ws, "inv.update").await;
+
+        // Drain what's queued; none of it should be a loot.lost.
+        for _ in 0..20 {
+            let Some(v) = recv_frame(&mut ws).await else { break };
+            assert_ne!(v["type"], "loot.lost", "gathering shouldn't nag about a full pack");
+        }
         drop(ws);
     }
 

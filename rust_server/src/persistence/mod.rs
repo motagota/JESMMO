@@ -128,6 +128,26 @@ async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str,
 /// at the gateway, precisely because "which instance" isn't a meaningful
 /// question for a stash slot) — kept generic rather than special-cased so
 /// it can't silently corrupt state if that guard is ever bypassed.
+/// How many of `item_id` a character holds, inside a caller-owned transaction.
+///
+/// The in-tx twin of [`Db::inventory_qty`], so a check and the removal it
+/// authorises can't be separated by another writer.
+async fn inventory_qty_in_tx(
+    tx: &mut Tx<'_>,
+    character_id: &str,
+    item_id: &str,
+) -> Result<i64, DbError> {
+    let qty: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+    )
+    .bind(character_id)
+    .bind(item_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    Ok(qty.unwrap_or(0))
+}
+
 async fn remove_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<i64, DbError> {
     if world::tool_max_durability(item_id).is_some() {
         let ids: Vec<String> = sqlx::query_scalar(
@@ -2975,6 +2995,63 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    // --- the creature bounty (wild dogs epic #157, issue #161) --------------
+
+    /// Hand in `cfg.required` trophies for `cfg.gold`, repeatably.
+    ///
+    /// Returns `(paid, held_after)` — the gold minted (0 if refused) and how
+    /// many trophies remain, so the caller can tell a player where they are
+    /// without a second query.
+    ///
+    /// **One transaction.** The trophies leave and the gold appears together, or
+    /// neither happens: a crash between them would either eat ten pelts for
+    /// nothing or pay twice on retry.
+    ///
+    /// **Deduped** through the same `market_command` table the market uses for
+    /// exactly-once (#139). A resent frame must not mint a second hundred gold —
+    /// this is a faucet, and a replayable faucet is a duplication bug that prints
+    /// money rather than merely repeating an action.
+    ///
+    /// **All or nothing.** Nine trophies is not a turn-in: it is refused whole,
+    /// consuming nothing. Part-paying would be the worst outcome, since the
+    /// player would have lost goods and gained no bounty.
+    pub async fn turn_in_bounty(
+        &self,
+        character_id: &str,
+        cfg: &crate::market_config::BountyConfig,
+        command_id: &str,
+        now: i64,
+    ) -> Result<(i64, i64), DbError> {
+        let mut tx = self.pool.begin().await?;
+        if !Self::claim_command_in_tx(&mut tx, command_id, character_id, now).await? {
+            // Already paid for this command. Report what they hold so a client
+            // that retried still renders the truth, and pay nothing.
+            let held = inventory_qty_in_tx(&mut tx, character_id, &cfg.item_id).await?;
+            tx.commit().await?;
+            return Ok((0, held));
+        }
+        let held = inventory_qty_in_tx(&mut tx, character_id, &cfg.item_id).await?;
+        if held < cfg.required {
+            tx.commit().await?;
+            return Ok((0, held));
+        }
+        let removed =
+            remove_inventory_in_tx(&mut tx, character_id, &cfg.item_id, cfg.required).await?;
+        if removed < cfg.required {
+            // Shouldn't happen — we just counted them under the same
+            // transaction — but paying for trophies that didn't actually leave
+            // would mint gold from nothing. Roll back rather than trust it.
+            tx.rollback().await?;
+            return Ok((0, held));
+        }
+        // A genuine faucet: the city creates the coin it pays with, so it goes
+        // on the supply ledger (#154) under its own reason. This is the largest
+        // tap in the game, and the one most worth being able to see.
+        mint_gold_in_tx(&mut tx, character_id, cfg.gold, "bounty", now).await?;
+        tx.commit().await?;
+        Ok((cfg.gold, held - cfg.required))
     }
 
     /// The money supply: every gold ever created minus every gold ever
@@ -7066,6 +7143,139 @@ mod tests {
         let flagged = db.trades_outside_bounds(&m, &cfg, 0).await.unwrap();
         assert_eq!(flagged.len(), 1, "an out-of-bounds trade went unreported: {flagged:?}");
         assert_eq!(flagged[0], ("wood".to_string(), 50, 2, 20));
+    }
+
+    // --- the creature bounty (#161) -----------------------------------------
+
+    fn bounty_cfg() -> crate::market_config::BountyConfig {
+        crate::market_config::BountyConfig::default()
+    }
+
+    async fn a_hunter_with(db: &Db, pelts: i64) -> String {
+        let cid = a_character(db).await;
+        db.add_to_inventory(&cid, "dog_pelt", pelts).await.unwrap();
+        cid
+    }
+
+    /// The loop: trophies in, gold out, trophies gone — and repeatable.
+    #[tokio::test]
+    async fn the_bounty_pays_and_repeats() {
+        let (db, _t) = TempDb::open().await;
+        let cfg = bounty_cfg();
+        let cid = a_hunter_with(&db, cfg.required * 3).await;
+        let purse = db.character_gold(&cid).await.unwrap();
+
+        for turn in 1..=3 {
+            let (paid, held) = db.turn_in_bounty(&cid, &cfg, &format!("b{turn}"), 0).await.unwrap();
+            assert_eq!(paid, cfg.gold, "turn {turn} paid {paid}");
+            assert_eq!(held, cfg.required * (3 - turn), "turn {turn} left {held}");
+        }
+        assert_eq!(db.character_gold(&cid).await.unwrap(), purse + cfg.gold * 3);
+        assert_eq!(db.inventory_qty(&cid, "dog_pelt").await.unwrap(), 0);
+
+        // Out of trophies: refused, and nothing is taken.
+        let (paid, held) = db.turn_in_bounty(&cid, &cfg, "b4", 0).await.unwrap();
+        assert_eq!((paid, held), (0, 0));
+    }
+
+    /// A partial hand-in is refused WHOLE. Part-paying would be the worst
+    /// outcome available: the player loses goods and gains no bounty.
+    #[tokio::test]
+    async fn a_partial_hand_in_is_refused_and_consumes_nothing() {
+        let (db, _t) = TempDb::open().await;
+        let cfg = bounty_cfg();
+        let short = cfg.required - 1;
+        let cid = a_hunter_with(&db, short).await;
+        let purse = db.character_gold(&cid).await.unwrap();
+
+        let (paid, held) = db.turn_in_bounty(&cid, &cfg, "short", 0).await.unwrap();
+        assert_eq!(paid, 0, "a short hand-in must pay nothing");
+        assert_eq!(held, short, "and it must report what they actually hold");
+        assert_eq!(
+            db.inventory_qty(&cid, "dog_pelt").await.unwrap(),
+            short,
+            "a refused turn-in ate the trophies"
+        );
+        assert_eq!(db.character_gold(&cid).await.unwrap(), purse);
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// A resent frame pays ONCE. This is a faucet, so a replayable one isn't a
+    /// repeated action — it's a duplication bug that prints money.
+    #[tokio::test]
+    async fn a_replayed_turn_in_pays_once() {
+        let (db, _t) = TempDb::open().await;
+        let cfg = bounty_cfg();
+        let cid = a_hunter_with(&db, cfg.required * 2).await;
+        let purse = db.character_gold(&cid).await.unwrap();
+
+        let (first, _) = db.turn_in_bounty(&cid, &cfg, "same-id", 0).await.unwrap();
+        assert_eq!(first, cfg.gold);
+        for _ in 0..4 {
+            let (again, held) = db.turn_in_bounty(&cid, &cfg, "same-id", 0).await.unwrap();
+            assert_eq!(again, 0, "a resent command minted a second bounty");
+            assert_eq!(held, cfg.required, "and it should still report the truth");
+        }
+        assert_eq!(db.character_gold(&cid).await.unwrap(), purse + cfg.gold);
+        assert_eq!(
+            db.inventory_qty(&cid, "dog_pelt").await.unwrap(),
+            cfg.required,
+            "the replay consumed a second batch of trophies"
+        );
+    }
+
+    /// Every coin is on the supply ledger under its own reason, so the largest
+    /// faucet in the game is measurable next to the others rather than showing
+    /// up as an unexplained rise in the money supply.
+    #[tokio::test]
+    async fn the_bounty_is_ledgered_as_its_own_faucet() {
+        let (db, _t) = TempDb::open().await;
+        let cfg = bounty_cfg();
+        let cid = a_hunter_with(&db, cfg.required * 2).await;
+
+        let before = db.gold_supply().await.unwrap();
+        db.turn_in_bounty(&cid, &cfg, "led1", 0).await.unwrap();
+        db.turn_in_bounty(&cid, &cfg, "led2", 0).await.unwrap();
+
+        assert_eq!(
+            db.gold_supply().await.unwrap(),
+            before + cfg.gold * 2,
+            "bounty gold must show up as newly created"
+        );
+        let by_reason = db.gold_by_reason().await.unwrap();
+        let bounty: i64 =
+            by_reason.iter().filter(|(r, _)| r == "bounty").map(|(_, g)| *g).sum();
+        assert_eq!(bounty, cfg.gold * 2, "not attributed to the bounty: {by_reason:?}");
+        assert_eq!(
+            db.gold_supply_gap().await.unwrap(),
+            0,
+            "the bounty broke the supply identity"
+        );
+    }
+
+    /// The bounty pays for trophies, however they were obtained — a pelt bought
+    /// on the market is indistinguishable from one you killed for, and that's
+    /// intended (#159). Nothing here should try to prove provenance.
+    #[tokio::test]
+    async fn bought_trophies_are_as_good_as_killed_ones() {
+        let (db, _t) = TempDb::open().await;
+        let cfg = bounty_cfg();
+        let m = a_market(&db).await;
+        let seller = a_character(&db).await;
+        db.add_to_inventory(&seller, "dog_pelt", cfg.required).await.unwrap();
+        db.warehouse_deposit(&m, &seller, "dog_pelt", cfg.required, 60).await.unwrap();
+        sell(&db, &m, &seller, "dog_pelt", 2, cfg.required).await;
+
+        let buyer = a_character(&db).await;
+        let out = db
+            .place_order(&m, &buyer, "buy", "dog_pelt", 2, cfg.required, NO_EXPIRY, &test_cfg(), "", 0)
+            .await
+            .unwrap();
+        assert_eq!(out.filled, cfg.required, "the pelts should have traded");
+        db.warehouse_withdraw(&m, &buyer, "dog_pelt", cfg.required).await.unwrap();
+
+        let (paid, _) = db.turn_in_bounty(&buyer, &cfg, "bought", 0).await.unwrap();
+        assert_eq!(paid, cfg.gold, "a bought pelt should claim the bounty just the same");
     }
 
     // --- the money supply ledger (#154) --------------------------------------

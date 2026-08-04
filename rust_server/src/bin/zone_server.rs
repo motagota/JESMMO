@@ -44,11 +44,19 @@ const MOB_ATTACK_COOLDOWN: i32 = 8; // ticks between a mob's hits (~0.4s)
 
 const MELEE_RANGE: i32 = 60; // how far a swing reaches
 const MELEE_ARC_COS: f64 = 0.0; // cos(90deg): hit within +/-90deg of facing
-const MELEE_DAMAGE: i32 = 20;
+// Melee damage moved to `world::melee_damage` in #160: it depends on the
+// equipped weapon, which lives in the gateway's DB, so the zone is told rather
+// than deciding. `world::MELEE_DAMAGE_BARE` is the unarmed value and the
+// default a freshly created entity carries.
 const PLAYER_ATTACK_COOLDOWN: i32 = 6; // ticks between swings (~0.3s)
 
 // --- Territory control (capture bar) ------------------------------------------
 const MOB_RESPAWN_TICKS: i32 = 40; // a killed mob trickles back ~every 2s
+/// How long an authored creature (#158) stays dead before returning to its
+/// authored spot. Much slower than the ambient trickle: clearing a pack should
+/// feel like an accomplishment that lasts a little while, and a bounty that
+/// respawned under your feet would be farming rather than hunting.
+const AUTHORED_MOB_RESPAWN_TICKS: i32 = 600; // ~30s at 20 Hz
 const CAPTURE_MOB_THRESHOLD: usize = 2; // capture only progresses at/below this many mobs
 const CAPTURE_RATE: f32 = 1.0; // bar units/tick while capturing (~5s to take a zone)
 const CAPTURE_DECAY: f32 = 0.5; // bar units/tick lost when a capture stalls
@@ -104,7 +112,7 @@ const HOME_STRUCTURE_RANGE: i32 = 60; // must be within this of a placed bed/sto
 
 type Tx = mpsc::UnboundedSender<Message>;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum EntityKind {
     Player,
     Mob,
@@ -141,6 +149,17 @@ impl Region {
     }
 }
 
+/// Runtime state for an authored creature (#158). The position is authored and
+/// immutable — a killed dog comes back where it was put, not wherever the RNG
+/// felt like, so a pack stays a landmark across a session.
+struct AuthoredMob {
+    species: &'static str,
+    x: i32,
+    y: i32,
+    /// Ticks until it comes back; 0 while it is alive.
+    respawn_timer: i32,
+}
+
 struct Entity {
     x: i32,
     y: i32,
@@ -174,6 +193,32 @@ struct Entity {
     poison_buildup: i32,
     /// The proc: sticks until death (no cure in v1); only respawn clears it.
     poisoned: bool,
+    /// What kind of creature this is (#158), for authored mobs. `None` for
+    /// players and for the ambient mobs `spawn_mobs` scatters — those stay the
+    /// anonymous territory population they have always been, and only authored
+    /// creatures are named content.
+    species: Option<&'static str>,
+    /// Where an authored creature belongs (#158). Past
+    /// `world::AUTHORED_MOB_LEASH` from here it abandons whatever it is doing
+    /// and walks back — see that constant for why. `None` for players and
+    /// ambient mobs, which roam their whole region freely as they always have.
+    home: Option<(i32, i32)>,
+    /// Who struck the blow that took this creature from alive to dead (#159).
+    ///
+    /// Set ONLY by the hit that crosses hp from `> 0` to `<= 0`, never by a
+    /// later one landing on a corpse in the same tick — otherwise two players
+    /// swinging together would credit whoever the iteration order happened to
+    /// reach last, rather than whoever actually killed it.
+    killed_by: Option<String>,
+    /// Damage this player's swing deals (#160), as the gateway most recently
+    /// reported it — the gateway owns equipment, this zone just stores the
+    /// verdict, exactly like `submerged` and `poison_sources` before it.
+    ///
+    /// Defaults to bare-handed, which is also the correct value for a recreated
+    /// entity until the gateway's next push: a migrated player briefly punching
+    /// instead of slashing is a far better failure than one briefly swinging a
+    /// sword they no longer own.
+    melee_damage: i64,
 }
 
 impl Entity {
@@ -194,7 +239,19 @@ impl Entity {
             poison_sources: 0,
             poison_buildup: 0,
             poisoned: false,
+            species: None,
+            home: None,
+            killed_by: None,
+            melee_damage: mmo::world::MELEE_DAMAGE_BARE,
         }
+    }
+
+    /// An ambient mob: no species, random placement, counts toward territory.
+    /// An authored creature: named, fixed-place, and content rather than
+    /// ambience. Identical to an ambient mob in every combat respect — same hp,
+    /// same AI — so nothing in the tick has to special-case it.
+    fn authored_mob(species: &'static str, x: i32, y: i32) -> Self {
+        Entity { species: Some(species), home: Some((x, y)), ..Entity::mob(x, y) }
     }
 
     fn mob(x: i32, y: i32) -> Self {
@@ -215,6 +272,10 @@ impl Entity {
             poison_sources: 0,
             poison_buildup: 0,
             poisoned: false,
+            species: None,
+            home: None,
+            killed_by: None,
+            melee_damage: mmo::world::MELEE_DAMAGE_BARE,
         }
     }
 }
@@ -336,6 +397,12 @@ fn entity_status_json(id: &str, e: &Entity) -> Value {
     // Vitals (#87/#88) ride the same state dict hp does, players only — the
     // HUD (#89) shows a breath meter while submerged and a poison gauge
     // while buildup is non-zero.
+    // Species (#158) so a client can name and draw a wild dog as a wild dog
+    // rather than as another anonymous blob. Absent for players and ambient
+    // mobs, which is exactly the distinction it exists to make.
+    if let Some(species) = e.species {
+        state["species"] = json!(species);
+    }
     if e.kind == EntityKind::Player {
         state["breath"] = json!(e.breath);
         state["max_breath"] = json!(BREATH_MAX_TICKS);
@@ -369,6 +436,11 @@ struct ZoneServer {
     /// Gatherable resource nodes in this zone's region (cache-only runtime state),
     /// keyed by node id.
     nodes: Mutex<HashMap<String, ResourceNode>>,
+    /// Authored creatures in this zone's region (#158), keyed by their authored
+    /// id — which is also the live entity id, so a death is matched back to its
+    /// spawn without a second lookup. Runtime state is just the respawn timer;
+    /// the position is authored and never drifts.
+    authored_mobs: Mutex<HashMap<String, AuthoredMob>>,
     /// Authored storage access points in this zone's region (deposit/withdraw spots).
     storage_points: Mutex<Vec<mmo::world::StoragePoint>>,
     /// Authored build-order boards in this zone's region (contribution spots).
@@ -399,6 +471,7 @@ impl ZoneServer {
             mob_counter: Mutex::new(0),
             capital: mmo::world::capital(),
             nodes: Mutex::new(HashMap::new()),
+            authored_mobs: Mutex::new(HashMap::new()),
             storage_points: Mutex::new(Vec::new()),
             build_boards: Mutex::new(Vec::new()),
             plots: Mutex::new(Vec::new()),
@@ -430,6 +503,32 @@ impl ZoneServer {
                     respawn_timer: 0,
                 },
             );
+        }
+    }
+
+    /// (Re)spawn the authored creatures inside this zone's current region (#158).
+    /// Replaces the set, so a split re-derives what this zone now owns — exactly
+    /// like `spawn_nodes`, and for the same reason: authored content is anchored
+    /// to the world, not to whichever zone happens to be serving it.
+    fn spawn_authored_mobs(&self) {
+        let r = *self.region.lock().unwrap();
+        let spawns = self
+            .capital
+            .mobs_in(mmo::world::Rect::new(r.x0, r.y0, r.x1, r.y1));
+        let mut authored = self.authored_mobs.lock().unwrap();
+        let mut entities = self.entities.lock().unwrap();
+        // Drop any authored creature this zone no longer owns, so a split
+        // doesn't leave a ghost behind in the half that lost it.
+        for id in authored.keys() {
+            entities.remove(id);
+        }
+        authored.clear();
+        for m in spawns {
+            authored.insert(
+                m.id.to_string(),
+                AuthoredMob { species: m.species, x: m.x, y: m.y, respawn_timer: 0 },
+            );
+            entities.insert(m.id.to_string(), Entity::authored_mob(m.species, m.x, m.y));
         }
     }
 
@@ -543,6 +642,15 @@ impl ZoneServer {
         if let Some(e) = self.entities.lock().unwrap().get_mut(player_id) {
             e.submerged = submerged;
             e.poison_sources = poison_sources;
+        }
+    }
+
+    /// Store the gateway's verdict on what this player's swing is worth (#160).
+    /// Mirrors [`ZoneServer::apply_env_state`] exactly: the gateway owns the
+    /// equipment, this zone owns the hit resolution, and the two meet here.
+    fn apply_loadout(&self, player_id: &str, melee_damage: i64) {
+        if let Some(e) = self.entities.lock().unwrap().get_mut(player_id) {
+            e.melee_damage = melee_damage.max(0);
         }
     }
 
@@ -745,6 +853,7 @@ impl ZoneServer {
                 // static world authoring) and repopulated by the `home_structures_sync`
                 // the gateway sends right after a region change (#13).
                 self.spawn_mobs(MOBS_PER_ZONE);
+                self.spawn_authored_mobs();
                 self.spawn_nodes();
                 self.spawn_storage_points();
                 self.spawn_build_boards();
@@ -875,6 +984,18 @@ impl ZoneServer {
                     let submerged = data.get("submerged").and_then(|v| v.as_bool()).unwrap_or(false);
                     let poison_sources = data.get("poison_sources").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     self.apply_env_state(&player_id, submerged, poison_sources);
+                }
+                "loadout" => {
+                    // What this player is holding, computed gateway-side (#160)
+                    // — same contract as `env_state` above. Pushed on every
+                    // equipment change for immediacy AND on the periodic sweep,
+                    // so a migrated or respawned entity self-heals rather than
+                    // staying stuck at whatever it was recreated with.
+                    let dmg = data
+                        .get("melee_damage")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(mmo::world::MELEE_DAMAGE_BARE);
+                    self.apply_loadout(&player_id, dmg);
                 }
                 "attack" => {
                     // Flag the swing; damage is resolved authoritatively in the tick.
@@ -1029,6 +1150,13 @@ impl ZoneServer {
             let mut changed: HashSet<String> = HashSet::new();
             let mut despawns: Vec<String> = Vec::new();
             let mut died: Vec<(String, i32)> = Vec::new(); // (player_id, respawn max_hp)
+            // (killer, item, species) for creatures that died with a killer this
+            // tick (#159). Collected while the entity lock is held and flushed
+            // with the rest of the packets below, like every other outcome.
+            let mut loot: Vec<(String, &'static str, &'static str)> = Vec::new();
+            // Players whose swing connected this tick (#160); the gateway owns
+            // durability, so it does the wearing.
+            let mut weapon_used: Vec<String> = Vec::new();
             let mut packets: Vec<String> = Vec::new();
 
             {
@@ -1058,15 +1186,28 @@ impl ZoneServer {
                 let aggro2 = (AGGRO_RADIUS as i64) * (AGGRO_RADIUS as i64);
                 let atk2 = (MOB_ATTACK_RANGE as i64) * (MOB_ATTACK_RANGE as i64);
                 for mid in &mob_ids {
-                    let (mx, my, ready) = {
+                    let (mx, my, ready, authored) = {
                         let e = entities.get(mid).unwrap();
-                        (e.x, e.y, e.attack_cooldown == 0)
+                        (e.x, e.y, e.attack_cooldown == 0, e.home.is_some())
                     };
-                    // Nearest player within aggro range. In a safe zone mobs never
-                    // target players — they only wander (friendly wildlife) — so no
-                    // contact damage is ever produced.
+                    // Nearest player within aggro range.
+                    //
+                    // A safe district makes AMBIENT mobs harmless — they only
+                    // wander, friendly wildlife, and produce no contact damage.
+                    // **Authored creatures are exempt (#159): wild dogs bite.**
+                    // A pack you can stand in the middle of unharmed isn't
+                    // something that "needs clearing", and a sword is a poor
+                    // reward when nothing can hurt you.
+                    //
+                    // Their reach is bounded by geometry rather than by a second
+                    // rule: a dog aggros within `AGGRO_RADIUS` of itself and is
+                    // leashed to `AUTHORED_MOB_LEASH` of its home (#158), so its
+                    // territory is exactly that sum and no larger. The pack is
+                    // sited 806 from the town centre precisely so this can never
+                    // reach spawn — see
+                    // `the_pack_cannot_reach_the_town_centre`.
                     let mut best: Option<(String, i32, i32, i64)> = None;
-                    if !safe {
+                    if !safe || authored {
                         for (pid, px, py) in &players {
                             let d2 = dist2(mx, my, *px, *py);
                             if d2 <= aggro2 && best.as_ref().map_or(true, |b| d2 < b.3) {
@@ -1076,6 +1217,25 @@ impl ZoneServer {
                     }
 
                     let e = entities.get_mut(mid).unwrap();
+                    // Leash first, ahead of both chasing and wandering (#158): an
+                    // authored creature dragged away from its ground gives up and
+                    // goes home. Ahead of the chase on purpose — otherwise a
+                    // player could kite the pack across the district and strand it
+                    // somewhere the siting guarantees don't hold.
+                    let straying = e.home.filter(|(hx, hy)| {
+                        dist2(e.x, e.y, *hx, *hy) > (mmo::world::AUTHORED_MOB_LEASH as i64).pow(2)
+                    });
+                    if let Some((hx, hy)) = straying {
+                        let (sx, sy) = step_toward(e.x, e.y, hx, hy, MOB_SPEED);
+                        let (nx, ny) = clamp_region(&region, e.x + sx, e.y + sy);
+                        e.x = nx;
+                        e.y = ny;
+                        if sx != 0 || sy != 0 {
+                            e.facing = (sx.signum(), sy.signum());
+                        }
+                        changed.insert(mid.clone());
+                        continue;
+                    }
                     if let Some((pid, px, py, d2)) = best {
                         let (sx, sy) = step_toward(mx, my, px, py, MOB_SPEED);
                         let (nx, ny) = clamp_region(&region, e.x + sx, e.y + sy);
@@ -1104,15 +1264,18 @@ impl ZoneServer {
                     changed.insert(mid.clone());
                 }
 
-                // Apply mob contact damage to players. Never in a safe zone — the
-                // map is empty there, but the guard makes "no player takes damage in
-                // the capital" an explicit, enforced invariant.
-                if !safe {
-                    for (pid, dmg) in player_damage {
-                        if let Some(e) = entities.get_mut(&pid) {
-                            e.hp -= dmg;
-                            changed.insert(pid);
-                        }
+                // Apply mob contact damage to players.
+                //
+                // No blanket safe-zone guard here any more (#159): TARGET
+                // SELECTION above is the authority, and it is the precise place
+                // to express the rule — an ambient mob in a safe district never
+                // acquires a target, so it can never contribute damage, while an
+                // authored creature can. Re-checking `safe` here would silently
+                // undo the exception and leave the dogs toothless.
+                for (pid, dmg) in player_damage {
+                    if let Some(e) = entities.get_mut(&pid) {
+                        e.hp -= dmg;
+                        changed.insert(pid);
                     }
                 }
 
@@ -1178,20 +1341,36 @@ impl ZoneServer {
                     .filter_map(|id| entities.get(id).map(|e| (id.clone(), e.x, e.y)))
                     .collect();
                 for sid in &swingers {
-                    let (px, py, fx, fy) = {
+                    let (px, py, fx, fy, dmg) = {
                         let e = entities.get(sid).unwrap();
-                        (e.x, e.y, e.facing.0, e.facing.1)
+                        (e.x, e.y, e.facing.0, e.facing.1, e.melee_damage as i32)
                     };
                     let hits: Vec<String> = mob_positions
                         .iter()
                         .filter(|(_, mx, my)| in_melee_arc(px, py, fx, fy, *mx, *my))
                         .map(|(id, _, _)| id.clone())
                         .collect();
+                    let connected = !hits.is_empty();
                     for hid in hits {
                         if let Some(m) = entities.get_mut(&hid) {
-                            m.hp -= MELEE_DAMAGE;
+                            let was_alive = m.hp > 0;
+                            m.hp -= dmg;
+                            // Credit the KILLING blow, and only it (#159). The
+                            // `was_alive` guard is what makes this exactly-once
+                            // when two swings land in the same tick: the second
+                            // hits a corpse and changes nothing.
+                            if was_alive && m.hp <= 0 {
+                                m.killed_by = Some(sid.clone());
+                            }
                             changed.insert(hid);
                         }
+                    }
+                    // A swing that CONNECTED wears the blade (#160) — once, not
+                    // once per victim. A cleave through five dogs is one swing
+                    // and one notch; charging five would make the arc a
+                    // liability instead of a reward. A whiff costs nothing.
+                    if connected {
+                        weapon_used.push(sid.clone());
                     }
                     let e = entities.get_mut(sid).unwrap();
                     e.swinging = false;
@@ -1206,8 +1385,30 @@ impl ZoneServer {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in dead_mobs {
+                    // The drop (#159), read off the corpse before it goes.
+                    // Species is what gates it: only authored creatures carry
+                    // one, so ambient mobs drop nothing and the bounty sends you
+                    // to the pack rather than turning every zone into a farm.
+                    //
+                    // No killer means no drop, and that is the normal case for
+                    // an environmental death — a dog that drowns or is poisoned
+                    // was killed by the world, and nobody earned anything.
+                    if let Some(e) = entities.get(&id) {
+                        if let (Some(species), Some(killer)) = (e.species, e.killed_by.clone()) {
+                            if let Some(item) = mmo::world::creature_drop(species) {
+                                loot.push((killer, item, species));
+                            }
+                        }
+                    }
                     entities.remove(&id);
                     changed.remove(&id);
+                    // An authored creature (#158) is remembered rather than
+                    // forgotten: it owes the world a comeback at the spot it was
+                    // authored, so a pack stays a landmark instead of drifting
+                    // into the RNG's hands after one clearing.
+                    if let Some(a) = self.authored_mobs.lock().unwrap().get_mut(&id) {
+                        a.respawn_timer = AUTHORED_MOB_RESPAWN_TICKS;
+                    }
                     despawns.push(id);
                 }
                 let dead_players: Vec<String> = entities
@@ -1238,8 +1439,35 @@ impl ZoneServer {
                     died.push((id.clone(), max_hp));
                 }
 
-                // --- 4. Trickle mobs back (slowly, so a zone can be cleared). ---
-                let live_mobs = entities.values().filter(|e| e.kind == EntityKind::Mob).count();
+                // --- 4a. Authored creatures come back where they were put (#158).
+                {
+                    let mut authored = self.authored_mobs.lock().unwrap();
+                    for (id, a) in authored.iter_mut() {
+                        if a.respawn_timer <= 0 {
+                            continue;
+                        }
+                        a.respawn_timer -= 1;
+                        if a.respawn_timer == 0 {
+                            entities
+                                .insert(id.clone(), Entity::authored_mob(a.species, a.x, a.y));
+                            changed.insert(id.clone());
+                        }
+                    }
+                }
+
+                // --- 4b. Trickle AMBIENT mobs back (slowly, so a zone can be
+                // cleared). Authored creatures are excluded from the count on
+                // purpose: they are content, not territory, and letting a pack
+                // of five suppress the ambient population would quietly change
+                // how a zone behaves just because someone put dogs in it.
+                let authored_ids: std::collections::HashSet<String> =
+                    self.authored_mobs.lock().unwrap().keys().cloned().collect();
+                let live_mobs = entities
+                    .iter()
+                    .filter(|(id, e)| {
+                        e.kind == EntityKind::Mob && !authored_ids.contains(*id)
+                    })
+                    .count();
                 if live_mobs < MOBS_PER_ZONE {
                     respawn_timer -= 1;
                     if respawn_timer <= 0 {
@@ -1338,6 +1566,29 @@ impl ZoneServer {
 
             for id in &despawns {
                 packets.push(json!({"type": "despawn", "player_id": id}).to_string());
+            }
+            // Loot (#159) rides the existing `gather_yield` path rather than a
+            // second, parallel one: it already carries an item from a zone event
+            // into a player's durable inventory through the gateway, already
+            // respects MAX_CARRY, and already refuses guests. A kill is a
+            // different WAY to earn an item, not a different kind of item.
+            //
+            // No `ability_id`: that field is what wears a tool down, and a kill
+            // is not a tool swing. Weapon wear is #160's business.
+            for pid in &weapon_used {
+                packets.push(
+                    json!({"type": "weapon_used", "player_id": pid}).to_string(),
+                );
+            }
+            for (killer, item, species) in &loot {
+                packets.push(
+                    json!({
+                        "type": "gather_yield", "player_id": killer,
+                        "item_id": item, "qty": 1, "skill": "", "xp": 0,
+                        "source": "kill", "species": species,
+                    })
+                    .to_string(),
+                );
             }
             // Order matters: `you_died` must reach the gateway while the dead
             // player's client still points at THIS zone (see the death block
@@ -1465,6 +1716,7 @@ impl ZoneServer {
         // Seed mobs, resource nodes, storage points, build boards, and plots, then
         // start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
+        self.spawn_authored_mobs();
         self.spawn_nodes();
         self.spawn_storage_points();
         self.spawn_build_boards();
@@ -1518,6 +1770,623 @@ mod tests {
 
     fn zone_for_region(region: Region) -> Arc<ZoneServer> {
         ZoneServer::new("test".to_string(), 0, None, region, 1)
+    }
+
+    // --- the weapon slot (#160) ---------------------------------------------
+
+    /// Put a lone dog in front of a hunter, standing back and facing it — see
+    /// `killing_a_dog_credits_the_killer_with_a_pelt` for why standing on top of
+    /// a target is flaky.
+    fn stage_duel(zone: &Arc<ZoneServer>) -> (String, (i32, i32)) {
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        let mut es = zone.entities.lock().unwrap();
+        let others: Vec<String> = es
+            .iter()
+            .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+            .map(|(oid, _)| oid.clone())
+            .collect();
+        for oid in others {
+            es.remove(&oid);
+        }
+        es.insert("duellist".to_string(), Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP));
+        es.get_mut("duellist").unwrap().facing = (1, 0);
+        (id, home)
+    }
+
+    /// An armed swing hits harder than a bare-handed one, resolved server-side.
+    /// A sword that didn't change how combat resolves would be a cosmetic item.
+    #[tokio::test]
+    async fn an_armed_swing_hits_harder_than_a_bare_one() {
+        // Bare-handed: the shipped default a fresh entity carries.
+        let bare = zone_for_region(CIVIC);
+        let (bare_id, _) = stage_duel(&bare);
+        bare.entities.lock().unwrap().get_mut("duellist").unwrap().swinging = true;
+        drive(bare.clone(), 3).await;
+        let bare_hp = bare.entities.lock().unwrap().get(&bare_id).map(|e| e.hp).unwrap();
+
+        // Armed: the gateway's verdict, applied by the zone.
+        let armed = zone_for_region(CIVIC);
+        let (armed_id, _) = stage_duel(&armed);
+        {
+            let mut es = armed.entities.lock().unwrap();
+            let d = es.get_mut("duellist").unwrap();
+            d.melee_damage = mmo::world::melee_damage(Some("sword"));
+            d.swinging = true;
+        }
+        drive(armed.clone(), 3).await;
+        let armed_hp = armed.entities.lock().unwrap().get(&armed_id).map(|e| e.hp);
+
+        assert!(
+            bare_hp > 0,
+            "bare hands should NOT one-shot a dog — that's the whole point of the sword"
+        );
+        assert!(
+            armed_hp.is_none() || armed_hp.unwrap() <= 0,
+            "a sword should drop a wild dog in one clean swing, got {armed_hp:?}"
+        );
+    }
+
+    /// Bare-handed combat is unchanged. It's the current combat, several tests
+    /// predate weapons entirely, and a player between swords still has to be
+    /// able to defend themselves.
+    #[test]
+    fn an_empty_weapon_slot_still_swings() {
+        assert_eq!(mmo::world::melee_damage(None), mmo::world::MELEE_DAMAGE_BARE);
+        assert_eq!(mmo::world::melee_damage(Some("pickaxe")), mmo::world::MELEE_DAMAGE_BARE,
+            "a gathering tool is not a weapon");
+        assert!(mmo::world::melee_damage(Some("sword")) > mmo::world::MELEE_DAMAGE_BARE);
+        // A fresh entity swings bare-handed until the gateway says otherwise —
+        // briefly punching is a far better failure than briefly swinging a sword
+        // you no longer own.
+        assert_eq!(Entity::player(0, 0, 100).melee_damage, mmo::world::MELEE_DAMAGE_BARE);
+    }
+
+    /// The gateway's `loadout` push is what arms a swing, and it reconverges a
+    /// recreated entity — the same contract `env_state` has.
+    #[tokio::test]
+    async fn the_loadout_push_arms_and_disarms_a_swing() {
+        let zone = zone_for_region(CIVIC);
+        zone.entities
+            .lock()
+            .unwrap()
+            .insert("p1".to_string(), Entity::player(12800, 12800, PLAYER_MAX_HP));
+
+        zone.apply_loadout("p1", mmo::world::melee_damage(Some("sword")));
+        assert_eq!(
+            zone.entities.lock().unwrap().get("p1").unwrap().melee_damage,
+            mmo::world::melee_damage(Some("sword"))
+        );
+
+        // Sword breaks: the gateway re-pushes, and the very next swing is worth
+        // bare-handed damage again.
+        zone.apply_loadout("p1", mmo::world::MELEE_DAMAGE_BARE);
+        assert_eq!(
+            zone.entities.lock().unwrap().get("p1").unwrap().melee_damage,
+            mmo::world::MELEE_DAMAGE_BARE
+        );
+    }
+
+    /// A connecting swing wears the blade ONCE, not once per victim. A cleave
+    /// through five dogs is one swing and one notch; charging five would make
+    /// the arc a liability instead of a reward.
+    #[tokio::test]
+    async fn a_cleave_wears_the_blade_once_not_once_per_victim() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let home = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let m = a.values().next().unwrap();
+            (m.x, m.y)
+        };
+        // Line the dogs up east of the swinger, all inside the 60-unit reach and
+        // the ±90° arc. Positioned EXPLICITLY rather than relying on the authored
+        // layout: the anchor dog comes out of a HashMap, so which way the rest of
+        // the pack lies relative to the swing varies run to run — and the pack is
+        // wider than a swing reaches anyway, so "hits all five" was never true.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            let ids: Vec<String> = es
+                .iter()
+                .filter(|(_, e)| e.species.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert!(ids.len() >= 3, "precondition: a pack to cleave");
+            for (i, id) in ids.iter().take(3).enumerate() {
+                let d = es.get_mut(id).unwrap();
+                d.x = home.0 + 20 + (i as i32 * 12);
+                d.y = home.1;
+            }
+            for id in ids.iter().skip(3) {
+                es.remove(id);
+            }
+            es.insert("cleaver".to_string(), Entity::player(home.0, home.1, PLAYER_MAX_HP));
+            let c = es.get_mut("cleaver").unwrap();
+            c.facing = (1, 0);
+            c.melee_damage = mmo::world::melee_damage(Some("sword"));
+            c.swinging = true;
+        }
+
+        let packets = drive_until(zone.clone(), |p| p.contains("weapon_used")).await;
+        let wears = packets.iter().filter(|p| p.contains("weapon_used")).count();
+        assert_eq!(wears, 1, "one swing should be one notch, got {wears}: {packets:?}");
+        // ...and it really did hit several of them.
+        let killed = packets.iter().filter(|p| p.contains("dog_pelt")).count();
+        assert_eq!(killed, 3, "one armed swing should have felled all three, got {killed}");
+    }
+
+    /// A whiff costs nothing. Wearing a blade on air would make missing doubly
+    /// punishing and turn every fight into a durability calculation.
+    #[tokio::test]
+    async fn a_missed_swing_does_not_wear_the_blade() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        // Far from every dog, swinging at nothing.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("whiffer".to_string(), Entity::player(18000, 18000, PLAYER_MAX_HP));
+            let w = es.get_mut("whiffer").unwrap();
+            w.facing = (1, 0);
+            w.melee_damage = mmo::world::melee_damage(Some("sword"));
+            w.swinging = true;
+        }
+        let packets = drive(zone.clone(), 6).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("weapon_used")),
+            "swinging at air wore the blade: {packets:?}"
+        );
+    }
+
+    // --- authored creatures (wild dogs epic #157, issue #158) ---------------
+
+    /// The authored pack turns up where it was authored, named, when a zone owns
+    /// that ground. Before #158 every mob was an anonymous blob at a random
+    /// point, so "is there a dog over there" had no answer.
+    #[tokio::test]
+    async fn a_zone_owning_the_pack_spawns_it_where_it_was_authored() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+
+        let authored = mmo::world::capital().mobs;
+        let entities = zone.entities.lock().unwrap();
+        for m in &authored {
+            let e = entities.get(m.id).unwrap_or_else(|| panic!("{} did not spawn", m.id));
+            assert_eq!((e.x, e.y), (m.x, m.y), "{} spawned somewhere else", m.id);
+            assert_eq!(e.species, Some(m.species), "{} lost its species", m.id);
+            assert_eq!(e.kind, EntityKind::Mob);
+            assert_eq!(e.hp, MOB_MAX_HP, "an authored creature fights like any other mob");
+        }
+    }
+
+    /// A zone that owns none of the authored ground gets none of them — and
+    /// still fills its ambient population exactly as before. Authored content
+    /// must not become a prerequisite for a zone working.
+    #[tokio::test]
+    async fn a_zone_without_authored_ground_is_unchanged() {
+        // A far corner of the world with nothing authored in it.
+        let empty = Region { x0: 100, y0: 100, x1: 900, y1: 900 };
+        let zone = zone_for_region(empty);
+        zone.spawn_authored_mobs();
+        assert!(zone.authored_mobs.lock().unwrap().is_empty());
+
+        zone.spawn_mobs(MOBS_PER_ZONE);
+        let entities = zone.entities.lock().unwrap();
+        let mobs: Vec<_> = entities.values().filter(|e| e.kind == EntityKind::Mob).collect();
+        assert_eq!(mobs.len(), MOBS_PER_ZONE, "the ambient population changed");
+        assert!(
+            mobs.iter().all(|e| e.species.is_none()),
+            "ambient mobs should stay anonymous — species is what marks authored content"
+        );
+    }
+
+    /// Re-deriving on a region change replaces the set rather than accumulating,
+    /// and a zone that loses the ground loses the creatures on it. This is the
+    /// bug a split would otherwise cause: the same dog alive in two zones.
+    #[tokio::test]
+    async fn a_region_change_re_derives_the_pack_without_ghosts() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let owned = zone.authored_mobs.lock().unwrap().len();
+        assert!(owned > 0, "precondition: the civic region owns the pack");
+
+        // Running it twice must not double anything.
+        zone.spawn_authored_mobs();
+        assert_eq!(zone.authored_mobs.lock().unwrap().len(), owned, "re-derive accumulated");
+        assert_eq!(
+            zone.entities.lock().unwrap().values().filter(|e| e.species.is_some()).count(),
+            owned,
+            "re-derive left duplicate entities"
+        );
+
+        // Hand the ground away: the creatures go with it, leaving no ghost.
+        *zone.region.lock().unwrap() = Region { x0: 100, y0: 100, x1: 900, y1: 900 };
+        zone.spawn_authored_mobs();
+        assert!(zone.authored_mobs.lock().unwrap().is_empty());
+        assert_eq!(
+            zone.entities.lock().unwrap().values().filter(|e| e.species.is_some()).count(),
+            0,
+            "an authored creature was left behind in a zone that no longer owns its ground"
+        );
+    }
+
+    /// Species rides the wire, so a client can name and draw a dog as a dog.
+    /// Absent for players and ambient mobs, which is the distinction it exists
+    /// to make.
+    #[test]
+    fn species_rides_the_entity_wire_only_for_authored_creatures() {
+        let dog = Entity::authored_mob(mmo::world::SPECIES_WILD_DOG, 1, 2);
+        let v = entity_status_json("mob_dog_0", &dog);
+        assert_eq!(v["state"]["species"], mmo::world::SPECIES_WILD_DOG);
+        assert_eq!(v["state"]["type"], "mob");
+
+        let ambient = entity_status_json("mob_x", &Entity::mob(1, 2));
+        assert!(ambient["state"]["species"].is_null(), "ambient mobs are anonymous");
+        let player = entity_status_json("p1", &Entity::player(1, 2, PLAYER_MAX_HP));
+        assert!(player["state"]["species"].is_null(), "players have no species");
+    }
+
+    /// A killed dog comes back **where it was authored**, not at a random point,
+    /// so a pack stays a landmark across a session rather than dispersing after
+    /// one clearing. It also takes materially longer than the ambient trickle:
+    /// clearing a pack should last a moment, and a bounty target that respawned
+    /// under your feet would be farming rather than hunting.
+    #[tokio::test]
+    async fn a_killed_authored_creature_returns_to_its_authored_spot() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+
+        // Kill it, and shove the corpse's timer down so the test doesn't wait
+        // 30 real seconds for the authored cadence.
+        zone.entities.lock().unwrap().get_mut(&id).unwrap().hp = 0;
+        drive(zone.clone(), 2).await;
+        assert!(!zone.entities.lock().unwrap().contains_key(&id), "it should have died");
+        assert!(
+            zone.authored_mobs.lock().unwrap().get(&id).unwrap().respawn_timer > 0,
+            "an authored creature owes the world a comeback"
+        );
+        zone.authored_mobs.lock().unwrap().get_mut(&id).unwrap().respawn_timer = 2;
+
+        drive(zone.clone(), 4).await;
+        let entities = zone.entities.lock().unwrap();
+        let back = entities.get(&id).expect("it should have come back");
+        // Near home, not exactly on it: a respawned mob starts wandering
+        // immediately, which is correct. The property that matters is that it
+        // came back to its authored ground rather than to a random point in a
+        // 12800-wide region — so the tolerance is tiny next to the alternative.
+        let drift = (((back.x - home.0) as f64).powi(2) + ((back.y - home.1) as f64).powi(2)).sqrt();
+        assert!(
+            drift < 100.0,
+            "it came back {drift:.0} from home ({:?} vs {home:?}) — that looks like a random              respawn, not an authored one",
+            (back.x, back.y)
+        );
+        assert_eq!(back.hp, MOB_MAX_HP, "and at full health");
+        assert_eq!(back.species, Some(mmo::world::SPECIES_WILD_DOG));
+    }
+
+    /// Wild dogs bite, even though the whole capital is a safe district (#159).
+    /// A pack you can stand in the middle of unharmed isn't something that
+    /// "needs clearing", and a sword is a poor reward when nothing can hurt you.
+    #[tokio::test]
+    async fn wild_dogs_bite_inside_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        assert!(zone.is_safe(), "precondition: the capital is a safe district");
+        zone.spawn_authored_mobs();
+        let home = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let m = a.values().next().unwrap();
+            (m.x, m.y)
+        };
+        // Standing in the middle of the pack.
+        zone.entities
+            .lock()
+            .unwrap()
+            .insert("prey".to_string(), Entity::player(home.0, home.1, PLAYER_MAX_HP));
+
+        drive_until(zone.clone(), |p| p.contains("\"prey\"") && p.contains("\"hp\"")).await;
+        // Give the dogs a few attack cooldowns' worth of contact.
+        drive(zone.clone(), (MOB_ATTACK_COOLDOWN * 4) as u32).await;
+
+        let hp = zone.entities.lock().unwrap().get("prey").map(|e| e.hp).unwrap_or(0);
+        assert!(
+            hp < PLAYER_MAX_HP,
+            "the pack never touched a player standing in the middle of it (hp {hp})"
+        );
+    }
+
+    /// The exception is precisely scoped: ambient mobs stay harmless in a safe
+    /// district exactly as before. Only authored creatures are exempt.
+    #[tokio::test]
+    async fn ambient_mobs_are_still_harmless_in_the_safe_capital() {
+        let zone = zone_for_region(CIVIC);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("bystander".to_string(), Entity::player(9000, 9000, PLAYER_MAX_HP));
+            for i in 0..4 {
+                es.insert(format!("mob_amb_{i}"), Entity::mob(9000, 9000));
+            }
+        }
+        drive(zone.clone(), (MOB_ATTACK_COOLDOWN * 6) as u32).await;
+        let hp = zone.entities.lock().unwrap().get("bystander").map(|e| e.hp).unwrap_or(0);
+        assert_eq!(
+            hp, PLAYER_MAX_HP,
+            "an anonymous mob drew blood in the capital — the #159 exception leaked"
+        );
+    }
+
+    // --- kill credit and the drop (#159) ------------------------------------
+
+    /// Killing an authored creature credits the killer, and the loot rides the
+    /// existing `gather_yield` path rather than a second parallel one.
+    #[tokio::test]
+    async fn killing_a_dog_credits_the_killer_with_a_pelt() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        // A player right on top of it, and the dog one hit from death.
+        {
+            let mut es = zone.entities.lock().unwrap();
+            // One dog in reach, for the same reason as above: a swing cleaves.
+            let others: Vec<String> = es
+                .iter()
+                .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+                .map(|(oid, _)| oid.clone())
+                .collect();
+            for oid in others {
+                es.remove(&oid);
+            }
+            // Stand BACK from the target, facing it. Standing on top of it is
+            // flaky: the arc is ±90°, mobs wander up to 2 units on the tick the
+            // swing resolves, and a dog that drifts behind you is a clean miss —
+            // with `swinging` consumed, there is no second chance. 30 units back
+            // is well inside the 60 reach and far enough that a 2-unit wander
+            // can't flip the angle.
+            es.insert(
+                "hunter".to_string(),
+                Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP),
+            );
+            es.get_mut(&id).unwrap().hp = 1;
+            es.get_mut("hunter").unwrap().facing = (1, 0);
+        }
+        zone.entities.lock().unwrap().get_mut("hunter").unwrap().swinging = true;
+
+        let packets = drive_until(zone.clone(), |p| p.contains("dog_pelt")).await;
+        let loot: Vec<&String> = packets
+            .iter()
+            .filter(|p| p.contains("\"gather_yield\"") && p.contains("dog_pelt"))
+            .collect();
+        assert_eq!(loot.len(), 1, "expected exactly one pelt, got {loot:?}");
+        let v: serde_json::Value = serde_json::from_str(loot[0]).unwrap();
+        assert_eq!(v["player_id"], "hunter", "the wrong player was credited");
+        assert_eq!(v["qty"], 1);
+        assert_eq!(v["source"], "kill");
+        // No ability id: a kill is not a tool swing, so nothing wears down here.
+        assert!(v["ability_id"].is_null(), "a kill must not wear a gathering tool");
+    }
+
+    /// Two hunters swinging in the same tick produce exactly ONE pelt, to
+    /// whoever landed the fatal blow. A creature can't die twice, and the second
+    /// swing hits a corpse.
+    #[tokio::test]
+    async fn two_hunters_in_one_tick_produce_exactly_one_pelt() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+        {
+            let mut es = zone.entities.lock().unwrap();
+            // Isolate the target. The pack is clustered inside ~65 units and a
+            // swing reaches 60 in a ±90° arc, so leaving the others in place
+            // means the swings cleave through several dogs at once — correct
+            // behaviour, but it would make this test about arcs rather than
+            // about credit.
+            let others: Vec<String> = es
+                .iter()
+                .filter(|(oid, e)| e.species.is_some() && *oid != &id)
+                .map(|(oid, _)| oid.clone())
+                .collect();
+            for oid in others {
+                es.remove(&oid);
+            }
+            es.get_mut(&id).unwrap().hp = 1;
+            // Back from the target and facing it, for the same reason as above.
+            for who in ["h1", "h2"] {
+                es.insert(who.to_string(), Entity::player(home.0 - 30, home.1, PLAYER_MAX_HP));
+                es.get_mut(who).unwrap().facing = (1, 0);
+            }
+        }
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.get_mut("h1").unwrap().swinging = true;
+            es.get_mut("h2").unwrap().swinging = true;
+        }
+
+        let packets = drive_until(zone.clone(), |p| p.contains("dog_pelt")).await;
+        let loot: Vec<&String> = packets
+            .iter()
+            .filter(|p| p.contains("\"gather_yield\"") && p.contains("dog_pelt"))
+            .collect();
+        assert_eq!(
+            loot.len(),
+            1,
+            "a creature died once but paid out {} times: {loot:?}",
+            loot.len()
+        );
+    }
+
+    /// A creature killed by the world — drowning, poison — has no killer, so
+    /// nobody earns anything and nothing panics looking for someone.
+    #[tokio::test]
+    async fn an_environmental_death_drops_nothing_and_credits_nobody() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let id = zone.authored_mobs.lock().unwrap().keys().next().unwrap().clone();
+        // Killed outright with no attacker, the way drowning/poison does it.
+        zone.entities.lock().unwrap().get_mut(&id).unwrap().hp = 0;
+
+        // Wait for the DESPAWN (the outcome that does happen), then assert the
+        // pelt isn't among what was emitted — waiting on an absence directly
+        // would just be a sleep with extra steps.
+        let packets = drive_until(zone.clone(), |p| p.contains("\"despawn\"")).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("dog_pelt")),
+            "the world killed it, but somebody got paid"
+        );
+        assert!(
+            packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(&id)),
+            "it should still have died"
+        );
+    }
+
+    /// Ambient mobs drop nothing. The bounty should send you to the authored
+    /// pack; a dropping ambient mob would turn every zone in the world into a
+    /// farm — which is also why they stay speciesless (#158).
+    #[tokio::test]
+    async fn an_ambient_mob_drops_nothing() {
+        let zone = zone_for_region(CIVIC);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.insert("mob_ambient".to_string(), Entity::mob(9000, 9000));
+            es.get_mut("mob_ambient").unwrap().hp = 1;
+            es.insert("hunter".to_string(), Entity::player(9000, 9000, PLAYER_MAX_HP));
+            es.get_mut("hunter").unwrap().facing = (1, 0);
+        }
+        zone.entities.lock().unwrap().get_mut("hunter").unwrap().swinging = true;
+
+        let packets = drive_until(zone.clone(), |p| p.contains("\"despawn\"")).await;
+        assert!(
+            !packets.iter().any(|p| p.contains("\"gather_yield\"")),
+            "an anonymous mob paid out loot: {packets:?}"
+        );
+    }
+
+    /// An authored creature never strays far from its ground (#158). Mob wander
+    /// is 2 units/tick at 20Hz, so an unleashed one drifts over a thousand units
+    /// within a minute — which is exactly what happened live, scattering the pack
+    /// up to 1250 units from its anchor and carrying it clean out of every
+    /// promise the siting made (dry land, level footing, clear of everything).
+    #[tokio::test]
+    async fn an_authored_creature_stays_near_its_ground() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let homes: Vec<(String, (i32, i32))> = zone
+            .authored_mobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, m)| (id.clone(), (m.x, m.y)))
+            .collect();
+
+        // Long enough to drift far past the leash if nothing held them.
+        drive(zone.clone(), 400).await;
+
+        let leash = mmo::world::AUTHORED_MOB_LEASH as f64;
+        let entities = zone.entities.lock().unwrap();
+        for (id, home) in &homes {
+            let e = entities.get(id).unwrap_or_else(|| panic!("{id} vanished"));
+            let drift =
+                (((e.x - home.0) as f64).powi(2) + ((e.y - home.1) as f64).powi(2)).sqrt();
+            // A step of slack: the leash turns them around, it doesn't teleport
+            // them, so they can be a stride or two beyond it at any instant.
+            assert!(
+                drift <= leash + (MOB_SPEED * 2) as f64,
+                "{id} drifted {drift:.0} from home, past the {leash:.0} leash"
+            );
+        }
+    }
+
+    /// Dragged out and released, it walks home rather than standing where it was
+    /// abandoned. The leash sits ahead of the chase on purpose — otherwise a
+    /// player could kite the pack across the district and strand it.
+    #[tokio::test]
+    async fn a_strayed_creature_walks_back_home() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let (id, home) = {
+            let a = zone.authored_mobs.lock().unwrap();
+            let (id, m) = a.iter().next().unwrap();
+            (id.clone(), (m.x, m.y))
+        };
+
+        // Shove it well past the leash, and park a player next to it so the
+        // chase branch would fire if the leash didn't take priority.
+        let far = (home.0 + 1200, home.1);
+        {
+            let mut es = zone.entities.lock().unwrap();
+            es.get_mut(&id).unwrap().x = far.0;
+            es.get_mut(&id).unwrap().y = far.1;
+            es.insert("bait".to_string(), Entity::player(far.0 + 20, far.1, PLAYER_MAX_HP));
+        }
+        let before =
+            (((far.0 - home.0) as f64).powi(2) + ((far.1 - home.1) as f64).powi(2)).sqrt();
+
+        drive(zone.clone(), 40).await;
+
+        let entities = zone.entities.lock().unwrap();
+        let e = entities.get(&id).unwrap();
+        let after = (((e.x - home.0) as f64).powi(2) + ((e.y - home.1) as f64).powi(2)).sqrt();
+        assert!(
+            after < before - 50.0,
+            "it stayed out with the player instead of going home ({before:.0} -> {after:.0})"
+        );
+    }
+
+    /// Ambient mobs are NOT leashed — they roam their whole region as they
+    /// always have. The leash is a property of authored content, not of mobs.
+    #[tokio::test]
+    async fn ambient_mobs_are_not_leashed() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_mobs(4);
+        let entities = zone.entities.lock().unwrap();
+        assert!(
+            entities.values().filter(|e| e.kind == EntityKind::Mob).all(|e| e.home.is_none()),
+            "an ambient mob was given a home — it would be leashed to a random point"
+        );
+    }
+
+    /// Authored creatures are CONTENT, ambient mobs are TERRITORY. A pack must
+    /// not suppress the ambient top-up — otherwise putting dogs somewhere would
+    /// quietly change how that zone behaves for reasons nobody wrote down.
+    #[tokio::test]
+    async fn the_pack_does_not_suppress_the_ambient_population() {
+        let zone = zone_for_region(CIVIC);
+        zone.spawn_authored_mobs();
+        let pack = zone.authored_mobs.lock().unwrap().len();
+        assert!(pack > 0);
+
+        // No ambient mobs yet: the trickle should still fill to its full quota
+        // despite the pack already standing there.
+        drive(zone.clone(), (MOB_RESPAWN_TICKS as u32 + 2) * MOBS_PER_ZONE as u32).await;
+
+        let entities = zone.entities.lock().unwrap();
+        let ambient = entities
+            .values()
+            .filter(|e| e.kind == EntityKind::Mob && e.species.is_none())
+            .count();
+        assert_eq!(
+            ambient, MOBS_PER_ZONE,
+            "the authored pack ate into the ambient population ({ambient} of {MOBS_PER_ZONE})"
+        );
+        assert_eq!(
+            entities.values().filter(|e| e.species.is_some()).count(),
+            pack,
+            "and the pack is still there"
+        );
     }
 
     /// Drive a freshly-built zone's `game_loop` for `ticks` with a wired (dummy)
@@ -1861,6 +2730,35 @@ mod tests {
     }
 
     /// Run the game loop for `ticks` and return every text packet the zone emitted.
+    /// Drive the sim until `want` matches one of the emitted packets, or a
+    /// generous deadline passes, and return everything seen.
+    ///
+    /// A fixed `drive(n)` sleeps wall-clock time and ASSUMES n ticks elapsed —
+    /// which is fine alone and flaky under the full suite's parallel load, where
+    /// the sim task may not be scheduled that often. Same trap `poll_progress_json`
+    /// was added for on the gateway side. Anything asserting on a specific
+    /// outcome should wait for that outcome, not for the clock.
+    async fn drive_until(
+        zone: Arc<ZoneServer>,
+        want: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *zone.proxy_tx.lock().unwrap() = Some(tx);
+        let runner = zone.clone();
+        tokio::spawn(runner.game_loop());
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            sleep(Duration::from_millis(TICK_MS * 2)).await;
+            while let Ok(Message::Text(t)) = rx.try_recv() {
+                out.push(t);
+            }
+            if out.iter().any(|p| want(p)) {
+                break;
+            }
+        }
+        out
+    }
+
     async fn drive(zone: Arc<ZoneServer>, ticks: u32) -> Vec<String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *zone.proxy_tx.lock().unwrap() = Some(tx);
