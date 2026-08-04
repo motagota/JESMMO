@@ -1481,6 +1481,78 @@ mod tests {
         }
     }
 
+    /// The SHIPPED `zones.toml` — not a synthetic fixture — is valid and sited
+    /// where it claims (#165).
+    ///
+    /// `zone_config`'s own tests prove the loader rejects bad layouts; this
+    /// proves the layout we actually ship isn't one of them, and that the adit
+    /// mouth obeys the same siting rules every other fixture does. A mine you
+    /// have to swim to, or that opens inside the dog pack, would be authored
+    /// exactly as easily as a good one.
+    #[test]
+    fn the_shipped_mine_is_valid_and_well_sited() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
+        let cfg = crate::zone_config::ZoneConfig::load(std::path::Path::new(path))
+            .expect("the shipped zones.toml must load");
+        let Some(mine) = cfg.interior("mine_starter") else {
+            // A checkout without the file is legitimate — it just means no
+            // interiors — so this is a skip, not a failure.
+            return;
+        };
+
+        let c = capital();
+        let t = loaded_terrain();
+        let (tcx, tcy) = c.town_centre;
+        let portal = mine.portals.first().expect("a way in");
+        let (px, py) = portal.world;
+
+        // On dry land across the whole mouth: the walk to a mine must not be a
+        // swim, and drowning is real (#83).
+        for (ox, oy) in [(0, 0), (-40, -40), (40, -40), (-40, 40), (40, 40)] {
+            assert!(
+                !t.is_water((px + ox) as f32, (py + oy) as f32),
+                "the adit mouth is in the water at ({}, {})",
+                px + ox,
+                py + oy
+            );
+        }
+        // Walkable from spawn without crossing water.
+        for i in 0..=200 {
+            let f = i as f32 / 200.0;
+            let x = tcx as f32 + (px - tcx) as f32 * f;
+            let y = tcy as f32 + (py - tcy) as f32 * f;
+            assert!(!t.is_water(x, y), "the walk to the mine crosses water at ({x:.0},{y:.0})");
+        }
+
+        let dist = (((px - tcx) as f64).powi(2) + ((py - tcy) as f64).powi(2)).sqrt();
+        assert!(
+            (300.0..1200.0).contains(&dist),
+            "the mine is {dist:.0} from spawn — a short walk, not an expedition or a doorstep"
+        );
+
+        // Outside the wild dogs' reach (#157): aggro 180 plus a 250 leash.
+        let threat = (AUTHORED_MOB_LEASH + 180) as f64;
+        for d in &c.mobs {
+            let g = (((d.x - px) as f64).powi(2) + ((d.y - py) as f64).powi(2)).sqrt();
+            assert!(g > threat, "{} can reach the adit mouth ({g:.0})", d.id);
+        }
+        // Clear of every other interaction, so the mouth is its own place.
+        for n in &c.npcs {
+            let g = (((n.x - px) as f64).powi(2) + ((n.y - py) as f64).powi(2)).sqrt();
+            assert!(g > 200.0, "the adit mouth is on top of NPC {}", n.id);
+        }
+        for n in &c.resource_nodes {
+            let g = (((n.x - px) as f64).powi(2) + ((n.y - py) as f64).powi(2)).sqrt();
+            assert!(g > 150.0, "the adit mouth is on top of node {}", n.id);
+        }
+
+        // The interior itself hangs together: you arrive on floor, the anchor is
+        // floor, and the galleries actually connect to the entrance chamber.
+        assert!(mine.contains(portal.inside.0, portal.inside.1));
+        assert!(mine.contains(mine.spawn_anchor.0, mine.spawn_anchor.1));
+        assert!(mine.volumes.len() >= 3, "three short galleries, so players disperse");
+    }
+
     /// Region filtering is what makes a zone split safe: each half must derive
     /// exactly the creatures inside it, with none duplicated into both and none
     /// lost from both. Same contract `resource_nodes_in` already honours.

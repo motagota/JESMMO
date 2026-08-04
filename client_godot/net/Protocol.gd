@@ -376,6 +376,16 @@ const S_LOOT_LOST := "loot.lost"
 ## `bounty.state {item_id, required, gold, held, paid}` answers EITHER WAY, paid
 ## or refused, because the panel has to show progress regardless and a silent
 ## refusal is indistinguishable from a dropped frame.
+## Interior zones (mine epic #164, issue #165).
+## `portal.enter {}` carries no destination on purpose: the server resolves which
+## portal you are standing at, from its own position cache, so a client can only
+## ever ask to go somewhere it could walk to.
+## `portal.entered {zone, x, y, interior, display_name, ambient_light}` confirms
+## the move; `portal.error {code, detail}` says why not.
+const C_PORTAL_ENTER := "portal.enter"
+const S_PORTAL_ENTERED := "portal.entered"
+const S_PORTAL_ERROR := "portal.error"
+
 const C_BOUNTY_TURN_IN := "bounty.turn_in"
 const S_BOUNTY_STATE := "bounty.state"
 const S_BOUNTY_ERROR := "bounty.error"

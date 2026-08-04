@@ -31,6 +31,25 @@ use mmo::world::WORLD_SIZE;
 
 // --- Simulation / combat tuning ------------------------------------------------
 const TICK_MS: u64 = 50; // 20 Hz authoritative simulation
+
+/// Where interior geometry is read from (#165) — the same file the gateway
+/// loads, resolved against the manifest dir rather than the cwd for the same
+/// reason (`start_servers.ps1` runs both processes from `rust_server/`).
+const DEFAULT_ZONE_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
+
+/// Load `zones.toml`, or refuse to start. A MISSING file means "no interiors",
+/// which is the world as it was; a malformed one is fatal, because a zone that
+/// silently fell back to surface rules would let players walk through rock.
+fn load_zone_config() -> mmo::zone_config::ZoneConfig {
+    let path = std::env::var("ZONE_CONFIG").unwrap_or_else(|_| DEFAULT_ZONE_CONFIG.to_string());
+    match mmo::zone_config::ZoneConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[Zone] FATAL: {e}");
+            panic!("zone config is unusable — refusing to start");
+        }
+    }
+}
 const PLAYER_MAX_HP: i32 = 100;
 
 const MOBS_PER_ZONE: usize = 8;
@@ -436,6 +455,13 @@ struct ZoneServer {
     /// Gatherable resource nodes in this zone's region (cache-only runtime state),
     /// keyed by node id.
     nodes: Mutex<HashMap<String, ResourceNode>>,
+    /// This zone's authored interior geometry (#165), or `None` for an ordinary
+    /// surface zone.
+    ///
+    /// Loaded from the same `zones.toml` the gateway reads, keyed by this
+    /// zone's own id — so the two processes cannot disagree about the shape of
+    /// the world, and there is no geometry on the wire to keep in step.
+    interior: Option<mmo::zone_config::InteriorZone>,
     /// Authored creatures in this zone's region (#158), keyed by their authored
     /// id — which is also the live entity id, so a death is matched back to its
     /// spawn without a second lookup. Runtime state is just the respawn timer;
@@ -460,7 +486,19 @@ struct ZoneServer {
 
 impl ZoneServer {
     fn new(zone_id: String, port: u16, proxy_uri: Option<String>, region: Region, version: u32) -> Arc<Self> {
+        // A zone whose id names an authored interior IS that interior (#165).
+        // Same file the gateway reads; a missing or unreadable `zones.toml`
+        // simply means no interiors, which is the world as it was.
+        let interior = load_zone_config().interior(&zone_id).cloned();
+        if let Some(z) = &interior {
+            println!(
+                "[Zone {zone_id}] Interior `{}` — {} volume(s); movement is bounded by the                  authored floor, not by a world region",
+                z.display_name,
+                z.volumes.len()
+            );
+        }
         Arc::new(ZoneServer {
+            interior,
             zone_id,
             port,
             proxy_uri,
@@ -937,7 +975,18 @@ impl ZoneServer {
                     let moved = {
                         let mut entities = self.entities.lock().unwrap();
                         if let Some(e) = entities.get_mut(&player_id) {
-                            let (nx, ny) = clamp_world(e.x + dx, e.y + dy);
+                            // In an interior (#165), the walls ARE the world:
+                            // a step that leaves the authored floor is simply
+                            // refused, and the player stays put. Surface
+                            // movement is unchanged — it clamps to the world
+                            // and hands off at a region boundary.
+                            let (nx, ny) = match &self.interior {
+                                Some(geom) => {
+                                    let (cx, cy) = (e.x + dx, e.y + dy);
+                                    if geom.contains(cx, cy) { (cx, cy) } else { (e.x, e.y) }
+                                }
+                                None => clamp_world(e.x + dx, e.y + dy),
+                            };
                             e.x = nx;
                             e.y = ny;
                             if dx != 0 || dy != 0 {
@@ -949,7 +998,10 @@ impl ZoneServer {
                         }
                     };
                     if let Some((nx, ny, hp)) = moved {
-                        if self.region.lock().unwrap().contains(nx, ny) {
+                        // An interior never hands a player off by geometry —
+                        // there is no neighbouring zone to walk into. The only
+                        // way out is the portal, which the gateway owns.
+                        if self.interior.is_some() || self.region.lock().unwrap().contains(nx, ny) {
                             self.send_status_update(&player_id).await;
                         } else {
                             // Left our slice of the world: hand off to the gateway.

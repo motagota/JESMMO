@@ -129,6 +129,10 @@ signal loot_lost(item_id: String, qty: int, detail: String)
 ## turn-in paid (0 when it was refused).
 signal bounty_state(item_id: String, required: int, gold: int, held: int, paid: int)
 signal bounty_error(code: String, detail: String)
+## Moved into or out of an interior zone (#165). `interior` says which side you
+## came out on, so the client knows whether to draw a cave or the world.
+signal portal_entered(zone: String, x: int, y: int, interior: bool, display_name: String, ambient_light: float)
+signal portal_error(code: String, detail: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -387,6 +391,18 @@ func _handle_text(text: String) -> void:
                 int(msg.get("gold", 0)),
                 int(msg.get("delta", 0)),
                 String(msg.get("reason", "")))
+        Protocol.S_PORTAL_ENTERED:
+            portal_entered.emit(
+                String(msg.get("zone", "")),
+                int(msg.get("x", 0)),
+                int(msg.get("y", 0)),
+                bool(msg.get("interior", false)),
+                String(msg.get("display_name", "")),
+                float(msg.get("ambient_light", 1.0)))
+        Protocol.S_PORTAL_ERROR:
+            portal_error.emit(
+                String(msg.get("code", "")),
+                String(msg.get("detail", "you can't go that way")))
         Protocol.S_BOUNTY_STATE:
             bounty_state.emit(
                 String(msg.get("item_id", "")),
@@ -690,6 +706,12 @@ func send_repair(instance_id: String) -> void:
 
 ## Talk to an NPC (validated server-side by proximity). Answered with
 ## `npc.dialogue` (mining/abilities epic #123, #121).
+## Step through whatever portal you're standing at (#165). Carries no
+## destination: the server resolves it from your live position, so this is a
+## request to use a door you can reach, not a claim about where you'll end up.
+func send_portal_enter() -> void:
+    _send({"type": Protocol.C_PORTAL_ENTER})
+
 ## Hand trophies to the weapon master (#161). `command_id` makes it
 ## exactly-once: a resent frame must not mint a second reward.
 func send_bounty_turn_in() -> void:

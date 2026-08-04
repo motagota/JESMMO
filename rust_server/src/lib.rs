@@ -11,3 +11,4 @@ pub mod persistence;
 pub mod protocol;
 pub mod util;
 pub mod world;
+pub mod zone_config;
