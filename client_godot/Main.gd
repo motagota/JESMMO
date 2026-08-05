@@ -20,6 +20,13 @@ const EDITOR_PASSWORD := "editor12345"
 
 var _net: NetworkClient
 var _world: World
+## The scene's light and atmosphere, held so an interior can dim them (#165).
+var _sun: DirectionalLight3D
+var _env: Environment
+## The floor plan from the most recent `portal.entered`, handed to the World when
+## the transition is applied. The client cannot know an interior's layout any
+## other way — it doesn't read the server's config, and shouldn't.
+var _last_portal_volumes: Array = []
 var _streamer: TerrainStreamer
 var _entities: EntityManager
 var _player: LocalPlayer
@@ -242,11 +249,24 @@ func _build_environment() -> void:
     var we := WorldEnvironment.new()
     we.environment = env
     add_child(we)
+    _env = env
 
     var sun := DirectionalLight3D.new()
     sun.rotation_degrees = Vector3(-55, -40, 0)
     sun.light_energy = 1.1
     add_child(sun)
+    _sun = sun
+
+## Drop the world to interior light, or restore daylight (#165). Underground
+## there is no sun and no sky — leaving them on is what would make a tunnel read
+## as a field with a roof over it.
+func _set_ambient(level: float) -> void:
+    if _sun != null:
+        _sun.light_energy = 1.1 * level
+    if _env != null:
+        _env.ambient_light_energy = maxf(level, 0.15)
+        _env.fog_density = 0.0001 if level >= 1.0 else 0.02
+        _env.fog_light_color = Color(0.55, 0.63, 0.72) if level >= 1.0 else Color(0.06, 0.05, 0.05)
 
 func _wire_signals() -> void:
     _net.opened.connect(func(): _hud.set_conn("connected"))
@@ -451,6 +471,20 @@ func _wire_signals() -> void:
         if paid > 0:
             _hud.flash_announce("Bounty paid: +%dg" % paid))
     _net.bounty_error.connect(func(_code, detail): _hud.flash_announce(detail))
+    # Interior zones (#165). The server has already moved us and is authoritative
+    # about where we can stand; this is presentation — hide the surface we can no
+    # longer see, lay the authored floor, and drop the light.
+    _net.portal_geometry.connect(func(volumes): _last_portal_volumes = volumes)
+    _net.portal_entered.connect(func(_zone, _x, _y, interior, display_name, ambient_light):
+        if interior:
+            _world.enter_interior(_last_portal_volumes)
+            _set_ambient(ambient_light)
+            _hud.flash_announce("Entered %s" % display_name)
+        else:
+            _world.leave_interior()
+            _set_ambient(1.0)
+            _hud.flash_announce("Back on the surface"))
+    _net.portal_error.connect(func(_code, detail): _hud.flash_announce(detail))
 
     _login.do_login.connect(func(email, pw): _save_email(email); _net.login(email, pw))
     _login.do_register.connect(func(email, pw, cname): _save_email(email); _net.register(email, pw, cname))

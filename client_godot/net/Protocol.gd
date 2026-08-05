@@ -376,6 +376,16 @@ const S_LOOT_LOST := "loot.lost"
 ## `bounty.state {item_id, required, gold, held, paid}` answers EITHER WAY, paid
 ## or refused, because the panel has to show progress regardless and a silent
 ## refusal is indistinguishable from a dropped frame.
+## Interior zones (mine epic #164, issue #165).
+## `portal.enter {}` carries no destination on purpose: the server resolves which
+## portal you are standing at, from its own position cache, so a client can only
+## ever ask to go somewhere it could walk to.
+## `portal.entered {zone, x, y, interior, display_name, ambient_light}` confirms
+## the move; `portal.error {code, detail}` says why not.
+const C_PORTAL_ENTER := "portal.enter"
+const S_PORTAL_ENTERED := "portal.entered"
+const S_PORTAL_ERROR := "portal.error"
+
 const C_BOUNTY_TURN_IN := "bounty.turn_in"
 const S_BOUNTY_STATE := "bounty.state"
 const S_BOUNTY_ERROR := "bounty.error"
@@ -613,7 +623,23 @@ static func _planar_height(h00: float, h10: float, h01: float, h11: float, fx: f
 ## streaming); otherwise falls back to the coarse whole-world backdrop grid
 ## from `terrain.data` — the permanent fallback, so there is always *an*
 ## answer everywhere from the moment the backdrop arrives.
+## Inside an interior zone (#165) the surface heightmap is meaningless — the
+## coordinates are the interior's own — so the floor is simply flat. Set by
+## `World.enter_interior`/`leave_interior`, which own the transition.
+static var _interior := false
+
+static func set_interior(on: bool) -> void:
+    _interior = on
+
+static func in_interior() -> bool:
+    return _interior
+
 static func terrain_height(wx: float, wy: float) -> float:
+    # Underground, the surface DEM says nothing about where the floor is: the
+    # same coordinates belong to a different space entirely. Flat floor, and no
+    # sampling of a heightmap that doesn't apply.
+    if _interior:
+        return 0.0
     var fine := _tile_height(wx, wy)
     if not is_nan(fine):
         return fine

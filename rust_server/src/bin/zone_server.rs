@@ -31,6 +31,41 @@ use mmo::world::WORLD_SIZE;
 
 // --- Simulation / combat tuning ------------------------------------------------
 const TICK_MS: u64 = 50; // 20 Hz authoritative simulation
+
+/// Where interior geometry is read from (#165) — the same file the gateway
+/// loads, resolved against the manifest dir rather than the cwd for the same
+/// reason (`start_servers.ps1` runs both processes from `rust_server/`).
+const DEFAULT_ZONE_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
+
+/// Load `zones.toml`, or refuse to start. A MISSING file means "no interiors",
+/// which is the world as it was; a malformed one is fatal, because a zone that
+/// silently fell back to surface rules would let players walk through rock.
+/// Where deposit/station/recipe tuning is read from (#166), resolved against
+/// the manifest dir for the same reason as the other configs.
+const DEFAULT_CRAFTING_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../crafting.toml");
+
+fn load_crafting_config() -> mmo::crafting_config::CraftingConfig {
+    let path =
+        std::env::var("CRAFTING_CONFIG").unwrap_or_else(|_| DEFAULT_CRAFTING_CONFIG.to_string());
+    match mmo::crafting_config::CraftingConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[Zone] FATAL: {e}");
+            panic!("crafting config is unusable — refusing to start");
+        }
+    }
+}
+
+fn load_zone_config() -> mmo::zone_config::ZoneConfig {
+    let path = std::env::var("ZONE_CONFIG").unwrap_or_else(|_| DEFAULT_ZONE_CONFIG.to_string());
+    match mmo::zone_config::ZoneConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[Zone] FATAL: {e}");
+            panic!("zone config is unusable — refusing to start");
+        }
+    }
+}
 const PLAYER_MAX_HP: i32 = 100;
 
 const MOBS_PER_ZONE: usize = 8;
@@ -290,6 +325,11 @@ struct ResourceNode {
     qty: i64,
     max_qty: i64,
     respawn_timer: i32, // ticks until refill while depleted (qty == 0)
+    /// A DEPOSIT (#166) rather than a surface node: `qty` is its remaining
+    /// charges and its behaviour — loot table, respawn window, XP, tool — comes
+    /// from `crafting.toml`. `None` for the ordinary trees and rocks that have
+    /// always been here, which keep working exactly as they did.
+    deposit: Option<String>,
 }
 
 /// A placed home structure's identity/position, as pushed by the gateway (the
@@ -436,6 +476,17 @@ struct ZoneServer {
     /// Gatherable resource nodes in this zone's region (cache-only runtime state),
     /// keyed by node id.
     nodes: Mutex<HashMap<String, ResourceNode>>,
+    /// This zone's authored interior geometry (#165), or `None` for an ordinary
+    /// surface zone.
+    ///
+    /// Loaded from the same `zones.toml` the gateway reads, keyed by this
+    /// zone's own id — so the two processes cannot disagree about the shape of
+    /// the world, and there is no geometry on the wire to keep in step.
+    interior: Option<mmo::zone_config::InteriorZone>,
+    /// Deposit behaviour (#166) — loot tables, charges, respawn windows. Loaded
+    /// from `crafting.toml`, the same file the gateway will read for stations
+    /// and recipes in #167.
+    crafting: mmo::crafting_config::CraftingConfig,
     /// Authored creatures in this zone's region (#158), keyed by their authored
     /// id — which is also the live entity id, so a death is matched back to its
     /// spawn without a second lookup. Runtime state is just the respawn timer;
@@ -460,7 +511,21 @@ struct ZoneServer {
 
 impl ZoneServer {
     fn new(zone_id: String, port: u16, proxy_uri: Option<String>, region: Region, version: u32) -> Arc<Self> {
+        // A zone whose id names an authored interior IS that interior (#165).
+        // Same file the gateway reads; a missing or unreadable `zones.toml`
+        // simply means no interiors, which is the world as it was.
+        let interior = load_zone_config().interior(&zone_id).cloned();
+        let crafting = load_crafting_config();
+        if let Some(z) = &interior {
+            println!(
+                "[Zone {zone_id}] Interior `{}` — {} volume(s); movement is bounded by the                  authored floor, not by a world region",
+                z.display_name,
+                z.volumes.len()
+            );
+        }
         Arc::new(ZoneServer {
+            interior,
+            crafting,
             zone_id,
             port,
             proxy_uri,
@@ -501,6 +566,49 @@ impl ZoneServer {
                     qty: s.qty,
                     max_qty: s.qty,
                     respawn_timer: 0,
+                    deposit: None,
+                },
+            );
+        }
+    }
+
+    /// (Re)spawn this interior's authored deposits (#166).
+    ///
+    /// Deposits are ordinary `ResourceNode`s with a `deposit` type attached, so
+    /// they inherit the entire Pick-ability swing path — range gating, cooldown,
+    /// tool wear, the client's hotbar — rather than needing a second one. What
+    /// the type adds is the loot table, the charge count and the respawn window.
+    fn spawn_deposits(&self) {
+        let Some(interior) = &self.interior else { return };
+        let mut nodes = self.nodes.lock().unwrap();
+        for d in &interior.deposits {
+            let Some(t) = self.crafting.deposit(&d.kind) else {
+                eprintln!(
+                    "[Zone {}] deposit `{}` names unknown type `{}` — skipped",
+                    self.zone_id, d.id, d.kind
+                );
+                continue;
+            };
+            // The node's `item_id` is what the Pick ability targets; the loot
+            // table is what it actually pays out. They differ on purpose: a seam
+            // yields several things, and the ability only needs to know it's a
+            // rock.
+            let target = t
+                .yields
+                .first()
+                .map(|y| y.item.clone())
+                .unwrap_or_else(|| "stone".to_string());
+            nodes.insert(
+                d.id.clone(),
+                ResourceNode {
+                    id: d.id.clone(),
+                    item_id: target,
+                    x: d.pos.0,
+                    y: d.pos.1,
+                    qty: t.charges,
+                    max_qty: t.charges,
+                    respawn_timer: 0,
+                    deposit: Some(d.kind.clone()),
                 },
             );
         }
@@ -725,36 +833,107 @@ impl ZoneServer {
             let entities = self.entities.lock().unwrap();
             let mut nodes = self.nodes.lock().unwrap();
             let Some(p) = entities.get(pid) else { return };
+            // What makes a node a valid target for this swing.
+            //
+            // An ordinary surface node matches on the item the ability harvests
+            // — Pick takes stone, Chop takes wood — which has been true since
+            // #125 and stays true.
+            //
+            // A DEPOSIT matches on the TOOL it declares instead (#166). A seam
+            // yields several things and its first line is not its identity: a
+            // clay seam worked with a pickaxe would otherwise be untargetable by
+            // Pick simply because it pays out clay. The deposit says what it
+            // needs; the ability says what it wields.
+            let targetable = |node: &ResourceNode| -> bool {
+                match node.deposit.as_deref().and_then(|k| self.crafting.deposit(k)) {
+                    Some(t) => {
+                        mmo::world::governing_tool(ability_id) == Some(t.required_tool.as_str())
+                    }
+                    None => node.item_id == target_item,
+                }
+            };
             match nodes.get_mut(node_id) {
-                Some(node) if node.item_id == target_item && node.qty > 0 => {
+                Some(node) if targetable(node) && node.qty > 0 => {
                     if dist2(p.x, p.y, node.x, node.y) > (SWING_RANGE as i64).pow(2) {
                         Err("out_of_range")
                     } else {
+                        // The charge is spent whether or not the roll pays out.
+                        // Working a seam costs a charge; the loot table decides
+                        // what you get for it, and starter iron misses on nearly
+                        // half the swings by design (#170).
                         node.qty -= 1;
                         let depleted = node.qty <= 0;
+                        let deposit = node.deposit.clone();
+                        let mut rng = rand::thread_rng();
+                        // A deposit rolls its whole table — nothing, one thing,
+                        // or several. An ordinary node yields its one unit, as
+                        // it always has.
+                        let (rolled, xp, respawn_ticks) = match deposit
+                            .as_deref()
+                            .and_then(|k| self.crafting.deposit(k))
+                        {
+                            Some(t) => {
+                                let secs = t.respawn_after(rng.gen::<f64>());
+                                (
+                                    t.roll(&mut rng),
+                                    t.xp_per_swing,
+                                    (secs * 1000 / TICK_MS as i64) as i32,
+                                )
+                            }
+                            None => (
+                                vec![(node.item_id.clone(), 1)],
+                                mmo::world::ability_xp_per_swing(ability_id),
+                                NODE_RESPAWN_TICKS,
+                            ),
+                        };
                         if depleted {
-                            node.respawn_timer = NODE_RESPAWN_TICKS;
+                            node.respawn_timer = respawn_ticks;
                         }
-                        Ok((node.item_id.clone(), depleted))
+                        Ok((rolled, xp, depleted, deposit))
                     }
                 }
                 _ => Err("exhausted"),
             }
         };
         match outcome {
-            Ok((item_id, depleted)) => {
-                let xp = mmo::world::ability_xp_per_swing(ability_id);
-                self.send_ability_result(pid, ability_id, true, "", cooldown_ms, Some((&item_id, 1)));
+            Ok((rolled, xp, depleted, deposit)) => {
+                // The swing itself succeeded even when the table paid out
+                // nothing — the animation, the cooldown and the tool wear all
+                // happened. Report the first line for the client's flash, or
+                // nothing at all for a miss.
+                let shown = rolled.first().map(|(i, q)| (i.as_str(), *q));
+                self.send_ability_result(pid, ability_id, true, "", cooldown_ms, shown);
                 if let Some(tx) = self.proxy_tx.lock().unwrap().clone() {
                     let skill = mmo::world::governing_skill(ability_id).unwrap_or("mining");
-                    let _ = tx.send(Message::Text(json!({
-                        "type": "gather_yield", "player_id": pid,
-                        "item_id": item_id, "qty": 1, "skill": skill, "xp": xp,
-                        // Tells the gateway which ability swung — it wears down
-                        // whatever tool governs it (#128). Only ever present for
-                        // a real swing; nothing else emits gather_yield anymore.
-                        "ability_id": ability_id,
-                    }).to_string()));
+                    // One `gather_yield` per rolled line. Several small messages
+                    // rather than one compound one: the gateway's grant path
+                    // already handles a single item with MAX_CARRY and the
+                    // full-pack nudge (#159), and reusing it beats teaching it a
+                    // second shape.
+                    //
+                    // XP rides the FIRST line only, so a two-item roll doesn't
+                    // pay twice for one swing. A miss pays nothing but the
+                    // charge — which is the cost of the swing, not of the loot.
+                    let mut first = true;
+                    for (item, qty) in &rolled {
+                        let _ = tx.send(Message::Text(json!({
+                            "type": "gather_yield", "player_id": pid,
+                            "item_id": item, "qty": qty, "skill": skill,
+                            "xp": if first { xp } else { 0 },
+                            "deposit": deposit,
+                            "ability_id": ability_id,
+                        }).to_string()));
+                        first = false;
+                    }
+                    if rolled.is_empty() {
+                        // Nothing to grant, but the tool still wore down.
+                        let _ = tx.send(Message::Text(json!({
+                            "type": "gather_yield", "player_id": pid,
+                            "item_id": "", "qty": 0, "skill": skill, "xp": xp,
+                            "deposit": deposit,
+                            "ability_id": ability_id,
+                        }).to_string()));
+                    }
                     let touch = if depleted {
                         json!({"type": "despawn", "player_id": node_id})
                     } else {
@@ -855,6 +1034,7 @@ impl ZoneServer {
                 self.spawn_mobs(MOBS_PER_ZONE);
                 self.spawn_authored_mobs();
                 self.spawn_nodes();
+                self.spawn_deposits();
                 self.spawn_storage_points();
                 self.spawn_build_boards();
                 self.spawn_plots();
@@ -937,7 +1117,18 @@ impl ZoneServer {
                     let moved = {
                         let mut entities = self.entities.lock().unwrap();
                         if let Some(e) = entities.get_mut(&player_id) {
-                            let (nx, ny) = clamp_world(e.x + dx, e.y + dy);
+                            // In an interior (#165), the walls ARE the world:
+                            // a step that leaves the authored floor is simply
+                            // refused, and the player stays put. Surface
+                            // movement is unchanged — it clamps to the world
+                            // and hands off at a region boundary.
+                            let (nx, ny) = match &self.interior {
+                                Some(geom) => {
+                                    let (cx, cy) = (e.x + dx, e.y + dy);
+                                    if geom.contains(cx, cy) { (cx, cy) } else { (e.x, e.y) }
+                                }
+                                None => clamp_world(e.x + dx, e.y + dy),
+                            };
                             e.x = nx;
                             e.y = ny;
                             if dx != 0 || dy != 0 {
@@ -949,7 +1140,10 @@ impl ZoneServer {
                         }
                     };
                     if let Some((nx, ny, hp)) = moved {
-                        if self.region.lock().unwrap().contains(nx, ny) {
+                        // An interior never hands a player off by geometry —
+                        // there is no neighbouring zone to walk into. The only
+                        // way out is the portal, which the gateway owns.
+                        if self.interior.is_some() || self.region.lock().unwrap().contains(nx, ny) {
                             self.send_status_update(&player_id).await;
                         } else {
                             // Left our slice of the world: hand off to the gateway.
@@ -1718,6 +1912,7 @@ impl ZoneServer {
         self.spawn_mobs(MOBS_PER_ZONE);
         self.spawn_authored_mobs();
         self.spawn_nodes();
+        self.spawn_deposits();
         self.spawn_storage_points();
         self.spawn_build_boards();
         self.spawn_plots();

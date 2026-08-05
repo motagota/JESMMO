@@ -54,6 +54,14 @@ Start-Process -FilePath $zoneExe -WorkingDirectory $server `
     -ArgumentList 'zone_a', '9001', 'ws://127.0.0.1:8764'
 Start-Sleep -Milliseconds 400
 
+# Interior zones (#165) run as ordinary zone processes; they just register under
+# an id that `zones.toml` names, which is what makes them an interior. They own
+# no slice of the world, so the --region they are given is never consulted.
+Write-Host 'Starting mine_starter (Kedron Cut, interior)...' -ForegroundColor Green
+Start-Process -FilePath $zoneExe -WorkingDirectory $server `
+    -ArgumentList 'mine_starter', '9002', 'ws://127.0.0.1:8764'
+Start-Sleep -Milliseconds 400
+
 if ($Bots -gt 0) {
     Start-Sleep -Milliseconds 600
     Write-Host "Starting $Bots simulated player bots..." -ForegroundColor Green

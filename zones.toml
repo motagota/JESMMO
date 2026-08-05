@@ -1,0 +1,239 @@
+# Authored interior zones (mine epic #164, issue #165).
+# Loaded at boot by BOTH the gateway and each zone process — one file, no wire
+# format to keep in step. See `rust_server/src/zone_config.rs`.
+#
+# THIS FILE IS OPTIONAL. Delete it and there are no interiors, which is exactly
+# the world before #165. A malformed one refuses to boot, same contract as
+# `market.toml`: a layout that would strand players is not something to discover
+# by watching one fall through the floor.
+#
+# INTERIOR COORDINATES ARE NOT WORLD COORDINATES. An interior has its own small
+# space starting at (0, 0). It is invisible to `zone_at`, never split, never
+# merged, and never handed a slice of the world — so an explicit portal is the
+# only way in or out, and no amount of walking, dying or region reshuffling can
+# drop somebody underground by accident.
+#
+# Because a position now only means something alongside its zone, the gateway's
+# position cache carries the zone with the coordinates, and every surface-only
+# gate (markets, the bounty, weather) checks it.
+
+# ---------------------------------------------------------------------------
+# Kedron Cut — the starter mine.
+#
+# The adit mouth sits at world (12800, 13500): 700 units south of the town
+# centre, on real bake terrain with ~36m of relief across 100 units, which is a
+# genuine cut bank to drive a tunnel into rather than a hole in a flat field.
+# Dry across its whole footprint, and 1249 units from the wild dog pack —
+# comfortably outside their 430-unit threat radius (#157), so the walk to the
+# mine is never an ambush.
+#
+# The layout is three short galleries off an entrance chamber, so players
+# naturally disperse rather than queueing at one seam (#166 places the deposits:
+# clay near the mouth as the tutorial resource, iron deeper).
+# ---------------------------------------------------------------------------
+[interior.mine_starter]
+display_name = "Kedron Cut"
+
+# Just inside the adit mouth. Also the fallback for a login whose stored
+# position no longer fits the geometry.
+spawn_anchor = [20, 30]
+
+# Bump by hand when the volumes change shape. Informational: the server checks
+# the stored POSITION against the current floor rather than trusting a version
+# number, because that tests the thing that actually matters — is this still
+# somewhere a player can stand?
+geometry_version = 1
+
+# Client hint. The server has no opinion about light.
+ambient_light = 0.08
+
+# --- the floor -------------------------------------------------------------
+# Half-open boxes (x0 <= x < x1), matching surface `Region::contains` so the two
+# kinds of geometry can never disagree about an edge.
+
+# Entrance chamber, at the mouth.
+[[interior.mine_starter.volumes]]
+x0 = 0
+y0 = 0
+x1 = 80
+y1 = 60
+
+# Gallery A — shallow, runs east. The clay seams live here.
+[[interior.mine_starter.volumes]]
+x0 = 80
+y0 = 20
+x1 = 280
+y1 = 50
+
+# Gallery B — continues east and narrows.
+[[interior.mine_starter.volumes]]
+x0 = 280
+y0 = 10
+x1 = 480
+y1 = 40
+
+# Gallery C — the deep working. Iron sits down here, a real walk from the mouth.
+[[interior.mine_starter.volumes]]
+x0 = 480
+y0 = 0
+x1 = 600
+y1 = 80
+
+# A side drift off Gallery A, so the mine branches rather than being a corridor.
+[[interior.mine_starter.volumes]]
+x0 = 140
+y0 = 50
+x1 = 190
+y1 = 160
+
+# --- the way in and out ----------------------------------------------------
+# One entry describes both directions on purpose: a portal authored as two
+# independent halves is a portal that can be made one-way by accident, and a
+# one-way portal into a mine is a trap.
+[[interior.mine_starter.portals]]
+id = "adit_mouth"
+world = [12800, 13500]
+inside = [20, 30]
+radius = 40
+
+# --- deposits (#166) -------------------------------------------------------
+# Behaviour lives in `crafting.toml`; this is only where each seam sits.
+#
+# Clay clusters near the mouth and down the side drift: it is the tutorial
+# resource (#169), so a new player should trip over it. Iron sits in the deep
+# working, a real walk away — which is also what disperses players rather than
+# queueing them at one seam.
+#
+# 10 clay and 16 iron. Density is the first knob for congestion, ahead of
+# respawn: more seams spreads people out, a faster respawn just concentrates
+# them on the same rock.
+
+[[interior.mine_starter.deposits]]
+id = "clay_01"
+type = "clay_starter"
+pos = [18, 12]
+
+[[interior.mine_starter.deposits]]
+id = "clay_02"
+type = "clay_starter"
+pos = [52, 14]
+
+[[interior.mine_starter.deposits]]
+id = "clay_03"
+type = "clay_starter"
+pos = [30, 46]
+
+[[interior.mine_starter.deposits]]
+id = "clay_04"
+type = "clay_starter"
+pos = [64, 44]
+
+[[interior.mine_starter.deposits]]
+id = "clay_05"
+type = "clay_starter"
+pos = [96, 32]
+
+[[interior.mine_starter.deposits]]
+id = "clay_06"
+type = "clay_starter"
+pos = [132, 28]
+
+[[interior.mine_starter.deposits]]
+id = "clay_07"
+type = "clay_starter"
+pos = [168, 40]
+
+[[interior.mine_starter.deposits]]
+id = "clay_08"
+type = "clay_starter"
+pos = [214, 30]
+
+[[interior.mine_starter.deposits]]
+id = "clay_09"
+type = "clay_starter"
+pos = [158, 74]
+
+[[interior.mine_starter.deposits]]
+id = "clay_10"
+type = "clay_starter"
+pos = [166, 128]
+
+[[interior.mine_starter.deposits]]
+id = "iron_01"
+type = "iron_starter"
+pos = [384, 27]
+
+[[interior.mine_starter.deposits]]
+id = "iron_02"
+type = "iron_starter"
+pos = [296, 22]
+
+[[interior.mine_starter.deposits]]
+id = "iron_03"
+type = "iron_starter"
+pos = [416, 29]
+
+[[interior.mine_starter.deposits]]
+id = "iron_04"
+type = "iron_starter"
+pos = [358, 18]
+
+[[interior.mine_starter.deposits]]
+id = "iron_05"
+type = "iron_starter"
+pos = [466, 33]
+
+[[interior.mine_starter.deposits]]
+id = "iron_06"
+type = "iron_starter"
+pos = [323, 23]
+
+[[interior.mine_starter.deposits]]
+id = "iron_07"
+type = "iron_starter"
+pos = [442, 34]
+
+[[interior.mine_starter.deposits]]
+id = "iron_08"
+type = "iron_starter"
+pos = [569, 45]
+
+[[interior.mine_starter.deposits]]
+id = "iron_09"
+type = "iron_starter"
+pos = [545, 22]
+
+[[interior.mine_starter.deposits]]
+id = "iron_10"
+type = "iron_starter"
+pos = [534, 63]
+
+[[interior.mine_starter.deposits]]
+id = "iron_11"
+type = "iron_starter"
+pos = [581, 12]
+
+[[interior.mine_starter.deposits]]
+id = "iron_12"
+type = "iron_starter"
+pos = [489, 7]
+
+[[interior.mine_starter.deposits]]
+id = "iron_13"
+type = "iron_starter"
+pos = [488, 44]
+
+[[interior.mine_starter.deposits]]
+id = "iron_14"
+type = "iron_starter"
+pos = [594, 56]
+
+[[interior.mine_starter.deposits]]
+id = "iron_15"
+type = "iron_starter"
+pos = [507, 62]
+
+[[interior.mine_starter.deposits]]
+id = "iron_16"
+type = "iron_starter"
+pos = [569, 70]

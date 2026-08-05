@@ -125,6 +125,10 @@ struct MarketAt {
 /// claimed it had loaded one — the precise quiet failure this config's
 /// strictness exists to prevent.
 const DEFAULT_MARKET_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../market.toml");
+/// Where interior zone geometry is read from (#165). Resolved against the
+/// manifest dir for the same reason as the market config: the proxy runs with
+/// its cwd set to `rust_server/`, so a cwd-relative path would silently miss.
+const DEFAULT_ZONE_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
 
 /// Load the repo-root `market.toml` (#152), or **refuse to start**.
 ///
@@ -137,6 +141,33 @@ const DEFAULT_MARKET_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../mar
 /// nobody chose, and by the time anyone noticed the trades would already have
 /// happened. `panic!` here is the same reasoning as `book_health`'s below: a
 /// market that won't start beats a market quietly doing the wrong thing.
+/// Load the repo-root `zones.toml` (#165), or refuse to start.
+///
+/// Same contract as `load_market_config`: a MISSING file is fine and means "no
+/// interiors", which is exactly the world before this issue. A PRESENT but
+/// broken one is fatal — a layout that would strand players is not something to
+/// discover by watching one fall through the floor.
+fn load_zone_config() -> mmo::zone_config::ZoneConfig {
+    let path = std::env::var("ZONE_CONFIG").unwrap_or_else(|_| DEFAULT_ZONE_CONFIG.to_string());
+    match mmo::zone_config::ZoneConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => {
+            for (id, z) in &cfg.interior {
+                println!(
+                    "[Proxy] Interior zone `{id}` ({}) — {} volume(s), {} portal(s)",
+                    z.display_name,
+                    z.volumes.len(),
+                    z.portals.len()
+                );
+            }
+            cfg
+        }
+        Err(e) => {
+            eprintln!("[Proxy] FATAL: {e}");
+            panic!("zone config is unusable — refusing to start");
+        }
+    }
+}
+
 fn load_market_config() -> mmo::market_config::MarketConfigSet {
     let path =
         std::env::var("MARKET_CONFIG").unwrap_or_else(|_| DEFAULT_MARKET_CONFIG.to_string());
@@ -366,8 +397,17 @@ struct Zone {
     version: u32,
     /// Path to the zone_server binary, for relaunching (rolling update / split).
     exe: String,
-    /// The slice of the world this zone owns.
+    /// The slice of the world this zone owns. Meaningless for an interior,
+    /// which is why interiors are excluded from every geometry decision — see
+    /// `Zone::interior`.
     region: Region,
+    /// An INTERIOR zone (#165): its coordinates are its own, not the world's.
+    ///
+    /// Interiors are invisible to `zone_at`, never split, never merged, and
+    /// never handed a share of the world — so the only way in or out is an
+    /// explicit portal. That is deliberate: no amount of walking, dying or
+    /// region reshuffling can drop somebody into the mine by accident.
+    interior: bool,
     /// Territory control: which player (if any) currently owns this zone, and the
     /// 0-100 capture-bar progress. Reported by the zone server each tick.
     owner: Option<String>,
@@ -398,6 +438,14 @@ struct EntityCache {
     x: i32,
     y: i32,
     hp: i32,
+    /// Which zone that position is IN (#165).
+    ///
+    /// A position without a zone is meaningless once interiors exist: two
+    /// players at (100, 100) in different zones are nowhere near each other,
+    /// and every proximity gate reading this cache — the market, the bounty,
+    /// the environment pass — would otherwise happily treat them as co-located.
+    /// Carried alongside the coordinates so a reader cannot forget it.
+    zone: String,
 }
 
 /// The outcome of the auth handshake: who this connection is and where to spawn.
@@ -415,6 +463,15 @@ struct Identity {
     /// A legacy/bot client may send a gameplay frame instead of authenticating;
     /// we treat it as a guest and carry that first frame so it isn't dropped.
     pending: Option<Value>,
+    /// The zone this character was last saved in (#165).
+    ///
+    /// `flush_once` has always written `ClientInfo::current_zone` into the
+    /// `character.district` column — it just was never read back, because
+    /// login could always re-derive the zone from the position. That stops
+    /// being true the moment interiors exist: an interior position means
+    /// nothing on the surface map, so the zone has to be remembered rather
+    /// than recomputed.
+    saved_zone: String,
 }
 
 struct Proxy {
@@ -464,6 +521,10 @@ struct Proxy {
     /// district. Loaded once at boot — there is no hot reload, so a rate can't
     /// change underneath an order that's mid-flight.
     market_cfg: mmo::market_config::MarketConfigSet,
+    /// Authored interior zones (#165), loaded once at boot from `zones.toml`.
+    /// The zone processes load the same file for their own geometry — one file,
+    /// no wire format to keep in step.
+    zone_cfg: mmo::zone_config::ZoneConfig,
     /// Unix-second timestamp of every rent reclaim (#16 ops counter, "reclaims in
     /// the last 24h"). In-memory only, like `dropped_frames` — a pure metric, not
     /// durable state (the reclaim itself is already durable via the DB).
@@ -736,6 +797,7 @@ impl Proxy {
             sessions: Mutex::new(HashMap::new()),
             capital: mmo::world::capital(),
             market_cfg,
+            zone_cfg: load_zone_config(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -1041,12 +1103,17 @@ impl Proxy {
         let Some(tx) = self.connect_zone_data(zone_id.clone(), &uri).await else {
             return;
         };
+        // A zone registering under an authored interior's id IS that interior
+        // (#165). Both processes read the same `zones.toml`, so there is no
+        // handshake to get wrong and no way for the two to disagree.
+        let interior = self.zone_cfg.is_interior(&zone_id);
 
         {
             let mut zones = self.zones.lock().unwrap();
             zones.insert(
                 zone_id.clone(),
                 Zone {
+                    interior,
                     uri: uri.clone(),
                     tx,
                     migration_state: MigrationState::Normal,
@@ -1106,7 +1173,7 @@ impl Proxy {
                             let x = st.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let y = st.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                             let hp = st.get("hp").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
-                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
+                            self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp, zone: zone_id.to_string() });
                         }
                     }
                     // Stamp the owning zone and fan the update out to EVERY client,
@@ -1339,7 +1406,10 @@ impl Proxy {
         let Some(tx) = target_tx else { return };
         let msg = json!({"type": "spawn_entity", "player_id": pid, "x": x, "y": y, "hp": hp});
         let _ = tx.send(Message::Text(msg.to_string()));
-        self.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp });
+        self.entity_state.lock().unwrap().insert(
+            pid.to_string(),
+            EntityCache { x, y, hp, zone: target.to_string() },
+        );
 
         // Follow the player's client session (every entity is a client).
         let mut clients = self.clients.lock().unwrap();
@@ -1351,14 +1421,42 @@ impl Proxy {
         }
     }
 
-    /// Find which zone owns world position (x, y).
+    /// Find which SURFACE zone owns world position (x, y).
+    ///
+    /// Interiors are deliberately invisible here (#165). Their coordinates are
+    /// their own, so asking "who owns (100, 100)" of an interior is a category
+    /// error — and excluding them is what guarantees an explicit portal is the
+    /// only way in or out. Every caller of this is a geometry decision: a
+    /// boundary crossing, a respawn, a login placement. None of them should be
+    /// able to land somebody underground by accident.
     fn zone_at(&self, x: i32, y: i32) -> Option<String> {
         self.zones
             .lock()
             .unwrap()
             .iter()
-            .find(|(_, z)| z.region.contains(x, y))
+            .find(|(_, z)| !z.interior && z.region.contains(x, y))
             .map(|(id, _)| id.clone())
+    }
+
+    /// Whether `zone_id` is a registered interior.
+    fn zone_is_interior(&self, zone_id: &str) -> bool {
+        self.zones.lock().unwrap().get(zone_id).map(|z| z.interior).unwrap_or(false)
+    }
+
+    /// The zone a player is currently in, per the position cache (#165).
+    /// `None` for an untracked player.
+    fn zone_of(&self, pid: &str) -> Option<String> {
+        self.entity_state.lock().unwrap().get(pid).map(|c| c.zone.clone())
+    }
+
+    /// Whether `pid` is on the surface — the precondition for every gate that
+    /// reasons about world geometry (markets, the bounty, weather, terrain).
+    /// An untracked player counts as surface, matching the pre-#165 world.
+    fn on_surface(&self, pid: &str) -> bool {
+        match self.zone_of(pid) {
+            Some(z) => !self.zone_is_interior(&z),
+            None => true,
+        }
     }
 
     /// Build the current spatial partition: world size + each shard's region,
@@ -1767,11 +1865,17 @@ impl Proxy {
             sleep(AUTOSCALE_INTERVAL).await;
             let now = Instant::now();
 
+            // Interiors are excluded from the whole auto-scaler (#165): they
+            // own no slice of the world, so splitting one in half is
+            // meaningless and merging one into a surface neighbour would hand
+            // it world geometry it cannot represent. A crowded mine is a
+            // capacity question for a later issue, not a partitioning one.
             let infos: Vec<(String, Region, usize)> = self
                 .zones
                 .lock()
                 .unwrap()
                 .iter()
+                .filter(|(_, z)| !z.interior)
                 .map(|(id, z)| (id.clone(), z.region, z.population))
                 .collect();
             let cooling = |id: &str| {
@@ -1904,6 +2008,7 @@ impl Proxy {
             zones.insert(
                 new_id.clone(),
                 Zone {
+                    interior: false,
                     uri: new_uri,
                     tx: new_tx.clone(),
                     migration_state: MigrationState::Normal,
@@ -2499,6 +2604,13 @@ impl Proxy {
     /// but per-market state is the whole point of the design (#136), and
     /// retrofitting a key later is worse than carrying one now.
     async fn market_at(&self, db: &Db, pid: &str) -> Option<MarketAt> {
+        // Markets are surface fixtures. Without this, an interior player whose
+        // local coordinates happened to fall near one would be trading from
+        // underground (#165) — the cache holds a position, and a position
+        // without a zone means nothing.
+        if !self.on_surface(pid) {
+            return None;
+        }
         let (px, py) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y))?;
         let district = self.capital.district_at(px, py)?.id.to_string();
         let range = self.market_cfg.for_district(&district).range;
@@ -4311,10 +4423,139 @@ impl Proxy {
         self.send_equipment(pid).await;
     }
 
+    /// Walk through a portal (#165) — in from the surface, or back out.
+    ///
+    /// One command for both directions, resolved from where the player actually
+    /// is. A client that could name its destination could name any destination;
+    /// asking "which portal are you standing at" instead means the answer is
+    /// always a place they could reach on foot.
+    ///
+    /// Routing lives here rather than in a zone because only the gateway knows
+    /// which zones exist, which one a player belongs to, and how to hand them
+    /// over without two zones briefly both holding them.
+    async fn apply_portal_enter(&self, pid: &str) {
+        let Some((x, y, hp, from_zone)) = self
+            .entity_state
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|c| (c.x, c.y, c.hp, c.zone.clone()))
+        else {
+            return;
+        };
+
+        // Which way are we going? Inside a zone we know is an interior, the only
+        // portals that count are that interior's own.
+        let (target_zone, to) = if self.zone_is_interior(&from_zone) {
+            match self.zone_cfg.portal_from_inside(&from_zone, x, y) {
+                Some(p) => {
+                    let world = p.world;
+                    match self.zone_at(world.0, world.1) {
+                        Some(z) => (z, world),
+                        None => {
+                            // The surface zone that owns the exit isn't running.
+                            // Refusing beats teleporting somebody into a zone
+                            // that doesn't exist — they keep their position and
+                            // can try again.
+                            self.push_to_player(pid, json!({
+                                "type": "portal.error", "code": "no_destination",
+                                "detail": "the way out is blocked",
+                            }));
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    self.push_to_player(pid, json!({
+                        "type": "portal.error", "code": "out_of_range",
+                        "detail": "stand at the entrance to leave",
+                    }));
+                    return;
+                }
+            }
+        } else {
+            match self.zone_cfg.portal_from_world(x, y) {
+                Some((zone_id, p)) => {
+                    if !self.zones.lock().unwrap().contains_key(zone_id) {
+                        // Authored but not running: say so rather than
+                        // silently doing nothing.
+                        self.push_to_player(pid, json!({
+                            "type": "portal.error", "code": "closed",
+                            "detail": "that way is closed",
+                        }));
+                        return;
+                    }
+                    (zone_id.to_string(), p.inside)
+                }
+                None => {
+                    self.push_to_player(pid, json!({
+                        "type": "portal.error", "code": "out_of_range",
+                        "detail": "stand at the entrance to go in",
+                    }));
+                    return;
+                }
+            }
+        };
+
+        // Tell the source zone to let go BEFORE the destination is told to
+        // spawn. Two zones holding the same player is the failure mode this
+        // whole path exists to avoid, and the migration work in #12 learned the
+        // hard way that ordering here is not cosmetic.
+        let from_tx = self.zones.lock().unwrap().get(&from_zone).map(|z| z.tx.clone());
+        if let Some(tx) = from_tx {
+            // `player_leave` is the zone's existing "drop this entity" message
+            // — reused rather than inventing a second removal path that could
+            // drift from it.
+            let _ = tx.send(Message::Text(
+                json!({"type": "player_leave", "player_id": pid}).to_string(),
+            ));
+        }
+        self.relocate_player(pid, to.0, to.1, hp, &target_zone);
+        self.push_to_player(pid, json!({
+            "type": "portal.entered", "zone": target_zone,
+            "x": to.0, "y": to.1,
+            "interior": self.zone_is_interior(&target_zone),
+            // Empty/full-light rather than null for a surface destination: an
+            // Option serialises to `null`, and a client asking for a string
+            // with a default gets the null instead of the default. Absent and
+            // "no name" are the same thing here, so say it in a way that can't
+            // be mistyped on the way out.
+            "display_name": self
+                .zone_cfg
+                .interior(&target_zone)
+                .map(|z| z.display_name.clone())
+                .unwrap_or_default(),
+            "ambient_light": self
+                .zone_cfg
+                .interior(&target_zone)
+                .map(|z| z.ambient_light)
+                .unwrap_or(1.0),
+            // The floor plan, so the client can draw a tunnel instead of the
+            // surface it can no longer see. The client cannot know the layout
+            // any other way — it doesn't read the server's config, and
+            // shouldn't. Empty when stepping back out to the world.
+            "volumes": self
+                .zone_cfg
+                .interior(&target_zone)
+                .map(|z| {
+                    z.volumes
+                        .iter()
+                        .map(|v| json!({"x0": v.x0, "y0": v.y0, "x1": v.x1, "y1": v.y1}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        }));
+        println!("[Proxy] PORTAL: {pid} {from_zone} -> {target_zone} at ({}, {})", to.0, to.1);
+    }
+
     /// Whether `pid` is standing close enough to the weapon master to deal with
     /// him (#161) — the same shape as `market_at`: resolved from the gateway's
     /// own position cache, so a client can't claim to be somewhere it isn't.
     fn at_weapon_master(&self, pid: &str) -> bool {
+        // Surface fixture, same reasoning as `market_at` (#165).
+        if !self.on_surface(pid) {
+            return false;
+        }
         let Some((px, py)) = self.entity_state.lock().unwrap().get(pid).map(|c| (c.x, c.y)) else {
             return false;
         };
@@ -4821,6 +5062,25 @@ impl Proxy {
             .collect();
         let radius2 = POISON_RADIUS_M * POISON_RADIUS_M;
         for (pid, x, y, zone_id) in players {
+            // An interior player's coordinates mean nothing on the surface map
+            // (#165). Reading the water mask or the poison-tree positions at
+            // them would drown or poison somebody standing in a dry tunnel,
+            // purely because their interior coordinates happened to land in the
+            // river. Push a cleared environment instead of a wrong one — the
+            // zone treats it as the gateway's verdict either way.
+            if self.zone_is_interior(&zone_id) {
+                let tx = self.zones.lock().unwrap().get(&zone_id).map(|z| z.tx.clone());
+                if let Some(tx) = tx {
+                    let _ = tx.send(Message::Text(
+                        json!({
+                            "type": "env_state", "player_id": pid,
+                            "submerged": false, "poison_sources": 0,
+                        })
+                        .to_string(),
+                    ));
+                }
+                continue;
+            }
             let in_mask = self.capital.terrain.is_water(x as f32, y as f32);
             let submerged = in_mask || {
                 let ground = self.composited_ground_height(x as f32, y as f32).await;
@@ -5484,8 +5744,17 @@ impl Proxy {
         if !persistent {
             return; // guests gather visually (gather.result) but nothing is persisted
         }
-        let Ok(added) = db.add_to_inventory(pid, item_id, qty).await else {
-            return;
+        // A deposit swing that rolled nothing still gets here (#166): the
+        // charge was spent, the tool wore down and the XP was earned, there is
+        // simply no item. Skip the grant rather than treating an empty id as an
+        // error — a miss is a normal outcome, not a failure.
+        let added = if item_id.is_empty() || qty <= 0 {
+            0
+        } else {
+            match db.add_to_inventory(pid, item_id, qty).await {
+                Ok(n) => n,
+                Err(_) => return,
+            }
         };
         // A full bag must not silently eat a kill's loot (#159). Gathering can
         // afford to be quiet about it — you're standing at the node and can see
@@ -5493,7 +5762,7 @@ impl Proxy {
         // for nothing with no explanation is the version of this that feels
         // broken. `MAX_CARRY` is the cap; the storehouse and the warehouse are
         // the answer, so say so.
-        if added < qty && source == Some("kill") {
+        if added < qty && !item_id.is_empty() && source == Some("kill") {
             self.push_to_player(pid, json!({
                 "type": "loot.lost", "item_id": item_id, "qty": qty - added,
                 "detail": "your pack is full — the kill's loot was left behind",
@@ -5580,14 +5849,39 @@ impl Proxy {
             }
         };
 
-        // A returning character spawns in whichever zone owns its saved position;
-        // a fresh character/guest lands in the default zone.
-        let spawn_zone_id = if identity.persistent {
+        // Where a returning character reappears (#165).
+        //
+        // Surface: whichever zone owns the saved position, as always.
+        //
+        // Interior: the saved ZONE, because the saved position is in that
+        // zone's own space and means nothing outside it. The position is then
+        // re-validated against the CURRENT geometry — if the layout changed and
+        // that spot is now solid rock, the player lands on the spawn anchor
+        // instead. Checking the position directly is stronger than comparing a
+        // geometry version: it tests the thing that actually matters (is this
+        // still floor?) rather than a proxy for it.
+        //
+        // An interior that no longer exists, or isn't running, falls back to
+        // the surface — nobody is stranded in a zone that isn't there.
+        let mut spawn_pos = (identity.x, identity.y);
+        let spawn_zone_id = if !identity.persistent {
+            default_zone_id.clone()
+        } else if self.zone_is_interior(&identity.saved_zone) {
+            match self.zone_cfg.interior(&identity.saved_zone) {
+                Some(z) => {
+                    spawn_pos = z.nearest_walkable(identity.x, identity.y);
+                    identity.saved_zone.clone()
+                }
+                None => {
+                    spawn_pos = (SPAWN_X, SPAWN_Y);
+                    self.zone_at(SPAWN_X, SPAWN_Y).unwrap_or_else(|| default_zone_id.clone())
+                }
+            }
+        } else {
             self.zone_at(identity.x, identity.y)
                 .unwrap_or_else(|| default_zone_id.clone())
-        } else {
-            default_zone_id.clone()
         };
+        let (identity_x, identity_y) = spawn_pos;
 
         self.clients.lock().unwrap().insert(
             player_id.clone(),
@@ -5623,11 +5917,16 @@ impl Proxy {
                 if identity.persistent {
                     self.entity_state.lock().unwrap().insert(
                         player_id.clone(),
-                        EntityCache { x: identity.x, y: identity.y, hp: identity.hp },
+                        EntityCache {
+                            x: identity_x,
+                            y: identity_y,
+                            hp: identity.hp,
+                            zone: spawn_zone_id.clone(),
+                        },
                     );
                     let _ = zone.tx.send(Message::Text(
                         json!({"type": "spawn_entity", "player_id": player_id,
-                               "x": identity.x, "y": identity.y, "hp": identity.hp})
+                               "x": identity_x, "y": identity_y, "hp": identity.hp})
                         .to_string(),
                     ));
                 } else {
@@ -5831,6 +6130,15 @@ impl Proxy {
                         self.apply_market_open(&player_id).await;
                         continue;
                     }
+                    // Interior portals (#165). Range-gated on the gateway's
+                    // position cache like every other interaction, and
+                    // gateway-owned because it is a ROUTING decision: only the
+                    // gateway knows which zones exist and which one a player
+                    // currently belongs to.
+                    if data.get("type").and_then(|v| v.as_str()) == Some("portal.enter") {
+                        self.apply_portal_enter(&player_id).await;
+                        continue;
+                    }
                     // The creature bounty (#161). Range-gated here on the
                     // gateway's position cache, exactly like `market.open` —
                     // standing next to the man who pays is a server-side fact,
@@ -5996,7 +6304,7 @@ impl Proxy {
                 if let Some(db) = &self.db {
                     let (x, y, hp) = last_state
                         .map(|c| (c.x, c.y, c.hp))
-                        .unwrap_or((identity.x, identity.y, identity.hp));
+                        .unwrap_or((identity_x, identity_y, identity.hp));
                     match db
                         .save_character(&player_id, x as i64, y as i64, hp as i64, &info.current_zone)
                         .await
@@ -6218,6 +6526,7 @@ fn guest_identity(pending: Option<Value>) -> Identity {
         persistent: false,
         role: "player".to_string(),
         pending,
+        saved_zone: String::new(),
     }
 }
 
@@ -6232,6 +6541,7 @@ fn persistent_identity(ch: mmo::persistence::Character, role: String) -> Identit
         persistent: true,
         role,
         pending: None,
+        saved_zone: ch.district,
     }
 }
 
@@ -6380,6 +6690,15 @@ mod tests {
     /// shipped, matching what the test `Proxy` constructor installs. Deliberately
     /// NOT the repo's `market.toml` — a suite whose expected fees moved when
     /// someone tuned a live config file would be worse than no suite.
+    /// A proxy with authored interiors (#165). `Proxy::new` reads the repo's
+    /// real `zones.toml`; tests want a layout they control, for the same reason
+    /// they don't read the live `market.toml`.
+    fn test_proxy_with_zone_config(cfg: mmo::zone_config::ZoneConfig) -> Arc<Proxy> {
+        let mut p = Proxy::new("127.0.0.1", 0, 0, 0, None);
+        Arc::get_mut(&mut p).expect("not yet shared").zone_cfg = cfg;
+        p
+    }
+
     fn test_market_cfg() -> mmo::market_config::MarketConfig {
         mmo::market_config::MarketConfig::default()
     }
@@ -6413,6 +6732,7 @@ mod tests {
             // covered by `market_config`'s own tests, and per-district
             // resolution by `market_rules_ride_on_market_opened`.
             market_cfg: mmo::market_config::MarketConfigSet::default(),
+            zone_cfg: load_zone_config(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -6434,6 +6754,7 @@ mod tests {
         p.zones.lock().unwrap().insert(
             id.to_string(),
             Zone {
+                interior: false,
                 uri: format!("ws://test/{id}"),
                 tx,
                 migration_state: MigrationState::Normal,
@@ -7035,7 +7356,7 @@ mod tests {
         let mut drop_rx = add_zone_region(&p, "drop", Region { x0: 600, y0: 0, x1: 1200, y1: 1200 });
         let mut client_rx = add_client(&p, "p1", "drop", 8);
         // p1 is at a world position inside `drop`.
-        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100 });
+        p.entity_state.lock().unwrap().insert("p1".into(), EntityCache { x: 650, y: 300, hp: 100, zone: "zone_a".into() });
 
         p.merge_zones("keep", "drop").await;
 
@@ -7223,7 +7544,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             ch.id.clone(),
-            EntityCache { x: 4242, y: 1337, hp: 55 },
+            EntityCache { x: 4242, y: 1337, hp: 55, zone: "zone_a".into() },
         );
 
         proxy.final_flush().await;
@@ -7249,7 +7570,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             "guest_1".to_string(),
-            EntityCache { x: 1, y: 2, hp: 100 },
+            EntityCache { x: 1, y: 2, hp: 100, zone: "zone_a".into() },
         );
 
         // Should not panic, and should leave no character row behind.
@@ -7376,7 +7697,7 @@ mod tests {
     /// into the same cache *after* `welcome` is sent, so a one-time setup at
     /// the top of a test gets silently overwritten.
     fn stand_at(proxy: &Arc<Proxy>, pid: &str, x: i32, y: i32) {
-        proxy.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.to_string(), EntityCache { x, y, hp: 100, zone: "zone_a".into() });
     }
 
     /// Poll a road order's aggregate `progress_json` until it matches
@@ -7724,7 +8045,7 @@ mod tests {
         // Stand at the order's own location so the gateway's proximity gate passes.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: tcx, y: tcy - 40, hp: 100 },
+            EntityCache { x: tcx, y: tcy - 40, hp: 100, zone: "zone_a".into() },
         );
 
         // Stock exactly the well's cost (wood 20 + stone 10), as gathering would.
@@ -7912,7 +8233,7 @@ mod tests {
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
         // Stand at the path's start point, nowhere near the civic board.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: x0, y: y0, hp: 100, zone: "zone_a".into() });
 
         zone.to_proxy.send(Message::Text(json!({
             "type": "gather_yield", "player_id": pid,
@@ -9033,7 +9354,7 @@ mod tests {
         proxy.clients.lock().unwrap().get_mut(&pid1).unwrap().current_zone = "z_suburbs".to_string();
         proxy.entity_state.lock().unwrap().insert(
             pid1.clone(),
-            EntityCache { x: 5000, y: 3000, hp: 100 },
+            EntityCache { x: 5000, y: 3000, hp: 100, zone: "zone_a".into() },
         );
 
         ws1.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -9102,7 +9423,7 @@ mod tests {
         );
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 5200, y: 3000, hp: 100 },
+            EntityCache { x: 5200, y: 3000, hp: 100, zone: "zone_a".into() },
         );
 
         ws.send(Message::Text(json!({"type": "plot.district"}).to_string())).await.unwrap();
@@ -9149,7 +9470,7 @@ mod tests {
         // crossed into the Suburbs.
         proxy.entity_state.lock().unwrap().insert(
             pid.clone(),
-            EntityCache { x: 12800, y: 12800, hp: 100 },
+            EntityCache { x: 12800, y: 12800, hp: 100, zone: "zone_a".into() },
         );
 
         ws.send(Message::Text(
@@ -10090,7 +10411,7 @@ mod tests {
             }
         }
         let (dx, dy) = wet.expect("the v3 bake has open water (~10% of the world is masked)");
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: dx, y: dy, hp: 100, zone: "zone_a".into() });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "open water at ({dx},{dy}) must submerge even over the flat 0m NoData fill");
@@ -10119,7 +10440,7 @@ mod tests {
         })
         .await
         .unwrap();
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: px as i32, y: py as i32, hp: 100, zone: "zone_a".into() });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["submerged"], true, "an editor-dug pond must count — the check reads composited ground");
@@ -10308,7 +10629,7 @@ mod tests {
         recv_until(&mut ws, "inv.update").await;
 
         // Far from the board, far from run 1, far from every run: rejected.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12850, y: 13250, hp: 100, zone: "zone_a".into() });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -10323,7 +10644,7 @@ mod tests {
         // ~100m from the civic board): accepted, but lands on ONE cell —
         // the order's aggregate moves by exactly this contribution, not the
         // whole road's cost.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12855, y: 12890, hp: 100, zone: "zone_a".into() });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -10357,7 +10678,7 @@ mod tests {
 
         // Walk to the path's START: the untouched cells near run 1 are now
         // in range, and finishing them completes the whole road.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100, zone: "zone_a".into() });
         for _ in 0..40 {
             zone.to_proxy
                 .send(Message::Text(json!({
@@ -10413,7 +10734,7 @@ mod tests {
 
         // Walk (cache-wise) into the suburbs: the board follows the player,
         // not the zone's region centre.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 600, y: 600, hp: 100, zone: "zone_a".into() });
         ws.send(Message::Text(json!({"type": "build.list"}).to_string())).await.unwrap();
         let board = recv_until(&mut ws, "build.list").await;
         let kinds: Vec<&str> = board["orders"].as_array().unwrap().iter().filter_map(|o| o["kind"].as_str()).collect();
@@ -10502,7 +10823,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut player_ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13050, y: 13000, hp: 100, zone: "zone_a".into() });
         for _ in 0..10 {
             zone.to_proxy
                 .send(Message::Text(json!({
@@ -10618,7 +10939,7 @@ mod tests {
         // The 40m stub is only 8 cells, all within BOARD_RANGE of its
         // midpoint (#131/#132/#133) — but each contribution still only
         // lands on one cell at a time, so finishing it takes several.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13420, y: 12600, hp: 100, zone: "zone_a".into() });
         for _ in 0..10 {
             zone.to_proxy
                 .send(Message::Text(json!({
@@ -10729,7 +11050,7 @@ mod tests {
         recv_until(&mut ws, "inv.update").await;
         // Each contribution lands on one cell (#131/#132/#133), so reaching
         // 12 stone takes 12 separate deposits from this spot.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13500, y: 12500, hp: 100, zone: "zone_a".into() });
         for _ in 0..12 {
             zone.to_proxy
                 .send(Message::Text(json!({
@@ -10825,7 +11146,7 @@ mod tests {
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 105, y: 100, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 105, y: 100, hp: 100, zone: "zone_a".into() });
 
         // One pooled contribution of the whole 5 completes it outright —
         // proving this landed on the legacy `db.contribute` path, not the
@@ -10869,7 +11190,7 @@ mod tests {
         let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
 
         // Standing right on the site, but nothing is built there yet: refused.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: mx as i32, y: my as i32, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: mx as i32, y: my as i32, hp: 100, zone: "zone_a".into() });
         ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
         let err = recv_until(&mut ws, "market.error").await;
         assert_eq!(err["code"].as_str().unwrap(), "out_of_range", "an unbuilt market can't be traded at");
@@ -10903,7 +11224,7 @@ mod tests {
         // Walk out of range: refused again, even though it's built. Range is
         // enforced here, not merely used to hide the panel.
         proxy.entity_state.lock().unwrap().insert(
-            pid.clone(), EntityCache { x: mx as i32 + test_market_cfg().range + 5, y: my as i32, hp: 100 },
+            pid.clone(), EntityCache { x: mx as i32 + test_market_cfg().range + 5, y: my as i32, hp: 100, zone: "zone_a".into() },
         );
         ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
         let err = recv_until(&mut ws, "market.error").await;
@@ -11474,6 +11795,209 @@ listing_fee_min_gold = 4
         drop(ws);
     }
 
+    // --- interior zones (#165) ----------------------------------------------
+
+    fn a_mine_config() -> mmo::zone_config::ZoneConfig {
+        mmo::zone_config::ZoneConfig::parse(
+            r#"
+            [interior.mine_test]
+            display_name = "Test Cut"
+            spawn_anchor = [20, 30]
+            [[interior.mine_test.volumes]]
+            x0 = 0
+            y0 = 0
+            x1 = 80
+            y1 = 60
+            [[interior.mine_test.portals]]
+            id = "adit"
+            world = [12800, 13500]
+            inside = [20, 30]
+            radius = 40
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Interiors are invisible to geometry routing (#165). That is the property
+    /// that makes an explicit portal the ONLY way in — no amount of walking,
+    /// dying or region reshuffling can land somebody underground by accident.
+    #[tokio::test]
+    async fn geometry_routing_never_finds_an_interior() {
+        let proxy = test_proxy();
+        let _surface = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let _mine = add_zone_region(&proxy, "mine_test", Region { x0: 0, y0: 0, x1: 600, y1: 300 });
+        proxy.zones.lock().unwrap().get_mut("mine_test").unwrap().interior = true;
+
+        // A point the interior's (meaningless) region also covers still resolves
+        // to the surface zone that genuinely owns it.
+        assert_eq!(proxy.zone_at(20, 30).as_deref(), Some("zone_a"));
+        assert_eq!(proxy.zone_at(12800, 13500).as_deref(), Some("zone_a"));
+        assert!(proxy.zone_is_interior("mine_test"));
+        assert!(!proxy.zone_is_interior("zone_a"));
+    }
+
+    /// A position without a zone is meaningless once interiors exist. Two
+    /// players at identical coordinates in different zones are not co-located,
+    /// and the surface-only gates have to know it.
+    #[tokio::test]
+    async fn an_interior_player_is_not_on_the_surface() {
+        let proxy = test_proxy();
+        let _s = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let _m = add_zone_region(&proxy, "mine_test", Region { x0: 0, y0: 0, x1: 600, y1: 300 });
+        proxy.zones.lock().unwrap().get_mut("mine_test").unwrap().interior = true;
+
+        // Both standing on the weapon master's exact coordinates — one outside,
+        // one underground.
+        let (wx, wy) = mmo::world::WEAPON_MASTER_AT;
+        proxy.entity_state.lock().unwrap().insert(
+            "outside".into(),
+            EntityCache { x: wx, y: wy, hp: 100, zone: "zone_a".into() },
+        );
+        proxy.entity_state.lock().unwrap().insert(
+            "underground".into(),
+            EntityCache { x: wx, y: wy, hp: 100, zone: "mine_test".into() },
+        );
+
+        assert!(proxy.on_surface("outside"));
+        assert!(!proxy.on_surface("underground"));
+        assert!(proxy.at_weapon_master("outside"));
+        assert!(
+            !proxy.at_weapon_master("underground"),
+            "an interior player claimed a surface NPC by sharing its coordinates"
+        );
+        // An untracked player counts as surface — the pre-#165 world.
+        assert!(proxy.on_surface("nobody"));
+    }
+
+    /// The whole round trip, through the real handler: in at the mouth, out
+    /// again, with the source zone told to let go each time.
+    #[tokio::test]
+    async fn a_portal_carries_a_player_in_and_back_out() {
+        let proxy = test_proxy_with_zone_config(a_mine_config());
+        let mut surface = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let mut mine = add_zone_region(&proxy, "mine_test", Region { x0: 0, y0: 0, x1: 600, y1: 300 });
+        proxy.zones.lock().unwrap().get_mut("mine_test").unwrap().interior = true;
+        let (info, _rx) = make_client("p1", "zone_a", 32);
+        proxy.clients.lock().unwrap().insert("p1".into(), info);
+
+        // Standing at the adit mouth on the surface.
+        proxy.entity_state.lock().unwrap().insert(
+            "p1".into(),
+            EntityCache { x: 12800, y: 13500, hp: 90, zone: "zone_a".into() },
+        );
+        proxy.apply_portal_enter("p1").await;
+
+        assert_eq!(
+            proxy.clients.lock().unwrap().get("p1").unwrap().current_zone,
+            "mine_test",
+            "the client should now be pointed at the interior"
+        );
+        let cached = proxy.entity_state.lock().unwrap().get("p1").cloned().unwrap();
+        assert_eq!((cached.x, cached.y), (20, 30), "arrived at the portal's inside point");
+        assert_eq!(cached.zone, "mine_test");
+        assert_eq!(cached.hp, 90, "health carries through a transition");
+        // The surface zone was told to let go, and the interior to take them.
+        let mut left = false;
+        while let Ok(Message::Text(t)) = surface.try_recv() {
+            if t.contains("player_leave") { left = true; }
+        }
+        let mut spawned = false;
+        while let Ok(Message::Text(t)) = mine.try_recv() {
+            if t.contains("spawn_entity") { spawned = true; }
+        }
+        assert!(left, "the source zone was never told to let go");
+        assert!(spawned, "the destination zone was never told to take them");
+
+        // ...and back out.
+        proxy.apply_portal_enter("p1").await;
+        assert_eq!(proxy.clients.lock().unwrap().get("p1").unwrap().current_zone, "zone_a");
+        let cached = proxy.entity_state.lock().unwrap().get("p1").cloned().unwrap();
+        assert_eq!((cached.x, cached.y), (12800, 13500), "back at the mouth, outside");
+        assert_eq!(cached.zone, "zone_a");
+    }
+
+    /// Standing nowhere near a portal does nothing but say so — the range gate
+    /// is server-side, like every other interaction here.
+    #[tokio::test]
+    async fn a_portal_out_of_reach_is_refused() {
+        let proxy = test_proxy_with_zone_config(a_mine_config());
+        let _s = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let _m = add_zone_region(&proxy, "mine_test", Region { x0: 0, y0: 0, x1: 600, y1: 300 });
+        proxy.zones.lock().unwrap().get_mut("mine_test").unwrap().interior = true;
+        let (info, mut rx) = make_client("p1", "zone_a", 32);
+        proxy.clients.lock().unwrap().insert("p1".into(), info);
+        proxy.entity_state.lock().unwrap().insert(
+            "p1".into(),
+            EntityCache { x: 12800, y: 12800, hp: 100, zone: "zone_a".into() },
+        );
+
+        proxy.apply_portal_enter("p1").await;
+
+        assert_eq!(
+            proxy.clients.lock().unwrap().get("p1").unwrap().current_zone,
+            "zone_a",
+            "an out-of-range portal moved somebody"
+        );
+        let mut saw_error = false;
+        while let Ok(Message::Text(t)) = rx.try_recv() {
+            if t.contains("portal.error") && t.contains("out_of_range") {
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "a refusal must say why");
+    }
+
+    /// An authored interior whose process isn't running is closed, not a
+    /// silent no-op and certainly not a one-way trip into nothing.
+    #[tokio::test]
+    async fn a_portal_to_an_unregistered_interior_is_closed() {
+        let proxy = test_proxy_with_zone_config(a_mine_config());
+        let _s = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let (info, mut rx) = make_client("p1", "zone_a", 32);
+        proxy.clients.lock().unwrap().insert("p1".into(), info);
+        proxy.entity_state.lock().unwrap().insert(
+            "p1".into(),
+            EntityCache { x: 12800, y: 13500, hp: 100, zone: "zone_a".into() },
+        );
+
+        proxy.apply_portal_enter("p1").await;
+
+        assert_eq!(proxy.clients.lock().unwrap().get("p1").unwrap().current_zone, "zone_a");
+        let mut saw = false;
+        while let Ok(Message::Text(t)) = rx.try_recv() {
+            if t.contains("portal.error") && t.contains("closed") {
+                saw = true;
+            }
+        }
+        assert!(saw, "an unrunning interior should report closed");
+    }
+
+    /// The auto-scaler must never consider an interior: it owns no slice of the
+    /// world, so splitting it is meaningless and merging it into a surface
+    /// neighbour would hand it geometry it cannot represent.
+    #[tokio::test]
+    async fn the_auto_scaler_ignores_interiors() {
+        let proxy = test_proxy();
+        let _s = add_zone_region(&proxy, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        let _m = add_zone_region(&proxy, "mine_test", Region { x0: 0, y0: 0, x1: 600, y1: 300 });
+        {
+            let mut zones = proxy.zones.lock().unwrap();
+            zones.get_mut("mine_test").unwrap().interior = true;
+            // Wildly over the split threshold, so it would certainly be chosen.
+            zones.get_mut("mine_test").unwrap().population = 10_000;
+            zones.get_mut("zone_a").unwrap().population = 0;
+        }
+        let infos: Vec<String> = proxy
+            .zones
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, z)| !z.interior)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(infos, vec!["zone_a".to_string()], "the scaler's view includes an interior");
+    }
+
     /// A kill's loot lands in a real inventory, as a real stackable item — the
     /// same shape build orders and the market already deal in. A hidden kill
     /// counter would be the one system in this game where the thing you earned
@@ -11804,7 +12328,7 @@ listing_fee_min_gold = 4
         recv_until(&mut ws, "inv.update").await;
 
         // Out of range: refused, and nothing moves.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12000, y: 12800, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12000, y: 12800, hp: 100, zone: "zone_a".into() });
         ws.send(Message::Text(
             json!({"type": "warehouse.deposit", "item_id": "wood", "qty": 10}).to_string(),
         ))
@@ -11815,7 +12339,7 @@ listing_fee_min_gold = 4
         assert!(db.warehouse_for_character(&market.id, &pid).await.unwrap().is_empty());
 
         // Step up to the market: opening hydrates the (empty) warehouse.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 12800, y: 12800, hp: 100, zone: "zone_a".into() });
         ws.send(Message::Text(json!({"type": "market.open"}).to_string())).await.unwrap();
         let state = recv_until(&mut ws, "warehouse.state").await;
         assert_eq!(state["market_id"].as_str().unwrap(), market.id);
@@ -12393,7 +12917,7 @@ listing_fee_min_gold = 4
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13820, y: 12600, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 13820, y: 12600, hp: 100, zone: "zone_a".into() });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -12502,7 +13026,7 @@ listing_fee_min_gold = 4
             }).to_string()))
             .unwrap();
         recv_until(&mut ws, "inv.update").await;
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 700, y: 700, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 700, y: 700, hp: 100, zone: "zone_a".into() });
         zone.to_proxy
             .send(Message::Text(json!({
                 "type": "build_contribute", "player_id": pid,
@@ -12562,7 +13086,7 @@ listing_fee_min_gold = 4
         assert_eq!(flags["poison_sources"], 0);
 
         // In the grove: exactly the two in-radius trees count.
-        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100 });
+        proxy.entity_state.lock().unwrap().insert(pid.clone(), EntityCache { x: 2000, y: 2000, hp: 100, zone: "zone_a".into() });
         proxy.env_tick_once().await;
         let flags = recv_env_state(&mut zone, &pid).await;
         assert_eq!(flags["poison_sources"], 2, "two trees in radius, the third is just outside");

@@ -181,6 +181,102 @@ func _process(delta: float) -> void:
 ## both known. `_zones` must be set *before* `_maybe_build_static()` so the
 ## ground's first (and only) build already has real safety data to paint —
 ## see `_build_ground`.
+## --- interior zones (mine epic #164, issue #165) ----------------------------
+
+## Nodes making up the interior's floor, torn down on the way out.
+var _interior_nodes: Array[Node3D] = []
+## What the surface looked like before we went underground, so leaving restores
+## exactly what was there rather than guessing.
+var _surface_visible := {}
+
+## Step into an interior: hide the world, lay the authored floor.
+##
+## The surface isn't destroyed, only hidden — the streamed terrain took real work
+## to fetch and the player is coming back out in a minute. Hiding is also what
+## makes leaving honest: it restores what was there rather than rebuilding an
+## approximation of it.
+##
+## `volumes` are the server's authored floor plan, sent with `portal.entered`.
+## The client can't know the layout any other way and shouldn't read the
+## server's config to find out.
+func enter_interior(volumes: Array) -> void:
+    Protocol.set_interior(true)
+    _surface_visible.clear()
+    for n in [_ground, _water]:
+        if n != null:
+            _surface_visible[n] = n.visible
+            n.visible = false
+    leave_interior_nodes()
+
+    for v in volumes:
+        var vol: Dictionary = v
+        var x0 := float(vol.get("x0", 0))
+        var y0 := float(vol.get("y0", 0))
+        var x1 := float(vol.get("x1", 0))
+        var y1 := float(vol.get("y1", 0))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        _interior_nodes.append(_floor_slab(x0, y0, x1, y1))
+        # A low lip around each volume so the edge of the floor reads as rock
+        # rather than as a drop into nothing — the player can't walk past it
+        # (the server refuses the step), and it should look that way.
+        for wall in _volume_walls(x0, y0, x1, y1):
+            _interior_nodes.append(wall)
+    for n in _interior_nodes:
+        add_child(n)
+
+## Step back out: drop the floor, restore the surface exactly as it was.
+func leave_interior() -> void:
+    Protocol.set_interior(false)
+    leave_interior_nodes()
+    for n in _surface_visible:
+        if is_instance_valid(n):
+            n.visible = _surface_visible[n]
+    _surface_visible.clear()
+
+func leave_interior_nodes() -> void:
+    for n in _interior_nodes:
+        if is_instance_valid(n):
+            n.queue_free()
+    _interior_nodes.clear()
+
+func _floor_slab(x0: float, y0: float, x1: float, y1: float) -> MeshInstance3D:
+    var mi := MeshInstance3D.new()
+    var box := BoxMesh.new()
+    box.size = Vector3((x1 - x0) * Protocol.WORLD_SCALE, 0.4, (y1 - y0) * Protocol.WORLD_SCALE)
+    mi.mesh = box
+    var mat := StandardMaterial3D.new()
+    mat.albedo_color = Color(0.24, 0.20, 0.17) # damp rock
+    mat.roughness = 1.0
+    mi.material_override = mat
+    mi.position = Protocol.w2v((x0 + x1) * 0.5, (y0 + y1) * 0.5, -0.2)
+    return mi
+
+## Four thin slabs standing on the volume's edges. Cheap, and enough to read as
+## a tunnel rather than a floating platform.
+func _volume_walls(x0: float, y0: float, x1: float, y1: float) -> Array[MeshInstance3D]:
+    var out: Array[MeshInstance3D] = []
+    var h := 3.0
+    var t := 0.6
+    var mat := StandardMaterial3D.new()
+    mat.albedo_color = Color(0.16, 0.14, 0.12)
+    mat.roughness = 1.0
+    var spans := [
+        [(x0 + x1) * 0.5, y0, (x1 - x0) * Protocol.WORLD_SCALE, t],
+        [(x0 + x1) * 0.5, y1, (x1 - x0) * Protocol.WORLD_SCALE, t],
+        [x0, (y0 + y1) * 0.5, t, (y1 - y0) * Protocol.WORLD_SCALE],
+        [x1, (y0 + y1) * 0.5, t, (y1 - y0) * Protocol.WORLD_SCALE],
+    ]
+    for sp in spans:
+        var mi := MeshInstance3D.new()
+        var box := BoxMesh.new()
+        box.size = Vector3(float(sp[2]), h, float(sp[3]))
+        mi.mesh = box
+        mi.material_override = mat
+        mi.position = Protocol.w2v(float(sp[0]), float(sp[1]), h * 0.5)
+        out.append(mi)
+    return out
+
 func apply_partition(msg: Dictionary) -> void:
     world_size = float(msg.get("world", world_size))
     _partition_received = true
