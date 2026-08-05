@@ -4530,6 +4530,20 @@ impl Proxy {
                 .interior(&target_zone)
                 .map(|z| z.ambient_light)
                 .unwrap_or(1.0),
+            // The floor plan, so the client can draw a tunnel instead of the
+            // surface it can no longer see. The client cannot know the layout
+            // any other way — it doesn't read the server's config, and
+            // shouldn't. Empty when stepping back out to the world.
+            "volumes": self
+                .zone_cfg
+                .interior(&target_zone)
+                .map(|z| {
+                    z.volumes
+                        .iter()
+                        .map(|v| json!({"x0": v.x0, "y0": v.y0, "x1": v.x1, "y1": v.y1}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
         }));
         println!("[Proxy] PORTAL: {pid} {from_zone} -> {target_zone} at ({}, {})", to.0, to.1);
     }

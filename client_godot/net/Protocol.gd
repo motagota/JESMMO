@@ -623,7 +623,23 @@ static func _planar_height(h00: float, h10: float, h01: float, h11: float, fx: f
 ## streaming); otherwise falls back to the coarse whole-world backdrop grid
 ## from `terrain.data` — the permanent fallback, so there is always *an*
 ## answer everywhere from the moment the backdrop arrives.
+## Inside an interior zone (#165) the surface heightmap is meaningless — the
+## coordinates are the interior's own — so the floor is simply flat. Set by
+## `World.enter_interior`/`leave_interior`, which own the transition.
+static var _interior := false
+
+static func set_interior(on: bool) -> void:
+    _interior = on
+
+static func in_interior() -> bool:
+    return _interior
+
 static func terrain_height(wx: float, wy: float) -> float:
+    # Underground, the surface DEM says nothing about where the floor is: the
+    # same coordinates belong to a different space entirely. Flat floor, and no
+    # sampling of a heightmap that doesn't apply.
+    if _interior:
+        return 0.0
     var fine := _tile_height(wx, wy)
     if not is_nan(fine):
         return fine

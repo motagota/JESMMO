@@ -132,6 +132,8 @@ signal bounty_error(code: String, detail: String)
 ## Moved into or out of an interior zone (#165). `interior` says which side you
 ## came out on, so the client knows whether to draw a cave or the world.
 signal portal_entered(zone: String, x: int, y: int, interior: bool, display_name: String, ambient_light: float)
+## The interior's authored floor plan, as boxes, carried with the transition.
+signal portal_geometry(volumes: Array)
 signal portal_error(code: String, detail: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
@@ -392,6 +394,9 @@ func _handle_text(text: String) -> void:
                 int(msg.get("delta", 0)),
                 String(msg.get("reason", "")))
         Protocol.S_PORTAL_ENTERED:
+            # Geometry first: the World needs the floor plan before it is told
+            # to lay it.
+            portal_geometry.emit(msg.get("volumes", []))
             portal_entered.emit(
                 String(msg.get("zone", "")),
                 int(msg.get("x", 0)),
