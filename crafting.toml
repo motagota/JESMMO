@@ -1,0 +1,88 @@
+# Deposits — and later stations and recipes — for the starter mine
+# (mine epic #164, issue #166). Loaded by the zone processes; the gateway will
+# read the same file for stations and recipes in #167.
+#
+# THIS FILE IS OPTIONAL. Delete it and there are no deposits, which is the world
+# before #166. A malformed one refuses to boot naming the fault, same contract
+# as `market.toml` and `zones.toml`.
+#
+# PLACEMENT LIVES IN `zones.toml`. This file is behaviour: what a seam yields,
+# how many swings it takes, how long it stays spent.
+#
+# THE CONTENTION MODEL IS AN ABSENCE. There is no lock on a deposit. Several
+# players work one at once, each swing resolving independently, and a late
+# arrival still gets value from a partly-worked seam — nobody can body-block a
+# node or steal a last hit. The resource is contested; the interaction is not.
+# It also means the mine's total output is capped by node count and respawn
+# rather than by player count, which is what keeps the coin faucet bounded no
+# matter how many people turn up (#170).
+
+# ---------------------------------------------------------------------------
+# Iron — the deep working.
+#
+# The MISS CHANCE is deliberate and load-bearing. At 0.55 a swing comes up empty
+# nearly half the time, which together with pickaxe wear (#129 put tool upkeep
+# at ~27% of what a tool gathers) and the XP falloff below is what stops a mine
+# full of respawning seams being an uncapped coin printer. #170 tunes the three
+# together against the wage and bounty benchmarks; do not raise this in
+# isolation.
+#
+# 8 charges x 3s is ~24 seconds of work for ~4.4 ore, before walking.
+# ---------------------------------------------------------------------------
+[deposit.iron_starter]
+display_name = "Iron Deposit"
+skill = "mining"
+required_level = 1
+required_tool = "pickaxe"
+charges = 8
+swing_time_ms = 3000
+durability_per_swing = 1
+respawn_seconds = 75
+respawn_jitter_seconds = 25
+xp_per_swing = 6
+
+# Above this the XP decays toward zero. This is the mechanism that stops the
+# tutorial mine being a viable place to grind Mining to cap WITHOUT ever locking
+# a newcomer out of it — a level gate would do both, and the second is the one
+# that matters in a starter area.
+xp_falloff_level = 15
+
+[[deposit.iron_starter.yields]]
+item = "iron_ore"
+chance = 0.55
+
+# Rock comes with the ore. Not filler: it's the other half of the tool recipes
+# (#129 made a pickaxe 3 wood + 5 stone), so a mining trip partly pays for its
+# own replacement pick.
+[[deposit.iron_starter.yields]]
+item = "stone"
+qty_min = 1
+qty_max = 2
+chance = 0.30
+
+# ---------------------------------------------------------------------------
+# Clay — the tutorial resource, near the mouth.
+#
+# Faster, more generous and more reliable than iron on purpose: it is the first
+# thing a new player is asked to mine (#169's tutorial track), and a first
+# experience that misses half the time teaches the wrong lesson. Its lower XP
+# and earlier falloff keep it from being the efficient grind despite that.
+# ---------------------------------------------------------------------------
+[deposit.clay_starter]
+display_name = "Clay Seam"
+skill = "mining"
+required_level = 1
+required_tool = "pickaxe"
+charges = 10
+swing_time_ms = 2400
+durability_per_swing = 1
+respawn_seconds = 60
+respawn_jitter_seconds = 20
+xp_per_swing = 4
+xp_falloff_level = 12
+
+[[deposit.clay_starter.yields]]
+item = "clay_lump"
+qty_min = 1
+qty_max = 2
+chance = 0.80

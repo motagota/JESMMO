@@ -93,6 +93,18 @@ fn default_portal_radius() -> i32 {
     40
 }
 
+/// One placed deposit (#166). The behaviour lives in `crafting.toml`; this is
+/// only where it sits.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepositPlacement {
+    pub id: String,
+    /// A key into `crafting.toml`'s `[deposit.*]`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub pos: (i32, i32),
+}
+
 /// One authored interior.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +123,9 @@ pub struct InteriorZone {
     pub ambient_light: f32,
     pub volumes: Vec<Volume>,
     pub portals: Vec<Portal>,
+    /// Deposits placed in this interior (#166).
+    #[serde(default)]
+    pub deposits: Vec<DepositPlacement>,
 }
 
 fn default_geometry_version() -> i64 {
@@ -211,6 +226,23 @@ impl ZoneConfig {
             }
             if z.portals.is_empty() {
                 return bad("has no portals — it could be entered but never left");
+            }
+            // A deposit in the rock is unreachable, and would be authored
+            // exactly as easily as a good one.
+            for d in &z.deposits {
+                if !z.contains(d.pos.0, d.pos.1) {
+                    return Err(ZoneConfigError::Invalid {
+                        zone: id.clone(),
+                        why: format!("deposit `{}` is outside the volumes", d.id),
+                    });
+                }
+            }
+            let mut seen: Vec<&str> = z.deposits.iter().map(|d| d.id.as_str()).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            if seen.len() != before {
+                return bad("has two deposits sharing an id");
             }
             for p in &z.portals {
                 if !z.contains(p.inside.0, p.inside.1) {

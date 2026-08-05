@@ -5744,8 +5744,17 @@ impl Proxy {
         if !persistent {
             return; // guests gather visually (gather.result) but nothing is persisted
         }
-        let Ok(added) = db.add_to_inventory(pid, item_id, qty).await else {
-            return;
+        // A deposit swing that rolled nothing still gets here (#166): the
+        // charge was spent, the tool wore down and the XP was earned, there is
+        // simply no item. Skip the grant rather than treating an empty id as an
+        // error — a miss is a normal outcome, not a failure.
+        let added = if item_id.is_empty() || qty <= 0 {
+            0
+        } else {
+            match db.add_to_inventory(pid, item_id, qty).await {
+                Ok(n) => n,
+                Err(_) => return,
+            }
         };
         // A full bag must not silently eat a kill's loot (#159). Gathering can
         // afford to be quiet about it — you're standing at the node and can see
@@ -5753,7 +5762,7 @@ impl Proxy {
         // for nothing with no explanation is the version of this that feels
         // broken. `MAX_CARRY` is the cap; the storehouse and the warehouse are
         // the answer, so say so.
-        if added < qty && source == Some("kill") {
+        if added < qty && !item_id.is_empty() && source == Some("kill") {
             self.push_to_player(pid, json!({
                 "type": "loot.lost", "item_id": item_id, "qty": qty - added,
                 "detail": "your pack is full — the kill's loot was left behind",

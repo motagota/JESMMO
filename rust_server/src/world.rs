@@ -179,6 +179,12 @@ pub fn items() -> Vec<Item> {
         // handles any commodity — and a bounty item that couldn't be sold would
         // be a strange exception in a game that just spent an epic on trading.
         Item { id: "dog_pelt", name: "Dog Pelt", stack_size: 100, category: "trophy" },
+        // Mined at the starter mine (#164/#166). Ordinary stackable commodities,
+        // so they carry, store, warehouse and trade like wood and stone — the
+        // iron chain has to be able to move through the market it was built
+        // alongside.
+        Item { id: "iron_ore", name: "Iron Ore", stack_size: 100, category: "ore" },
+        Item { id: "clay_lump", name: "Clay Lump", stack_size: 100, category: "clay" },
         // The game's first WEAPON (#160). stack_size 1, like the tools: it's an
         // instance with its own wear, not a stack.
         Item { id: "sword", name: "Sword", stack_size: 1, category: "weapon" },
@@ -417,6 +423,29 @@ pub fn ability_cooldown_ms(ability_id: &str, skill_level: i64) -> i64 {
         "pick" => (2200 - 120 * skill_level).max(1300),
         _ => 1000,
     }
+}
+
+/// XP for a swing, scaled down once the swinger has outgrown what they are
+/// swinging at (#166).
+///
+/// Above `falloff_level` the award decays toward zero rather than stopping
+/// dead. That is the whole mechanism that keeps the tutorial mine from being a
+/// viable place to grind Mining to cap **without ever locking a newcomer out of
+/// it** — a level gate would do the first thing and the second, and the second
+/// is the one that matters for a starter area.
+///
+/// Decay is linear over the same span again, so a source with a falloff of 15
+/// is worthless by level 30. Never negative.
+pub fn xp_with_falloff(base: i64, level: i64, falloff_level: i64) -> i64 {
+    if falloff_level <= 0 || level <= falloff_level {
+        return base.max(0);
+    }
+    let over = level - falloff_level;
+    if over >= falloff_level {
+        return 0;
+    }
+    let remaining = falloff_level - over;
+    ((base * remaining) / falloff_level).max(0)
 }
 
 /// Mining-skill xp per successful swing per ability (mining/abilities epic
@@ -1551,6 +1580,64 @@ mod tests {
         assert!(mine.contains(portal.inside.0, portal.inside.1));
         assert!(mine.contains(mine.spawn_anchor.0, mine.spawn_anchor.1));
         assert!(mine.volumes.len() >= 3, "three short galleries, so players disperse");
+    }
+
+    /// The shipped deposits (#166) are real, reachable, and laid out the way the
+    /// design intends: clay near the mouth as the tutorial resource, iron deep
+    /// enough to be a walk.
+    ///
+    /// `zone_config` proves a deposit in the rock is refused; this proves the
+    /// mine we actually ship isn't one, and that the two files agree — a
+    /// placement naming a type that `crafting.toml` doesn't define would spawn
+    /// nothing at all, silently.
+    #[test]
+    fn the_shipped_deposits_are_reachable_and_sensibly_spread() {
+        let zpath = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
+        let cpath = concat!(env!("CARGO_MANIFEST_DIR"), "/../crafting.toml");
+        let zones = crate::zone_config::ZoneConfig::load(std::path::Path::new(zpath)).unwrap();
+        let crafting =
+            crate::crafting_config::CraftingConfig::load(std::path::Path::new(cpath)).unwrap();
+        let Some(mine) = zones.interior("mine_starter") else { return };
+        if mine.deposits.is_empty() {
+            return;
+        }
+
+        let portal = mine.portals.first().expect("a way in");
+        let (ex, ey) = portal.inside;
+        let (mut clay, mut iron) = (0, 0);
+        for d in &mine.deposits {
+            // Both files have to agree, or the seam silently never spawns.
+            let t = crafting
+                .deposit(&d.kind)
+                .unwrap_or_else(|| panic!("{} names undefined type `{}`", d.id, d.kind));
+            assert!(mine.contains(d.pos.0, d.pos.1), "{} is inside the rock", d.id);
+            let walk = (((d.pos.0 - ex) as f64).powi(2) + ((d.pos.1 - ey) as f64).powi(2)).sqrt();
+            match d.kind.as_str() {
+                "clay_starter" => {
+                    clay += 1;
+                    assert!(walk < 260.0, "{} is meant to be near the mouth ({walk:.0})", d.id);
+                }
+                "iron_starter" => {
+                    iron += 1;
+                    assert!(walk > 260.0, "{} is meant to be a walk in ({walk:.0})", d.id);
+                }
+                _ => {}
+            }
+            assert_eq!(t.required_tool, "pickaxe");
+        }
+        assert!(clay >= 8, "not enough clay to be the tutorial resource ({clay})");
+        assert!(iron >= 12, "not enough iron seams to disperse players ({iron})");
+
+        // Seams shouldn't stack on each other, or two of them are one in
+        // practice and the density that bounds the faucet is a lie.
+        for (i, a) in mine.deposits.iter().enumerate() {
+            for b in &mine.deposits[i + 1..] {
+                let g = (((a.pos.0 - b.pos.0) as f64).powi(2)
+                    + ((a.pos.1 - b.pos.1) as f64).powi(2))
+                .sqrt();
+                assert!(g > 20.0, "{} and {} are on top of each other ({g:.0})", a.id, b.id);
+            }
+        }
     }
 
     /// Region filtering is what makes a zone split safe: each half must derive
