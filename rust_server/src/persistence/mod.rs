@@ -2997,6 +2997,43 @@ impl Db {
         Ok(out)
     }
 
+    // --- deposit state (mine epic #164, issue #166) --------------------------
+
+    /// Record that a seam was worked out, so a restart resumes its timer rather
+    /// than refilling it.
+    pub async fn mark_deposit_depleted(&self, deposit_id: &str, at: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO deposit_state (deposit_id, depleted_at) VALUES (?, ?)              ON CONFLICT(deposit_id) DO UPDATE SET depleted_at = excluded.depleted_at",
+        )
+        .bind(deposit_id)
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget a seam's depletion — it has come back.
+    pub async fn clear_deposit_depleted(&self, deposit_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM deposit_state WHERE deposit_id = ?")
+            .bind(deposit_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every seam currently recorded as worked out, as `(id, depleted_at)`.
+    ///
+    /// Pushed to a zone when it starts so it can resume mid-cycle. An absent id
+    /// means full, which is why nothing is written for an untouched seam.
+    pub async fn depleted_deposits(&self) -> Result<Vec<(String, i64)>, DbError> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT deposit_id, depleted_at FROM deposit_state ORDER BY deposit_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     // --- the creature bounty (wild dogs epic #157, issue #161) --------------
 
     /// Hand in `cfg.required` trophies for `cfg.gold`, repeatably.
@@ -7143,6 +7180,41 @@ mod tests {
         let flagged = db.trades_outside_bounds(&m, &cfg, 0).await.unwrap();
         assert_eq!(flagged.len(), 1, "an out-of-bounds trade went unreported: {flagged:?}");
         assert_eq!(flagged[0], ("wood".to_string(), 50, 2, 20));
+    }
+
+    // --- deposit state (#166) -----------------------------------------------
+
+    /// Only the one fact that can't be recomputed is stored, and an absent row
+    /// means full — so a fresh database, a newly authored seam and an untouched
+    /// one are all the same case, with nothing to backfill.
+    #[tokio::test]
+    async fn deposit_depletion_is_remembered_and_forgotten() {
+        let (db, _t) = TempDb::open().await;
+        assert!(db.depleted_deposits().await.unwrap().is_empty(), "a fresh mine is full");
+
+        db.mark_deposit_depleted("clay_01", 1_000).await.unwrap();
+        db.mark_deposit_depleted("iron_04", 2_000).await.unwrap();
+        assert_eq!(
+            db.depleted_deposits().await.unwrap(),
+            vec![("clay_01".to_string(), 1_000), ("iron_04".to_string(), 2_000)]
+        );
+
+        // Working out an already-empty seam updates the timestamp rather than
+        // duplicating it — this is live state, not a ledger of every depletion.
+        db.mark_deposit_depleted("clay_01", 5_000).await.unwrap();
+        let rows = db.depleted_deposits().await.unwrap();
+        assert_eq!(rows.len(), 2, "a second depletion added a row: {rows:?}");
+        assert_eq!(rows[0], ("clay_01".to_string(), 5_000));
+
+        // Coming back forgets it, so a later restart can't resurrect a
+        // depletion that has already been served.
+        db.clear_deposit_depleted("clay_01").await.unwrap();
+        assert_eq!(
+            db.depleted_deposits().await.unwrap(),
+            vec![("iron_04".to_string(), 2_000)]
+        );
+        // Clearing something already full is a no-op, not an error.
+        db.clear_deposit_depleted("clay_01").await.unwrap();
     }
 
     // --- the creature bounty (#161) -----------------------------------------

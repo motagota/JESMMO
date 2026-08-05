@@ -61,6 +61,28 @@ qty_max = 2
 chance = 0.30
 
 # ---------------------------------------------------------------------------
+# What levelling a gathering skill buys (#166).
+#
+# BOTH BONUSES ARE CAPPED, and the cap is the point. An uncapped per-level bonus
+# eventually makes a high-level miner strictly better at everything, at which
+# point the cap is the only thing between "progression" and "the only correct
+# answer". 25% off the swing and a 20% chance at a bonus roll are meaningful
+# without being decisive.
+#
+# The bonus is an extra roll of the WHOLE loot table, not of one line, so it pays
+# out in the same proportions the seam does rather than favouring whichever item
+# happens to be listed first.
+#
+# Speed applies to the deposit's own `swing_time_ms`, so a skilled miner is
+# faster at every seam without erasing the difference between clay and iron.
+# ---------------------------------------------------------------------------
+[skill.mining]
+speed_bonus_pct_per_level = 0.4
+max_speed_bonus_pct = 25
+bonus_yield_chance_per_level = 0.3
+max_bonus_yield_chance = 20
+
+# ---------------------------------------------------------------------------
 # Clay — the tutorial resource, near the mouth.
 #
 # Faster, more generous and more reliable than iron on purpose: it is the first
