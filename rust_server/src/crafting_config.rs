@@ -168,6 +168,100 @@ impl SkillCurve {
     }
 }
 
+/// What a station *is*, which decides only one thing: whether it burns fuel.
+///
+/// Furnace, kiln, campfire and potter's wheel are deliberately ONE entity with a
+/// recipe filter rather than four station implementations, so the next station is
+/// a config entry instead of new code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StationKind {
+    /// Burns fuel to do its work: furnace, kiln, campfire.
+    Heat,
+    /// Needs no fuel, only hands: potter's wheel, workbench.
+    Shaping,
+}
+
+/// One ingredient of a station recipe.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ingredient {
+    pub item: String,
+    #[serde(default = "one")]
+    pub qty: i64,
+}
+
+/// A kind of station. Placement lives in `zones.toml`; this is the behaviour —
+/// exactly the split deposits use.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationType {
+    pub display_name: String,
+    pub kind: StationKind,
+    /// A recipe is usable here if any of its tags appears in this list. Tags
+    /// rather than a recipe list so adding a recipe doesn't mean editing every
+    /// station that should accept it.
+    pub recipe_tags: Vec<String>,
+    /// Accepted fuel items, and what one of each is worth in fuel units. Empty
+    /// for a `shaping` station, which is why the two kinds exist at all.
+    #[serde(default)]
+    pub fuels: BTreeMap<String, i64>,
+    /// Concurrent jobs **per player**, not in total.
+    ///
+    /// This is the load-bearing number on a public station. A queue shared
+    /// across everyone is a griefing surface and a miserable wait; per-player
+    /// slots are what make a public station usable at all.
+    #[serde(default = "one")]
+    pub job_slots: i64,
+    /// Charged in gold when a job starts, and BURNED — see `station_fee` on the
+    /// gold ledger. A fee that quietly vanished would break the supply identity
+    /// #154 established.
+    #[serde(default)]
+    pub usage_fee_gold: i64,
+    /// How close a player must be to use it, in world units.
+    #[serde(default = "default_station_radius")]
+    pub radius: i64,
+    /// When false, jobs run on while the player is offline and the output waits
+    /// in the slot. That is the default because the alternative — a job that
+    /// silently stops when you walk away — is indistinguishable from a bug.
+    #[serde(default)]
+    pub requires_presence: bool,
+}
+
+fn default_station_radius() -> i64 {
+    40
+}
+
+/// A timed recipe made at a station, as opposed to the instant `world::Recipe`
+/// made at a home crafting structure.
+///
+/// The two registries are deliberately separate. An instant recipe is a
+/// compile-time constant in `world.rs`; a station recipe is data, because the
+/// mine's tuning surface is meant to be editable without a rebuild. Merging them
+/// would mean either making the instant ones data (a refactor this issue doesn't
+/// need) or making these code (which defeats the point).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationRecipe {
+    pub display_name: String,
+    /// Matched against a station's `recipe_tags`.
+    pub tags: Vec<String>,
+    pub skill: String,
+    #[serde(default = "one")]
+    pub required_level: i64,
+    pub inputs: Vec<Ingredient>,
+    pub output_item: String,
+    #[serde(default = "one")]
+    pub output_qty: i64,
+    /// Fuel units burned by the whole job, taken from the station's buffer at
+    /// START. Zero for a `shaping` recipe.
+    #[serde(default)]
+    pub fuel_units: i64,
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub xp: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CraftingConfig {
@@ -176,11 +270,40 @@ pub struct CraftingConfig {
     /// Per-skill progression curves, keyed by skill id.
     #[serde(default)]
     pub skill: BTreeMap<String, SkillCurve>,
+    /// Station types, keyed by type id. `zones.toml` places instances of these.
+    #[serde(default)]
+    pub station: BTreeMap<String, StationType>,
+    /// Timed station recipes, keyed by recipe id.
+    #[serde(default)]
+    pub recipe: BTreeMap<String, StationRecipe>,
 }
 
 impl CraftingConfig {
     pub fn deposit(&self, id: &str) -> Option<&DepositType> {
         self.deposit.get(id)
+    }
+
+    pub fn station(&self, id: &str) -> Option<&StationType> {
+        self.station.get(id)
+    }
+
+    pub fn recipe(&self, id: &str) -> Option<&StationRecipe> {
+        self.recipe.get(id)
+    }
+
+    /// Whether `recipe` may be made at `station` — the tag intersection.
+    pub fn station_accepts(&self, station: &StationType, recipe: &StationRecipe) -> bool {
+        recipe.tags.iter().any(|t| station.recipe_tags.contains(t))
+    }
+
+    /// Every recipe this station type accepts, in id order. What the client's
+    /// station panel is populated from, so the two can never disagree about
+    /// what is makeable where.
+    pub fn recipes_for(&self, station: &StationType) -> Vec<(&String, &StationRecipe)> {
+        self.recipe
+            .iter()
+            .filter(|(_, r)| self.station_accepts(station, r))
+            .collect()
     }
 
     /// The curve for `skill`, or a flat one — an unconfigured skill simply
@@ -208,7 +331,7 @@ impl CraftingConfig {
     fn validate(&self) -> Result<(), CraftingConfigError> {
         for (id, d) in &self.deposit {
             let bad = |why: &str| {
-                Err(CraftingConfigError::Invalid { what: id.clone(), why: why.to_string() })
+                Err(CraftingConfigError::Invalid { what: format!("deposit.{id}"), why: why.to_string() })
             };
             if d.charges <= 0 {
                 return bad("charges must be positive — a seam with none can never be worked");
@@ -246,21 +369,123 @@ impl CraftingConfig {
             for y in &d.yields {
                 if crate::world::item(&y.item).is_none() {
                     return Err(CraftingConfigError::Invalid {
-                        what: id.clone(),
+                        what: format!("deposit.{id}"),
                         why: format!("yields `{}`, which is not a real item", y.item),
                     });
                 }
                 if !(0.0..=1.0).contains(&y.chance) {
                     return Err(CraftingConfigError::Invalid {
-                        what: id.clone(),
+                        what: format!("deposit.{id}"),
                         why: format!("`{}` has a chance outside 0.0-1.0", y.item),
                     });
                 }
                 if y.qty_min <= 0 || y.qty_max < y.qty_min {
                     return Err(CraftingConfigError::Invalid {
-                        what: id.clone(),
+                        what: format!("deposit.{id}"),
                         why: format!("`{}` has a nonsense quantity range", y.item),
                     });
+                }
+            }
+        }
+        for (id, st) in &self.station {
+            let bad = |why: &str| {
+                Err(CraftingConfigError::Invalid { what: format!("station.{id}"), why: why.to_string() })
+            };
+            if st.job_slots <= 0 {
+                return bad("job_slots must be positive — a station nobody can queue at is furniture");
+            }
+            if st.usage_fee_gold < 0 {
+                return bad("usage_fee_gold must not be negative — a station that PAYS you is a gold faucet");
+            }
+            if st.radius <= 0 {
+                return bad("radius must be positive");
+            }
+            if st.recipe_tags.is_empty() {
+                return bad("has no recipe_tags, so nothing could ever be made at it");
+            }
+            match st.kind {
+                StationKind::Heat if st.fuels.is_empty() => {
+                    return bad("is a heat station with no accepted fuels, so it could never be lit");
+                }
+                StationKind::Shaping if !st.fuels.is_empty() => {
+                    return bad("is a shaping station but accepts fuel — it has nothing to burn it for");
+                }
+                _ => {}
+            }
+            for (item, units) in &st.fuels {
+                if crate::world::item(item).is_none() {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("station.{id}"),
+                        why: format!("accepts `{item}` as fuel, which is not a real item"),
+                    });
+                }
+                if *units <= 0 {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("station.{id}"),
+                        why: format!("`{item}` is worth {units} fuel units — loading it would burn nothing"),
+                    });
+                }
+            }
+        }
+        for (id, r) in &self.recipe {
+            let bad = |why: &str| {
+                Err(CraftingConfigError::Invalid { what: format!("recipe.{id}"), why: why.to_string() })
+            };
+            if r.duration_ms <= 0 {
+                return bad("duration_ms must be positive — an instant job belongs in the world.rs registry");
+            }
+            if r.tags.is_empty() {
+                return bad("has no tags, so no station would accept it");
+            }
+            if r.inputs.is_empty() {
+                return bad("has no inputs — it would make something from nothing");
+            }
+            if r.output_qty <= 0 {
+                return bad("output_qty must be positive");
+            }
+            if r.fuel_units < 0 {
+                return bad("fuel_units must not be negative");
+            }
+            if r.xp < 0 {
+                return bad("xp must not be negative");
+            }
+            if crate::world::item(&r.output_item).is_none() {
+                return Err(CraftingConfigError::Invalid {
+                    what: format!("recipe.{id}"),
+                    why: format!("outputs `{}`, which is not a real item", r.output_item),
+                });
+            }
+            for i in &r.inputs {
+                if crate::world::item(&i.item).is_none() {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("recipe.{id}"),
+                        why: format!("takes `{}`, which is not a real item", i.item),
+                    });
+                }
+                if i.qty <= 0 {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("recipe.{id}"),
+                        why: format!("takes {} of `{}`", i.qty, i.item),
+                    });
+                }
+            }
+            // A recipe no station accepts is unmakeable, and silently so — it
+            // shows up as an empty panel rather than an error, which is exactly
+            // the kind of thing that survives a review.
+            if !self.station.is_empty()
+                && !self.station.values().any(|st| self.station_accepts(st, r))
+            {
+                return bad("no configured station accepts any of its tags, so it could never be made");
+            }
+            // Fuel is charged at start against the station's buffer. A fuelled
+            // recipe on a shaping station could never start.
+            if r.fuel_units > 0 {
+                let heat_accepts = self
+                    .station
+                    .values()
+                    .any(|st| st.kind == StationKind::Heat && self.station_accepts(st, r));
+                if !self.station.is_empty() && !heat_accepts {
+                    return bad("needs fuel but only shaping stations accept it, so it could never start");
                 }
             }
         }
@@ -281,7 +506,7 @@ impl std::fmt::Display for CraftingConfigError {
             CraftingConfigError::Toml(e) => write!(f, "crafting.toml parse error: {e}"),
             CraftingConfigError::Io(e) => write!(f, "crafting.toml read error: {e}"),
             CraftingConfigError::Invalid { what, why } => {
-                write!(f, "crafting.toml [deposit.{what}]: {why}")
+                write!(f, "crafting.toml [{what}]: {why}")
             }
         }
     }

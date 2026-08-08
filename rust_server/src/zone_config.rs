@@ -105,6 +105,25 @@ pub struct DepositPlacement {
     pub pos: (i32, i32),
 }
 
+/// Where a crafting station stands (#167). Behaviour lives in `crafting.toml`;
+/// this is placement, the same split deposits use.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationPlacement {
+    pub id: String,
+    /// A key into `crafting.toml`'s `[station.*]`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub pos: (i32, i32),
+    /// The interior this stands in, or `None` for a surface fixture.
+    ///
+    /// A position alone is not a location: since #165 the same coordinates
+    /// exist both underground and above it, so a station that only knew its
+    /// (x, y) could be used from the wrong side of the rock.
+    #[serde(default)]
+    pub interior: Option<String>,
+}
+
 /// One authored interior.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +178,12 @@ impl InteriorZone {
 pub struct ZoneConfig {
     #[serde(default)]
     pub interior: BTreeMap<String, InteriorZone>,
+    /// Where the world's crafting stations physically stand (#167). Top-level
+    /// rather than nested under an interior because most stations are surface
+    /// fixtures — the mine's furnace sits in the yard outside the adit, not
+    /// down the tunnel.
+    #[serde(default)]
+    pub station: Vec<StationPlacement>,
 }
 
 impl ZoneConfig {
@@ -256,6 +281,33 @@ impl ZoneConfig {
                         zone: id.clone(),
                         why: format!("portal `{}` has a non-positive radius", p.id),
                     });
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for st in &self.station {
+            let bad = |why: &str| {
+                Err(ZoneConfigError::Invalid { zone: format!("station {}", st.id), why: why.to_string() })
+            };
+            if !seen.insert(st.id.clone()) {
+                return bad("is a duplicate id — a station is addressed by id, so two would be one");
+            }
+            // A station inside an interior must be somewhere a player can stand,
+            // or it is unreachable and silently so. Surface stations are checked
+            // against the world bounds only; the terrain under them isn't ours
+            // to validate here.
+            match &st.interior {
+                Some(zone) => match self.interior.get(zone) {
+                    None => return bad("names an interior that doesn't exist"),
+                    Some(z) if !z.contains(st.pos.0, st.pos.1) => {
+                        return bad("stands inside solid rock — nobody could reach it")
+                    }
+                    Some(_) => {}
+                },
+                None => {
+                    if st.pos.0 < 0 || st.pos.1 < 0 {
+                        return bad("stands outside the world");
+                    }
                 }
             }
         }

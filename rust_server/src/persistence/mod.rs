@@ -837,6 +837,115 @@ pub struct SkillGain {
     pub leveled_up: bool,
 }
 
+
+/// A station job as the database holds it, with `inputs_json` still raw.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct StationJobRow {
+    id: String,
+    station_id: String,
+    character_id: String,
+    slot: i64,
+    recipe_id: String,
+    inputs_json: String,
+    fuel_units: i64,
+    output_item: String,
+    output_qty: i64,
+    xp: i64,
+    skill: String,
+    started_at: i64,
+    ready_at: i64,
+    state: String,
+    fail_reason: Option<String>,
+}
+
+/// A timed job at a station (#167), with its escrowed inputs decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationJob {
+    pub id: String,
+    pub station_id: String,
+    pub character_id: String,
+    pub slot: i64,
+    pub recipe_id: String,
+    /// What was ACTUALLY taken at start, so a refund returns that rather than
+    /// whatever the recipe says today.
+    pub inputs: Vec<(String, i64)>,
+    pub fuel_units: i64,
+    pub output_item: String,
+    pub output_qty: i64,
+    pub xp: i64,
+    pub skill: String,
+    pub started_at: i64,
+    pub ready_at: i64,
+    pub state: String,
+    pub fail_reason: Option<String>,
+}
+
+impl From<StationJobRow> for StationJob {
+    fn from(r: StationJobRow) -> Self {
+        StationJob {
+            id: r.id,
+            station_id: r.station_id,
+            character_id: r.character_id,
+            slot: r.slot,
+            recipe_id: r.recipe_id,
+            inputs: serde_json::from_str(&r.inputs_json).unwrap_or_default(),
+            fuel_units: r.fuel_units,
+            output_item: r.output_item,
+            output_qty: r.output_qty,
+            xp: r.xp,
+            skill: r.skill,
+            started_at: r.started_at,
+            ready_at: r.ready_at,
+            state: r.state,
+            fail_reason: r.fail_reason,
+        }
+    }
+}
+
+/// Why a job couldn't start. Each variant carries the numbers so the player is
+/// told what they're short of rather than just "no".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartJobError {
+    SlotBusy,
+    NotEnoughGold { need: i64, have: i64 },
+    NotEnoughFuel { need: i64, have: i64 },
+    MissingInput { item: String, need: i64, have: i64 },
+}
+
+impl StartJobError {
+    /// A short reason code for the wire; the client renders the prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            StartJobError::SlotBusy => "slot_busy",
+            StartJobError::NotEnoughGold { .. } => "not_enough_gold",
+            StartJobError::NotEnoughFuel { .. } => "not_enough_fuel",
+            StartJobError::MissingInput { .. } => "missing_input",
+        }
+    }
+}
+
+/// Why a collect didn't happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectError {
+    NoSuchJob,
+    NotReady { ready_at: i64 },
+    /// The pack is full. The job is untouched and still holding the goods —
+    /// this is a refusal, not a loss.
+    NoRoom { need: i64, room: i64 },
+}
+
+/// What a successful collect handed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedJob {
+    pub station_id: String,
+    pub slot: i64,
+    pub failed: bool,
+    pub fail_reason: Option<String>,
+    pub payout: Vec<(String, i64)>,
+    pub xp: i64,
+    pub skill: String,
+}
+
 /// A carried inventory item (finite slots). `durability` is `None` for an
 /// ordinary stackable item and `Some(0..=max)` for a tool instance (#128) —
 /// a tool row's `qty` is always 1, since instances never stack.
@@ -3035,6 +3144,412 @@ impl Db {
     }
 
     // --- the creature bounty (wild dogs epic #157, issue #161) --------------
+
+    // --- Stations, fuel and timed jobs (mine epic #164, issue #167) ---------
+
+    /// How many fuel units a station is holding.
+    pub async fn station_fuel(&self, station_id: &str) -> Result<i64, DbError> {
+        let units: Option<i64> =
+            sqlx::query_scalar("SELECT units FROM station_fuel WHERE station_id = ?")
+                .bind(station_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(units.unwrap_or(0))
+    }
+
+    /// Load fuel into a station's shared buffer, converting items to units at
+    /// the station type's rate.
+    ///
+    /// **The items leave the player and the units appear together**, so a crash
+    /// between the two can't burn charcoal for nothing.
+    ///
+    /// Loading is an explicit player action rather than something a job does
+    /// implicitly, because it is the mechanic the tutorial (#169) exists to
+    /// teach: a furnace you have to feed is a furnace you understand.
+    ///
+    /// Returns the new total, or `None` if the player didn't have the items.
+    pub async fn load_station_fuel(
+        &self,
+        station_id: &str,
+        character_id: &str,
+        item_id: &str,
+        qty: i64,
+        units_per_item: i64,
+        now: i64,
+    ) -> Result<Option<i64>, DbError> {
+        if qty <= 0 || units_per_item <= 0 {
+            return Ok(None);
+        }
+        let mut tx = self.pool.begin().await?;
+        let have: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if have.unwrap_or(0) < qty {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        remove_inventory_in_tx(&mut tx, character_id, item_id, qty).await?;
+        let units = qty * units_per_item;
+        sqlx::query(
+            "INSERT INTO station_fuel (station_id, units, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(station_id) DO UPDATE SET units = units + excluded.units, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(station_id)
+        .bind(units)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT units FROM station_fuel WHERE station_id = ?")
+            .bind(station_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(total))
+    }
+
+    /// Start a timed job: charge the fee, escrow the inputs and the fuel, and
+    /// write the job row — **all in one transaction**.
+    ///
+    /// The ordering inside matters. Everything that can refuse is checked
+    /// before anything is taken, because a fee charged for a job that then
+    /// fails validation is silent theft. The transaction makes that guarantee
+    /// total rather than merely likely.
+    ///
+    /// `slot` is chosen by the caller from what [`Db::station_jobs`] reports
+    /// free, but the unique index is what actually enforces it: two starts
+    /// racing for one slot lose to the database, not to whichever read first.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_station_job(
+        &self,
+        station_id: &str,
+        character_id: &str,
+        slot: i64,
+        recipe_id: &str,
+        recipe: &crate::crafting_config::StationRecipe,
+        fee_gold: i64,
+        duration_ms: i64,
+        now: i64,
+    ) -> Result<Result<StationJob, StartJobError>, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Slot free?
+        let taken: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM station_job WHERE station_id = ? AND character_id = ? AND slot = ?",
+        )
+        .bind(station_id)
+        .bind(character_id)
+        .bind(slot)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if taken.is_some() {
+            tx.commit().await?;
+            return Ok(Err(StartJobError::SlotBusy));
+        }
+
+        // Gold for the fee?
+        let gold: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(0);
+        if gold < fee_gold {
+            tx.commit().await?;
+            return Ok(Err(StartJobError::NotEnoughGold { need: fee_gold, have: gold }));
+        }
+
+        // Every ingredient, before taking any of them.
+        for i in &recipe.inputs {
+            let have: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+            )
+            .bind(character_id)
+            .bind(&i.item)
+            .fetch_one(&mut *tx)
+            .await?;
+            if have.unwrap_or(0) < i.qty {
+                tx.commit().await?;
+                return Ok(Err(StartJobError::MissingInput {
+                    item: i.item.clone(),
+                    need: i.qty,
+                    have: have.unwrap_or(0),
+                }));
+            }
+        }
+
+        // Fuel, taken from the SHARED buffer. Reserved here rather than spent at
+        // completion so a second job can't promise itself the same charcoal.
+        if recipe.fuel_units > 0 {
+            let units: i64 =
+                sqlx::query_scalar("SELECT units FROM station_fuel WHERE station_id = ?")
+                    .bind(station_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or(0);
+            if units < recipe.fuel_units {
+                tx.commit().await?;
+                return Ok(Err(StartJobError::NotEnoughFuel {
+                    need: recipe.fuel_units,
+                    have: units,
+                }));
+            }
+            sqlx::query(
+                "UPDATE station_fuel SET units = units - ?, updated_at = ? WHERE station_id = ?",
+            )
+            .bind(recipe.fuel_units)
+            .bind(now)
+            .bind(station_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Past this point nothing can refuse, so it is safe to start taking.
+        for i in &recipe.inputs {
+            remove_inventory_in_tx(&mut tx, character_id, &i.item, i.qty).await?;
+        }
+        if fee_gold > 0 {
+            // Burned, not banked. A station fee is gold leaving the world, and
+            // it goes through the ledger for the same reason market fees do —
+            // `gold_supply_gap()` has to stay 0.
+            sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+                .bind(fee_gold)
+                .bind(character_id)
+                .execute(&mut *tx)
+                .await?;
+            ledger_gold_in_tx(&mut tx, character_id, -fee_gold, "station_fee", now).await?;
+        }
+
+        let inputs: Vec<(String, i64)> =
+            recipe.inputs.iter().map(|i| (i.item.clone(), i.qty)).collect();
+        let inputs_json = serde_json::to_string(&inputs).unwrap_or_else(|_| "[]".to_string());
+        let job = StationJob {
+            id: Uuid::new_v4().to_string(),
+            station_id: station_id.to_string(),
+            character_id: character_id.to_string(),
+            slot,
+            recipe_id: recipe_id.to_string(),
+            inputs,
+            fuel_units: recipe.fuel_units,
+            output_item: recipe.output_item.clone(),
+            output_qty: recipe.output_qty,
+            xp: recipe.xp,
+            skill: recipe.skill.clone(),
+            started_at: now,
+            ready_at: now + (duration_ms.max(1) + 999) / 1000,
+            state: "running".to_string(),
+            fail_reason: None,
+        };
+        sqlx::query(
+            "INSERT INTO station_job (id, station_id, character_id, slot, recipe_id, inputs_json, \
+             fuel_units, output_item, output_qty, xp, skill, started_at, ready_at, state) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+        )
+        .bind(&job.id)
+        .bind(&job.station_id)
+        .bind(&job.character_id)
+        .bind(job.slot)
+        .bind(&job.recipe_id)
+        .bind(&inputs_json)
+        .bind(job.fuel_units)
+        .bind(&job.output_item)
+        .bind(job.output_qty)
+        .bind(job.xp)
+        .bind(&job.skill)
+        .bind(job.started_at)
+        .bind(job.ready_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Ok(job))
+    }
+
+    /// Every job this player owns at this station, slot order.
+    pub async fn station_jobs(
+        &self,
+        station_id: &str,
+        character_id: &str,
+    ) -> Result<Vec<StationJob>, DbError> {
+        let rows: Vec<StationJobRow> = sqlx::query_as(
+            "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             FROM station_job WHERE station_id = ? AND character_id = ? ORDER BY slot",
+        )
+        .bind(station_id)
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(StationJob::from).collect())
+    }
+
+    /// Mark every running job whose time has come as `ready`, and report them so
+    /// the caller can notify the owners.
+    ///
+    /// Ripening is separate from collecting on purpose: the output waits in the
+    /// slot, so a player who logged out mid-job comes back to a finished one
+    /// rather than to a job that stopped when they did.
+    pub async fn ripen_station_jobs(&self, now: i64) -> Result<Vec<StationJob>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<StationJobRow> = sqlx::query_as(
+            "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             FROM station_job WHERE state = 'running' AND ready_at <= ?",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !rows.is_empty() {
+            sqlx::query("UPDATE station_job SET state = 'ready' WHERE state = 'running' AND ready_at <= ?")
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| StationJob { state: "ready".to_string(), ..StationJob::from(r) })
+            .collect())
+    }
+
+    /// Fail a job and refund exactly what it escrowed — the inputs recorded on
+    /// the row, not what the recipe currently says they should have been.
+    ///
+    /// This is the path a job takes when its recipe vanishes from `crafting.toml`
+    /// between restarts. The config is edited by hand and the row outlives it,
+    /// so "the recipe is gone" is an ordinary Tuesday rather than an invariant
+    /// violation, and it must never panic.
+    ///
+    /// The refund goes back to the slot, not to the inventory: a player whose
+    /// pack is full when a job fails would otherwise lose the materials to the
+    /// very error that was supposed to protect them.
+    pub async fn fail_station_job(&self, job_id: &str, reason: &str) -> Result<bool, DbError> {
+        let n = sqlx::query(
+            "UPDATE station_job SET state = 'failed', fail_reason = ? \
+             WHERE id = ? AND state <> 'failed'",
+        )
+        .bind(reason)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Collect a finished job: the output (or, for a failed one, the refunded
+    /// inputs and fuel) moves into the player's inventory and the slot frees.
+    ///
+    /// **Compare-and-clear**, the pattern #142's listing purchase established:
+    /// the DELETE carries the state in its WHERE clause, so two collect commands
+    /// racing produce one payout and one "nothing to collect" rather than two
+    /// payouts. Reading the row first and deleting after would be exactly the
+    /// duplication bug that pattern exists to prevent.
+    ///
+    /// **A full pack does not destroy anything.** If the output doesn't fit, the
+    /// job stays exactly where it is and the caller is told — the slot keeps
+    /// holding it until there is room.
+    pub async fn collect_station_job(
+        &self,
+        job_id: &str,
+        character_id: &str,
+        bonus_qty: i64,
+        now: i64,
+    ) -> Result<Result<CollectedJob, CollectError>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<StationJobRow> = sqlx::query_as(
+            "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             FROM station_job WHERE id = ? AND character_id = ?",
+        )
+        .bind(job_id)
+        .bind(character_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(Err(CollectError::NoSuchJob));
+        };
+        let job = StationJob::from(row);
+        if job.state == "running" {
+            tx.commit().await?;
+            return Ok(Err(CollectError::NotReady { ready_at: job.ready_at }));
+        }
+
+        // What is actually owed: the output, or the refund of a failed job.
+        let failed = job.state == "failed";
+        let payout: Vec<(String, i64)> = if failed {
+            job.inputs.clone()
+        } else {
+            vec![(job.output_item.clone(), job.output_qty + bonus_qty.max(0))]
+        };
+
+        // Room for all of it, checked before any of it moves. A partial payout
+        // would leave the slot half-collected with no way to describe that.
+        let carried: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        let want: i64 = payout.iter().map(|(_, q)| *q).sum();
+        if want > room {
+            tx.commit().await?;
+            return Ok(Err(CollectError::NoRoom { need: want, room }));
+        }
+
+        // Compare-and-clear: whoever's DELETE lands first owns the payout.
+        let cleared = sqlx::query("DELETE FROM station_job WHERE id = ? AND state = ?")
+            .bind(job_id)
+            .bind(&job.state)
+            .execute(&mut *tx)
+            .await?;
+        if cleared.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(Err(CollectError::NoSuchJob));
+        }
+
+        for (item, qty) in &payout {
+            add_inventory_in_tx(&mut tx, character_id, item, *qty).await?;
+        }
+        // A failed job also hands back the fuel it reserved, to the station
+        // rather than to the player — it was never theirs, it was the fire's.
+        if failed && job.fuel_units > 0 {
+            sqlx::query(
+                "INSERT INTO station_fuel (station_id, units, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(station_id) DO UPDATE SET units = units + excluded.units, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(&job.station_id)
+            .bind(job.fuel_units)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Ok(CollectedJob {
+            station_id: job.station_id,
+            slot: job.slot,
+            failed,
+            fail_reason: job.fail_reason,
+            payout,
+            xp: if failed { 0 } else { job.xp },
+            skill: job.skill,
+        }))
+    }
+
+    /// Every job in the world that is not yet collected. The gateway uses this
+    /// at boot to fail any whose recipe has vanished from config.
+    pub async fn all_station_jobs(&self) -> Result<Vec<StationJob>, DbError> {
+        let rows: Vec<StationJobRow> = sqlx::query_as(
+            "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             FROM station_job ORDER BY started_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(StationJob::from).collect())
+    }
 
     /// Hand in `cfg.required` trophies for `cfg.gold`, repeatably.
     ///
@@ -8580,4 +9095,385 @@ mod tests {
         db.wear_equipped_tool(&cid, "tool", 10).await.unwrap();
         assert_eq!(db.repair_instance(&stranger, &instance_id).await.unwrap(), None);
     }
+    // --- Stations, fuel and timed jobs (#167) -------------------------------
+
+    use crate::crafting_config::{Ingredient, StationRecipe};
+
+    fn a_smelt_recipe() -> StationRecipe {
+        StationRecipe {
+            display_name: "Smelt Iron Ingot".into(),
+            tags: vec!["smelting".into()],
+            skill: "smelting".into(),
+            required_level: 1,
+            inputs: vec![Ingredient { item: "iron_ore".into(), qty: 2 }],
+            output_item: "iron_ingot".into(),
+            output_qty: 1,
+            fuel_units: 2,
+            duration_ms: 12_000,
+            xp: 10,
+        }
+    }
+
+    async fn carrying(db: &Db, cid: &str, item: &str, qty: i64) {
+        db.add_to_inventory(cid, item, qty).await.unwrap();
+    }
+
+    async fn held(db: &Db, cid: &str, item: &str) -> i64 {
+        db.inventory_for_character(cid)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|i| i.item_id == item)
+            .map(|i| i.qty)
+            .sum()
+    }
+
+    /// The core custody claim: inputs and fuel leave at START, not at collect.
+    /// If they left at collect, a job would be free to start and the whole
+    /// escrow model would be decorative.
+    #[tokio::test]
+    async fn a_job_consumes_its_inputs_and_fuel_at_start() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 5).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 0, 2, 100).await.unwrap();
+        // Load fuel properly: the player needs the charcoal first.
+        carrying(&db, &cid, "charcoal", 3).await;
+        let total = db.load_station_fuel("f1", &cid, "charcoal", 3, 2, 100).await.unwrap();
+        assert_eq!(total, Some(6), "3 charcoal at 2 units each");
+        assert_eq!(held(&db, &cid, "charcoal").await, 0, "the charcoal went into the fire");
+
+        let r = a_smelt_recipe();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1_000)
+            .await
+            .unwrap()
+            .expect("should start");
+
+        assert_eq!(held(&db, &cid, "iron_ore").await, 3, "2 ore escrowed at start");
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 4, "2 fuel units reserved at start");
+        assert_eq!(job.inputs, vec![("iron_ore".to_string(), 2)]);
+        assert_eq!(job.ready_at, 1_012, "12s job started at t=1000");
+        assert_eq!(held(&db, &cid, "iron_ingot").await, 0, "nothing produced yet");
+    }
+
+    /// A restart between start and collect must neither duplicate the materials
+    /// nor void them. The job row IS the durable custody, so reopening the same
+    /// database is exactly the test.
+    #[tokio::test]
+    async fn escrow_survives_a_restart_between_start_and_collect() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 4).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let r = a_smelt_recipe();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 0, 12_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // "Restart": a second Db over the same file, as the gateway would open.
+        let db2 = Db::connect(&_t.url).await.unwrap();
+        let jobs = db2.station_jobs("f1", &cid).await.unwrap();
+        assert_eq!(jobs.len(), 1, "the job outlived the process");
+        assert_eq!(jobs[0].inputs, vec![("iron_ore".to_string(), 2)], "escrow intact");
+        assert_eq!(held(&db2, &cid, "iron_ore").await, 2, "not silently refunded either");
+
+        let ripe = db2.ripen_station_jobs(1_020).await.unwrap();
+        assert_eq!(ripe.len(), 1);
+        let got = db2.collect_station_job(&job.id, &cid, 0, 1_020).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
+        assert_eq!(held(&db2, &cid, "iron_ingot").await, 1, "exactly one, not two");
+    }
+
+    /// Per-player slots are the whole point of a public station: one player
+    /// filling theirs must not touch anyone else's.
+    #[tokio::test]
+    async fn one_players_full_slots_do_not_block_another() {
+        let (db, _t) = TempDb::open().await;
+        let (a, b) = (a_character(&db).await, a_character(&db).await);
+        for c in [&a, &b] {
+            carrying(&db, c, "iron_ore", 10).await;
+            carrying(&db, c, "charcoal", 5).await;
+            db.load_station_fuel("f1", c, "charcoal", 5, 2, 100).await.unwrap();
+        }
+        let r = a_smelt_recipe();
+        // A fills both their slots.
+        for slot in 0..2 {
+            db.start_station_job("f1", &a, slot, "iron_ingot", &r, 0, 12_000, 1_000)
+                .await
+                .unwrap()
+                .expect("A's own slots are free");
+        }
+        assert!(
+            matches!(
+                db.start_station_job("f1", &a, 0, "iron_ingot", &r, 0, 12_000, 1_000).await.unwrap(),
+                Err(StartJobError::SlotBusy)
+            ),
+            "A's slot 0 is taken"
+        );
+        // B is unaffected — same station, same slot number, different player.
+        db.start_station_job("f1", &b, 0, "iron_ingot", &r, 0, 12_000, 1_000)
+            .await
+            .unwrap()
+            .expect("B's slot 0 is their own");
+        assert_eq!(db.station_jobs("f1", &a).await.unwrap().len(), 2);
+        assert_eq!(db.station_jobs("f1", &b).await.unwrap().len(), 1);
+    }
+
+    /// Every refusal consumes nothing. A fee charged for a job that then fails
+    /// validation is silent theft, and the ordering inside the transaction is
+    /// what prevents it — so each refusal is checked for side effects, not just
+    /// for the error.
+    #[tokio::test]
+    async fn every_refusal_leaves_the_player_exactly_as_they_were() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let r = a_smelt_recipe();
+        let gold0 = db.character_gold(&cid).await.unwrap();
+
+        // No ore, no fuel.
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1).await.unwrap();
+        assert!(matches!(e, Err(StartJobError::MissingInput { .. })), "{e:?}");
+
+        // Ore but still no fuel.
+        carrying(&db, &cid, "iron_ore", 2).await;
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1).await.unwrap();
+        assert!(matches!(e, Err(StartJobError::NotEnoughFuel { need: 2, have: 0 })), "{e:?}");
+
+        // Fuel, but not enough gold for the fee.
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let e = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, gold0 + 1, 12_000, 1)
+            .await
+            .unwrap();
+        assert!(matches!(e, Err(StartJobError::NotEnoughGold { .. })), "{e:?}");
+
+        // Nothing was taken by any of the three.
+        assert_eq!(held(&db, &cid, "iron_ore").await, 2, "ore untouched");
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 2, "fuel untouched");
+        assert_eq!(db.character_gold(&cid).await.unwrap(), gold0, "no fee charged");
+        assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "no job row");
+    }
+
+    /// The station fee is a SINK: it leaves the world through the ledger, and
+    /// the supply identity #154 established still holds afterwards.
+    #[tokio::test]
+    async fn the_station_fee_is_burned_and_the_supply_still_balances() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let gold0 = db.character_gold(&cid).await.unwrap();
+
+        db.start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(db.character_gold(&cid).await.unwrap(), gold0 - 2);
+        let by_reason = db.gold_by_reason().await.unwrap();
+        assert_eq!(
+            by_reason.iter().find(|(r, _)| r == "station_fee").map(|(_, a)| *a),
+            Some(-2),
+            "the burn is on the ledger under its own reason: {by_reason:?}"
+        );
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "supply identity holds");
+    }
+
+    /// A recipe vanishing from `crafting.toml` between restarts fails the job
+    /// and refunds exactly what it escrowed — never a panic, and never the
+    /// recipe's current cost, which may itself have changed.
+    #[tokio::test]
+    async fn a_vanished_recipe_fails_the_job_and_refunds_the_escrow() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held(&db, &cid, "iron_ore").await, 0);
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 0);
+
+        assert!(db.fail_station_job(&job.id, "recipe_gone").await.unwrap());
+        let got = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap().unwrap();
+
+        assert!(got.failed);
+        assert_eq!(got.fail_reason.as_deref(), Some("recipe_gone"));
+        assert_eq!(got.payout, vec![("iron_ore".to_string(), 2)], "the ore comes back");
+        assert_eq!(got.xp, 0, "a failed job teaches nothing");
+        assert_eq!(held(&db, &cid, "iron_ore").await, 2);
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 2, "the fuel goes back to the fire");
+        assert_eq!(held(&db, &cid, "iron_ingot").await, 0, "and no ingot was made");
+    }
+
+    /// Collecting with a full pack holds the output in the slot and says so.
+    /// Destroying it would be the worst outcome — the player did the work and
+    /// paid the fee.
+    #[tokio::test]
+    async fn a_full_pack_holds_the_output_rather_than_destroying_it() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+
+        // Fill the pack to the brim while the job runs.
+        carrying(&db, &cid, "stone", MAX_CARRY).await;
+        let e = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
+        assert!(matches!(e, Err(CollectError::NoRoom { .. })), "{e:?}");
+        assert_eq!(
+            db.station_jobs("f1", &cid).await.unwrap().len(),
+            1,
+            "the job is still there holding the ingot"
+        );
+
+        // Make room; now it collects.
+        db.remove_from_inventory(&cid, "stone", 5).await.unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
+        assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "slot freed");
+    }
+
+    /// Collecting the same job twice pays out once.
+    ///
+    /// Note what this does and does NOT prove. Sequentially, the second collect
+    /// finds no row at all, so it never reaches the compare-and-clear in the
+    /// DELETE — verified by sabotage: removing the state guard leaves this test
+    /// green. The guard is still correct and still wanted (it is #142's pattern,
+    /// and the pool being one connection today is a tuning decision rather than
+    /// a contract), but the honest claim here is idempotence, not a won race.
+    /// `concurrent_collects_of_one_job_produce_one_ingot` covers the overlap.
+    #[tokio::test]
+    async fn collecting_the_same_job_twice_pays_out_once() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+
+        let first = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
+        let second = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
+        assert!(first.is_ok(), "{first:?}");
+        assert!(matches!(second, Err(CollectError::NoSuchJob)), "{second:?}");
+        assert_eq!(held(&db, &cid, "iron_ingot").await, 1, "exactly one ingot");
+    }
+
+    /// Two collects genuinely in flight at once still produce one ingot.
+    ///
+    /// The single-connection pool serialises the transactions, so this is not
+    /// the hostile interleaving the compare-and-clear was written for — but it
+    /// does exercise both calls overlapping in the executor, which the
+    /// sequential test above cannot.
+    #[tokio::test]
+    async fn concurrent_collects_of_one_job_produce_one_ingot() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+
+        let db = std::sync::Arc::new(db);
+        let (d1, d2) = (db.clone(), db.clone());
+        let (j1, j2) = (job.id.clone(), job.id.clone());
+        let (c1, c2) = (cid.clone(), cid.clone());
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { d1.collect_station_job(&j1, &c1, 0, 200).await.unwrap() }),
+            tokio::spawn(async move { d2.collect_station_job(&j2, &c2, 0, 200).await.unwrap() }),
+        );
+        let wins = [a.unwrap().is_ok(), b.unwrap().is_ok()];
+        assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one collect wins");
+        assert_eq!(held(&db, &cid, "iron_ingot").await, 1, "and exactly one ingot exists");
+    }
+
+    /// A job can't be collected early, and ripening is what makes it collectable
+    /// — not the player asking nicely.
+    #[tokio::test]
+    async fn a_running_job_refuses_to_be_collected_early() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let e = db.collect_station_job(&job.id, &cid, 0, 1_005).await.unwrap();
+        assert!(matches!(e, Err(CollectError::NotReady { ready_at: 1_012 })), "{e:?}");
+
+        // Not yet due: ripening does nothing.
+        assert!(db.ripen_station_jobs(1_005).await.unwrap().is_empty());
+        assert_eq!(db.ripen_station_jobs(1_012).await.unwrap().len(), 1, "due on the second");
+        assert!(db.collect_station_job(&job.id, &cid, 0, 1_012).await.unwrap().is_ok());
+    }
+
+    /// Fuel is SHARED: one player can burn what another loaded. That is the
+    /// documented choice for a public furnace, and it deserves a test precisely
+    /// because it would otherwise look like a bug.
+    #[tokio::test]
+    async fn fuel_is_shared_across_players_at_a_public_station() {
+        let (db, _t) = TempDb::open().await;
+        let (a, b) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &a, "charcoal", 2).await;
+        db.load_station_fuel("f1", &a, "charcoal", 2, 2, 100).await.unwrap();
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 4);
+
+        carrying(&db, &b, "iron_ore", 2).await;
+        db.start_station_job("f1", &b, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .expect("B burns the fire A lit");
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 2);
+    }
+
+    /// A levelled smelter's bonus output is applied at collect, and it is a
+    /// whole extra unit rather than a fraction — an ingot is not divisible.
+    #[tokio::test]
+    async fn a_bonus_output_adds_a_whole_extra_unit() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 2).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+
+        let got = db.collect_station_job(&job.id, &cid, 1, 200).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 2)], "1 base + 1 bonus");
+        assert_eq!(held(&db, &cid, "iron_ingot").await, 2);
+    }
+
 }

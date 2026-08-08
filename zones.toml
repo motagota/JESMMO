@@ -237,3 +237,19 @@ pos = [507, 62]
 id = "iron_16"
 type = "iron_starter"
 pos = [569, 70]
+
+# ===========================================================================
+# STATIONS (#167). Behaviour lives in `crafting.toml`; this is where they stand.
+# ===========================================================================
+
+# The mine yard furnace. It sits OUTSIDE the adit rather than down a gallery,
+# and that is the whole shape of the loop: mine ore in the dark, walk out, smelt
+# it in the yard. A furnace at the coal face would collapse that into standing
+# still, and a smelter underground with no ventilation is also a lie.
+#
+# 62 units from the adit mouth at (12800, 13500) — close enough that the round
+# trip is a beat rather than a haul, far enough that the two are distinct places.
+[[station]]
+id = "furnace_mine_yard"
+type = "furnace"
+pos = [12860, 13520]

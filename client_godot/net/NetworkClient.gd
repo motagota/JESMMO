@@ -135,6 +135,19 @@ signal portal_entered(zone: String, x: int, y: int, interior: bool, display_name
 ## The interior's authored floor plan, as boxes, carried with the transition.
 signal portal_geometry(volumes: Array)
 signal portal_error(code: String, detail: String)
+## The station panel's whole state (#167), server-computed. Passed through as a
+## Dictionary rather than exploded into arguments because it is a VIEW, not a
+## set of facts the client reasons about — every field is drawn, none is used to
+## decide anything.
+## The authored station placements (#167), sent once at login.
+signal station_list(stations: Array)
+signal station_state(state: Dictionary)
+## You walked away from the station, or it can't be reached from where you are.
+signal station_closed()
+## A job finished while you were standing somewhere else.
+signal station_ready(station_id: String, job_id: String, slot: int, output_item: String, output_qty: int)
+signal station_collected(slot: int, failed: bool, fail_reason: String, bonus: int, items: Array)
+signal station_error(reason: String, detail: Dictionary)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -408,6 +421,30 @@ func _handle_text(text: String) -> void:
             portal_error.emit(
                 String(msg.get("code", "")),
                 String(msg.get("detail", "you can't go that way")))
+        Protocol.S_STATION_LIST:
+            station_list.emit(msg.get("stations", []))
+        Protocol.S_STATION_STATE:
+            station_state.emit(msg)
+        Protocol.S_STATION_CLOSED:
+            station_closed.emit()
+        Protocol.S_STATION_READY:
+            station_ready.emit(
+                String(msg.get("station_id", "")),
+                String(msg.get("job_id", "")),
+                int(msg.get("slot", 0)),
+                String(msg.get("output_item", "")),
+                int(msg.get("output_qty", 0)))
+        Protocol.S_STATION_COLLECTED:
+            station_collected.emit(
+                int(msg.get("slot", 0)),
+                bool(msg.get("failed", false)),
+                # An explicit null on the wire is not an absent key, and a
+                # default doesn't apply to one (#165 was bitten by exactly this).
+                String(msg.get("fail_reason", "") if msg.get("fail_reason") != null else ""),
+                int(msg.get("bonus", 0)),
+                msg.get("items", []))
+        Protocol.S_STATION_ERROR:
+            station_error.emit(String(msg.get("reason", "")), msg)
         Protocol.S_BOUNTY_STATE:
             bounty_state.emit(
                 String(msg.get("item_id", "")),
@@ -721,6 +758,21 @@ func send_portal_enter() -> void:
 ## exactly-once: a resent frame must not mint a second reward.
 func send_bounty_turn_in() -> void:
     _send({"type": Protocol.C_BOUNTY_TURN_IN, "command_id": _command_id()})
+
+## Ask the server what station you are standing at (#167). Carries no id: the
+## server resolves it from its own position cache, so a client can only ever ask
+## about a station it could walk to.
+func send_station_open() -> void:
+    _send({"type": Protocol.C_STATION_OPEN})
+
+func send_station_load_fuel(item_id: String, qty: int) -> void:
+    _send({"type": Protocol.C_STATION_LOAD_FUEL, "item_id": item_id, "qty": qty})
+
+func send_station_start(recipe_id: String) -> void:
+    _send({"type": Protocol.C_STATION_START, "recipe_id": recipe_id})
+
+func send_station_collect(job_id: String) -> void:
+    _send({"type": Protocol.C_STATION_COLLECT, "job_id": job_id})
 
 func send_npc_talk(npc_id: String) -> void:
     _send({"type": Protocol.C_NPC_TALK, "npc_id": npc_id})

@@ -185,6 +185,12 @@ pub fn items() -> Vec<Item> {
         // alongside.
         Item { id: "iron_ore", name: "Iron Ore", stack_size: 100, category: "ore" },
         Item { id: "clay_lump", name: "Clay Lump", stack_size: 100, category: "clay" },
+        // Fuel for every heat station (#167). Charcoal exists as an item before
+        // the woodcutting-to-charcoal chain does: for now it is made straight
+        // from wood at a home crafting structure, and Marlow hands out a bundle
+        // (#169). The kiln chain that should really produce it is Phase 2.
+        Item { id: "charcoal", name: "Charcoal", stack_size: 100, category: "fuel" },
+        Item { id: "iron_ingot", name: "Iron Ingot", stack_size: 100, category: "metal" },
         // The game's first WEAPON (#160). stack_size 1, like the tools: it's an
         // instance with its own wear, not a stack.
         Item { id: "sword", name: "Sword", stack_size: 1, category: "weapon" },
@@ -246,6 +252,19 @@ pub fn recipes() -> Vec<Recipe> {
         Recipe {
             id: "axe", name: "Axe", inputs: &[("wood", 3), ("stone", 2)],
             output_item: "axe", output_qty: 1,
+        },
+        // Charcoal (#167). This is the ONLY source of fuel in the game, so it is
+        // deliberately cheap and instant: a furnace whose fuel is hard to get is
+        // a furnace nobody lights, and the interesting constraint is meant to be
+        // the ore, not the firewood. 3 wood -> 2 charcoal, and one smelt burns 2
+        // fuel, so a tree's worth of wood is a handful of ingots.
+        //
+        // It is an INSTANT recipe rather than a kiln job on purpose — the kiln
+        // and the real charcoal chain are Phase 2, and until they exist a timed
+        // fuel recipe would just be a second wait in front of the first one.
+        Recipe {
+            id: "charcoal", name: "Charcoal", inputs: &[("wood", 3)],
+            output_item: "charcoal", output_qty: 2,
         },
     ]
 }
