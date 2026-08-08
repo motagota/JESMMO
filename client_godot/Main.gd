@@ -81,6 +81,9 @@ var _tutorial: TutorialPanel
 ## arriving at. Client-side proximity decides when to ASK; the server decides
 ## whether the answer is yes.
 var _stations: Array = []
+## The authored portals, from `portal.list`. Used ONLY to decide what to draw
+## and when to offer "enter" — the server re-checks range on the command.
+var _portals: Array = []
 var _station_id := ""
 ## Which zone we are in, from the portal transitions. A station's coordinates
 ## mean nothing without it — the same (x, y) exists on both sides of the rock.
@@ -229,7 +232,14 @@ func _process(_delta: float) -> void:
     # interaction doesn't exist anymore, every resource is ability-swing-gated
     # (Pick/Chop on the hotbar). No hint at all when nothing's in range.
     var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
-    _hud.set_interact_verb("talk" if npc_id != "" else "")
+    # "enter" when standing at a portal with nobody to talk to. Without this the
+    # adit gives no indication it can be used at all.
+    if npc_id != "":
+        _hud.set_interact_verb("talk")
+    elif Protocol.in_interior():
+        _hud.set_interact_verb("leave" if _nearest_portal_inside() else "")
+    else:
+        _hud.set_interact_verb("enter" if _nearest_portal() != "" else "")
 
     # Auto-fire (mining/abilities epic #123, #120): re-attempt every
     # auto-armed, ready slot each frame — a no-target miss is silent
@@ -413,6 +423,9 @@ func _wire_signals() -> void:
     # Stations (#167). The panel is a view of `station.state` and nothing else;
     # every button round-trips to the server, which re-checks range itself.
     _net.station_list.connect(func(stations): _stations = stations)
+    _net.portal_list.connect(func(portals):
+        _portals = portals
+        _world.set_portals(portals))
     # The track (#169). A view of the server's evaluation and nothing else —
     # the client never decides a step is done.
     _net.tutorial_state.connect(func(steps, done, total): _tutorial.set_track(steps, done, total))
@@ -790,9 +803,46 @@ func _on_interact_pressed() -> void:
     if _npc_dialogue.visible:
         _npc_dialogue.close()
         return
+    # An NPC first: they stand closer than a portal's radius and talking is the
+    # more common intent. Marlow is 73 units from the adit precisely so the two
+    # never compete for the same keypress (#169).
     var npc_id := _entities.nearest_npc(_player.world_pos(), Protocol.NPC_TALK_RANGE)
     if npc_id != "":
         _net.send_npc_talk(npc_id)
+        return
+    # ...then a portal. This branch is why the mine was unreachable: the whole
+    # of epic #164 shipped with `send_portal_enter` defined and never called by
+    # anything but a test probe.
+    if _nearest_portal() != "" or _nearest_portal_inside() != "":
+        _net.send_portal_enter()
+
+## The portal we are standing at from INSIDE, or "". One portal entry describes
+## both directions (#165), so leaving needs its own proximity test against the
+## interior-side coordinates rather than the world ones.
+func _nearest_portal_inside() -> String:
+    var here := _player.world_pos()
+    for p in _portals:
+        if String(p.get("zone", "")) != _zone_id:
+            continue
+        var d := here.distance_to(Vector2(float(p.get("inside_x", 0)), float(p.get("inside_y", 0))))
+        if d <= float(p.get("radius", 40)):
+            return String(p.get("id", ""))
+    return ""
+
+## The portal we are standing in, or "". The client picks a candidate; the
+## server re-resolves it from its own position cache, exactly as it does for
+## stations and markets.
+func _nearest_portal() -> String:
+    # Underground the world coordinates mean something else entirely (#165), so
+    # a surface portal must not match on position alone.
+    if Protocol.in_interior():
+        return ""
+    var here := _player.world_pos()
+    for p in _portals:
+        var d := here.distance_to(Vector2(float(p.get("x", 0)), float(p.get("y", 0))))
+        if d <= float(p.get("radius", 40)):
+            return String(p.get("id", ""))
+    return ""
 
 ## Resolve a hotbar press to a target node and send `ability.use` (mining/
 ## abilities epic #123, #119/#120). For a non-harvesting ability (none exist

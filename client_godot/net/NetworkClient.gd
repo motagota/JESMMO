@@ -135,6 +135,8 @@ signal portal_entered(zone: String, x: int, y: int, interior: bool, display_name
 ## The interior's authored floor plan, as boxes, carried with the transition.
 signal portal_geometry(volumes: Array)
 signal portal_error(code: String, detail: String)
+## The authored portals, sent once at login so they can be drawn and offered.
+signal portal_list(portals: Array)
 ## The station panel's whole state (#167), server-computed. Passed through as a
 ## Dictionary rather than exploded into arguments because it is a VIEW, not a
 ## set of facts the client reasons about — every field is drawn, none is used to
@@ -425,6 +427,8 @@ func _handle_text(text: String) -> void:
                 bool(msg.get("interior", false)),
                 String(msg.get("display_name", "")),
                 float(msg.get("ambient_light", 1.0)))
+        Protocol.S_PORTAL_LIST:
+            portal_list.emit(msg.get("portals", []))
         Protocol.S_PORTAL_ERROR:
             portal_error.emit(
                 String(msg.get("code", "")),
