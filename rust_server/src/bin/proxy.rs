@@ -4547,6 +4547,50 @@ impl Proxy {
         (take > 0).then_some((owner, take))
     }
 
+    /// What is waiting in the caller's recovery vault (#184).
+    async fn send_vault(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let now = now_secs();
+        let rows: Vec<Value> = db
+            .vault_for(pid)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                json!({
+                    "item": v.item_id, "qty": v.qty, "source": v.source,
+                    // Days left, shown loudly. A vault that expires without
+                    // warning is the property destruction this exists to
+                    // prevent, arriving late.
+                    "days_left": ((v.expires_at - now) / 86_400).max(0),
+                })
+            })
+            .collect();
+        self.push_to_player(pid, json!({"type": "vault.state", "entries": rows}));
+    }
+
+    /// Claim it. Goods go to storage, which is uncapped — a station's
+    /// materials are 52 units against a 50-unit pack.
+    async fn apply_vault_claim(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        match db.claim_vault(pid, now_secs()).await {
+            Ok(items) if !items.is_empty() => {
+                println!("[Proxy] {pid} claimed {} vault entry(ies)", items.len());
+                self.push_to_player(
+                    pid,
+                    json!({
+                        "type": "vault.claimed",
+                        "items": items.iter().map(|(i, q)| json!({"item": i, "qty": q}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                self.send_vault(pid).await;
+            }
+            Ok(_) => self.push_to_player(pid, json!({"type": "vault.claimed", "items": []})),
+            Err(e) => eprintln!("[Proxy] vault claim failed: {e}"),
+        }
+    }
+
     /// Put somebody on the caller's roster (#183), or renew them.
     ///
     /// GRANTS ALWAYS EXPIRE. `days` is bounded rather than trusted: a grant of
@@ -5265,7 +5309,9 @@ impl Proxy {
                 // A station on a plot whose lease has lapsed is inert. The plot
                 // is on its way back to the pool and its owner should not be
                 // collecting fees from it (#181, #184).
-                if ps.plot_state != "active" {
+                // `lapsed` still works — see `station_access`. Only derelict
+                // and reclaimed take a station out of the world.
+                if !matches!(ps.plot_state.as_str(), "active" | "lapsed") {
                     continue;
                 }
                 let Some(t) = self.crafting_cfg.station(&ps.station_type) else { continue };
@@ -5300,10 +5346,15 @@ impl Proxy {
             // rather than guess.
             return Err("closed");
         };
-        // A lapsed lease earns its holder nothing. `station_at` already skips
-        // these, so reaching here means the state changed mid-command.
-        if plot.state != "active" {
-            return Err("closed");
+        match plot.state.as_str() {
+            "active" => {}
+            // LATE, NOT LOST. The stations still run — being behind on rent
+            // costs the owner their income, not their business. The fee routes
+            // to the landlord instead, which is a sink and is burned.
+            "lapsed" => return Ok(None),
+            // Derelict: production has stopped. Nobody uses it, including the
+            // owner, until the rent is paid.
+            _ => return Err("plot_derelict"),
         }
         // Their standing on this plot, if any (#183). Evaluated against NOW,
         // not against whenever a sweep last ran — a lapsed grant must stop
@@ -7171,7 +7222,45 @@ impl Proxy {
                     self.push_to_player(&owner, rent_status_json(&fresh, gold));
                 }
             }
-            "reclaimed" => self.reclaim_plot(&owner, plot).await,
+            // Derelict (#184): production stops, but nothing is taken yet. This
+            // is the last moment at which paying up saves everything, so it has
+            // to be said as loudly as the lapse was — a state change the owner
+            // cannot see is a state change that surprises them.
+            "derelict" if plot.state != "derelict" => {
+                if let Ok(Some(fresh)) = db.load_plot(&plot.id).await {
+                    let gold = db.character_gold(&owner).await.unwrap_or(0);
+                    self.push_to_player(&owner, rent_status_json(&fresh, gold));
+                }
+                // Everyone's running jobs on this plot are failed WITH REFUNDS
+                // — #168's `failed`, not `spoiled`. Other players may have
+                // materials escrowed in a furnace here, and somebody else's
+                // unpaid rent must not cost them their ore.
+                let stations: Vec<String> = self
+                    .plot_stations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|ps| ps.plot_id == plot.id)
+                    .map(|ps| ps.id.clone())
+                    .collect();
+                if !stations.is_empty() {
+                    for job in db.all_station_jobs().await.unwrap_or_default() {
+                        if job.state == "running" && stations.contains(&job.station_id) {
+                            let _ = db.fail_station_job(&job.id, "plot_derelict").await;
+                        }
+                    }
+                }
+                self.refresh_plot_stations().await;
+                println!("[Proxy] plot {} went derelict — production halted", plot.id);
+            }
+            "reclaimed" => {
+                self.reclaim_plot(&owner, plot).await;
+                // What was banked on the way out (#184). Told plainly, because
+                // "your lease ended" and "your lease ended and your furnace is
+                // waiting for you" are very different messages.
+                self.refresh_plot_stations().await;
+                self.send_vault(&owner).await;
+            }
             _ => {}
         }
     }
@@ -7653,7 +7742,7 @@ impl Proxy {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .and_then(|t| t.strip_prefix("station."))
-                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish" | "policy" | "grant" | "revoke" | "roster"))
+                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish" | "policy" | "grant" | "revoke" | "roster" | "vault" | "claim"))
                     {
                         let op = op.to_string();
                         match op.as_str() {
@@ -7669,6 +7758,8 @@ impl Proxy {
                                 self.apply_plot_revoke(&player_id, &who).await;
                             }
                             "roster" => self.send_plot_roster_panel(&player_id).await,
+                            "vault" => self.send_vault(&player_id).await,
+                            "claim" => self.apply_vault_claim(&player_id).await,
                             "policy" => {
                                 let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let fee = data.get("fee_gp").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -11109,9 +11200,21 @@ mod tests {
         assert_eq!(status["plot_id"], plot.id);
         assert_eq!(status["state"], "lapsed");
 
-        // Tick 3: past the grace window — reclaimed. The bed despawns, the zone
-        // drops it from its proximity cache, and the former owner is notified.
+        // Tick 3: past the first grace window — DERELICT, not reclaimed. #184
+        // put a second window between falling behind and losing the land, so
+        // that there is a stretch where the consequence is visible but not yet
+        // final. Production has stopped; nothing has been taken.
         proxy.tick_rent(due_at + RENT_GRACE_SECS + 1).await;
+        let derelict = recv_until(&mut ws, "rent.status").await;
+        assert_eq!(derelict["state"], "derelict");
+        assert!(
+            db.load_plot(&plot.id).await.unwrap().unwrap().owner_character_id.is_some(),
+            "a derelict plot is still theirs — losing a lease is a slope, not a cliff"
+        );
+
+        // Tick 4: past the second — now reclaimed. The bed despawns, the zone
+        // drops it from its proximity cache, and the former owner is notified.
+        proxy.tick_rent(due_at + RENT_GRACE_SECS * 2 + 1).await;
         let mut saw_despawn = false;
         let mut reclaimed = None;
         while reclaimed.is_none() {

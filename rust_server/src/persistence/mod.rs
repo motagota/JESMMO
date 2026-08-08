@@ -30,6 +30,13 @@ pub type DbError = sqlx::Error;
 /// yielding into a full inventory; depositing frees it.
 pub const MAX_CARRY: i64 = 50;
 
+/// How long a reclaimed plot's goods wait for their last owner (#184).
+///
+/// Thirty days is long enough to survive a holiday and short enough that the
+/// vault cannot become a rent-free warehouse. The point is that losing a lease
+/// is survivable, not that it costs nothing.
+pub const VAULT_KEEP_SECS: i64 = 30 * 86_400;
+
 /// Building-skill XP granted per unit contributed to a build order, paid lump-sum to
 /// each contributor when the order completes (see [`Db::contribute`]).
 pub const BUILD_XP_PER_UNIT: i64 = 5;
@@ -896,6 +903,19 @@ pub struct SkillGain {
     pub leveled_up: bool,
 }
 
+
+/// Something waiting for a player whose lease ran out (#184).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct VaultEntry {
+    pub id: String,
+    pub character_id: String,
+    pub item_id: String,
+    pub qty: i64,
+    /// Where it came from, so the claim screen can say "your furnace".
+    pub source: String,
+    pub deposited_at: i64,
+    pub expires_at: i64,
+}
 
 /// A role somebody holds on somebody else's plot (#183).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -3419,6 +3439,129 @@ impl Db {
         Ok(add)
     }
 
+    // --- The recovery vault (#184) ------------------------------------------
+
+    /// Move everything left on a reclaimed plot into its last owner's vault.
+    ///
+    /// Called as the plot goes `derelict -> reclaimed`, in the same transaction
+    /// that clears the owner, so there is no instant at which the goods belong
+    /// to nobody.
+    ///
+    /// Station materials are returned at their BUILD cost rather than salvaged
+    /// at a discount: the player already paid for them once, and this is not a
+    /// penalty, it is the absence of one.
+    pub async fn sweep_plot_to_vault(
+        &self,
+        plot_id: &str,
+        owner: &str,
+        keep_secs: i64,
+        now: i64,
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let mut moved: Vec<(String, i64)> = Vec::new();
+        let expires = now + keep_secs;
+
+        // Every station on the plot: its build cost, and whatever fuel is in it.
+        let stations: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, station_type FROM plot_station WHERE plot_id = ?")
+                .bind(plot_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (station_id, _kind) in &stations {
+            for (item, qty) in world::structure_cost("station") {
+                moved.push(((*item).to_string(), *qty));
+                sqlx::query(
+                    "INSERT INTO recovery_vault (id, character_id, item_id, qty, source, deposited_at, expires_at) \
+                     VALUES (?, ?, ?, ?, 'station', ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(owner)
+                .bind(*item)
+                .bind(*qty)
+                .bind(now)
+                .bind(expires)
+                .execute(&mut *tx)
+                .await?;
+            }
+            // Fuel belongs to whoever loaded it, which is unknowable — it is a
+            // shared buffer by design (#167). The last owner is the only
+            // answer that is not "it evaporates".
+            let fuel: i64 =
+                sqlx::query_scalar("SELECT units FROM station_fuel WHERE station_id = ?")
+                    .bind(station_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or(0);
+            if fuel > 0 {
+                sqlx::query("DELETE FROM station_fuel WHERE station_id = ?")
+                    .bind(station_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        // Only the stations — see the note in `apply_rent_tick`.
+        sqlx::query("DELETE FROM structure WHERE plot_id = ? AND kind = 'station'")
+            .bind(plot_id)
+            .execute(&mut *tx)
+            .await?;
+        // And the roster, which is meaningless once the land changes hands.
+        sqlx::query("DELETE FROM plot_grant WHERE plot_id = ?")
+            .bind(plot_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// What is waiting for this character, and for how long.
+    pub async fn vault_for(&self, character_id: &str) -> Result<Vec<VaultEntry>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, character_id, item_id, qty, source, deposited_at, expires_at \
+             FROM recovery_vault WHERE character_id = ? ORDER BY deposited_at",
+        )
+        .bind(character_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Claim everything in the vault that fits, leaving the rest.
+    ///
+    /// A partial claim is correct here: a station's materials are 52 units
+    /// against a 50-unit pack, so an all-or-nothing claim would be unclaimable.
+    /// Goods go to STORAGE, which is uncapped and is where they came from.
+    pub async fn claim_vault(&self, character_id: &str, now: i64) -> Result<Vec<(String, i64)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT id, item_id, qty FROM recovery_vault \
+             WHERE character_id = ? AND expires_at > ?",
+        )
+        .bind(character_id)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut claimed = Vec::new();
+        for (id, item, qty) in rows {
+            add_storage_in_tx(&mut tx, character_id, &item, qty).await?;
+            sqlx::query("DELETE FROM recovery_vault WHERE id = ?")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            claimed.push((item, qty));
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    /// Empty expired vaults. THE VAULT MUST NOT BECOME STORAGE — without this
+    /// it is a way to hold goods rent-free forever by deliberately lapsing.
+    pub async fn expire_vaults(&self, now: i64) -> Result<u64, DbError> {
+        let n = sqlx::query("DELETE FROM recovery_vault WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected())
+    }
+
     // --- The roster: who else may use your plot (#183) ----------------------
 
     /// Grant `character_id` a role on `plot_id`, or renew one they hold.
@@ -4973,7 +5116,10 @@ impl Db {
     /// ticker's per-tick source of truth (#14). Cheap: Phase 1 has 24 plots total.
     pub async fn rent_active_plots(&self) -> Result<Vec<Plot>, DbError> {
         sqlx::query_as::<_, Plot>(
-            "SELECT * FROM plot WHERE owner_character_id IS NOT NULL AND state IN ('active','lapsed')",
+            // `derelict` included (#184), or a plot that reaches it falls off
+            // the ticker and stays derelict forever — never reclaimed, never
+            // returned to the pool, and never swept into its owner's vault.
+            "SELECT * FROM plot WHERE owner_character_id IS NOT NULL              AND state IN ('active','lapsed','derelict')",
         )
         .fetch_all(&self.pool)
         .await
@@ -5041,13 +5187,73 @@ impl Db {
             return Ok(None);
         };
         let due = p.rent_due_at.unwrap_or(i64::MAX);
+        // FOUR STATES NOW, not three (#184).
+        //
+        //   active   -> paid up
+        //   lapsed   -> late. The stations still RUN; the owner just stops
+        //               earning from them. Being late costs income, not
+        //               property.
+        //   derelict -> production halts and running jobs are failed with
+        //               refunds. The owner may still recover what is theirs.
+        //   reclaimed-> the land returns to the pool and everything left goes
+        //               to the recovery vault.
+        //
+        // The extra state exists so that losing a lease is a slope rather than
+        // a cliff. Reclaiming straight out of `lapsed` gave a player no moment
+        // at which the consequence was visible but not yet final.
         let new_state = match p.state.as_str() {
             "active" if now > due => Some("lapsed"),
-            "lapsed" if now > due + grace_secs => Some("reclaimed"),
+            "lapsed" if now > due + grace_secs => Some("derelict"),
+            "derelict" if now > due + grace_secs * 2 => Some("reclaimed"),
             _ => None,
         };
         if let Some(state) = new_state {
             if state == "reclaimed" {
+                // The goods go to the vault BEFORE the owner is cleared, or
+                // there would be no owner to give them to. Done here rather
+                // than by the caller so the two can never come apart: a reclaim
+                // that forgot to sweep is exactly the property destruction #43
+                // objected to.
+                if let Some(owner) = p.owner_character_id.clone() {
+                    let expires = now + VAULT_KEEP_SECS;
+                    let stations: Vec<(String,)> =
+                        sqlx::query_as("SELECT id FROM plot_station WHERE plot_id = ?")
+                            .bind(plot_id)
+                            .fetch_all(&mut *tx)
+                            .await?;
+                    for (station_id,) in &stations {
+                        for (item, qty) in world::structure_cost("station") {
+                            sqlx::query(
+                                "INSERT INTO recovery_vault (id, character_id, item_id, qty, source, deposited_at, expires_at)                                  VALUES (?, ?, ?, ?, 'station', ?, ?)",
+                            )
+                            .bind(Uuid::new_v4().to_string())
+                            .bind(&owner)
+                            .bind(*item)
+                            .bind(*qty)
+                            .bind(now)
+                            .bind(expires)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        sqlx::query("DELETE FROM station_fuel WHERE station_id = ?")
+                            .bind(station_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    // ONLY the stations. Beds, storage and crafting structures
+                    // are `reclaim_plot_belongings`' job and have been since
+                    // #14 — two paths deleting the same rows would mean
+                    // whichever ran second silently found nothing, which is how
+                    // a reclaim quietly stops reporting what it removed.
+                    sqlx::query("DELETE FROM structure WHERE plot_id = ? AND kind = 'station'")
+                        .bind(plot_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM plot_grant WHERE plot_id = ?")
+                        .bind(plot_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 sqlx::query(
                     "UPDATE plot SET state = 'reclaimed', owner_character_id = NULL, \
                      rent_due_at = NULL, rent_paid_through = NULL WHERE id = ?",
@@ -6712,9 +6918,16 @@ mod tests {
         let paid = db.pay_rent(&plot.id, 1000, 1500).await.unwrap().unwrap();
         assert_eq!(paid.state, "active");
         assert_eq!(paid.rent_due_at, Some(2500));
-        // Let it lapse and exceed grace → reclaimed, owner cleared, back in pool.
+        // Let it lapse and run out the clock. #184 put `derelict` between
+        // `lapsed` and `reclaimed`, so this now takes TWO grace windows —
+        // losing a lease is a slope rather than a cliff, and there is a stretch
+        // where the consequence is visible but not yet final.
         db.apply_rent_tick(&plot.id, 3000, 500).await.unwrap(); // -> lapsed
-        let st = db.apply_rent_tick(&plot.id, 4000, 500).await.unwrap();
+        assert_eq!(
+            db.apply_rent_tick(&plot.id, 4000, 500).await.unwrap().as_deref(),
+            Some("derelict")
+        );
+        let st = db.apply_rent_tick(&plot.id, 5000, 500).await.unwrap();
         assert_eq!(st.as_deref(), Some("reclaimed"));
         let reclaimed = db.load_plot(&plot.id).await.unwrap().unwrap();
         assert_eq!(reclaimed.owner_character_id, None);
@@ -6772,7 +6985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rent_active_plots_only_returns_owned_active_or_lapsed_plots() {
+    async fn rent_active_plots_returns_owned_plots_that_are_still_on_the_clock() {
         let (db, _t) = TempDb::open().await;
         let cid = a_character(&db).await;
         db.insert_unowned_plot("suburbs", 0, 0, 8, 8, 0).await.unwrap();
@@ -6785,9 +6998,15 @@ mod tests {
         assert_eq!(active[0].id, owned.id);
 
         db.apply_rent_tick(&owned.id, 1500, 500).await.unwrap(); // -> lapsed
-        assert_eq!(db.rent_active_plots().await.unwrap().len(), 1, "lapsed still counts, until reclaimed");
+        assert_eq!(db.rent_active_plots().await.unwrap().len(), 1, "lapsed still counts");
 
-        db.apply_rent_tick(&owned.id, 3000, 500).await.unwrap(); // -> reclaimed
+        // Derelict has to stay on the clock too (#184). A plot that fell off
+        // here would be stuck derelict forever: never reclaimed, never returned
+        // to the pool, and never swept into its owner's vault.
+        db.apply_rent_tick(&owned.id, 3000, 500).await.unwrap(); // -> derelict
+        assert_eq!(db.rent_active_plots().await.unwrap().len(), 1, "derelict is still ticking down");
+
+        db.apply_rent_tick(&owned.id, 4000, 500).await.unwrap(); // -> reclaimed
         assert!(db.rent_active_plots().await.unwrap().is_empty(), "reclaimed drops out (no owner)");
     }
 
@@ -6846,8 +7065,11 @@ mod tests {
 
         // Reclaim only Alice's plot: the pure state-machine transition (as the
         // real ticker would drive it) plus the belongings side-effect.
+        // Two grace windows now: `derelict` sits between lapsed and reclaimed
+        // (#184), so a plot is never destroyed one tick after falling behind.
         db.apply_rent_tick(&alice_plot.id, 1500, 500).await.unwrap(); // -> lapsed
-        db.apply_rent_tick(&alice_plot.id, 3000, 500).await.unwrap(); // -> reclaimed
+        db.apply_rent_tick(&alice_plot.id, 3000, 500).await.unwrap(); // -> derelict
+        db.apply_rent_tick(&alice_plot.id, 4000, 500).await.unwrap(); // -> reclaimed
         let deleted = db.reclaim_plot_belongings(&alice_plot.id, &alice).await.unwrap();
         assert_eq!(deleted, vec![alice_bed.id]);
 
@@ -10011,6 +10233,160 @@ mod tests {
             .filter(|i| i.item_id == item)
             .map(|i| i.qty)
             .sum()
+    }
+
+    // --- derelict and the recovery vault (#184) -----------------------------
+
+    /// The lease now walks four states, and reclaim is two grace periods away
+    /// rather than one. Losing a lease should be a slope, not a cliff.
+    #[tokio::test]
+    async fn the_lease_walks_active_lapsed_derelict_reclaimed() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 1_000, 0).await.unwrap().unwrap();
+        let grace = 500;
+        let due = plot.rent_due_at.unwrap();
+
+        assert_eq!(db.apply_rent_tick(&plot.id, due - 1, grace).await.unwrap().as_deref(), Some("active"));
+        assert_eq!(db.apply_rent_tick(&plot.id, due + 1, grace).await.unwrap().as_deref(), Some("lapsed"));
+        // Still lapsed inside the first grace window.
+        assert_eq!(db.apply_rent_tick(&plot.id, due + grace, grace).await.unwrap().as_deref(), Some("lapsed"));
+        assert_eq!(db.apply_rent_tick(&plot.id, due + grace + 1, grace).await.unwrap().as_deref(), Some("derelict"));
+        // And still derelict inside the second.
+        assert_eq!(db.apply_rent_tick(&plot.id, due + grace * 2, grace).await.unwrap().as_deref(), Some("derelict"));
+        assert_eq!(db.apply_rent_tick(&plot.id, due + grace * 2 + 1, grace).await.unwrap().as_deref(), Some("reclaimed"));
+
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert_eq!(p.owner_character_id, None, "the land goes back to the pool");
+    }
+
+    /// **Reclaiming destroys nothing.** This is #43's objection, answered.
+    ///
+    /// A station cost 40 stone and 12 ingots (#180). Deleting it on non-payment
+    /// would be destroying real property, and the difference between rent as a
+    /// pressure and rent as a punishment is exactly this.
+    #[tokio::test]
+    async fn reclaiming_a_plot_banks_its_property_rather_than_deleting_it() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 1_000, 0).await.unwrap().unwrap();
+
+        let cost = crate::world::structure_cost("station");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&owner, item, *qty).await.unwrap();
+        }
+        let (_, station) = db
+            .build_plot_station(&plot.id, &owner, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.deposit_to_storage(&owner, "charcoal", 2).await.unwrap();
+        // (fuel loaded straight in, so there is something in the buffer to lose)
+        carrying(&db, &owner, "charcoal", 2).await;
+        db.load_station_fuel(&station.id, &owner, "charcoal", 2, 2, 100).await.unwrap();
+
+        let due = plot.rent_due_at.unwrap();
+        let grace = 500;
+        db.apply_rent_tick(&plot.id, due + 1, grace).await.unwrap();
+        db.apply_rent_tick(&plot.id, due + grace + 1, grace).await.unwrap();
+        db.apply_rent_tick(&plot.id, due + grace * 2 + 1, grace).await.unwrap();
+
+        // The station is gone from the world...
+        assert!(db.plot_stations().await.unwrap().is_empty());
+        assert!(db.structures_for_plot(&plot.id).await.unwrap().is_empty());
+        // ...and its materials are waiting, not destroyed.
+        let vault = db.vault_for(&owner).await.unwrap();
+        for (item, qty) in cost {
+            let banked: i64 = vault.iter().filter(|v| v.item_id == *item).map(|v| v.qty).sum();
+            assert_eq!(banked, *qty, "{item} should be in the vault, not deleted");
+        }
+        assert!(vault.iter().all(|v| v.source == "station"), "and labelled where it came from");
+    }
+
+    /// Claiming moves everything into storage, which is uncapped — a station's
+    /// materials are 52 units against a 50-unit pack, so a claim into the pack
+    /// would be unclaimable.
+    #[tokio::test]
+    async fn claiming_the_vault_returns_everything_to_storage() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 1_000, 0).await.unwrap().unwrap();
+        let cost = crate::world::structure_cost("station");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&owner, item, *qty).await.unwrap();
+        }
+        db.build_plot_station(&plot.id, &owner, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let due = plot.rent_due_at.unwrap();
+        for t in [due + 1, due + 501, due + 1_001] {
+            db.apply_rent_tick(&plot.id, t, 500).await.unwrap();
+        }
+
+        let claimed = db.claim_vault(&owner, due + 1_002).await.unwrap();
+        assert!(!claimed.is_empty());
+        let stored = db.storage_for_character(&owner).await.unwrap();
+        for (item, qty) in cost {
+            let n: i64 = stored.iter().filter(|s| s.item_id == *item).map(|s| s.qty).sum();
+            assert_eq!(n, *qty, "{item} is back in the storehouse");
+        }
+        assert!(db.vault_for(&owner).await.unwrap().is_empty(), "and the vault is empty");
+        // Claiming again is a no-op rather than a second payout.
+        assert!(db.claim_vault(&owner, due + 1_003).await.unwrap().is_empty());
+    }
+
+    /// **The vault must not become storage.** Without expiry it is a way to
+    /// hold goods rent-free forever by deliberately lapsing.
+    #[tokio::test]
+    async fn an_expired_vault_is_emptied_and_cannot_be_claimed() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 1_000, 0).await.unwrap().unwrap();
+        let cost = crate::world::structure_cost("station");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&owner, item, *qty).await.unwrap();
+        }
+        db.build_plot_station(&plot.id, &owner, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let due = plot.rent_due_at.unwrap();
+        for t in [due + 1, due + 501, due + 1_001] {
+            db.apply_rent_tick(&plot.id, t, 500).await.unwrap();
+        }
+        assert!(!db.vault_for(&owner).await.unwrap().is_empty());
+
+        let long_after = due + 1_001 + crate::persistence::VAULT_KEEP_SECS + 1;
+        // Past the window, a claim gets nothing even before the sweep runs.
+        assert!(db.claim_vault(&owner, long_after).await.unwrap().is_empty(),
+            "expiry is evaluated at the moment of asking, not by a timer");
+        assert!(db.expire_vaults(long_after).await.unwrap() > 0);
+        assert!(db.vault_for(&owner).await.unwrap().is_empty());
+    }
+
+    /// The roster goes with the land. Grants on a reclaimed plot are
+    /// meaningless and must not survive to confuse its next holder.
+    #[tokio::test]
+    async fn reclaiming_clears_the_roster() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        let hand = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 1_000, 0).await.unwrap().unwrap();
+        db.grant_plot_role(&plot.id, &owner, &hand, "worker", 9_999_999, 0).await.unwrap();
+        assert_eq!(db.plot_roster(&plot.id).await.unwrap().len(), 1);
+
+        let due = plot.rent_due_at.unwrap();
+        for t in [due + 1, due + 501, due + 1_001] {
+            db.apply_rent_tick(&plot.id, t, 500).await.unwrap();
+        }
+        assert!(db.plot_roster(&plot.id).await.unwrap().is_empty(),
+            "the next holder should not inherit somebody else's staff");
     }
 
     // --- The roster (#183) --------------------------------------------------

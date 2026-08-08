@@ -440,6 +440,13 @@ static func role_text(role: String) -> String:
         "patron": return "Patron — may use the stations, and pays the fee"
         _: return role
 
+## The recovery vault (#184). Losing a lease must never destroy property: what
+## was on a reclaimed plot waits here for its last owner.
+const C_STATION_VAULT := "station.vault"
+const C_STATION_CLAIM := "station.claim"
+const S_VAULT_STATE := "vault.state"
+const S_VAULT_CLAIMED := "vault.claimed"
+
 const C_STATION_DEMOLISH := "station.demolish"
 const S_STATION_DEMOLISHED := "station.demolished"
 const S_STATION_STATE := "station.state"
@@ -474,6 +481,9 @@ static func station_error_text(reason: String, d: Dictionary) -> String:
         "no_plot": return "You have no plot to set a policy on."
         "bad_policy": return "That policy was refused."
         "bad_grant": return "That grant was refused — check the name and the role."
+        # Not "closed": the difference matters. Closed is a choice; derelict is
+        # a warning that the rent has gone unpaid long enough to stop the work.
+        "plot_derelict": return "This plot has gone derelict — the rent is unpaid."
         "no_fuel_to_load": return "You have none to load."
         "no_such_recipe": return "No such recipe."
         "wrong_station": return "That can't be made here."
