@@ -121,8 +121,23 @@ func _redraw() -> void:
         return
     var fee := int(_state.get("usage_fee_gold", 0))
     _title.text = String(_state.get("name", "Station"))
-    if fee > 0:
+    # SOMEBODY ELSE'S FEE IS SHOWN BEFORE COMMITTING, never discovered after
+    # (#181). It is also shown separately from the world's, because they are
+    # different things: one is burned, one goes to the person whose furnace
+    # this is, and a player deciding whether to use it should know which.
+    var owner_fee := int(_state.get("owner_fee_gp", 0))
+    var mine := bool(_state.get("mine", false))
+    if fee > 0 and owner_fee > 0:
+        _title.text += "  (%dg fee + %dg to the owner)" % [fee, owner_fee]
+    elif owner_fee > 0:
+        _title.text += "  (%dg to the owner)" % owner_fee
+    elif fee > 0:
         _title.text += "  (%dg per job)" % fee
+    if mine:
+        _title.text += "  — yours"
+    var denied := String(_state.get("access_error", ""))
+    if denied != "":
+        _title.text += "  — %s" % Protocol.station_error_text(denied, {})
 
     # A station you must STAY at behaves differently from one you can walk away
     # from, and finding that out by losing a job is the wrong way to learn it.

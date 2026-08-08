@@ -4508,6 +4508,32 @@ impl Proxy {
         }
     }
 
+    /// Set the caller's own access policy (#181).
+    async fn apply_station_policy(&self, pid: &str, mode: &str, fee_gp: i64, skill_floor: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "no_plot"}));
+            return;
+        };
+        match db.set_station_policy(&plot.id, pid, mode, fee_gp, skill_floor).await {
+            Ok(true) => {
+                println!("[Proxy] {pid} set plot {} to {mode} (fee {fee_gp}g)", plot.id);
+                self.push_to_player(
+                    pid,
+                    json!({
+                        "type": "station.policy", "mode": mode,
+                        "fee_gp": fee_gp.max(0), "skill_floor": skill_floor.max(0),
+                    }),
+                );
+            }
+            // An unknown mode, or a plot that is not theirs. Said out loud
+            // rather than falling through to "closed", which would look like
+            // the policy took and then quietly refuse everyone.
+            Ok(false) => self.push_to_player(pid, json!({"type": "station.error", "reason": "bad_policy"})),
+            Err(e) => eprintln!("[Proxy] set policy failed: {e}"),
+        }
+    }
+
     /// Tear down a station the caller owns, refunding its materials and fuel.
     ///
     /// Any jobs still running on it are failed FIRST, with full refunds — #168's
@@ -5132,6 +5158,57 @@ impl Proxy {
         best.map(|(_, r, t)| (r, t))
     }
 
+    /// What this player may do at this station, and what it costs them (#181).
+    ///
+    /// An authored public fixture answers "free, go ahead" — the mine yard
+    /// furnace must keep working exactly as it always has, for everyone,
+    /// including the tutorial (#169).
+    async fn station_access(
+        &self,
+        db: &Db,
+        pid: &str,
+        station: &StationRef,
+    ) -> Result<Option<(String, i64)>, &'static str> {
+        let Some(owner) = station.owner.clone() else {
+            return Ok(None); // authored fixture: public and free
+        };
+        if owner == pid {
+            return Ok(None); // an owner is never charged their own fee
+        }
+        let Ok(Some(plot)) = db.plot_for_character(&owner).await else {
+            // The owner has no plot, so this station should not exist. Refuse
+            // rather than guess.
+            return Err("closed");
+        };
+        // A lapsed lease earns its holder nothing. `station_at` already skips
+        // these, so reaching here means the state changed mid-command.
+        if plot.state != "active" {
+            return Err("closed");
+        }
+        match plot.station_mode.as_str() {
+            "public" => Ok(None),
+            "fee" => Ok(Some((owner, plot.station_fee_gp.max(0)))),
+            // The roster lands in #183. Until it exists, `roster` means nobody
+            // but the owner — the safe reading, and it must not silently behave
+            // as `public` in the meantime.
+            "roster" => Err("not_on_the_roster"),
+            _ => Err("closed"),
+        }
+    }
+
+    /// The skill floor an owner set, if any. Checked before anything is
+    /// consumed: a spoiled shaping job (#168) eats the clay, and an owner
+    /// letting novices burn their fuel has a real cost.
+    async fn station_skill_floor(&self, db: &Db, station: &StationRef) -> i64 {
+        let Some(owner) = &station.owner else { return 0 };
+        db.plot_for_character(owner)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.station_skill_floor)
+            .unwrap_or(0)
+    }
+
     /// Reload the in-memory plot-station list from the database.
     ///
     /// Cached rather than queried per proximity check, because `station_at`
@@ -5333,11 +5410,25 @@ impl Proxy {
             })
             .collect();
 
+        // What this caller will actually be charged, computed server-side.
+        // #155's lesson: a client-side copy of a server-side rule becomes a lie
+        // the moment config changes, and a fee discovered after the fact is
+        // worse than one shown before.
+        let access = self.station_access(&db, cid, &placement).await;
+        let (owner_fee_gp, access_error) = match &access {
+            Ok(Some((_, f))) => (*f, ""),
+            Ok(None) => (0, ""),
+            Err(reason) => (0, *reason),
+        };
         self.push_to_player(
             pid,
             json!({
                 "type": "station.state",
                 "station_id": placement.id,
+                "owner": placement.owner,
+                "mine": placement.owner.as_deref() == Some(cid),
+                "owner_fee_gp": owner_fee_gp,
+                "access_error": access_error,
                 "name": t.display_name,
                 "kind": if t.kind == mmo::crafting_config::StationKind::Heat { "heat" } else { "shaping" },
                 "fuel_units": fuel,
@@ -5367,6 +5458,10 @@ impl Proxy {
             self.push_to_player(pid, json!({"type": "station.error", "reason": "out_of_range"}));
             return;
         };
+        if let Err(reason) = self.station_access(&db, cid, &placement).await {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": reason}));
+            return;
+        }
         let Some(units_per) = t.fuels.get(item_id).copied() else {
             self.push_to_player(
                 pid,
@@ -5416,7 +5511,26 @@ impl Proxy {
             );
             return;
         }
+        // Whose station this is, and what they charge (#181).
+        let owner_fee = match self.station_access(&db, cid, &placement).await {
+            Ok(f) => f,
+            Err(reason) => {
+                self.push_to_player(pid, json!({"type": "station.error", "reason": reason}));
+                return;
+            }
+        };
+        let floor = self.station_skill_floor(&db, &placement).await;
         let level = db.skill_level(cid, &recipe.skill).await.unwrap_or(0);
+        if level < floor {
+            self.push_to_player(
+                pid,
+                json!({
+                    "type": "station.error", "reason": "below_owners_skill_floor",
+                    "need": floor, "have": level,
+                }),
+            );
+            return;
+        }
         if level < recipe.required_level {
             self.push_to_player(
                 pid,
@@ -5470,6 +5584,7 @@ impl Proxy {
             .start_station_job(
                 &placement.id, cid, slot, recipe_id, &recipe,
                 t.usage_fee_gold * recipe.fee_multiplier.max(1),
+                owner_fee.clone(),
                 duration.max(1), will_fail, catalyst, now_secs(),
             )
             .await
@@ -5477,6 +5592,20 @@ impl Proxy {
             Ok(Ok(_)) => {
                 self.send_inventory(pid).await;
                 self.push_gold(pid, 0, "station_fee").await;
+                // The owner is told, and their balance refreshed, so a fee
+                // arriving is visible rather than something they notice later.
+                if let Some((owner, fee)) = &owner_fee {
+                    if *fee > 0 {
+                        self.push_gold(owner, *fee, "station_rent").await;
+                        self.push_to_player(
+                            owner,
+                            json!({
+                                "type": "station.earned", "station_id": placement.id,
+                                "gold": fee, "from": pid,
+                            }),
+                        );
+                    }
+                }
                 self.send_station_state(pid).await;
             }
             Ok(Err(e)) => {
@@ -7173,6 +7302,12 @@ impl Proxy {
             // station from its own position cache on every command, exactly as
             // it does for markets.
             self.send_station_list(&player_id);
+            // The player's own purse. `gold.update` only fires when gold MOVES
+            // (#145), so before this a fresh session showed 0 gold until the
+            // player happened to earn or spend something — the balance was
+            // correct on the server and simply never sent. Found while writing
+            // #181's two-player probe, which could not read a baseline.
+            self.push_gold(&player_id, 0, "login").await;
             self.send_portal_list(&player_id);
             // The track, with every step already evaluated (#169). Sent at
             // login rather than on meeting Marlow: the counters have been
@@ -7359,11 +7494,17 @@ impl Proxy {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .and_then(|t| t.strip_prefix("station."))
-                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish"))
+                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish" | "policy"))
                     {
                         let op = op.to_string();
                         match op.as_str() {
                             "open" => self.send_station_state(&player_id).await,
+                            "policy" => {
+                                let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let fee = data.get("fee_gp").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let floor = data.get("skill_floor").and_then(|v| v.as_i64()).unwrap_or(0);
+                                self.apply_station_policy(&player_id, &mode, fee, floor).await;
+                            }
                             "demolish" => {
                                 let sid = data.get("station_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 self.apply_demolish_station(&player_id, &sid).await;
@@ -10657,7 +10798,7 @@ mod tests {
         };
         recipe.fuel_units = 2;
         let job = db
-            .start_station_job("f1", &pid, 0, "iron_ingot", &recipe, 0, 1_000, false, None, 1_000)
+            .start_station_job("f1", &pid, 0, "iron_ingot", &recipe, 0, None, 1_000, false, None, 1_000)
             .await
             .unwrap()
             .expect("smelting works without the tutorial");
@@ -14768,7 +14909,17 @@ listing_fee_min_gold = 4
             .unwrap();
 
         // The wage push carries the authoritative balance and the delta.
-        let paid = recv_until(&mut ws, "gold.update").await;
+        //
+        // Wait for the WAGE specifically rather than the first `gold.update`:
+        // #181 added a balance push at login (a fresh client showed 0 gold
+        // until money happened to move), so "the next gold update" is no longer
+        // the same thing as "the wage".
+        let paid = loop {
+            let msg = recv_until(&mut ws, "gold.update").await;
+            if msg["reason"].as_str() == Some("build_wages") {
+                break msg;
+            }
+        };
         let delta = paid["delta"].as_i64().unwrap();
         assert!(delta > 0, "building pays");
         assert_eq!(paid["reason"].as_str().unwrap(), "build_wages");

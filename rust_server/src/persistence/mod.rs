@@ -506,6 +506,47 @@ async fn grant_gold_in_tx(tx: &mut Tx<'_>, character_id: &str, amount: i64) -> R
     Ok(())
 }
 
+/// Move gold from one player to another. **No ledger entry**, deliberately.
+///
+/// `gold_ledger` records gold entering or leaving the WORLD. A transfer does
+/// neither: the sum across purses is unchanged, so ledgering it would inflate
+/// the recorded supply against unchanged purses and break the #154 identity in
+/// the direction nobody notices — `gold_supply_gap()` drifting positive while
+/// every individual balance looks right.
+///
+/// This is the first player-to-player gold movement in the game (#181). The
+/// existing split between `mint_gold_in_tx` (creates, ledgers) and
+/// `grant_gold_in_tx` (moves, does not) is exactly what makes it expressible;
+/// reaching for the wrong one here is the single most damaging mistake
+/// available in this issue.
+///
+/// Returns false if the payer cannot afford it, having moved nothing.
+async fn transfer_gold_in_tx(
+    tx: &mut Tx<'_>,
+    from: &str,
+    to: &str,
+    amount: i64,
+) -> Result<bool, DbError> {
+    if amount <= 0 || from == to {
+        return Ok(true);
+    }
+    let have: i64 = sqlx::query_scalar("SELECT gold FROM character WHERE id = ?")
+        .bind(from)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(0);
+    if have < amount {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
+        .bind(amount)
+        .bind(from)
+        .execute(&mut **tx)
+        .await?;
+    grant_gold_in_tx(tx, to, amount).await?;
+    Ok(true)
+}
+
 async fn add_storage_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT id FROM storage_item WHERE character_id = ? AND item_id = ? LIMIT 1",
@@ -1063,6 +1104,13 @@ pub struct Plot {
     pub rent_due_at: Option<i64>,
     pub rent_paid_through: Option<i64>,
     pub state: String,
+    /// Who may use the stations on this plot, and what it costs them (#181).
+    /// `"closed"` (owner only), `"public"` (free), `"fee"`, or `"roster"`.
+    pub station_mode: String,
+    /// Flat gold per station use, paid to the owner. A TRANSFER, not a burn.
+    pub station_fee_gp: i64,
+    /// Minimum skill to use them. Stops wastage rather than gating content.
+    pub station_skill_floor: i64,
     /// Whether the ticker should try to auto-deduct gold when rent comes due,
     /// rather than requiring an explicit `rent.pay` (#14; opt-in, default off).
     pub auto_pay: bool,
@@ -3628,6 +3676,10 @@ impl Db {
         recipe_id: &str,
         recipe: &crate::crafting_config::StationRecipe,
         fee_gold: i64,
+        // The plot owner and what they charge, when this is somebody's business
+        // rather than a public fixture (#181). `None` for an authored station,
+        // and for an owner using their own.
+        owner_fee: Option<(String, i64)>,
         duration_ms: i64,
         // Rolled by the caller and fixed here (#168) — see `will_fail` on the row.
         will_fail: bool,
@@ -3659,9 +3711,13 @@ impl Db {
             .fetch_optional(&mut *tx)
             .await?
             .unwrap_or(0);
-        if gold < fee_gold {
+        // BOTH fees, checked together. Checking only the world's would let a
+        // player start a job they cannot actually pay for and discover it
+        // halfway through the transaction.
+        let owed = fee_gold + owner_fee.as_ref().map(|(_, f)| *f).unwrap_or(0);
+        if gold < owed {
             tx.commit().await?;
-            return Ok(Err(StartJobError::NotEnoughGold { need: fee_gold, have: gold }));
+            return Ok(Err(StartJobError::NotEnoughGold { need: owed, have: gold }));
         }
 
         // Every ingredient, before taking any of them.
@@ -3714,15 +3770,36 @@ impl Db {
             remove_inventory_in_tx(&mut tx, character_id, &i.item, i.qty).await?;
         }
         if fee_gold > 0 {
-            // Burned, not banked. A station fee is gold leaving the world, and
-            // it goes through the ledger for the same reason market fees do —
-            // `gold_supply_gap()` has to stay 0.
+            // Burned, not banked. The WORLD's station fee is gold leaving the
+            // world, and it goes through the ledger for the same reason market
+            // fees do — `gold_supply_gap()` has to stay 0.
             sqlx::query("UPDATE character SET gold = gold - ? WHERE id = ?")
                 .bind(fee_gold)
                 .bind(character_id)
                 .execute(&mut *tx)
                 .await?;
             ledger_gold_in_tx(&mut tx, character_id, -fee_gold, "station_fee", now).await?;
+        }
+        // ...and the OWNER's fee, which is a different thing entirely (#181).
+        //
+        // This is a TRANSFER: no gold is created or destroyed, so it is NOT
+        // ledgered. Sending it through `mint_gold_in_tx` — the obvious-looking
+        // reach, since it is right there and takes a reason string — would
+        // inflate the recorded supply against unchanged purses and break the
+        // #154 identity silently.
+        //
+        // The world still takes its cut alongside. Collapsing the two would
+        // quietly delete a sink the moment any station had an owner.
+        if let Some((owner, owner_fee)) = owner_fee {
+            if !transfer_gold_in_tx(&mut tx, character_id, &owner, owner_fee).await? {
+                // Checked above, so this is a race rather than a mistake — but
+                // rolling back is the only correct answer either way.
+                tx.rollback().await?;
+                return Ok(Err(StartJobError::NotEnoughGold {
+                    need: fee_gold + owner_fee,
+                    have: gold,
+                }));
+            }
         }
 
         // The catalyst is spent here with everything else. Worn at start, its
@@ -4419,9 +4496,44 @@ impl Db {
             rent_due_at: None,
             rent_paid_through: None,
             state: "unowned".to_string(),
+            // Closed by default: a plot must never become usable by strangers
+            // without its owner deciding so (#181).
+            station_mode: "closed".to_string(),
+            station_fee_gp: 0,
+            station_skill_floor: 0,
             auto_pay: false,
             warned: false,
         })
+    }
+
+    /// Set who may use this plot's stations and what it costs (#181).
+    ///
+    /// Validated here rather than trusted from the wire: an unknown mode would
+    /// otherwise fall through `station_access`'s catch-all to "closed", which
+    /// is safe but silent — the owner would set a policy, see no error, and
+    /// find nobody could use their furnace.
+    pub async fn set_station_policy(
+        &self,
+        plot_id: &str,
+        owner: &str,
+        mode: &str,
+        fee_gp: i64,
+        skill_floor: i64,
+    ) -> Result<bool, DbError> {
+        if !matches!(mode, "closed" | "public" | "fee" | "roster") {
+            return Ok(false);
+        }
+        let n = sqlx::query(
+            "UPDATE plot SET station_mode = ?, station_fee_gp = ?, station_skill_floor = ?              WHERE id = ? AND owner_character_id = ?",
+        )
+        .bind(mode)
+        .bind(fee_gp.max(0))
+        .bind(skill_floor.max(0))
+        .bind(plot_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
     }
 
     pub async fn load_plot(&self, plot_id: &str) -> Result<Option<Plot>, DbError> {
@@ -9674,6 +9786,159 @@ mod tests {
             .sum()
     }
 
+    // --- One player charging another (#181) ---------------------------------
+
+    /// **The money identity survives a player-to-player fee.**
+    ///
+    /// This is the assertion the whole issue turns on. A burned fee is recorded
+    /// on `gold_ledger` because gold leaves the world; a TRANSFERRED fee must
+    /// not be, because none is created or destroyed. Sending it through
+    /// `mint_gold_in_tx` — the obvious-looking reach, since it is right there
+    /// and takes a reason string — would inflate the recorded supply against
+    /// unchanged purses and break #154 in the direction nobody notices.
+    #[tokio::test]
+    async fn an_owner_charging_a_user_conserves_the_money_supply() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &user, "iron_ore", 2).await;
+        carrying(&db, &user, "charcoal", 1).await;
+        db.load_station_fuel("f1", &user, "charcoal", 1, 2, 100).await.unwrap();
+
+        let (o0, u0) = (
+            db.character_gold(&owner).await.unwrap(),
+            db.character_gold(&user).await.unwrap(),
+        );
+        let world_fee = 2;
+        let owner_fee = 7;
+
+        db.start_station_job(
+            "f1", &user, 0, "iron_ingot", &a_smelt_recipe(),
+            world_fee, Some((owner.clone(), owner_fee)), 12_000, false, None, 1_000,
+        )
+        .await
+        .unwrap()
+        .expect("should start");
+
+        let (o1, u1) = (
+            db.character_gold(&owner).await.unwrap(),
+            db.character_gold(&user).await.unwrap(),
+        );
+        assert_eq!(u1, u0 - world_fee - owner_fee, "the user paid both");
+        assert_eq!(o1, o0 + owner_fee, "the owner received exactly the transfer");
+
+        // The world's cut left the world; the owner's did not.
+        let by_reason = db.gold_by_reason().await.unwrap();
+        let burned: i64 = by_reason
+            .iter()
+            .filter(|(r, _)| r == "station_fee")
+            .map(|(_, a)| *a)
+            .sum();
+        assert_eq!(burned, -world_fee, "only the world's fee is ledgered: {by_reason:?}");
+        assert!(
+            !by_reason.iter().any(|(r, _)| r == "station_rent"),
+            "a transfer must not appear on the supply ledger at all: {by_reason:?}"
+        );
+        assert_eq!(
+            db.gold_supply_gap().await.unwrap(),
+            0,
+            "THE identity: {:?}",
+            db.gold_by_reason().await.unwrap()
+        );
+    }
+
+    /// A user who cannot afford BOTH fees starts nothing and pays nothing.
+    ///
+    /// Checking only the world's fee would let a job begin that cannot be paid
+    /// for, and discover it halfway through the transaction.
+    #[tokio::test]
+    async fn a_user_who_cannot_afford_both_fees_pays_neither() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &user, "iron_ore", 2).await;
+        carrying(&db, &user, "charcoal", 1).await;
+        db.load_station_fuel("f1", &user, "charcoal", 1, 2, 100).await.unwrap();
+        let (o0, u0) = (
+            db.character_gold(&owner).await.unwrap(),
+            db.character_gold(&user).await.unwrap(),
+        );
+
+        // Affordable alone, unaffordable together.
+        let e = db
+            .start_station_job(
+                "f1", &user, 0, "iron_ingot", &a_smelt_recipe(),
+                2, Some((owner.clone(), u0)), 12_000, false, None, 1_000,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(e, Err(StartJobError::NotEnoughGold { .. })), "{e:?}");
+
+        assert_eq!(db.character_gold(&user).await.unwrap(), u0, "nothing taken");
+        assert_eq!(db.character_gold(&owner).await.unwrap(), o0, "nothing paid");
+        assert_eq!(held(&db, &user, "iron_ore").await, 2, "and no ore escrowed");
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 2, "and no fuel reserved");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// Whatever the fee, gold is conserved between the two purses. A transfer
+    /// that lost or created a coin would be invisible on any single balance.
+    #[tokio::test]
+    async fn a_transfer_moves_exactly_what_it_takes() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        let before = db.character_gold(&owner).await.unwrap() + db.character_gold(&user).await.unwrap();
+
+        for fee in [1, 13, 250] {
+            carrying(&db, &user, "iron_ore", 2).await;
+            carrying(&db, &user, "charcoal", 1).await;
+            db.load_station_fuel("f1", &user, "charcoal", 1, 2, 100).await.unwrap();
+            let job = db
+                .start_station_job(
+                    "f1", &user, 0, "iron_ingot", &a_smelt_recipe(),
+                    0, Some((owner.clone(), fee)), 12_000, false, None, 1_000,
+                )
+                .await
+                .unwrap()
+                .expect("should start");
+            db.ripen_station_jobs(2_000).await.unwrap();
+            db.collect_station_job(&job.id, &user, 0, 0, 2_000).await.unwrap().unwrap();
+        }
+
+        let after = db.character_gold(&owner).await.unwrap() + db.character_gold(&user).await.unwrap();
+        assert_eq!(after, before, "no world fee, so the two purses total the same");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
+    }
+
+    /// Setting a policy validates the mode and the ownership.
+    ///
+    /// An unknown mode falling through to "closed" would be safe but silent:
+    /// the owner sets a policy, sees no error, and finds nobody can use their
+    /// furnace.
+    #[tokio::test]
+    async fn setting_a_policy_validates_the_mode_and_the_owner() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, stranger) = (a_character(&db).await, a_character(&db).await);
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 604_800, 0).await.unwrap().unwrap();
+        assert_eq!(plot.station_mode, "closed", "closed by default, never open by accident");
+
+        assert!(db.set_station_policy(&plot.id, &owner, "fee", 5, 3).await.unwrap());
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert_eq!((p.station_mode.as_str(), p.station_fee_gp, p.station_skill_floor), ("fee", 5, 3));
+
+        assert!(!db.set_station_policy(&plot.id, &owner, "freeforall", 5, 0).await.unwrap(),
+            "an unknown mode is refused, not silently treated as closed");
+        assert!(!db.set_station_policy(&plot.id, &stranger, "public", 0, 0).await.unwrap(),
+            "somebody else's plot is not theirs to open");
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert_eq!(p.station_mode, "fee", "and neither refusal changed anything");
+
+        // A negative fee would be the owner paying the user to use their
+        // furnace — a gold faucet with someone else's hand on the tap.
+        db.set_station_policy(&plot.id, &owner, "fee", -50, -1).await.unwrap();
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert_eq!((p.station_fee_gp, p.station_skill_floor), (0, 0), "clamped, never negative");
+    }
+
     // --- Player-built stations on plots (#180) ------------------------------
 
     async fn a_plot_for(db: &Db, cid: &str) -> String {
@@ -9875,7 +10140,7 @@ mod tests {
         carrying(&db, &cid, "clay_lump", 5).await;
         let job = db
             .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
-                               0, 6_000, true, None, 1)
+                               0, None, 6_000, true, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9901,7 +10166,7 @@ mod tests {
         carrying(&db, &cid, "clay_lump", 4).await;
         let job = db
             .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
-                               0, 6_000, false, None, 1)
+                               0, None, 6_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9925,7 +10190,7 @@ mod tests {
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
             .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(),
-                               0, 12_000, false, None, 1)
+                               0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9948,7 +10213,7 @@ mod tests {
         carrying(&db, &cid, "clay_lump", 4).await;
         let job = db
             .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
-                               0, 6_000, false, None, 1)
+                               0, None, 6_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9981,7 +10246,7 @@ mod tests {
         let mut recipe = a_smelt_recipe();
         recipe.fuel_units = 0;
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, 12_000, false,
+            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, None, 12_000, false,
                                Some((crucible.id.clone(), 1, 25.0)), 1)
             .await
             .unwrap()
@@ -10020,7 +10285,7 @@ mod tests {
         let mut recipe = a_smelt_recipe();
         recipe.fuel_units = 0;
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, 12_000, false,
+            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, None, 12_000, false,
                                Some((crucible.id.clone(), 1, 25.0)), 1)
             .await
             .unwrap()
@@ -10089,7 +10354,7 @@ mod tests {
 
         let r = a_smelt_recipe();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, None, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .expect("should start");
@@ -10113,7 +10378,7 @@ mod tests {
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let r = a_smelt_recipe();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 0, None, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .unwrap();
@@ -10146,20 +10411,20 @@ mod tests {
         let r = a_smelt_recipe();
         // A fills both their slots.
         for slot in 0..2 {
-            db.start_station_job("f1", &a, slot, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
+            db.start_station_job("f1", &a, slot, "iron_ingot", &r, 0, None, 12_000, false, None, 1_000)
                 .await
                 .unwrap()
                 .expect("A's own slots are free");
         }
         assert!(
             matches!(
-                db.start_station_job("f1", &a, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000).await.unwrap(),
+                db.start_station_job("f1", &a, 0, "iron_ingot", &r, 0, None, 12_000, false, None, 1_000).await.unwrap(),
                 Err(StartJobError::SlotBusy)
             ),
             "A's slot 0 is taken"
         );
         // B is unaffected — same station, same slot number, different player.
-        db.start_station_job("f1", &b, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
+        db.start_station_job("f1", &b, 0, "iron_ingot", &r, 0, None, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .expect("B's slot 0 is their own");
@@ -10179,19 +10444,19 @@ mod tests {
         let gold0 = db.character_gold(&cid).await.unwrap();
 
         // No ore, no fuel.
-        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1).await.unwrap();
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, None, 12_000, false, None, 1).await.unwrap();
         assert!(matches!(e, Err(StartJobError::MissingInput { .. })), "{e:?}");
 
         // Ore but still no fuel.
         carrying(&db, &cid, "iron_ore", 2).await;
-        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1).await.unwrap();
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, None, 12_000, false, None, 1).await.unwrap();
         assert!(matches!(e, Err(StartJobError::NotEnoughFuel { need: 2, have: 0 })), "{e:?}");
 
         // Fuel, but not enough gold for the fee.
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let e = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, gold0 + 1, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, gold0 + 1, None, 12_000, false, None, 1)
             .await
             .unwrap();
         assert!(matches!(e, Err(StartJobError::NotEnoughGold { .. })), "{e:?}");
@@ -10228,7 +10493,7 @@ mod tests {
 
         // Smelted, paying the station fee — gold BURNED.
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000,
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, None, 12_000,
                                false, None, 1_000)
             .await
             .unwrap()
@@ -10285,7 +10550,7 @@ mod tests {
         bulk.output_qty = 4;
         bulk.fuel_units = 8;
         bulk.fee_multiplier = 4;
-        db.start_station_job("f1", &cid, 0, "iron_ingot_x4", &bulk, 2 * 4, 48_000,
+        db.start_station_job("f1", &cid, 0, "iron_ingot_x4", &bulk, 2 * 4, None, 48_000,
                              false, None, 1_000)
             .await
             .unwrap()
@@ -10306,7 +10571,7 @@ mod tests {
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let gold0 = db.character_gold(&cid).await.unwrap();
 
-        db.start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000, false, None, 1)
+        db.start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -10332,7 +10597,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -10362,7 +10627,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -10402,7 +10667,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -10429,7 +10694,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -10458,7 +10723,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .unwrap();
@@ -10484,7 +10749,7 @@ mod tests {
         assert_eq!(db.station_fuel("f1").await.unwrap(), 4);
 
         carrying(&db, &b, "iron_ore", 2).await;
-        db.start_station_job("f1", &b, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+        db.start_station_job("f1", &b, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .expect("B burns the fire A lit");
@@ -10501,7 +10766,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, None, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
