@@ -76,6 +76,7 @@ var _rent_panel_down := false
 ## to one sends `market.open` exactly once rather than every frame in range.
 var _market_entity := ""
 var _station: StationPanel
+var _tutorial: TutorialPanel
 ## The authored station placements (#167) and which one we last announced
 ## arriving at. Client-side proximity decides when to ASK; the server decides
 ## whether the answer is yes.
@@ -142,6 +143,9 @@ func _ready() -> void:
     _station = StationPanel.new()
     _station.visible = false
     add_child(_station)
+
+    _tutorial = TutorialPanel.new()
+    add_child(_tutorial)
 
     _hotbar = HotbarPanel.new()
     add_child(_hotbar)
@@ -409,6 +413,12 @@ func _wire_signals() -> void:
     # Stations (#167). The panel is a view of `station.state` and nothing else;
     # every button round-trips to the server, which re-checks range itself.
     _net.station_list.connect(func(stations): _stations = stations)
+    # The track (#169). A view of the server's evaluation and nothing else —
+    # the client never decides a step is done.
+    _net.tutorial_state.connect(func(steps, done, total): _tutorial.set_track(steps, done, total))
+    _net.tutorial_complete.connect(func(item, qty):
+        _tutorial.note_complete(item, qty)
+        _hud.flash_announce("Kedron Cut: done. Marlow leaves you %d %s." % [qty, item]))
     _net.station_state.connect(func(state): _station.set_state(state))
     _net.station_closed.connect(func():
         _station.visible = false

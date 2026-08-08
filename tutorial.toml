@@ -1,0 +1,118 @@
+# Foreman Marlow's handouts and the tutorial track (mine epic #164, issue #169).
+#
+# THIS FILE IS OPTIONAL. Delete it and there is no tutorial and no handouts —
+# which is a perfectly playable world, because NOTHING IS GATED BEHIND THE
+# TRACK. That is a property worth stating rather than assuming: a player who
+# ignores Marlow entirely can mine, smelt, throw pots and sell them exactly as
+# well as one who follows him. The track is a set of hints that tick themselves,
+# not a gate.
+#
+# A malformed condition REFUSES THE BOOT naming the step it came from, same
+# contract as market.toml (#152) and crafting.toml (#166). That is not
+# pedantry here: a handout condition that failed silently at runtime would
+# either mean nobody can ever get a pickaxe, or everybody can farm them.
+
+# ===========================================================================
+# HANDOUTS — valves, not gifts.
+#
+# Bram (#160) set this contract for the sword: hand one over only when the
+# player has NONE AT ALL, so losing yours is never a dead end and dropping one
+# is never a farm. Marlow does the same for the pickaxe with a stronger
+# condition, because a pickaxe is worth more to a farmer than a sword is.
+# ===========================================================================
+
+# The pickaxe valve. Removes exactly one failure mode: the player with no
+# pickaxe, no ore, and no coin to buy either — genuinely stuck, through no
+# decision they'd recognise as a decision.
+#
+# THREE CONDITIONS, and each closes a different farm:
+#   no_item pickaxe          — you already have one
+#   inventory_below iron_ore — you have ore, so you evidently had a pickaxe
+#                              recently and dropping it is not a supply line
+#   cooldown_secs            — and even at rock bottom, not on demand
+#
+# The ore condition is the interesting one. Without it a player could mine a
+# stack, drop the pickaxe, and collect a fresh one — turning the safety net
+# into a free tool tap. With it, the valve only opens for someone who has
+# nothing to show for having had a tool.
+[[handout]]
+npc = "npc_mine_foreman"
+item = "pickaxe"
+qty = 1
+cooldown_secs = 600
+when = ["no_item pickaxe", "inventory_below iron_ore 1"]
+line = "No pick, no ore, and that face. Here — try not to leave this one down a hole."
+
+# The charcoal bundle, ONCE, ever.
+#
+# The furnace needs fuel; fuel means charcoal; charcoal means the whole
+# woodcutting chain. Gating the smelting lesson behind that is bad first-hour
+# pacing — the player is standing in front of a furnace being told to go find
+# an axe. Ten is enough to run several jobs and learn the mechanic, and nowhere
+# near enough to skip woodcutting forever.
+#
+# It fires once the player has ore to smelt, so it arrives exactly when the
+# furnace becomes interesting rather than as a lump of stuff at hello.
+[[handout]]
+npc = "npc_mine_foreman"
+item = "charcoal"
+qty = 10
+once = true
+when = ["gained iron_ore 2"]
+line = "Got ore? Then you'll want this. Charcoal — the fire doesn't light itself."
+
+# ===========================================================================
+# THE TRACK — the seed of a quest system, and deliberately only the seed.
+#
+# There is no branching, no prerequisite graph, no reward tiers and no
+# generalisation, because there is exactly one track to generalise from. The
+# second one is what should force those decisions, not this one.
+#
+# EVERY STEP COMPLETES BY DOING THE THING. None of them completes by talking to
+# anyone, which means a player who already knows the game finishes the track
+# incidentally and never has to click through dialogue to be allowed to play.
+# It also means steps done BEFORE meeting Marlow are already ticked when they
+# do meet him — the counters run for everyone from login, so there is no start
+# event to have missed.
+# ===========================================================================
+
+[[step]]
+id = "take_pickaxe"
+text = "Get a pickaxe — Marlow keeps spares."
+when = "has_item pickaxe"
+
+[[step]]
+id = "mine_clay"
+text = "Work a clay seam near the mine mouth for 4 clay."
+when = "gained clay_lump 4"
+
+[[step]]
+id = "mine_iron"
+text = "Go deeper. Iron misses often — 4 ore is a few minutes' work."
+when = "gained iron_ore 4"
+
+[[step]]
+id = "load_fuel"
+text = "Load charcoal into the furnace in the yard. A cold furnace does nothing."
+when = "loaded_fuel"
+
+[[step]]
+id = "smelt_ingot"
+text = "Smelt an iron ingot. It takes time — start it and go back to mining."
+when = "made iron_ingot"
+
+[[step]]
+id = "shape_crucible"
+text = "At the wheel, throw a crucible. Clay spoils sometimes; that's the job."
+when = "made greenware_crucible"
+
+[[step]]
+id = "fire_crucible"
+text = "Fire it in the furnace. Then smelt with it loaded and see the difference."
+when = "made clay_crucible"
+
+# A handful of clay: enough for another crucible or two, so finishing the track
+# hands the player their next action rather than a trophy.
+[[reward]]
+item = "clay_lump"
+qty = 6
