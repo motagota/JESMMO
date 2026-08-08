@@ -164,6 +164,11 @@ signal station_demolished(station_id: String, refunded: Array, fuel_lost: int)
 signal station_policy(mode: String, fee_gp: int, skill_floor: int)
 ## Somebody paid to use your station.
 signal station_earned(station_id: String, gold: int, from_player: String)
+## Your plot's roster (#183). Expired grants are included, not hidden: an owner
+## should see that somebody lapsed rather than silently find them missing.
+signal plot_roster(plot_id: String, grants: Array)
+signal plot_granted(plot_id: String, role: String, days: int)
+signal plot_revoked(plot_id: String)
 ## The tutorial track (#169), fully evaluated server-side.
 signal tutorial_state(steps: Array, done: int, total: int)
 signal tutorial_complete(item: String, qty: int)
@@ -481,6 +486,15 @@ func _handle_text(text: String) -> void:
                 String(msg.get("station_id", "")),
                 int(msg.get("gold", 0)),
                 String(msg.get("from", "")))
+        Protocol.S_PLOT_ROSTER:
+            plot_roster.emit(String(msg.get("plot_id", "")), msg.get("grants", []))
+        Protocol.S_PLOT_GRANTED:
+            plot_granted.emit(
+                String(msg.get("plot_id", "")),
+                String(msg.get("role", "")),
+                int(msg.get("days", 0)))
+        Protocol.S_PLOT_REVOKED:
+            plot_revoked.emit(String(msg.get("plot_id", "")))
         Protocol.S_STATION_DEMOLISHED:
             station_demolished.emit(
                 String(msg.get("station_id", "")),
@@ -827,6 +841,16 @@ func send_station_policy(
     _send({"type": Protocol.C_STATION_POLICY, "mode": mode,
            "fee_gp": fee_gp, "skill_floor": skill_floor,
            "fee_in_kind": fee_in_kind, "fee_in_kind_max_gp": fee_in_kind_max_gp})
+
+func send_station_grant(character_id: String, role: String, days: int = 30) -> void:
+    _send({"type": Protocol.C_STATION_GRANT, "character_id": character_id,
+           "role": role, "days": days})
+
+func send_station_revoke(character_id: String) -> void:
+    _send({"type": Protocol.C_STATION_REVOKE, "character_id": character_id})
+
+func send_station_roster() -> void:
+    _send({"type": Protocol.C_STATION_ROSTER})
 
 func send_station_demolish(station_id: String) -> void:
     _send({"type": Protocol.C_STATION_DEMOLISH, "station_id": station_id})

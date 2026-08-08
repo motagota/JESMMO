@@ -422,6 +422,24 @@ const S_STATION_POLICY := "station.policy"
 ## Somebody paid to use your station. The first player-to-player gold in the
 ## game — a TRANSFER, not minted, so it never touches the supply ledger.
 const S_STATION_EARNED := "station.earned"
+## The roster (#183): who else may use your plot's stations. Every grant
+## expires — without that, a guild that stops playing leaves a plot rostered to
+## people who will never log in again.
+const C_STATION_GRANT := "station.grant"
+const C_STATION_REVOKE := "station.revoke"
+const C_STATION_ROSTER := "station.roster"
+const S_PLOT_ROSTER := "plot.roster"
+const S_PLOT_GRANTED := "plot.granted"
+const S_PLOT_REVOKED := "plot.revoked"
+
+## What a role means, in one line each, for the roster panel.
+static func role_text(role: String) -> String:
+    match role:
+        "manager": return "Manager — works, stocks, and takes finished goods"
+        "worker": return "Worker — works and stocks, takes nothing out"
+        "patron": return "Patron — may use the stations, and pays the fee"
+        _: return role
+
 const C_STATION_DEMOLISH := "station.demolish"
 const S_STATION_DEMOLISHED := "station.demolished"
 const S_STATION_STATE := "station.state"
@@ -455,6 +473,7 @@ static func station_error_text(reason: String, d: Dictionary) -> String:
         "below_owners_skill_floor": return "The owner asks for level %d here (you are %d)." % [int(d.get("need", 0)), int(d.get("have", 0))]
         "no_plot": return "You have no plot to set a policy on."
         "bad_policy": return "That policy was refused."
+        "bad_grant": return "That grant was refused — check the name and the role."
         "no_fuel_to_load": return "You have none to load."
         "no_such_recipe": return "No such recipe."
         "wrong_station": return "That can't be made here."
