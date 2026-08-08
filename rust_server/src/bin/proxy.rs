@@ -4686,17 +4686,65 @@ impl Proxy {
             (c.x, c.y, c.zone.clone())
         };
         let interior = self.zone_is_interior(&zone);
-        self.zone_cfg.station.iter().find_map(|st| {
+        // NEAREST, not first-in-config-order. Two stations whose radii overlap
+        // are authored out by validation, but order-dependence would still be
+        // the wrong rule: the client picks the nearest, and a server that
+        // picked the first would put the two into quiet disagreement about
+        // which station the player is even standing at. (It did — the mine
+        // yard's wheel and furnace were 40 apart with radius 40, and the live
+        // probe walked to the wheel and was handed the furnace.)
+        let mut best: Option<(i64, &mmo::zone_config::StationPlacement, &mmo::crafting_config::StationType)> = None;
+        for st in self.zone_cfg.station.iter() {
             // A surface station is unreachable from inside an interior and vice
             // versa, whatever the coordinates say.
             match (&st.interior, interior) {
                 (Some(z), true) if *z == zone => {}
                 (None, false) => {}
-                _ => return None,
+                _ => continue,
             }
-            let t = self.crafting_cfg.station(&st.kind)?;
-            (dist2(px, py, st.pos.0, st.pos.1) <= (t.radius as i64).pow(2)).then_some((st, t))
-        })
+            let Some(t) = self.crafting_cfg.station(&st.kind) else { continue };
+            let d2 = dist2(px, py, st.pos.0, st.pos.1);
+            if d2 > (t.radius as i64).pow(2) {
+                continue;
+            }
+            if best.map(|(bd, _, _)| d2 < bd).unwrap_or(true) {
+                best = Some((d2, st, t));
+            }
+        }
+        best.map(|(_, st, t)| (st, t))
+    }
+
+    /// Refuse to boot on two stations whose radii overlap (#168).
+    ///
+    /// This is validated HERE rather than in `zone_config` because it needs both
+    /// files: `zones.toml` has the positions, `crafting.toml` has the radii, and
+    /// neither can see the other. It has to be validated somewhere, though —
+    /// overlapping stations mean a player standing between them can only ever
+    /// reach one, and which one depends on a distance comparison they cannot
+    /// see. The mine yard shipped exactly that for an afternoon: a wheel and a
+    /// furnace 40 apart, both with radius 40.
+    fn check_station_spacing(&self) {
+        let placed: Vec<_> = self
+            .zone_cfg
+            .station
+            .iter()
+            .filter_map(|st| self.crafting_cfg.station(&st.kind).map(|t| (st, t)))
+            .collect();
+        for (i, (a, ta)) in placed.iter().enumerate() {
+            for (b, tb) in placed.iter().skip(i + 1) {
+                if a.interior != b.interior {
+                    continue;
+                }
+                let need = ta.radius + tb.radius;
+                let d2 = dist2(a.pos.0, a.pos.1, b.pos.0, b.pos.1);
+                if d2 < (need as i64).pow(2) {
+                    panic!(
+                        "stations `{}` and `{}` are {:.0} units apart but their radii total {need}                          — they overlap, so standing between them would reach whichever the                          distance check happened to favour. Move one, or shrink a radius.",
+                        a.id, b.id, (d2 as f64).sqrt()
+                    );
+                }
+            }
+        }
     }
 
     /// The authored station placements, so the client knows where to expect one.
@@ -4769,6 +4817,16 @@ impl Proxy {
                     "skill": r.skill,
                     "required_level": r.required_level,
                     "locked": level < r.required_level,
+                    // The caller's ACTUAL odds at their level, not the recipe's
+                    // base — same reasoning as `duration_ms` above. A player
+                    // deciding whether to risk two clay should be shown the
+                    // number that will really be rolled.
+                    "failure_pct": (self.crafting_cfg.skill(&r.skill)
+                        .failure_chance(r.failure_chance, level) * 100.0 * 10.0).round() / 10.0,
+                    "catalyst": r.catalyst.as_ref().map(|c| json!({
+                        "item": c.item, "bonus_chance": c.bonus_chance,
+                        "speed_bonus_pct": c.speed_bonus_pct,
+                    })),
                 })
             })
             .collect();
@@ -4802,6 +4860,10 @@ impl Proxy {
                     .collect::<Vec<_>>(),
                 "job_slots": t.job_slots,
                 "usage_fee_gold": t.usage_fee_gold,
+                // The panel has to say this out loud (#168): a station you must
+                // stay at behaves differently from one you can walk away from,
+                // and discovering that by losing a job is the wrong way to learn.
+                "requires_presence": t.requires_presence,
                 "skill_level": level,
                 "recipes": recipes,
                 "jobs": jobs,
@@ -4894,11 +4956,34 @@ impl Proxy {
             return;
         };
 
-        let duration = self.crafting_cfg.skill(&recipe.skill).swing_time_ms(recipe.duration_ms, level);
+        let curve = self.crafting_cfg.skill(&recipe.skill);
+        let mut duration = curve.swing_time_ms(recipe.duration_ms, level);
+
+        // The catalyst (#168), if they have one with life left in it. Entirely
+        // optional: a smelt with no crucible is a perfectly ordinary smelt, and
+        // that is deliberate — a required catalyst would mean a clay shortage
+        // stalls the whole iron economy.
+        let mut catalyst: Option<(String, i64, f64)> = None;
+        if let Some(c) = &recipe.catalyst {
+            if let Ok(Some(eq)) = db.equipped_tool(cid, "catalyst").await {
+                if eq.item_id == c.item && eq.durability > 0 {
+                    duration = (duration as f64 * (1.0 - c.speed_bonus_pct / 100.0)).round() as i64;
+                    catalyst = Some((eq.instance_id, c.wear, c.bonus_chance));
+                }
+            }
+        }
+
+        // Rolled HERE and fixed on the row, not at collect. Whether an attempt
+        // spoils decides whether its inputs come back, and that is a custody
+        // question — custody is settled when the goods change hands, not when
+        // the player gets round to clicking Collect.
+        let fail_chance = curve.failure_chance(recipe.failure_chance, level);
+        let will_fail = fail_chance > 0.0 && rand::random::<f64>() < fail_chance;
+
         match db
             .start_station_job(
                 &placement.id, cid, slot, recipe_id, &recipe,
-                t.usage_fee_gold, duration, now_secs(),
+                t.usage_fee_gold, duration.max(1), will_fail, catalyst, now_secs(),
             )
             .await
         {
@@ -4945,11 +5030,26 @@ impl Proxy {
             return;
         };
         let level = db.skill_level(cid, &job.skill).await.unwrap_or(0);
-        let chance = self.crafting_cfg.skill(&job.skill).bonus_yield_chance(level);
+        // Two independent chances at one extra unit: the player's skill, and the
+        // crucible they burned. `catalyst_bonus` was recorded when the crucible
+        // was worn, so a crucible that has since broken or been traded away
+        // still pays out on the job it funded.
+        let chance = self.crafting_cfg.skill(&job.skill).bonus_yield_chance(level) * 100.0
+            + job.catalyst_bonus;
         let bonus = if job.state == "ready" && rand::random::<f64>() * 100.0 < chance { 1 } else { 0 };
+        // What a spoiled attempt still teaches. Zero if the recipe is gone —
+        // there is nothing left to read the fraction off, and a refunded job
+        // grants nothing anyway.
+        let spoiled_xp = self
+            .crafting_cfg
+            .recipe(&job.recipe_id)
+            .map(|r| (job.xp as f64 * r.failure_xp_fraction).round() as i64)
+            .unwrap_or(0);
 
-        match db.collect_station_job(job_id, cid, bonus, now_secs()).await {
+        match db.collect_station_job(job_id, cid, bonus, spoiled_xp, now_secs()).await {
             Ok(Ok(done)) => {
+                // Spoiled attempts included: failure that teaches nothing is
+                // just a tax, and `done.xp` already carries the reduced figure.
                 if !done.failed && done.xp > 0 && !done.skill.is_empty() {
                     if let Ok(gain) = db.grant_skill_xp(cid, &done.skill, done.xp).await {
                         self.push_skill_gain(pid, &gain);
@@ -4962,6 +5062,7 @@ impl Proxy {
                         "type": "station.collected",
                         "slot": done.slot,
                         "failed": done.failed,
+                        "spoiled": done.spoiled,
                         "fail_reason": done.fail_reason,
                         "bonus": bonus,
                         "items": done.payout.iter().map(|(i, q)| json!({"item": i, "qty": q}))
@@ -4990,6 +5091,65 @@ impl Proxy {
                 self.push_to_player(pid, msg);
             }
             Err(e) => eprintln!("[Proxy] collect job failed: {e}"),
+        }
+    }
+
+    /// Cancel every running job whose owner has walked away from a station that
+    /// requires them to stay (#168).
+    ///
+    /// `requires_presence` was declared on `StationType` in #167 and read
+    /// nowhere — dead config, which is the same trap the mine epic has now hit
+    /// three times. The wheel is what makes it real: shaping is an ACTIVE
+    /// action, and walking away has to stop it.
+    ///
+    /// Cancelling refunds everything. That is the deliberate asymmetry with
+    /// spoiling: losing clay to bad luck is the mechanic, losing it to a
+    /// disconnect is a bug wearing the mechanic's clothes.
+    async fn cancel_absent_station_jobs(&self) {
+        let Some(db) = self.db.clone() else { return };
+        let watched: Vec<(String, i64)> = self
+            .zone_cfg
+            .station
+            .iter()
+            .filter_map(|st| {
+                let t = self.crafting_cfg.station(&st.kind)?;
+                t.requires_presence.then(|| (st.id.clone(), 0))
+            })
+            .collect();
+        if watched.is_empty() {
+            return;
+        }
+        let jobs = db.all_station_jobs().await.unwrap_or_default();
+        for job in jobs {
+            if job.state != "running" || !watched.iter().any(|(id, _)| *id == job.station_id) {
+                continue;
+            }
+            // Still standing there? `station_at` answers with the gateway's own
+            // position cache, so this is the same test the start had to pass.
+            let present = self
+                .station_at(&job.character_id)
+                .map(|(st, _)| st.id == job.station_id)
+                .unwrap_or(false);
+            if present {
+                continue;
+            }
+            if let Ok(Some(cancelled)) = db.cancel_station_job(&job.id, now_secs()).await {
+                println!(
+                    "[Proxy] Cancelled {} at {} — walked away; escrow returned",
+                    cancelled.recipe_id, cancelled.station_id
+                );
+                let pid = cancelled.character_id.clone();
+                self.push_to_player(
+                    &pid,
+                    json!({
+                        "type": "station.cancelled", "station_id": cancelled.station_id,
+                        "slot": cancelled.slot, "recipe_id": cancelled.recipe_id,
+                        "reason": "walked_away",
+                    }),
+                );
+                self.send_inventory(&pid).await;
+                self.send_station_state(&pid).await;
+            }
         }
     }
 
@@ -5026,6 +5186,9 @@ impl Proxy {
     async fn station_job_monitor(&self) {
         loop {
             sleep(Duration::from_secs(1)).await;
+            // Presence first: a job the player abandoned should be handed back
+            // rather than ripened into something they then have to walk back for.
+            self.cancel_absent_station_jobs().await;
             self.sweep_station_jobs().await;
         }
     }
@@ -7016,6 +7179,10 @@ impl Proxy {
         // Station jobs (#167): ripen what is due. A sweep rather than a timer
         // per job, because `ready_at` is absolute — a job started before a
         // restart finishes on time with nothing to reschedule at boot.
+        // Config sanity before anything can use it. A panic here is correct:
+        // an overlapping pair is unfixable at runtime and silently wrong.
+        self.check_station_spacing();
+
         let me = self.clone();
         tokio::spawn(async move { me.station_job_monitor().await });
 
@@ -12557,6 +12724,62 @@ listing_fee_min_gold = 4
 
         assert_eq!(at_furnace, vec!["iron_ingot"]);
         assert_eq!(at_wheel, vec!["clay_pot"]);
+    }
+
+    /// Overlapping stations refuse to boot.
+    ///
+    /// A player standing in the overlap can only ever reach one of them, and
+    /// which one depends on a distance comparison they cannot see. The mine
+    /// yard shipped exactly this pair for an afternoon — the live probe walked
+    /// to the wheel and was handed the furnace.
+    #[test]
+    #[should_panic(expected = "overlap")]
+    fn two_stations_within_each_others_radius_refuse_to_boot() {
+        // Both stations sit at (100, 100), but one is underground — those are
+        // different places, so bring the wheel to the surface to collide.
+        let mut cfg = a_station_world().0;
+        cfg.station[1].interior = None;
+        let mut q = Proxy::new("127.0.0.1", 0, 0, 0, None);
+        {
+            let m = Arc::get_mut(&mut q).expect("not yet shared");
+            m.zone_cfg = cfg;
+            m.crafting_cfg = a_station_world().1;
+        }
+        q.check_station_spacing();
+    }
+
+    /// ...and the ones we actually ship are spaced properly.
+    #[test]
+    fn the_shipped_stations_do_not_overlap() {
+        let p = Proxy::new("127.0.0.1", 0, 0, 0, None);
+        p.check_station_spacing(); // panics if they do
+    }
+
+    /// The nearest station wins, not the first in config order. The client
+    /// picks the nearest, and a server that picked the first would put the two
+    /// into quiet disagreement about where the player is standing.
+    #[test]
+    fn station_at_picks_the_nearest_not_the_first_listed() {
+        let (mut zones, crafting) = a_station_world();
+        // Two surface stations, deliberately overlapping so both are in range.
+        zones.station[1].interior = None;
+        zones.station[1].pos = (140, 100);
+        let mut p = Proxy::new("127.0.0.1", 0, 0, 0, None);
+        {
+            let m = Arc::get_mut(&mut p).expect("not yet shared");
+            m.zone_cfg = zones;
+            m.crafting_cfg = crafting;
+        }
+        add_zone_region(&p, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+
+        stand(&p, "u", 110, 100, "zone_a"); // 10 from the furnace, 30 from the wheel
+        assert_eq!(p.station_at("u").map(|(s, _)| s.id.clone()), Some("yard_furnace".into()));
+        stand(&p, "u", 135, 100, "zone_a"); // 35 from the furnace, 5 from the wheel
+        assert_eq!(
+            p.station_at("u").map(|(s, _)| s.id.clone()),
+            Some("deep_wheel".into()),
+            "the nearer one, even though the furnace is listed first"
+        );
     }
 
     /// The shipped configs have to agree with each other: every placed station

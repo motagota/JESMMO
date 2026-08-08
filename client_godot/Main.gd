@@ -417,9 +417,20 @@ func _wire_signals() -> void:
         _station.note(Protocol.station_error_text(reason, detail)))
     _net.station_ready.connect(func(_sid, _jid, _slot, item, qty):
         _hud.flash_announce("%s x%d is ready" % [item, qty]))
-    _net.station_collected.connect(func(_slot, failed, fail_reason, bonus, items):
+    _net.station_cancelled.connect(func(_sid, _slot, _recipe, reason):
+        var text := Protocol.job_cancel_text(reason)
+        _station.note(text)
+        _hud.flash_announce(text))
+    _net.station_collected.connect(func(_slot, failed, spoiled, fail_reason, bonus, items):
         if failed:
             _station.note(Protocol.job_fail_text(fail_reason))
+            return
+        # A spoil is not a refund and must not be worded like one — the clay is
+        # genuinely gone, and softening that would just move the surprise.
+        if spoiled:
+            var lost := "It came out wrong. The clay is lost, but you learned something."
+            _station.note(lost)
+            _hud.flash_announce(lost)
             return
         var parts: Array[String] = []
         for it in items:

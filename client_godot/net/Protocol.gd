@@ -413,6 +413,9 @@ const S_STATION_CLOSED := "station.closed"
 const S_STATION_READY := "station.ready"
 const S_STATION_COLLECTED := "station.collected"
 const S_STATION_ERROR := "station.error"
+## A presence-required job (#168) ended because you walked away. Distinct from
+## a spoil: everything comes back, so the wording must not read as a loss.
+const S_STATION_CANCELLED := "station.cancelled"
 
 ## Prose for a `station.error` reason. The server sends a code and the numbers;
 ## the wording lives here.
@@ -434,6 +437,13 @@ static func station_error_text(reason: String, d: Dictionary) -> String:
         "no_room": return "Your pack is full — it will wait in the slot."
         "no_such_job": return "That job is gone."
         _: return reason
+
+## Why a presence-required job stopped. Everything was returned, and saying so
+## is the point — an unexplained job vanishing reads as materials lost.
+static func job_cancel_text(reason: String) -> String:
+    match reason:
+        "walked_away": return "You left the wheel — your materials came back."
+        _: return "The job stopped — your materials came back."
 
 ## Why a job failed, in words. A refund with no explanation reads as a bug.
 static func job_fail_text(reason: String) -> String:

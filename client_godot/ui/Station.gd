@@ -124,6 +124,11 @@ func _redraw() -> void:
     if fee > 0:
         _title.text += "  (%dg per job)" % fee
 
+    # A station you must STAY at behaves differently from one you can walk away
+    # from, and finding that out by losing a job is the wrong way to learn it.
+    if bool(_state.get("requires_presence", false)):
+        _title.text += "  — stay at the wheel"
+
     var fuel := int(_state.get("fuel_units", 0))
     var is_heat := String(_state.get("kind", "")) == "heat"
     _fuel_bar.visible = is_heat
@@ -202,6 +207,16 @@ func _slot_row(index: int, job: Dictionary) -> Control:
     var state := String(job.get("state", "running"))
     var out := String(job.get("output_item", ""))
     var qty := int(job.get("output_qty", 1))
+    if state == "spoiled":
+        # NOT a refund. The clay is gone and saying otherwise would be a lie the
+        # player discovers at their inventory rather than here.
+        label.text = "  Slot %d — it came out wrong. The clay is lost." % (index + 1)
+        var b := Button.new()
+        b.text = "Clear"
+        b.pressed.connect(func(): do_collect.emit(String(job.get("id", ""))))
+        row.add_child(b)
+        return row
+
     if state == "failed":
         # A refund with no explanation reads as a bug, so the reason is shown
         # and the button says what it will actually hand back.
@@ -259,6 +274,16 @@ func _recipe_row(r: Dictionary, fuel: int, slots_full: bool) -> Control:
     ]
     if need_fuel > 0:
         label.text += ", %d fuel" % need_fuel
+    # The player's ACTUAL odds at their level, as the server computed them. A
+    # decision to risk two clay should be made against the real number.
+    var fail_pct := float(r.get("failure_pct", 0.0))
+    if fail_pct > 0.0:
+        label.text += "  ⚠ %.0f%% spoil" % fail_pct
+    var cat = r.get("catalyst")
+    if cat != null:
+        label.text += "  (+%.0f%% with a %s)" % [
+            float(cat.get("bonus_chance", 0.0)), String(cat.get("item", "")),
+        ]
     row.add_child(label)
 
     var b := Button.new()

@@ -253,3 +253,16 @@ pos = [569, 70]
 id = "furnace_mine_yard"
 type = "furnace"
 pos = [12860, 13520]
+
+# The potter's wheel, beside the furnace in the mine yard. Shaping and firing
+# are two stations 40 units apart on purpose: the walk between them is what
+# makes the two stages feel like two stages.
+[[station]]
+id = "wheel_mine_yard"
+type = "potters_wheel"
+# 100 units from the furnace at (12860, 13520), not 40. Both have a 40-unit
+# radius, so at 40 apart they OVERLAPPED — a player standing at the wheel was
+# inside the furnace's radius too, and which one they got depended on a
+# distance comparison they could not see. `check_station_spacing` now refuses
+# to boot on that, but the real fix is that shaping and firing are two places.
+pos = [12960, 13520]
