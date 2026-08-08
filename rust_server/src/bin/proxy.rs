@@ -129,6 +129,7 @@ const DEFAULT_MARKET_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../mar
 /// manifest dir for the same reason as the market config: the proxy runs with
 /// its cwd set to `rust_server/`, so a cwd-relative path would silently miss.
 const DEFAULT_ZONE_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones.toml");
+const DEFAULT_CRAFTING_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../crafting.toml");
 
 /// Load the repo-root `market.toml` (#152), or **refuse to start**.
 ///
@@ -147,6 +148,19 @@ const DEFAULT_ZONE_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zones
 /// interiors", which is exactly the world before this issue. A PRESENT but
 /// broken one is fatal — a layout that would strand players is not something to
 /// discover by watching one fall through the floor.
+/// Deposit/station/recipe tuning (#166). Missing means none; malformed is fatal.
+fn load_crafting_config() -> mmo::crafting_config::CraftingConfig {
+    let path = std::env::var("CRAFTING_CONFIG")
+        .unwrap_or_else(|_| DEFAULT_CRAFTING_CONFIG.to_string());
+    match mmo::crafting_config::CraftingConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[Proxy] FATAL: {e}");
+            panic!("crafting config is unusable — refusing to start");
+        }
+    }
+}
+
 fn load_zone_config() -> mmo::zone_config::ZoneConfig {
     let path = std::env::var("ZONE_CONFIG").unwrap_or_else(|_| DEFAULT_ZONE_CONFIG.to_string());
     match mmo::zone_config::ZoneConfig::load(std::path::Path::new(&path)) {
@@ -525,6 +539,10 @@ struct Proxy {
     /// The zone processes load the same file for their own geometry — one file,
     /// no wire format to keep in step.
     zone_cfg: mmo::zone_config::ZoneConfig,
+    /// Deposit and skill tuning (#166), shared with the zone processes — the
+    /// gateway needs it because it enforces the swing cooldown and knows skill
+    /// levels, neither of which a zone can see.
+    crafting_cfg: mmo::crafting_config::CraftingConfig,
     /// Unix-second timestamp of every rent reclaim (#16 ops counter, "reclaims in
     /// the last 24h"). In-memory only, like `dropped_frames` — a pure metric, not
     /// durable state (the reclaim itself is already durable via the DB).
@@ -798,6 +816,7 @@ impl Proxy {
             capital: mmo::world::capital(),
             market_cfg,
             zone_cfg: load_zone_config(),
+            crafting_cfg: load_crafting_config(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -1132,6 +1151,7 @@ impl Proxy {
         println!("[Proxy] Registered zone {zone_id} at {uri} (v{version})");
         self.broadcast_partition();
         self.sync_home_structures_to_zone(&zone_id, region).await;
+        self.sync_deposit_state_to_zone(&zone_id).await;
     }
 
     /// Read messages coming back from a zone and route them to clients.
@@ -1233,6 +1253,25 @@ impl Proxy {
                     }
                     if owner_changed {
                         self.broadcast_partition();
+                    }
+                }
+                Some("deposit_depleted") => {
+                    // Durable half of a seam being worked out (#166). The zone
+                    // owns the live charges; this is the one fact that can't be
+                    // recomputed from config on restart.
+                    if let (Some(db), Some(node)) = (
+                        self.db.clone(),
+                        data.get("node_id").and_then(|v| v.as_str()),
+                    ) {
+                        let _ = db.mark_deposit_depleted(node, now_secs()).await;
+                    }
+                }
+                Some("deposit_respawned") => {
+                    if let (Some(db), Some(node)) = (
+                        self.db.clone(),
+                        data.get("node_id").and_then(|v| v.as_str()),
+                    ) {
+                        let _ = db.clear_deposit_depleted(node).await;
                     }
                 }
                 Some("weapon_used") => {
@@ -4377,6 +4416,46 @@ impl Proxy {
     /// mirroring how `storage_points`/`build_boards` are (re)derived on those
     /// events, except this data lives in the DB (not static world authoring), so
     /// the gateway must push it rather than the zone deriving it itself (#13).
+    /// Replay worked-out seams to a zone that has just come up (#166).
+    ///
+    /// Without this a restart refills the whole mine, which is a free reset for
+    /// anyone who notices the server bounce. The zone works out how much of each
+    /// respawn window is left; a seam whose window elapsed while the server was
+    /// down simply comes back, because the world doesn't pause.
+    async fn sync_deposit_state_to_zone(&self, zone_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(rows) = db.depleted_deposits().await else { return };
+        // Only this zone's own rocks. `deposit_state` is keyed by deposit id
+        // alone, so without this every zone was sent every worked-out seam in the
+        // world — harmless, since a zone drops ids it doesn't know, but the log
+        // line then claimed a replay to zones that had nothing replayed to them,
+        // which is exactly the sort of false detail you end up trusting later.
+        let mine: Vec<(String, i64)> = match self.zone_cfg.interior(zone_id) {
+            Some(interior) => rows
+                .into_iter()
+                .filter(|(id, _)| interior.deposits.iter().any(|d| &d.id == id))
+                .collect(),
+            None => Vec::new(),
+        };
+        if mine.is_empty() {
+            return;
+        }
+        let rows = mine;
+        let tx = self.zones.lock().unwrap().get(zone_id).map(|z| z.tx.clone());
+        let Some(tx) = tx else { return };
+        let now = now_secs();
+        for (node_id, depleted_at) in &rows {
+            let _ = tx.send(Message::Text(
+                json!({
+                    "type": "deposit_state", "node_id": node_id,
+                    "depleted_at": depleted_at, "now": now,
+                })
+                .to_string(),
+            ));
+        }
+        println!("[Proxy] Replayed {} depleted deposit(s) to {zone_id}", rows.len());
+    }
+
     async fn sync_home_structures_to_zone(&self, zone_id: &str, region: Region) {
         let db = match &self.db { Some(d) => d.clone(), None => return };
         let Some(district) = self.capital.districts.iter().find(|d| d.plot_grid.is_some()) else {
@@ -4546,6 +4625,23 @@ impl Proxy {
                 .unwrap_or_default(),
         }));
         println!("[Proxy] PORTAL: {pid} {from_zone} -> {target_zone} at ({}, {})", to.0, to.1);
+    }
+
+    /// The deposit type a node id names, if it is an authored seam (#166).
+    ///
+    /// The gateway can answer this because deposits are authored — placement in
+    /// `zones.toml`, behaviour in `crafting.toml`, both of which it loads. It
+    /// needs to, because the swing cooldown is enforced here and a seam sets its
+    /// own swing time.
+    fn deposit_for_node(&self, node_id: &str) -> Option<&mmo::crafting_config::DepositType> {
+        let kind = self
+            .zone_cfg
+            .interior
+            .values()
+            .flat_map(|z| z.deposits.iter())
+            .find(|d| d.id == node_id)
+            .map(|d| d.kind.as_str())?;
+        self.crafting_cfg.deposit(kind)
     }
 
     /// Whether `pid` is standing close enough to the weapon master to deal with
@@ -4745,7 +4841,18 @@ impl Proxy {
             Some(skill) => db.skill_level(pid, skill).await.unwrap_or(0),
             None => 0,
         };
-        let cooldown_ms = mmo::world::ability_cooldown_ms(ability_id, level);
+        // A DEPOSIT sets its own swing time (#166): clay is quicker to work than
+        // iron, and that difference is authored per seam rather than being a
+        // property of the arm swinging the pick. Without this the deposit's
+        // `swing_time_ms` would be a config value that did nothing, since the
+        // ability curve alone decided the rate.
+        //
+        // The Mining curve then takes its percentage off that, capped. Ordinary
+        // surface nodes keep #129's ability curve exactly as it was.
+        let cooldown_ms = match self.deposit_for_node(node_id) {
+            Some(d) => self.crafting_cfg.skill(&d.skill).swing_time_ms(d.swing_time_ms, level),
+            None => mmo::world::ability_cooldown_ms(ability_id, level),
+        };
         let now = Instant::now();
         {
             let mut ledger = self.ability_cooldowns.lock().unwrap();
@@ -4763,6 +4870,11 @@ impl Proxy {
         }
         self.route_client_frame(pid, json!({
             "type": "ability_swing", "id": ability_id, "node_id": node_id, "cooldown_ms": cooldown_ms,
+            // The swinger's level in the governing skill (#166). The zone rolls
+            // the loot table but cannot see skills, so the bonus-yield chance
+            // has to travel with the swing — same shape as the pre-scaled
+            // cooldown beside it.
+            "skill_level": level,
         }));
     }
 
@@ -6733,6 +6845,7 @@ mod tests {
             // resolution by `market_rules_ride_on_market_opened`.
             market_cfg: mmo::market_config::MarketConfigSet::default(),
             zone_cfg: load_zone_config(),
+            crafting_cfg: load_crafting_config(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),

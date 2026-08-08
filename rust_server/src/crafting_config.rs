@@ -116,16 +116,77 @@ impl DepositType {
     }
 }
 
+/// What levelling a gathering skill buys (#166).
+///
+/// Both bonuses are capped. An uncapped per-level bonus eventually makes a
+/// high-level miner strictly better at everything, which quietly removes the
+/// reason for anyone else to mine — and at that point the cap is the only thing
+/// standing between "progression" and "the only correct answer".
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillCurve {
+    /// Percent off the swing time per level.
+    #[serde(default)]
+    pub speed_bonus_pct_per_level: f64,
+    #[serde(default)]
+    pub max_speed_bonus_pct: f64,
+    /// Percentage-point chance per level of one extra roll of the whole loot
+    /// table — so the bonus pays out in the same proportions the seam does,
+    /// rather than favouring whichever line happens to be listed first.
+    #[serde(default)]
+    pub bonus_yield_chance_per_level: f64,
+    #[serde(default)]
+    pub max_bonus_yield_chance: f64,
+}
+
+impl Default for SkillCurve {
+    fn default() -> Self {
+        SkillCurve {
+            speed_bonus_pct_per_level: 0.0,
+            max_speed_bonus_pct: 0.0,
+            bonus_yield_chance_per_level: 0.0,
+            max_bonus_yield_chance: 0.0,
+        }
+    }
+}
+
+impl SkillCurve {
+    /// Swing time at `level`, never below a quarter of the base however the
+    /// numbers are tuned — a swing that rounds to nothing stops being an action.
+    pub fn swing_time_ms(&self, base: i64, level: i64) -> i64 {
+        let pct = (self.speed_bonus_pct_per_level * level.max(0) as f64)
+            .min(self.max_speed_bonus_pct.max(0.0));
+        let scaled = (base as f64 * (1.0 - pct / 100.0)).round() as i64;
+        scaled.max((base as f64 * 0.25).round() as i64).max(1)
+    }
+
+    /// Chance in 0.0..1.0 of an extra roll of the loot table at `level`.
+    pub fn bonus_yield_chance(&self, level: i64) -> f64 {
+        let pct = (self.bonus_yield_chance_per_level * level.max(0) as f64)
+            .min(self.max_bonus_yield_chance.max(0.0));
+        (pct / 100.0).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CraftingConfig {
     #[serde(default)]
     pub deposit: BTreeMap<String, DepositType>,
+    /// Per-skill progression curves, keyed by skill id.
+    #[serde(default)]
+    pub skill: BTreeMap<String, SkillCurve>,
 }
 
 impl CraftingConfig {
     pub fn deposit(&self, id: &str) -> Option<&DepositType> {
         self.deposit.get(id)
+    }
+
+    /// The curve for `skill`, or a flat one — an unconfigured skill simply
+    /// grants no bonuses rather than failing.
+    pub fn skill(&self, skill: &str) -> SkillCurve {
+        self.skill.get(skill).cloned().unwrap_or_default()
     }
 
     pub fn parse(text: &str) -> Result<CraftingConfig, CraftingConfigError> {
@@ -256,6 +317,47 @@ mod tests {
         qty_max = 2
         chance = 0.30
         "#
+    }
+
+    /// Both bonuses are capped, and the cap is what stops a high-level miner
+    /// becoming the only correct answer.
+    #[test]
+    fn skill_bonuses_scale_with_level_and_stop_at_their_cap() {
+        let cfg = CraftingConfig::parse(
+            r#"
+            [skill.mining]
+            speed_bonus_pct_per_level = 0.4
+            max_speed_bonus_pct = 25
+            bonus_yield_chance_per_level = 0.3
+            max_bonus_yield_chance = 20
+            "#,
+        )
+        .unwrap();
+        let m = cfg.skill("mining");
+
+        assert_eq!(m.swing_time_ms(3000, 0), 3000, "level 0 gets nothing");
+        assert_eq!(m.swing_time_ms(3000, 10), 2880, "0.4%/level -> 4% off at 10");
+        // Capped: level 100 and level 1000 are the same swing.
+        assert_eq!(m.swing_time_ms(3000, 100), m.swing_time_ms(3000, 1000));
+        assert_eq!(m.swing_time_ms(3000, 100), 2250, "25% is the ceiling");
+
+        assert!(m.bonus_yield_chance(0).abs() < 1e-9);
+        assert!((m.bonus_yield_chance(10) - 0.03).abs() < 1e-9);
+        assert!((m.bonus_yield_chance(1000) - 0.20).abs() < 1e-9, "capped at 20%");
+
+        // A swing can never round away to nothing, however it is tuned.
+        let silly = CraftingConfig::parse(
+            "[skill.mining]
+speed_bonus_pct_per_level = 50
+max_speed_bonus_pct = 99",
+        )
+        .unwrap();
+        assert!(silly.skill("mining").swing_time_ms(3000, 50) >= 750);
+
+        // An unconfigured skill grants nothing rather than failing.
+        let flat = cfg.skill("smelting");
+        assert_eq!(flat.swing_time_ms(3000, 99), 3000);
+        assert!(flat.bonus_yield_chance(99).abs() < 1e-9);
     }
 
     #[test]

@@ -572,6 +572,34 @@ impl ZoneServer {
         }
     }
 
+    /// Resume depletion state pushed by the gateway on startup (#166), so a
+    /// restart mid-cycle picks the timers back up rather than refilling the
+    /// mine — which would be a free reset for anyone who noticed.
+    fn apply_deposit_state(&self, node_id: &str, depleted_at: i64, now: i64) {
+        let Some(kind) = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .and_then(|n| n.deposit.clone())
+        else {
+            return;
+        };
+        let Some(t) = self.crafting.deposit(&kind) else { return };
+        // Mid-window: empty, with whatever is left of its timer. Past it: the
+        // seam came back while the server was down, which is correct — the
+        // world doesn't pause.
+        let elapsed = (now - depleted_at).max(0);
+        let window = t.respawn_seconds;
+        let mut nodes = self.nodes.lock().unwrap();
+        let Some(node) = nodes.get_mut(node_id) else { return };
+        if elapsed >= window {
+            return;
+        }
+        node.qty = 0;
+        node.respawn_timer = (((window - elapsed) * 1000) / TICK_MS as i64) as i32;
+    }
+
     /// (Re)spawn this interior's authored deposits (#166).
     ///
     /// Deposits are ordinary `ResourceNode`s with a `deposit` type attached, so
@@ -598,6 +626,15 @@ impl ZoneServer {
                 .first()
                 .map(|y| y.item.clone())
                 .unwrap_or_else(|| "stone".to_string());
+            // Re-deriving the deposit SET must not refill the seams in it.
+            //
+            // This runs on startup and again on any region change, and the
+            // gateway replays worked-out seams (#166) right after registration —
+            // so a blind insert here silently undid that replay and handed
+            // everyone a full mine after every restart. Live charge state is
+            // carried over; only genuinely new placements start full.
+            let live = nodes.get(&d.id).map(|n| (n.qty, n.respawn_timer));
+            let (qty, respawn_timer) = live.unwrap_or((t.charges, 0));
             nodes.insert(
                 d.id.clone(),
                 ResourceNode {
@@ -605,9 +642,9 @@ impl ZoneServer {
                     item_id: target,
                     x: d.pos.0,
                     y: d.pos.1,
-                    qty: t.charges,
+                    qty,
                     max_qty: t.charges,
-                    respawn_timer: 0,
+                    respawn_timer,
                     deposit: Some(d.kind.clone()),
                 },
             );
@@ -827,7 +864,14 @@ impl ZoneServer {
     /// alone knows live positions and node state. A successful swing
     /// yields through the same internal `gather_yield` persistence path
     /// every ability already shares — instantly, with no channel.
-    fn apply_ability_swing(&self, pid: &str, ability_id: &str, node_id: &str, cooldown_ms: i64) {
+    fn apply_ability_swing(
+        &self,
+        pid: &str,
+        ability_id: &str,
+        node_id: &str,
+        cooldown_ms: i64,
+        skill_level: i64,
+    ) {
         let Some(target_item) = mmo::world::ability_target_item(ability_id) else { return };
         let outcome = {
             let entities = self.entities.lock().unwrap();
@@ -874,9 +918,25 @@ impl ZoneServer {
                         {
                             Some(t) => {
                                 let secs = t.respawn_after(rng.gen::<f64>());
+                                let mut got = t.roll(&mut rng);
+                                // Skill's bonus (#166): a chance at one extra
+                                // roll of the WHOLE table, so it pays out in the
+                                // same proportions the seam does rather than
+                                // favouring whichever line is listed first.
+                                let bonus = self
+                                    .crafting
+                                    .skill(&t.skill)
+                                    .bonus_yield_chance(skill_level);
+                                if bonus > 0.0 && rng.gen_bool(bonus) {
+                                    got.extend(t.roll(&mut rng));
+                                }
                                 (
-                                    t.roll(&mut rng),
-                                    t.xp_per_swing,
+                                    got,
+                                    mmo::world::xp_with_falloff(
+                                        t.xp_per_swing,
+                                        skill_level,
+                                        t.xp_falloff_level,
+                                    ),
                                     (secs * 1000 / TICK_MS as i64) as i32,
                                 )
                             }
@@ -933,6 +993,14 @@ impl ZoneServer {
                             "deposit": deposit,
                             "ability_id": ability_id,
                         }).to_string()));
+                    }
+                    // Durable state is the gateway's (#166): the zone owns the
+                    // live charge count and the tick, and reports the one fact
+                    // that can't be recomputed — when the seam emptied.
+                    if depleted && deposit.is_some() {
+                        let _ = tx.send(Message::Text(
+                            json!({"type": "deposit_depleted", "node_id": node_id}).to_string(),
+                        ));
                     }
                     let touch = if depleted {
                         json!({"type": "despawn", "player_id": node_id})
@@ -1089,6 +1157,21 @@ impl ZoneServer {
                 continue;
             }
 
+            // The gateway replaying what it knows about worked-out seams (#166),
+            // on zone start. Same contract as `env_state`: it owns the durable
+            // fact, this zone owns the live world.
+            //
+            // THIS IS A WORLD MESSAGE, NOT A PLAYER ONE, and it has to be handled
+            // above the gate below — a rock belongs to nobody, so a `deposit_state`
+            // carries no `player_id` and the `continue` would drop it silently.
+            if msg_type == "deposit_state" {
+                let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+                let at = data.get("depleted_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                let now = data.get("now").and_then(|v| v.as_i64()).unwrap_or(0);
+                self.apply_deposit_state(node_id, at, now);
+                continue;
+            }
+
             let player_id = match data.get("player_id").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
                 None => continue,
@@ -1213,7 +1296,11 @@ impl ZoneServer {
                     let ability_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let node_id = data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let cooldown_ms = data.get("cooldown_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                    self.apply_ability_swing(&player_id, &ability_id, &node_id, cooldown_ms);
+                    let skill_level =
+                        data.get("skill_level").and_then(|v| v.as_i64()).unwrap_or(0);
+                    self.apply_ability_swing(
+                        &player_id, &ability_id, &node_id, cooldown_ms, skill_level,
+                    );
                 }
                 "npc.talk" => {
                     let npc_id = data.get("npc_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1754,6 +1841,15 @@ impl ZoneServer {
                 for id in &touched {
                     if let Some(n) = nodes.get(id) {
                         packets.push(node_status_json(n).to_string());
+                        // A seam that came back is no longer depleted, so the
+                        // gateway should forget it (#166) — otherwise a later
+                        // restart would resurrect a depletion that has already
+                        // been served.
+                        if n.deposit.is_some() {
+                            packets.push(
+                                json!({"type": "deposit_respawned", "node_id": id}).to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -1902,11 +1998,6 @@ impl ZoneServer {
             self.zone_id, self.port, self.version, r.x0, r.y0, r.x1, r.y1
         );
 
-        if self.proxy_uri.is_some() {
-            let me = self.clone();
-            tokio::spawn(async move { me.register_with_proxy().await });
-        }
-
         // Seed mobs, resource nodes, storage points, build boards, and plots, then
         // start the 20 Hz sim.
         self.spawn_mobs(MOBS_PER_ZONE);
@@ -1917,6 +2008,17 @@ impl ZoneServer {
         self.spawn_build_boards();
         self.spawn_plots();
         self.spawn_npcs();
+
+        // Register only ONCE THE WORLD EXISTS (#166). Registering first is a
+        // race: the gateway answers by replaying state it owns — worked-out
+        // deposits, home structures — and anything referring to a node this zone
+        // hasn't spawned yet is silently dropped, so a restart quietly refilled
+        // the mine. A zone should not advertise itself as ready before it has
+        // something to be ready with.
+        if self.proxy_uri.is_some() {
+            let me = self.clone();
+            tokio::spawn(async move { me.register_with_proxy().await });
+        }
         {
             let me = self.clone();
             tokio::spawn(async move { me.game_loop().await });
@@ -1965,6 +2067,84 @@ mod tests {
 
     fn zone_for_region(region: Region) -> Arc<ZoneServer> {
         ZoneServer::new("test".to_string(), 0, None, region, 1)
+    }
+
+    // --- deposit state replayed across a restart (#166) ----------------------
+
+    /// The real mine, with its authored seams spawned — the shipped configs are
+    /// what the replay has to work against, so the test uses them.
+    fn mine_zone() -> Arc<ZoneServer> {
+        let zone = ZoneServer::new("mine_starter".to_string(), 0, None, CIVIC, 1);
+        zone.spawn_deposits();
+        zone
+    }
+
+    fn charges(zone: &Arc<ZoneServer>, id: &str) -> i64 {
+        zone.nodes.lock().unwrap().get(id).map(|n| n.qty).unwrap_or(-1)
+    }
+
+    /// A seam worked out before the restart comes back EMPTY, with what is left
+    /// of its respawn window still to run — the world doesn't pause while the
+    /// server is down, and it doesn't reset either.
+    #[test]
+    fn a_worked_out_seam_survives_a_restart_mid_window() {
+        let zone = mine_zone();
+        let now = 1_000_000;
+        assert_eq!(charges(&zone, "clay_01"), 10, "seams start full");
+
+        // Emptied 20s ago; clay's window is 60s, so 40s remain.
+        zone.apply_deposit_state("clay_01", now - 20, now);
+        assert_eq!(charges(&zone, "clay_01"), 0, "still spent after the restart");
+        let ticks = zone.nodes.lock().unwrap().get("clay_01").unwrap().respawn_timer;
+        assert_eq!(ticks, (40 * 1000) / TICK_MS as i32, "the timer resumes, it doesn't restart");
+    }
+
+    /// Emptied long enough ago that it refilled while the server was down: the
+    /// row is stale, not authoritative, and the seam is simply full.
+    #[test]
+    fn a_seam_whose_window_elapsed_while_down_is_full_again() {
+        let zone = mine_zone();
+        let now = 1_000_000;
+        zone.apply_deposit_state("clay_01", now - 600, now);
+        assert_eq!(charges(&zone, "clay_01"), 10);
+
+        zone.apply_deposit_state("no_such_rock", now - 5, now); // unknown id: no-op
+    }
+
+    /// Re-deriving the deposit set must not refill it. `spawn_deposits` runs
+    /// again on any region change, and it used to blind-insert full nodes —
+    /// which silently undid the replay that had just been applied.
+    #[test]
+    fn respawning_the_deposit_set_preserves_live_charges() {
+        let zone = mine_zone();
+        let now = 1_000_000;
+        zone.apply_deposit_state("clay_01", now - 20, now);
+        zone.nodes.lock().unwrap().get_mut("clay_02").unwrap().qty = 4;
+
+        zone.spawn_deposits();
+
+        assert_eq!(charges(&zone, "clay_01"), 0, "a spent seam stays spent");
+        assert_eq!(charges(&zone, "clay_02"), 4, "a part-worked seam keeps its charges");
+        assert_eq!(charges(&zone, "clay_03"), 10, "an untouched one is still full");
+    }
+
+    /// `deposit_state` has to be handled ABOVE the `player_id` gate in the
+    /// gateway message loop.
+    ///
+    /// This asserts on the source text, which is unusual, and it is here because
+    /// the bug it guards cannot be reached from a unit test: the handler itself
+    /// was correct and fully tested above, but the loop `continue`s on any
+    /// message without a `player_id`, so the arm was dead code and the mine
+    /// refilled on every restart. A rock belongs to nobody. Any future
+    /// world-scoped message has the same trap waiting for it.
+    #[test]
+    fn deposit_state_is_dispatched_before_the_player_id_gate() {
+        let src = include_str!("zone_server.rs");
+        let gate = src.find("let player_id = match data.get(\"player_id\")")
+            .expect("the player_id gate should exist");
+        let handler = src.find("if msg_type == \"deposit_state\"")
+            .expect("deposit_state should be handled as a world-level message");
+        assert!(handler < gate, "deposit_state must be handled before the player_id gate, or it is dropped");
     }
 
     // --- the weapon slot (#160) ---------------------------------------------
@@ -2976,7 +3156,7 @@ mod tests {
     async fn pick_swing_yields_stone_and_mining_xp() {
         let zone = civic_zone_on_rock();
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
@@ -2995,7 +3175,7 @@ mod tests {
         let zone = civic_zone_on_rock();
         zone.nodes.lock().unwrap().get_mut(ROCK).unwrap().qty = 1;
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(ROCK)));
@@ -3011,7 +3191,7 @@ mod tests {
         let zone = civic_zone_on_rock();
         zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12900; // well past PICK_RANGE
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":false")
@@ -3026,13 +3206,13 @@ mod tests {
         let zone = civic_zone_on_rock();
         zone.nodes.lock().unwrap().get_mut(ROCK).unwrap().qty = 0;
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
         assert!(drain(&mut rx).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
 
         // Standing on a tree instead: pick only targets stone.
         let zone2 = civic_zone_on_tree();
         let mut rx2 = wire_proxy_tx(&zone2);
-        zone2.apply_ability_swing("p1", "pick", TREE, 1600);
+        zone2.apply_ability_swing("p1", "pick", TREE, 1600, 0);
         assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
         assert_eq!(zone2.nodes.lock().unwrap().get(TREE).unwrap().qty, 5, "wrong-target swing takes nothing");
     }
@@ -3045,7 +3225,7 @@ mod tests {
     async fn ability_result_carries_the_yield_for_the_client_flash() {
         let zone = civic_zone_on_rock();
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
             && p.contains("\"item_id\":\"stone\"") && p.contains("\"qty\":1")),
@@ -3054,7 +3234,7 @@ mod tests {
         // A rejection carries no item_id/qty — nothing was taken.
         zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12900; // out of range
         let mut rx2 = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "pick", ROCK, 1600);
+        zone.apply_ability_swing("p1", "pick", ROCK, 1600, 0);
         let packets2 = drain(&mut rx2);
         assert!(packets2.iter().any(|p| p.contains("\"ok\":false") && !p.contains("\"item_id\"")),
             "a rejected swing must not carry an item_id: {packets2:?}");
@@ -3068,7 +3248,7 @@ mod tests {
     async fn chop_swing_yields_wood_and_woodcutting_xp() {
         let zone = civic_zone_on_tree();
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":true")
@@ -3085,7 +3265,7 @@ mod tests {
         let zone = civic_zone_on_tree();
         zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 1;
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"despawn\"") && p.contains(TREE)));
@@ -3100,7 +3280,7 @@ mod tests {
         let zone = civic_zone_on_tree();
         zone.entities.lock().unwrap().get_mut("p1").unwrap().x = 12850; // well past SWING_RANGE
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600, 0);
 
         let packets = drain(&mut rx);
         assert!(packets.iter().any(|p| p.contains("\"ability.result\"") && p.contains("\"ok\":false")
@@ -3116,12 +3296,12 @@ mod tests {
         let zone = civic_zone_on_tree();
         zone.nodes.lock().unwrap().get_mut(TREE).unwrap().qty = 0;
         let mut rx = wire_proxy_tx(&zone);
-        zone.apply_ability_swing("p1", "chop", TREE, 1600);
+        zone.apply_ability_swing("p1", "chop", TREE, 1600, 0);
         assert!(drain(&mut rx).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
 
         let zone2 = civic_zone_on_rock();
         let mut rx2 = wire_proxy_tx(&zone2);
-        zone2.apply_ability_swing("p1", "chop", ROCK, 1600);
+        zone2.apply_ability_swing("p1", "chop", ROCK, 1600, 0);
         assert!(drain(&mut rx2).iter().any(|p| p.contains("\"reason\":\"exhausted\"")));
         assert_eq!(zone2.nodes.lock().unwrap().get(ROCK).unwrap().qty, 5, "wrong-target swing takes nothing");
     }
