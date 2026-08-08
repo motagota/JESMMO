@@ -1,0 +1,41 @@
+-- Shaping failure and the catalyst slot (mine epic #164, issue #168).
+--
+-- Two additions to `station_job`, and one new job state.
+--
+-- THE FOURTH STATE IS THE POINT. A job could already end `ready` (it worked) or
+-- `failed` (the system failed it — its recipe vanished, its station went away,
+-- the player walked off a presence-required wheel). Shaping adds a third ending
+-- that is neither: the attempt was made properly and the clay came out wrong.
+--
+-- These must not share a state, because they must not share a refund rule:
+--
+--   'failed'  -> the world let the player down. Full escrow back, no XP.
+--   'spoiled' -> the player's luck let them down. Inputs consumed, partial XP.
+--
+-- Losing materials to a server restart is not the same as losing them to a
+-- rolled failure, and a single "failed" state would have had to pick one rule
+-- for both. That is exactly the distinction #168 asked for.
+
+-- Whether this job is already doomed, decided AT START.
+--
+-- Rolled when the inputs are committed rather than at collect, because the
+-- outcome decides whether those inputs are refundable — that is a custody
+-- question, and custody is settled when the goods change hands. It also makes
+-- the result survive a restart unchanged: a job that was going to spoil still
+-- spoils, rather than getting a fresh roll every time the server bounces.
+--
+-- The player cannot see this before collecting, so fixing it early costs them
+-- no agency. Payout-SIZE rolls (the skill bonus) still happen at collect, where
+-- a level gained mid-job can still count.
+ALTER TABLE station_job ADD COLUMN will_fail INTEGER NOT NULL DEFAULT 0;
+
+-- The catalyst's contribution, captured at start.
+--
+-- The crucible is worn at START and its bonus recorded here, which is what
+-- makes "a catalyst that vanishes mid-job" a non-event: by the time the job
+-- ends, nothing needs to look at the crucible again. Broken, dropped, traded or
+-- sold, the job it already paid for still pays out. Storing the granted chance
+-- rather than the item id is deliberate for the same reason the escrowed inputs
+-- are stored — the config may have changed, and what matters is what was
+-- actually spent.
+ALTER TABLE station_job ADD COLUMN catalyst_bonus REAL NOT NULL DEFAULT 0;
