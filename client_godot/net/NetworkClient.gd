@@ -153,6 +153,9 @@ signal station_collected(slot: int, failed: bool, spoiled: bool, fail_reason: St
 signal station_error(reason: String, detail: Dictionary)
 ## A presence-required job ended because the player walked away (#168).
 signal station_cancelled(station_id: String, slot: int, recipe_id: String, reason: String)
+## The tutorial track (#169), fully evaluated server-side.
+signal tutorial_state(steps: Array, done: int, total: int)
+signal tutorial_complete(item: String, qty: int)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -449,6 +452,10 @@ func _handle_text(text: String) -> void:
                 String(msg.get("fail_reason", "") if msg.get("fail_reason") != null else ""),
                 int(msg.get("bonus", 0)),
                 msg.get("items", []))
+        Protocol.S_TUTORIAL_STATE:
+            tutorial_state.emit(msg.get("steps", []), int(msg.get("done", 0)), int(msg.get("total", 0)))
+        Protocol.S_TUTORIAL_COMPLETE:
+            tutorial_complete.emit(String(msg.get("item", "")), int(msg.get("qty", 0)))
         Protocol.S_STATION_CANCELLED:
             station_cancelled.emit(
                 String(msg.get("station_id", "")),

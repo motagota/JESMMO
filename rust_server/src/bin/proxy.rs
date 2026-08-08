@@ -161,6 +161,30 @@ fn load_crafting_config() -> mmo::crafting_config::CraftingConfig {
     }
 }
 
+/// `tutorial.toml`, on the same strict contract as the others: a missing file
+/// means no tutorial and no handouts — a playable world, since nothing is gated
+/// behind the track — and a malformed one refuses the boot naming the step.
+fn load_tutorial_config() -> mmo::tutorial_config::TutorialConfig {
+    let path = format!("{}/../tutorial.toml", env!("CARGO_MANIFEST_DIR"));
+    match mmo::tutorial_config::TutorialConfig::load(std::path::Path::new(&path)) {
+        Ok(cfg) => {
+            if cfg.steps.is_empty() && cfg.handouts.is_empty() {
+                println!("[Proxy] tutorial.toml ABSENT — no track, no handouts");
+            } else {
+                println!(
+                    "[Proxy] tutorial.toml: {} step(s), {} handout(s)",
+                    cfg.steps.len(),
+                    cfg.handouts.len()
+                );
+            }
+            cfg
+        }
+        // Refusing to boot is correct here. A handout condition that failed
+        // silently would either strand every new player or print pickaxes.
+        Err(e) => panic!("{e}"),
+    }
+}
+
 fn load_zone_config() -> mmo::zone_config::ZoneConfig {
     let path = std::env::var("ZONE_CONFIG").unwrap_or_else(|_| DEFAULT_ZONE_CONFIG.to_string());
     match mmo::zone_config::ZoneConfig::load(std::path::Path::new(&path)) {
@@ -543,6 +567,11 @@ struct Proxy {
     /// gateway needs it because it enforces the swing cooldown and knows skill
     /// levels, neither of which a zone can see.
     crafting_cfg: mmo::crafting_config::CraftingConfig,
+    tutorial_cfg: mmo::tutorial_config::TutorialConfig,
+    /// Items some `gained` condition watches, precomputed at boot so the
+    /// gather path is a set lookup rather than a config walk per swing.
+    tutorial_counted: std::collections::BTreeSet<String>,
+    tutorial_made: std::collections::BTreeSet<String>,
     /// Unix-second timestamp of every rent reclaim (#16 ops counter, "reclaims in
     /// the last 24h"). In-memory only, like `dropped_frames` — a pure metric, not
     /// durable state (the reclaim itself is already durable via the DB).
@@ -817,6 +846,9 @@ impl Proxy {
             market_cfg,
             zone_cfg: load_zone_config(),
             crafting_cfg: load_crafting_config(),
+            tutorial_cfg: load_tutorial_config(),
+            tutorial_counted: load_tutorial_config().counted_items(),
+            tutorial_made: load_tutorial_config().made_items(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -4664,6 +4696,179 @@ impl Proxy {
     /// Answers with `bounty.state` either way — paid or not — because the panel
     /// needs to show progress ("7 of 10") regardless, and a refusal that says
     /// nothing is indistinguishable from a dropped frame.
+    // --- The tutorial track and Marlow's handouts (#169) --------------------
+
+    /// Evaluate one condition for a player.
+    ///
+    /// State conditions read the player; history conditions read the counters
+    /// that have been running since their first login. Nothing here can fail
+    /// partially: an unreadable database answers `false`, which closes a
+    /// handout rather than opening one. That asymmetry is deliberate — the
+    /// failure mode of a condition that wrongly answers `true` is an item
+    /// printer.
+    async fn condition_holds(
+        &self,
+        db: &Db,
+        pid: &str,
+        c: &mmo::tutorial_config::Condition,
+        counters: &std::collections::HashMap<String, i64>,
+    ) -> bool {
+        use mmo::tutorial_config::Condition as C;
+        match c {
+            C::HasItem(item) => {
+                db.inventory_qty(pid, item).await.unwrap_or(0) > 0
+                    || self.holds_equipped(db, pid, item).await
+            }
+            C::NoItem(item) => {
+                db.inventory_qty(pid, item).await.unwrap_or(-1) == 0
+                    && !self.holds_equipped(db, pid, item).await
+            }
+            C::InventoryBelow(item, n) => match db.inventory_qty(pid, item).await {
+                Ok(have) => have < *n,
+                Err(_) => false,
+            },
+            C::Gained(item, n) => counters.get(&format!("gained:{item}")).copied().unwrap_or(0) >= *n,
+            C::Made(item) => counters.get(&format!("made:{item}")).copied().unwrap_or(0) > 0,
+            C::LoadedFuel => counters.get("loaded_fuel").copied().unwrap_or(0) > 0,
+        }
+    }
+
+    /// Whether this item is in any equipment slot. A pickaxe in hand is a
+    /// pickaxe owned — `no_item pickaxe` must not open for someone holding one.
+    async fn holds_equipped(&self, db: &Db, pid: &str, item: &str) -> bool {
+        for slot in ["tool", "weapon", "catalyst"] {
+            if db.equipped(pid, slot).await.ok().flatten().as_deref() == Some(item) {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn counters_for(&self, db: &Db, pid: &str) -> std::collections::HashMap<String, i64> {
+        db.tutorial_counters(pid).await.unwrap_or_default().into_iter().collect()
+    }
+
+    /// Offer any handout whose conditions all hold. Returns the lines to speak.
+    async fn apply_handouts(&self, db: &Db, pid: &str, npc_id: &str) -> Vec<String> {
+        let mut spoken = Vec::new();
+        let handouts: Vec<_> = self
+            .tutorial_cfg
+            .handouts_from(npc_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        if handouts.is_empty() {
+            return spoken;
+        }
+        let now = now_secs();
+        let counters = self.counters_for(db, pid).await;
+        for h in handouts {
+            // Rate limit BEFORE conditions: cheaper, and a handout inside its
+            // cooldown is refused regardless of how deserving the player looks.
+            match db.handout_state(pid, &h.npc, &h.item).await {
+                Ok(Some((granted_at, _))) => {
+                    if h.once || now - granted_at < h.cooldown_secs {
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => continue,
+            }
+            let mut ok = true;
+            for c in &h.when {
+                if !self.condition_holds(db, pid, c, &counters).await {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if db.grant_handout(pid, &h.npc, &h.item, h.qty, h.once, now).await.unwrap_or(0) > 0 {
+                if !h.line.is_empty() {
+                    spoken.push(h.line.clone());
+                }
+                println!("[Proxy] {npc_id} handed {pid} {} x{}", h.item, h.qty);
+            }
+        }
+        if !spoken.is_empty() {
+            self.send_inventory(pid).await;
+        }
+        spoken
+    }
+
+    /// The track as this player stands against it, with every step already
+    /// evaluated — so a step completed before they ever met Marlow arrives
+    /// ticked rather than waiting to be noticed.
+    async fn send_tutorial_state(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        if self.tutorial_cfg.steps.is_empty() || !self.is_persistent(pid) {
+            return;
+        }
+        let counters = self.counters_for(&db, pid).await;
+        let mut steps = Vec::new();
+        let mut done = 0;
+        for st in &self.tutorial_cfg.steps {
+            let complete = self.condition_holds(&db, pid, &st.when, &counters).await;
+            if complete {
+                done += 1;
+            }
+            steps.push(json!({"id": st.id, "text": st.text, "done": complete}));
+        }
+        self.push_to_player(
+            pid,
+            json!({
+                "type": "tutorial.state",
+                "steps": steps,
+                "done": done,
+                "total": self.tutorial_cfg.steps.len(),
+            }),
+        );
+        // Finishing pays out once, through the handout log so the once-ever
+        // rule is the same mechanism the charcoal bundle uses rather than a
+        // second bespoke flag.
+        if done == self.tutorial_cfg.steps.len() && !self.tutorial_cfg.reward.is_empty() {
+            let now = now_secs();
+            for (item, qty) in &self.tutorial_cfg.reward {
+                // `once` makes this atomic — no read-then-write, because two
+                // `send_tutorial_state` calls genuinely overlap (the login push
+                // and an event push) and both would otherwise pay out.
+                if db.grant_handout(pid, "tutorial", item, *qty, true, now).await.unwrap_or(0) > 0 {
+                    self.push_to_player(
+                        pid,
+                        json!({"type": "tutorial.complete", "item": item, "qty": qty}),
+                    );
+                    self.send_inventory(pid).await;
+                }
+            }
+        }
+    }
+
+    /// Record a watched event, then re-push the track if it moved.
+    ///
+    /// Called for EVERY persistent character, not only ones following the
+    /// track. There is no "tutorial started" state to be inside or outside of,
+    /// which is exactly what makes the steps retroactive.
+    async fn note_tutorial(&self, pid: &str, event: &str, by: i64) {
+        let Some(db) = self.db.clone() else { return };
+        if !self.is_persistent(pid) {
+            return; // guests have no durable progress, and nothing breaks
+        }
+        if db.note_tutorial_event(pid, event, by, now_secs()).await.is_ok() {
+            self.send_tutorial_state(pid).await;
+        }
+    }
+
+    /// Whether any condition anywhere watches gathering this item — checked
+    /// before writing, so an unwatched item costs one set lookup.
+    fn tutorial_counts_gain(&self, item_id: &str) -> bool {
+        self.tutorial_counted.contains(item_id)
+    }
+
+    fn tutorial_counts_made(&self, item_id: &str) -> bool {
+        self.tutorial_made.contains(item_id)
+    }
+
     // --- Stations, fuel and timed jobs (mine epic #164, issue #167) ---------
 
     /// The station this player is standing at, if any.
@@ -4894,6 +5099,7 @@ impl Proxy {
             .await
         {
             Ok(Some(_)) => {
+                self.note_tutorial(pid, "loaded_fuel", 1).await;
                 self.send_inventory(pid).await;
                 self.send_station_state(pid).await;
             }
@@ -5053,6 +5259,13 @@ impl Proxy {
                 if !done.failed && done.xp > 0 && !done.skill.is_empty() {
                     if let Ok(gain) = db.grant_skill_xp(cid, &done.skill, done.xp).await {
                         self.push_skill_gain(pid, &gain);
+                    }
+                }
+                if !done.failed && !done.spoiled {
+                    for (item, _) in &done.payout {
+                        if self.tutorial_counts_made(item) {
+                            self.note_tutorial(pid, &format!("made:{item}"), 1).await;
+                        }
                     }
                 }
                 self.send_inventory(pid).await;
@@ -5493,11 +5706,32 @@ impl Proxy {
                 }
             }
         }
-        let lines = if granted { npc.lines_granted } else { npc.lines_repeat };
+        // Conditional handouts (#169) sit alongside the legacy single-item
+        // `grants_item`, not inside it: the static field cannot express "no
+        // pickaxe AND no ore, and not in the last ten minutes", and a second
+        // hardcoded special case beside Bram's is how a registry becomes a pile.
+        let extra = if self.is_persistent(pid) {
+            self.apply_handouts(&db, pid, npc_id).await
+        } else {
+            Vec::new() // guests have no durable inventory to hand anything into
+        };
+        let mut lines: Vec<String> = if granted { npc.lines_granted } else { npc.lines_repeat }
+            .iter()
+            .map(|l| (*l).to_string())
+            .collect();
+        let granted = granted || !extra.is_empty();
+        // A handout's own line replaces the idle chatter rather than following
+        // it — being told what you were just given matters more than flavour.
+        if !extra.is_empty() {
+            lines = extra;
+        }
         self.push_to_player(pid, json!({
             "type": "npc.dialogue", "npc_id": npc_id, "name": npc.name,
             "lines": lines, "granted": granted,
         }));
+        // Talking is not what advances the track, but it IS the moment a player
+        // asks where they stand — so answer, with every step already evaluated.
+        self.send_tutorial_state(pid).await;
         // Talking to the weapon master reports the bounty (#161); claiming it is
         // a separate, deliberate act. Conflating the two would mean walking up
         // to him silently spends ten pelts the moment you have them.
@@ -6439,7 +6673,15 @@ impl Proxy {
             0
         } else {
             match db.add_to_inventory(pid, item_id, qty).await {
-                Ok(n) => n,
+                Ok(n) => {
+                    // The track counts what was actually GATHERED, not what fit
+                    // (#169). A full pack is a carrying problem; it should not
+                    // also silently stall the tutorial.
+                    if self.tutorial_counts_gain(item_id) {
+                        self.note_tutorial(pid, &format!("gained:{item_id}"), qty).await;
+                    }
+                    n
+                }
                 Err(_) => return,
             }
         };
@@ -6650,6 +6892,11 @@ impl Proxy {
             // station from its own position cache on every command, exactly as
             // it does for markets.
             self.send_station_list(&player_id);
+            // The track, with every step already evaluated (#169). Sent at
+            // login rather than on meeting Marlow: the counters have been
+            // running since this character's first session, so a player who
+            // has already done half of it sees half of it ticked.
+            self.send_tutorial_state(&player_id).await;
             self.send_equipment(&player_id).await;
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
@@ -7471,6 +7718,9 @@ mod tests {
             market_cfg: mmo::market_config::MarketConfigSet::default(),
             zone_cfg: load_zone_config(),
             crafting_cfg: load_crafting_config(),
+            tutorial_cfg: load_tutorial_config(),
+            tutorial_counted: load_tutorial_config().counted_items(),
+            tutorial_made: load_tutorial_config().made_items(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
             db_write_latencies_ms: Mutex::new(VecDeque::new()),
             terrain_edit_lock: tokio::sync::Mutex::new(()),
@@ -9848,6 +10098,289 @@ mod tests {
         assert_eq!(db.inventory_qty(&pid, "axe").await.unwrap(), 1, "no second grant");
 
         drop(ws);
+    }
+
+    // --- Foreman Marlow and the tutorial track (#169) -----------------------
+
+    /// A proxy running a small, explicit tutorial rather than the shipped one,
+    /// so these tests pin behaviour instead of today's authored numbers.
+    async fn proxy_with_tutorial(toml: &str) -> (Arc<Proxy>, Arc<Db>, TestDb, FakeZone) {
+        let dbf = TestDb::new();
+        let db = Arc::new(Db::connect(dbf.url()).await.unwrap());
+        let cfg = mmo::tutorial_config::TutorialConfig::parse(toml).expect("valid tutorial");
+        // Installed BEFORE the Arc is shared. `register_zone` clones it, so
+        // there is no later moment at which `Arc::get_mut` would succeed.
+        let mut proxy = Proxy::new_with_market_config(
+            "127.0.0.1", 0, 0, 0, Some(db.clone()),
+            mmo::market_config::MarketConfigSet::default(),
+        );
+        {
+            let m = Arc::get_mut(&mut proxy).expect("not yet shared");
+            m.tutorial_counted = cfg.counted_items();
+            m.tutorial_made = cfg.made_items();
+            m.tutorial_cfg = cfg;
+        }
+        let zone = spawn_fake_zone().await;
+        proxy
+            .register_zone("zone_a".to_string(), zone.uri.clone(), 1, String::new(), Region::whole_world())
+            .await;
+        (proxy, db, dbf, zone)
+    }
+
+    const VALVE: &str = r#"
+        [[handout]]
+        npc = "npc_mine_foreman"
+        item = "pickaxe"
+        cooldown_secs = 600
+        when = ["no_item pickaxe", "inventory_below iron_ore 1"]
+        line = "Here. Try not to lose this one."
+
+        [[handout]]
+        npc = "npc_mine_foreman"
+        item = "charcoal"
+        qty = 10
+        once = true
+        when = ["gained iron_ore 2"]
+        line = "Charcoal. The fire doesn't light itself."
+
+        [[step]]
+        id = "take_pickaxe"
+        text = "Get a pickaxe"
+        when = "has_item pickaxe"
+
+        [[step]]
+        id = "mine_clay"
+        text = "Mine 4 clay"
+        when = "gained clay_lump 4"
+
+        [[reward]]
+        item = "clay_lump"
+        qty = 6
+    "#;
+
+    async fn a_player(
+        proxy: &Arc<Proxy>,
+    ) -> (WebSocketStream<MaybeTlsStream<TcpStream>>, String) {
+        let mut ws = dial(proxy).await;
+        ws.send(Message::Text(
+            json!({"type": "register", "email": format!("tut_{}@t.test", Uuid::new_v4().simple()),
+                   "password": "pw12", "name": "Learner"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+        (ws, pid)
+    }
+
+    /// The valve opens for exactly the person it exists for: no pickaxe, no ore.
+    /// Anyone else gets nothing, and that is the whole design — a handout that
+    /// fired for someone with a pickaxe would be a tool tap.
+    #[tokio::test]
+    async fn the_pickaxe_valve_opens_only_with_no_pickaxe_and_no_ore() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+
+        // Nothing in hand: it opens.
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "the valve opened");
+
+        // EACH REFUSAL GETS ITS OWN FRESH PLAYER, deliberately. Reusing the one
+        // above would let the 600-second cooldown be the reason nothing is
+        // granted, and the test would pass with the conditions deleted — it did
+        // exactly that until a sabotage run caught it.
+        let (_w2, has_pick) = a_player(&proxy).await;
+        db.add_to_inventory(&has_pick, "pickaxe", 1).await.unwrap();
+        proxy.apply_npc_interact(&has_pick, "npc_mine_foreman").await;
+        assert_eq!(
+            db.inventory_qty(&has_pick, "pickaxe").await.unwrap(),
+            1,
+            "already has one, on a cooldown that has never fired: still no second"
+        );
+
+        // Ore but no pickaxe: STILL shut. Without this a player could mine a
+        // stack, drop the pick and collect a fresh one forever.
+        let (_w3, has_ore) = a_player(&proxy).await;
+        db.add_to_inventory(&has_ore, "iron_ore", 3).await.unwrap();
+        proxy.apply_npc_interact(&has_ore, "npc_mine_foreman").await;
+        assert_eq!(
+            db.inventory_qty(&has_ore, "pickaxe").await.unwrap(),
+            0,
+            "having ore means they had a pick recently — the valve stays shut"
+        );
+    }
+
+    /// Arming your only pickaxe does not reopen the valve.
+    ///
+    /// Note WHAT MAKES THIS TRUE, because it is not the equipment lookup in
+    /// `holds_equipped`: `equipment.instance_id` is a foreign key onto
+    /// `inventory_item`, so an armed pickaxe necessarily still has a row and
+    /// `no_item` fails on the count alone. Deleting the row to isolate the
+    /// equipment check is impossible — the FK refuses.
+    ///
+    /// `holds_equipped` is therefore belt-and-braces rather than load-bearing
+    /// today, and is kept for the case where equipping stops implying
+    /// ownership. This test asserts the property players care about; it does
+    /// not claim to prove which of the two mechanisms delivered it.
+    #[tokio::test]
+    async fn a_pickaxe_in_hand_still_closes_the_valve() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        let inst = db.inventory_for_character(&pid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "pickaxe").unwrap();
+        db.equip_instance(&pid, &inst.id).await.unwrap();
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1, "arming keeps the row");
+
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        assert_eq!(
+            db.inventory_qty(&pid, "pickaxe").await.unwrap(),
+            1,
+            "an armed pickaxe is still a pickaxe owned — no second one"
+        );
+    }
+
+    /// Even at rock bottom, not on demand. The cooldown is the last line
+    /// against a player who genuinely has nothing farming the safety net.
+    #[tokio::test]
+    async fn the_valve_respects_its_cooldown() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 1);
+        db.remove_from_inventory(&pid, "pickaxe", 1).await.unwrap();
+
+        // Conditions hold again — no pickaxe, no ore — but it is minutes early.
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        assert_eq!(
+            db.inventory_qty(&pid, "pickaxe").await.unwrap(),
+            0,
+            "inside the cooldown, deserving or not"
+        );
+    }
+
+    /// The charcoal bundle is genuinely once, forever — not once per cooldown.
+    #[tokio::test]
+    async fn the_charcoal_bundle_is_one_time_ever() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+
+        // Its condition is `gained iron_ore 2`, which is HISTORY: spending the
+        // ore afterwards must not un-earn it.
+        db.note_tutorial_event(&pid, "gained:iron_ore", 2, 1_000).await.unwrap();
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        assert_eq!(db.inventory_qty(&pid, "charcoal").await.unwrap(), 10);
+
+        for _ in 0..3 {
+            proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        }
+        assert_eq!(db.inventory_qty(&pid, "charcoal").await.unwrap(), 10, "once, ever");
+    }
+
+    /// A step completed before ever meeting Marlow is already ticked when the
+    /// track first arrives. This is the property the whole counter design
+    /// exists for — there is no "tutorial started" event to have missed.
+    #[tokio::test]
+    async fn steps_done_before_meeting_marlow_arrive_already_ticked() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (mut ws, pid) = a_player(&proxy).await;
+
+        // Mine clay and buy a pickaxe without ever talking to anyone.
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        proxy.note_tutorial(&pid, "gained:clay_lump", 4).await;
+
+        proxy.send_tutorial_state(&pid).await;
+        let state = recv_until(&mut ws, "tutorial.state").await;
+        let steps = state["steps"].as_array().unwrap();
+        assert!(steps.iter().all(|s| s["done"].as_bool().unwrap()),
+            "both steps should already be ticked: {steps:?}");
+        assert_eq!(state["done"], json!(2));
+    }
+
+    /// Finishing pays out once, and only once.
+    #[tokio::test]
+    async fn finishing_the_track_rewards_exactly_once() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        proxy.note_tutorial(&pid, "gained:clay_lump", 4).await;
+
+        for _ in 0..4 {
+            proxy.send_tutorial_state(&pid).await;
+        }
+        assert_eq!(
+            db.inventory_qty(&pid, "clay_lump").await.unwrap(),
+            6,
+            "the reward lands once however often the track is re-evaluated"
+        );
+    }
+
+    /// Guests get no durable progress and nothing panics. They have no
+    /// inventory to hand anything into, so the handouts must simply not fire.
+    #[tokio::test]
+    async fn guests_get_nothing_and_nothing_breaks() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let mut ws = dial(&proxy).await;
+        ws.send(Message::Text(json!({"type": "guest"}).to_string())).await.unwrap();
+        let pid = recv_until(&mut ws, "welcome").await["player_id"].as_str().unwrap().to_string();
+
+        proxy.apply_npc_interact(&pid, "npc_mine_foreman").await;
+        proxy.note_tutorial(&pid, "gained:clay_lump", 4).await;
+        proxy.send_tutorial_state(&pid).await;
+
+        assert!(db.tutorial_counters(&pid).await.unwrap().is_empty(),
+            "a guest leaves no durable progress");
+        assert_eq!(db.inventory_qty(&pid, "pickaxe").await.unwrap(), 0);
+    }
+
+    /// The track can be skipped entirely with nothing locked behind it. The
+    /// only thing a player who ignores Marlow misses is the reward.
+    #[tokio::test]
+    async fn ignoring_the_track_locks_nothing() {
+        let (proxy, db, _dbf, _zone) = proxy_with_tutorial(VALVE).await;
+        let (_ws, pid) = a_player(&proxy).await;
+
+        // Never talk to Marlow, never look at the track — just play.
+        db.add_to_inventory(&pid, "pickaxe", 1).await.unwrap();
+        db.add_to_inventory(&pid, "iron_ore", 4).await.unwrap();
+        db.add_to_inventory(&pid, "charcoal", 2).await.unwrap();
+        db.load_station_fuel("f1", &pid, "charcoal", 1, 2, 1_000).await.unwrap();
+        let mut recipe = mmo::crafting_config::StationRecipe {
+            display_name: "Smelt".into(), tags: vec!["smelting".into()],
+            skill: "smelting".into(), required_level: 0,
+            inputs: vec![mmo::crafting_config::Ingredient { item: "iron_ore".into(), qty: 2 }],
+            output_item: "iron_ingot".into(), output_qty: 1, fuel_units: 2,
+            duration_ms: 1_000, xp: 10, failure_chance: 0.0,
+            failure_xp_fraction: 0.5, catalyst: None,
+        };
+        recipe.fuel_units = 2;
+        let job = db
+            .start_station_job("f1", &pid, 0, "iron_ingot", &recipe, 0, 1_000, false, None, 1_000)
+            .await
+            .unwrap()
+            .expect("smelting works without the tutorial");
+        db.ripen_station_jobs(2_000).await.unwrap();
+        let got = db.collect_station_job(&job.id, &pid, 0, 0, 2_000).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)],
+            "the whole economy works for someone who never met Marlow");
+    }
+
+    /// Marlow stands where he can see what he is talking about, and outside
+    /// the portal's reach so talking to him is never the same gesture as
+    /// walking into the mine.
+    #[test]
+    fn marlow_stands_in_the_yard_but_clear_of_the_adit() {
+        let marlow = mmo::world::npc("npc_mine_foreman").expect("Marlow should exist");
+        let zones = load_zone_config();
+        let mine = zones.interior("mine_starter").unwrap();
+        let adit = mine.portals.first().unwrap();
+        let d = (((marlow.x - adit.world.0).pow(2) + (marlow.y - adit.world.1).pow(2)) as f64).sqrt();
+        assert!(d > 50.0, "inside the portal's reach ({d:.0})");
+        assert!(d < 250.0, "too far from the yard he is meant to explain ({d:.0})");
+
+        // He hands nothing over unconditionally — every grant of his is a valve
+        // in tutorial.toml, and a static one here would bypass all of it.
+        assert!(marlow.grants_item.is_none(), "Marlow's grants must all be conditional");
     }
 
     /// Each NPC's grant is scoped to its OWN item (#126) — talking to one

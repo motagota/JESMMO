@@ -417,6 +417,17 @@ const S_STATION_ERROR := "station.error"
 ## a spoil: everything comes back, so the wording must not read as a loss.
 const S_STATION_CANCELLED := "station.cancelled"
 
+# --- the tutorial track (#169) ------------------------------------------------
+## `tutorial.state {steps:[{id,text,done}], done, total}` — the whole track with
+## every step already evaluated server-side. The client never decides that a
+## step is done: the server has been counting since this character's first
+## login, which is what lets a step finished before ever meeting Marlow arrive
+## already ticked.
+##
+## Nothing is gated behind the track. Ignoring it entirely locks nothing.
+const S_TUTORIAL_STATE := "tutorial.state"
+const S_TUTORIAL_COMPLETE := "tutorial.complete"
+
 ## Prose for a `station.error` reason. The server sends a code and the numbers;
 ## the wording lives here.
 static func station_error_text(reason: String, d: Dictionary) -> String:

@@ -3177,6 +3177,141 @@ impl Db {
 
     // --- the creature bounty (wild dogs epic #157, issue #161) --------------
 
+    // --- Tutorial track and conditional handouts (#169) ---------------------
+
+    /// Bump a watched counter. Called from the gather/craft paths for every
+    /// persistent character, so a step done before meeting Marlow is already
+    /// ticked when they meet him.
+    pub async fn note_tutorial_event(
+        &self,
+        character_id: &str,
+        event: &str,
+        by: i64,
+        now: i64,
+    ) -> Result<i64, DbError> {
+        sqlx::query(
+            "INSERT INTO tutorial_counter (character_id, event, count, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(character_id, event) DO UPDATE SET \
+             count = count + excluded.count, updated_at = excluded.updated_at",
+        )
+        .bind(character_id)
+        .bind(event)
+        .bind(by.max(0))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count FROM tutorial_counter WHERE character_id = ? AND event = ?",
+        )
+        .bind(character_id)
+        .bind(event)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Every watched counter for this character.
+    pub async fn tutorial_counters(&self, character_id: &str) -> Result<Vec<(String, i64)>, DbError> {
+        Ok(sqlx::query_as("SELECT event, count FROM tutorial_counter WHERE character_id = ?")
+            .bind(character_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// When a handout last fired for this character, and how many times.
+    pub async fn handout_state(
+        &self,
+        character_id: &str,
+        npc_id: &str,
+        item_id: &str,
+    ) -> Result<Option<(i64, i64)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT granted_at, times FROM handout_log \
+             WHERE character_id = ? AND npc_id = ? AND item_id = ?",
+        )
+        .bind(character_id)
+        .bind(npc_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Hand over a conditional grant and record it, in ONE transaction.
+    ///
+    /// The record and the goods must land together. A crash between them would
+    /// either give a free pickaxe with no cooldown started — which is the
+    /// infinite-pickaxe bug the conditions exist to prevent — or start a
+    /// cooldown for an item the player never received, which strands exactly
+    /// the person the valve is for.
+    ///
+    /// Returns how many actually fit; a full pack takes what it can. The
+    /// cooldown starts either way, because the alternative is a player at the
+    /// cap re-triggering the handout every second.
+    ///
+    /// `once` makes the whole thing ATOMIC against a second caller: the log row
+    /// is claimed with `ON CONFLICT DO NOTHING`, and the goods are handed over
+    /// only if that insert actually took. Asking "has this already fired?" and
+    /// then firing are two statements, and two `send_tutorial_state` calls
+    /// genuinely overlap — the login push and an event push — so both would
+    /// otherwise pass the check and both pay out. Found exactly that way.
+    /// Same compare-and-claim shape as #142's listing purchase.
+    pub async fn grant_handout(
+        &self,
+        character_id: &str,
+        npc_id: &str,
+        item_id: &str,
+        qty: i64,
+        once: bool,
+        now: i64,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        if once {
+            let claimed = sqlx::query(
+                "INSERT INTO handout_log (character_id, npc_id, item_id, granted_at, times) \
+                 VALUES (?, ?, ?, ?, 1) ON CONFLICT(character_id, npc_id, item_id) DO NOTHING",
+            )
+            .bind(character_id)
+            .bind(npc_id)
+            .bind(item_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if claimed.rows_affected() == 0 {
+                tx.commit().await?;
+                return Ok(0); // someone else already claimed it
+            }
+        }
+        let carried: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(qty) FROM inventory_item WHERE character_id = ?")
+                .bind(character_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let room = (carry_capacity_in_tx(&mut tx, character_id).await? - carried.unwrap_or(0)).max(0);
+        let add = qty.min(room);
+        if add > 0 {
+            add_inventory_in_tx(&mut tx, character_id, item_id, add).await?;
+        }
+        if !once {
+            // A cooldown handout logs by overwriting: what it needs from the row
+            // is the timestamp, not a claim.
+            sqlx::query(
+                "INSERT INTO handout_log (character_id, npc_id, item_id, granted_at, times) \
+                 VALUES (?, ?, ?, ?, 1) \
+                 ON CONFLICT(character_id, npc_id, item_id) DO UPDATE SET \
+                 granted_at = excluded.granted_at, times = times + 1",
+            )
+            .bind(character_id)
+            .bind(npc_id)
+            .bind(item_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(add)
+    }
+
     // --- Stations, fuel and timed jobs (mine epic #164, issue #167) ---------
 
     /// How many fuel units a station is holding.

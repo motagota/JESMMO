@@ -732,6 +732,29 @@ pub fn npc_spawns() -> Vec<NpcSpawn> {
                 "Practice sharpens more than the edge — you'll swing faster with time.",
             ],
         },
+        // Foreman Marlow (#169), in the mine yard: the adit at (12800, 13500),
+        // the furnace at (12860, 13520) and the wheel at (12960, 13520) are the
+        // three things he teaches, and all three are in sight of him.
+        //
+        // 73 units from the adit mouth — outside the portal's 40-unit radius by
+        // a clear margin, so walking up to talk and walking in are never the
+        // same gesture.
+        //
+        // His `grants_item` is None on purpose. Everything he hands over is
+        // CONDITIONAL and lives in `tutorial.toml`: the static single-item grant
+        // on this struct cannot express "no pickaxe AND no ore, and not in the
+        // last ten minutes", and bolting a second hardcoded special case on
+        // beside Bram's is how a registry turns into a pile.
+        NpcSpawn {
+            id: "npc_mine_foreman", name: "Marlow", district: "civic", x: 12820, y: 13570,
+            grants_item: None,
+            lines_granted: &[],
+            lines_repeat: &[
+                "Kedron Cut. Clay near the mouth, iron in the deep working.",
+                "Furnace behind me, wheel past it. Ore goes in one, clay in the other.",
+                "Nothing here you can't work out by swinging at it. Go on.",
+            ],
+        },
         // The weapon master (#160). Same "safety net, not a farm" contract the
         // foremen have: he hands over a blade only when you have none at all, so
         // losing yours is never a dead end and dropping one is never a farm.
@@ -1626,10 +1649,24 @@ mod tests {
             let g = (((d.x - px) as f64).powi(2) + ((d.y - py) as f64).powi(2)).sqrt();
             assert!(g > threat, "{} can reach the adit mouth ({g:.0})", d.id);
         }
-        // Clear of every other interaction, so the mouth is its own place.
+        // Clear of the PORTAL, so entering the mine and talking to someone are
+        // never the same gesture.
+        //
+        // This was a flat 200 when the adit stood alone, which #169 made wrong
+        // rather than merely strict: the mine yard is now a designed place with
+        // a furnace 63 units out and a wheel at 160, and the man who explains
+        // them has to stand among them. The number that was ever load-bearing is
+        // the portal's own 40-unit radius plus the zone's 10-unit talk range —
+        // past that the two interactions cannot be confused for each other. The
+        // 200 was a proxy for this, so it is stated directly now.
+        let separation = 40.0 + 10.0;
         for n in &c.npcs {
             let g = (((n.x - px) as f64).powi(2) + ((n.y - py) as f64).powi(2)).sqrt();
-            assert!(g > 200.0, "the adit mouth is on top of NPC {}", n.id);
+            assert!(
+                g > separation,
+                "NPC {} stands {g:.0} from the adit mouth — inside the portal's reach,                  so talking to them and entering the mine would be the same gesture",
+                n.id
+            );
         }
         for n in &c.resource_nodes {
             let g = (((n.x - px) as f64).powi(2) + ((n.y - py) as f64).powi(2)).sqrt();

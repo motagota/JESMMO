@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod crafting_config;
+pub mod tutorial_config;
 pub mod market_config;
 pub mod persistence;
 pub mod protocol;
