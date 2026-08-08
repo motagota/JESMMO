@@ -416,6 +416,12 @@ const C_STATION_COLLECT := "station.collect"
 ## Tear down a station you own (#180). The materials go back to your storehouse
 ## rather than your pack: a station costs more than a pack holds, so a refund
 ## into carried inventory would silently drop the overflow.
+## Set who may use your plot's stations and what it costs (#181).
+const C_STATION_POLICY := "station.policy"
+const S_STATION_POLICY := "station.policy"
+## Somebody paid to use your station. The first player-to-player gold in the
+## game — a TRANSFER, not minted, so it never touches the supply ledger.
+const S_STATION_EARNED := "station.earned"
 const C_STATION_DEMOLISH := "station.demolish"
 const S_STATION_DEMOLISHED := "station.demolished"
 const S_STATION_STATE := "station.state"
@@ -444,6 +450,11 @@ static func station_error_text(reason: String, d: Dictionary) -> String:
     match reason:
         "out_of_range": return "Stand at the station to use it."
         "not_a_fuel": return "That doesn't burn."
+        "closed": return "The owner keeps this one to themselves."
+        "not_on_the_roster": return "You are not on this owner's roster."
+        "below_owners_skill_floor": return "The owner asks for level %d here (you are %d)." % [int(d.get("need", 0)), int(d.get("have", 0))]
+        "no_plot": return "You have no plot to set a policy on."
+        "bad_policy": return "That policy was refused."
         "no_fuel_to_load": return "You have none to load."
         "no_such_recipe": return "No such recipe."
         "wrong_station": return "That can't be made here."

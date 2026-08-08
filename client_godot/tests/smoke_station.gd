@@ -182,6 +182,40 @@ func _process(_delta: float) -> bool:
 		_fail("a full pack must be described as waiting, not lost: '%s'" % msg)
 		return true
 
+	# --- somebody else's fee is shown BEFORE committing (#181) ---------------
+	# A fee discovered after the fact is worse than one shown up front, and the
+	# owner's cut is named separately from the world's because they are
+	# different things: one is burned, one goes to a person.
+	var rented := _state(6, [])
+	rented["owner_fee_gp"] = 7
+	rented["owner"] = "someone_else"
+	_panel.set_inventory([{"item_id": "iron_ore", "qty": 4}, {"item_id": "charcoal", "qty": 3}])
+	_panel.set_state(rented)
+	t = _text()
+	if t.findn("7g to the owner") < 0:
+		_fail("the owner's cut should be quoted before committing: %s" % t)
+		return true
+	if t.findn("2g fee") < 0:
+		_fail("...alongside the world's, not instead of it: %s" % t)
+		return true
+
+	# --- your own station says so, and charges you nothing -------------------
+	var mine_state := _state(6, [])
+	mine_state["mine"] = true
+	mine_state["owner_fee_gp"] = 0
+	_panel.set_state(mine_state)
+	if _text().findn("yours") < 0:
+		_fail("your own station should be labelled: %s" % _text())
+		return true
+
+	# --- a closed station says why, rather than just failing later -----------
+	var shut := _state(6, [])
+	shut["access_error"] = "closed"
+	_panel.set_state(shut)
+	if _text().findn("keeps this one to themselves") < 0:
+		_fail("a closed station should explain itself: %s" % _text())
+		return true
+
 	# --- a spoiled job must NOT read like a refund (#168) --------------------
 	# The clay is genuinely gone. A "materials came back" message here would
 	# just move the player's surprise to their inventory screen.

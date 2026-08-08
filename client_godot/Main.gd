@@ -463,6 +463,14 @@ func _wire_signals() -> void:
             text += " (a bonus from your skill)"
         _station.note(text)
         _hud.flash_announce(text))
+    # Somebody paid to use your furnace (#181) — the first player-to-player
+    # gold in the game, and worth announcing.
+    _net.station_earned.connect(func(_sid, gold, _from):
+        _hud.flash_announce("A customer paid you %dg" % gold)
+        _hud.flash_gain("gold", gold))
+    _net.station_policy.connect(func(mode, fee, _floor):
+        _station.note("Your stations are now %s%s." % [
+            mode, (" at %dg" % fee) if mode == "fee" else ""]))
     _station.do_load_fuel.connect(func(item_id, qty): _net.send_station_load_fuel(item_id, qty))
     _station.do_start.connect(func(recipe_id): _net.send_station_start(recipe_id))
     _station.do_collect.connect(func(job_id): _net.send_station_collect(job_id))

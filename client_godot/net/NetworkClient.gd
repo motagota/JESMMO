@@ -160,6 +160,10 @@ signal station_error(reason: String, detail: Dictionary)
 signal station_cancelled(station_id: String, slot: int, recipe_id: String, reason: String)
 ## A station you owned was torn down (#180), with what came back.
 signal station_demolished(station_id: String, refunded: Array, fuel_lost: int)
+## Your access policy, as the server accepted it (#181).
+signal station_policy(mode: String, fee_gp: int, skill_floor: int)
+## Somebody paid to use your station.
+signal station_earned(station_id: String, gold: int, from_player: String)
 ## The tutorial track (#169), fully evaluated server-side.
 signal tutorial_state(steps: Array, done: int, total: int)
 signal tutorial_complete(item: String, qty: int)
@@ -467,6 +471,16 @@ func _handle_text(text: String) -> void:
             tutorial_complete.emit(String(msg.get("item", "")), int(msg.get("qty", 0)))
         Protocol.S_BUILD_ERROR:
             build_error.emit(String(msg.get("reason", "")))
+        Protocol.S_STATION_POLICY:
+            station_policy.emit(
+                String(msg.get("mode", "")),
+                int(msg.get("fee_gp", 0)),
+                int(msg.get("skill_floor", 0)))
+        Protocol.S_STATION_EARNED:
+            station_earned.emit(
+                String(msg.get("station_id", "")),
+                int(msg.get("gold", 0)),
+                String(msg.get("from", "")))
         Protocol.S_STATION_DEMOLISHED:
             station_demolished.emit(
                 String(msg.get("station_id", "")),
@@ -805,6 +819,10 @@ func send_station_load_fuel(item_id: String, qty: int) -> void:
 
 func send_station_start(recipe_id: String) -> void:
     _send({"type": Protocol.C_STATION_START, "recipe_id": recipe_id})
+
+func send_station_policy(mode: String, fee_gp: int, skill_floor: int) -> void:
+    _send({"type": Protocol.C_STATION_POLICY, "mode": mode,
+           "fee_gp": fee_gp, "skill_floor": skill_floor})
 
 func send_station_demolish(station_id: String) -> void:
     _send({"type": Protocol.C_STATION_DEMOLISH, "station_id": station_id})
