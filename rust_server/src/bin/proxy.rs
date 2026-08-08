@@ -512,6 +512,48 @@ struct Identity {
     saved_zone: String,
 }
 
+/// Where a station stands and who owns it, whether authored into the world or
+/// built by a player (#180).
+///
+/// Owned rather than borrowed because the two sources differ: an authored
+/// station is a borrow into config that lives forever, a plot station is a row
+/// that can be demolished mid-call. One owned answer keeps every caller from
+/// caring which it got.
+#[derive(Debug, Clone, PartialEq)]
+struct StationRef {
+    /// The runtime id `station_fuel` and `station_job` key on — an authored id
+    /// like `furnace_mine_yard`, or a plot station's uuid.
+    id: String,
+    kind: String,
+    x: i32,
+    y: i32,
+    /// `None` for an authored public fixture; the plot's owner otherwise. This
+    /// is what #181's fees will read.
+    owner: Option<String>,
+}
+
+impl StationRef {
+    fn authored(st: &mmo::zone_config::StationPlacement) -> StationRef {
+        StationRef {
+            id: st.id.clone(),
+            kind: st.kind.clone(),
+            x: st.pos.0,
+            y: st.pos.1,
+            owner: None,
+        }
+    }
+
+    fn on_plot(ps: &mmo::persistence::PlotStation) -> StationRef {
+        StationRef {
+            id: ps.id.clone(),
+            kind: ps.station_type.clone(),
+            x: ps.x as i32,
+            y: ps.y as i32,
+            owner: ps.owner_character_id.clone(),
+        }
+    }
+}
+
 struct Proxy {
     host: String,
     port: u16,
@@ -568,6 +610,8 @@ struct Proxy {
     /// levels, neither of which a zone can see.
     crafting_cfg: mmo::crafting_config::CraftingConfig,
     tutorial_cfg: mmo::tutorial_config::TutorialConfig,
+    /// Player-built stations (#180), cached — see `refresh_plot_stations`.
+    plot_stations: Mutex<Vec<mmo::persistence::PlotStation>>,
     /// Items some `gained` condition watches, precomputed at boot so the
     /// gather path is a set lookup rather than a config walk per swing.
     tutorial_counted: std::collections::BTreeSet<String>,
@@ -847,6 +891,7 @@ impl Proxy {
             zone_cfg: load_zone_config(),
             crafting_cfg: load_crafting_config(),
             tutorial_cfg: load_tutorial_config(),
+            plot_stations: Mutex::new(Vec::new()),
             tutorial_counted: load_tutorial_config().counted_items(),
             tutorial_made: load_tutorial_config().made_items(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),
@@ -4381,6 +4426,136 @@ impl Proxy {
         }
     }
 
+    /// Build a crafting station on the caller's own plot (#180).
+    ///
+    /// The station type comes from the caller, but everything that matters is
+    /// re-derived here: the cost, the radius, and whether the spot is free.
+    ///
+    /// **This is the first structure that costs anything.** Placement was free
+    /// until now, which is why #43 could observe that reclaim deletes
+    /// structures and conclude nothing of value was lost. Now something is, so
+    /// demolition refunds (see `apply_demolish_station`) and the lease machine
+    /// has to grow a vault (#184).
+    async fn apply_build_station(
+        &self,
+        pid: &str,
+        plot: &mmo::persistence::Plot,
+        x: i32,
+        y: i32,
+        rot: i64,
+    ) {
+        let Some(db) = self.db.clone() else { return };
+        let refuse = |reason: &str| {
+            self.push_to_player(pid, json!({"type": "build.error", "reason": reason}));
+        };
+        // Which station: the client names a type, the server decides whether it
+        // is a real one. Defaulting would let a typo build something arbitrary.
+        let station_type = "furnace"; // Phase 1: one buildable type
+        let Some(t) = self.crafting_cfg.station(station_type) else {
+            refuse("no_such_station");
+            return;
+        };
+
+        // Overlap, against EVERY station in the world. `check_station_spacing`
+        // refuses overlapping authored pairs at boot (#168); a player-placed one
+        // has to be refused at placement, where the answer can be a message
+        // rather than a panic.
+        let mut occupied: Vec<(i32, i32, i64)> = self
+            .zone_cfg
+            .station
+            .iter()
+            .filter(|st| st.interior.is_none())
+            .filter_map(|st| {
+                self.crafting_cfg
+                    .station(&st.kind)
+                    .map(|ot| (st.pos.0, st.pos.1, ot.radius))
+            })
+            .collect();
+        occupied.extend(self.plot_stations.lock().unwrap().iter().filter_map(|ps| {
+            self.crafting_cfg
+                .station(&ps.station_type)
+                .map(|ot| (ps.x as i32, ps.y as i32, ot.radius))
+        }));
+        for (ox, oy, orad) in occupied {
+            let need = t.radius + orad;
+            if dist2(x, y, ox, oy) < (need as i64).pow(2) {
+                refuse("too_close_to_another_station");
+                return;
+            }
+        }
+
+        let cost = mmo::world::structure_cost("station");
+        match db
+            .build_plot_station(&plot.id, pid, station_type, cost, x as i64, y as i64, rot, now_secs())
+            .await
+        {
+            Ok(Some((structure, _))) => {
+                self.refresh_plot_stations().await;
+                self.send_inventory(pid).await;
+                self.send_station_list(pid);
+                println!("[Proxy] {pid} built a {station_type} on plot {}", plot.id);
+                self.push_to_player(
+                    pid,
+                    json!({"type": "build.placed", "structure": structure_json(&structure)}),
+                );
+                self.broadcast_to_district(&plot.district, home_structure_status_json(&structure));
+                self.push_home_structure_to_zones(&plot.district, &structure);
+            }
+            // Nothing was taken — `build_plot_station` checks every material
+            // before it takes any.
+            Ok(None) => refuse("not_enough_materials"),
+            Err(e) => eprintln!("[Proxy] build station failed: {e}"),
+        }
+    }
+
+    /// Tear down a station the caller owns, refunding its materials and fuel.
+    ///
+    /// Any jobs still running on it are failed FIRST, with full refunds — #168's
+    /// `failed`, not `spoiled`, because the world is what changed its mind.
+    /// Other players may have materials escrowed in this furnace and demolition
+    /// must not be a way to take them.
+    async fn apply_demolish_station(&self, pid: &str, station_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let owns = self
+            .plot_stations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ps| ps.id == station_id && ps.plot_id == plot.id);
+        if !owns {
+            self.push_to_player(pid, json!({"type": "build.error", "reason": "not_yours"}));
+            return;
+        }
+
+        // Fail everyone's running jobs before the station stops existing.
+        for job in db.all_station_jobs().await.unwrap_or_default() {
+            if job.station_id == station_id && job.state == "running" {
+                let _ = db.fail_station_job(&job.id, "station_removed").await;
+            }
+        }
+
+        let cost = mmo::world::structure_cost("station");
+        match db.demolish_plot_station(station_id, &plot.id, cost).await {
+            Ok(Some((refunded, fuel))) => {
+                self.refresh_plot_stations().await;
+                self.send_inventory(pid).await;
+                self.send_station_list(pid);
+                self.push_to_player(
+                    pid,
+                    json!({
+                        "type": "station.demolished", "station_id": station_id,
+                        "refunded": refunded.iter().map(|(i, q)| json!({"item": i, "qty": q}))
+                            .collect::<Vec<_>>(),
+                        "fuel_lost": fuel,
+                    }),
+                );
+            }
+            Ok(None) => self.push_to_player(pid, json!({"type": "build.error", "reason": "no_such_station"})),
+            Err(e) => eprintln!("[Proxy] demolish station failed: {e}"),
+        }
+    }
+
     /// Apply a `build_place` reported by a zone (which validated only that the
     /// *target* point sits on some plot — geometry, not ownership). Resolve the
     /// caller's own plot and validate kind/bounds/overlap here, where ownership
@@ -4402,7 +4577,13 @@ impl Proxy {
         };
         let bounds = cell.rect();
         if x < bounds.x0 || y < bounds.y0 || x + w > bounds.x1 || y + h > bounds.y1 {
-            return; // footprint would escape the owner's own plot
+            // Was a silent return. Placement could only fail silently while it
+            // was free and consequence-free; now it costs materials, and a
+            // refusal the player cannot see is the same shape of bug that made
+            // the mine unreachable (#186) — the action simply does nothing and
+            // nothing says why.
+            self.push_to_player(pid, json!({"type": "build.error", "reason": "outside_your_plot"}));
+            return;
         }
         let Ok(existing) = db.structures_for_plot(&plot.id).await else { return };
         for s in &existing {
@@ -4410,9 +4591,20 @@ impl Proxy {
             let overlap_x = (x as i64) < s.x + ew as i64 && s.x < (x + w) as i64;
             let overlap_y = (y as i64) < s.y + eh as i64 && s.y < (y + h) as i64;
             if overlap_x && overlap_y {
-                return; // would overlap something already on the plot
+                self.push_to_player(pid, json!({"type": "build.error", "reason": "overlaps_something"}));
+                return;
             }
         }
+        // A station is a different kind of placement (#180): it costs materials,
+        // it carries a runtime identity, and it must not overlap any other
+        // station in the world — including the authored public ones, or a player
+        // could build over the mine yard furnace and make it ambiguous which one
+        // anybody standing there is using.
+        if kind == "station" {
+            self.apply_build_station(pid, &plot, x, y, rot).await;
+            return;
+        }
+
         let Ok(structure) = db
             .place_structure(&plot.id, kind, x as i64, y as i64, rot, 100, Some(pid), "{}")
             .await
@@ -4884,7 +5076,7 @@ impl Proxy {
     /// alone could be used from the wrong side of the rock — the mine yard
     /// furnace sits at (12860, 13520), and so does a patch of Gallery B's floor
     /// in the interior's local frame.
-    fn station_at(&self, pid: &str) -> Option<(&mmo::zone_config::StationPlacement, &mmo::crafting_config::StationType)> {
+    fn station_at(&self, pid: &str) -> Option<(StationRef, mmo::crafting_config::StationType)> {
         let (px, py, zone) = {
             let cache = self.entity_state.lock().unwrap();
             let c = cache.get(pid)?;
@@ -4892,13 +5084,19 @@ impl Proxy {
         };
         let interior = self.zone_is_interior(&zone);
         // NEAREST, not first-in-config-order. Two stations whose radii overlap
-        // are authored out by validation, but order-dependence would still be
-        // the wrong rule: the client picks the nearest, and a server that
-        // picked the first would put the two into quiet disagreement about
+        // are refused at authoring and at placement, but order-dependence would
+        // still be the wrong rule: the client picks the nearest, and a server
+        // that picked the first would put the two into quiet disagreement about
         // which station the player is even standing at. (It did — the mine
         // yard's wheel and furnace were 40 apart with radius 40, and the live
         // probe walked to the wheel and was handed the furnace.)
-        let mut best: Option<(i64, &mmo::zone_config::StationPlacement, &mmo::crafting_config::StationType)> = None;
+        let mut best: Option<(i64, StationRef, mmo::crafting_config::StationType)> = None;
+        let mut consider = |d2: i64, r: StationRef, t: mmo::crafting_config::StationType| {
+            if best.as_ref().map(|(bd, _, _)| d2 < *bd).unwrap_or(true) {
+                best = Some((d2, r, t));
+            }
+        };
+
         for st in self.zone_cfg.station.iter() {
             // A surface station is unreachable from inside an interior and vice
             // versa, whatever the coordinates say.
@@ -4909,14 +5107,42 @@ impl Proxy {
             }
             let Some(t) = self.crafting_cfg.station(&st.kind) else { continue };
             let d2 = dist2(px, py, st.pos.0, st.pos.1);
-            if d2 > (t.radius as i64).pow(2) {
-                continue;
-            }
-            if best.map(|(bd, _, _)| d2 < bd).unwrap_or(true) {
-                best = Some((d2, st, t));
+            if d2 <= (t.radius as i64).pow(2) {
+                consider(d2, StationRef::authored(st), t.clone());
             }
         }
-        best.map(|(_, st, t)| (st, t))
+
+        // ...and the ones players built (#180). Plots are a surface feature, so
+        // an interior player is never standing at one.
+        if !interior {
+            for ps in self.plot_stations.lock().unwrap().iter() {
+                // A station on a plot whose lease has lapsed is inert. The plot
+                // is on its way back to the pool and its owner should not be
+                // collecting fees from it (#181, #184).
+                if ps.plot_state != "active" {
+                    continue;
+                }
+                let Some(t) = self.crafting_cfg.station(&ps.station_type) else { continue };
+                let d2 = dist2(px, py, ps.x as i32, ps.y as i32);
+                if d2 <= (t.radius as i64).pow(2) {
+                    consider(d2, StationRef::on_plot(ps), t.clone());
+                }
+            }
+        }
+        best.map(|(_, r, t)| (r, t))
+    }
+
+    /// Reload the in-memory plot-station list from the database.
+    ///
+    /// Cached rather than queried per proximity check, because `station_at`
+    /// runs on the interact path and on the presence sweep once a second for
+    /// every running job. The authored list has always been held this way; this
+    /// keeps player-built stations on the same footing.
+    async fn refresh_plot_stations(&self) {
+        let Some(db) = self.db.clone() else { return };
+        if let Ok(rows) = db.plot_stations().await {
+            *self.plot_stations.lock().unwrap() = rows;
+        }
     }
 
     /// Refuse to boot on two stations whose radii overlap (#168).
@@ -5010,6 +5236,24 @@ impl Proxy {
                 }))
             })
             .collect();
+        // ...and the ones players built (#180). Without these the client draws
+        // no prompt at a furnace somebody put on their own plot, which is the
+        // shape of bug that made the mine unreachable (#186).
+        let mut stations = stations;
+        for ps in self.plot_stations.lock().unwrap().iter() {
+            if ps.plot_state != "active" {
+                continue;
+            }
+            let Some(t) = self.crafting_cfg.station(&ps.station_type) else { continue };
+            stations.push(json!({
+                "id": ps.id, "name": t.display_name,
+                "x": ps.x, "y": ps.y, "radius": t.radius, "zone": "",
+                // Whose it is, so the client can label it and — once #181 lands
+                // — show the fee before the player commits.
+                "owner": ps.owner_character_id,
+                "mine": ps.owner_character_id.as_deref() == Some(pid),
+            }));
+        }
         self.push_to_player(pid, json!({"type": "station.list", "stations": stations}));
     }
 
@@ -5026,7 +5270,7 @@ impl Proxy {
             return; // guests have no durable inventory or purse
         }
         let cid = pid;
-        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+        let Some((placement, t)) = self.station_at(pid) else {
             self.push_to_player(pid, json!({"type": "station.closed"}));
             return;
         };
@@ -5119,7 +5363,7 @@ impl Proxy {
             return; // guests have no durable inventory or purse
         }
         let cid = pid;
-        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+        let Some((placement, t)) = self.station_at(pid) else {
             self.push_to_player(pid, json!({"type": "station.error", "reason": "out_of_range"}));
             return;
         };
@@ -5154,7 +5398,7 @@ impl Proxy {
             return; // guests have no durable inventory or purse
         }
         let cid = pid;
-        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+        let Some((placement, t)) = self.station_at(pid) else {
             self.push_to_player(pid, json!({"type": "station.error", "reason": "out_of_range"}));
             return;
         };
@@ -7115,11 +7359,15 @@ impl Proxy {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .and_then(|t| t.strip_prefix("station."))
-                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect"))
+                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish"))
                     {
                         let op = op.to_string();
                         match op.as_str() {
                             "open" => self.send_station_state(&player_id).await,
+                            "demolish" => {
+                                let sid = data.get("station_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                self.apply_demolish_station(&player_id, &sid).await;
+                            }
                             "load_fuel" => {
                                 let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(1);
@@ -7468,6 +7716,10 @@ impl Proxy {
         // an overlapping pair is unfixable at runtime and silently wrong.
         self.check_station_spacing();
 
+        // Player-built stations, cached before anything can stand at one.
+        let me = self.clone();
+        tokio::spawn(async move { me.refresh_plot_stations().await });
+
         let me = self.clone();
         tokio::spawn(async move { me.station_job_monitor().await });
 
@@ -7757,6 +8009,7 @@ mod tests {
             zone_cfg: load_zone_config(),
             crafting_cfg: load_crafting_config(),
             tutorial_cfg: load_tutorial_config(),
+            plot_stations: Mutex::new(Vec::new()),
             tutorial_counted: load_tutorial_config().counted_items(),
             tutorial_made: load_tutorial_config().made_items(),
             rent_reclaim_log: Mutex::new(VecDeque::new()),

@@ -856,6 +856,26 @@ pub struct SkillGain {
 }
 
 
+/// A station standing on a plot (#180), joined to its plot's ownership.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PlotStation {
+    pub id: String,
+    pub structure_id: String,
+    pub plot_id: String,
+    /// A key into `crafting.toml`'s `[station.*]`. May no longer exist.
+    pub station_type: String,
+    pub x: i64,
+    pub y: i64,
+    pub built_at: i64,
+    /// From the plot. `None` on an unowned plot, which should not happen while
+    /// a station stands on it but is not worth panicking over.
+    pub owner_character_id: Option<String>,
+    /// The plot's lease state. A station on a lapsed plot must not be usable —
+    /// checked at the gate rather than trusted here.
+    #[sqlx(rename = "state")]
+    pub plot_state: String,
+}
+
 /// A station job as the database holds it, with `inputs_json` still raw.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct StationJobRow {
@@ -3310,6 +3330,215 @@ impl Db {
         }
         tx.commit().await?;
         Ok(add)
+    }
+
+    // --- Player-built stations on plots (business epic #179, issue #180) ----
+
+    /// A station instance standing on somebody's plot.
+    ///
+    /// `owner` comes from the plot, not from the station — which is what makes
+    /// #181's fees possible without stations carrying an owner of their own.
+    pub async fn plot_stations(&self) -> Result<Vec<PlotStation>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT ps.id, ps.structure_id, ps.plot_id, ps.station_type, ps.x, ps.y, \
+             ps.built_at, p.owner_character_id, p.state \
+             FROM plot_station ps JOIN plot p ON p.id = ps.plot_id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Build a station on a plot: take the materials and write both rows in ONE
+    /// transaction.
+    ///
+    /// Structures were free until this issue, so nothing about placement had to
+    /// be atomic. Now it does: a crash between taking 40 stone and recording the
+    /// station would be the materials gone and no furnace, which is the exact
+    /// shape of loss #43 objected to.
+    ///
+    /// Returns `None` if the builder cannot pay, having taken nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_plot_station(
+        &self,
+        plot_id: &str,
+        character_id: &str,
+        station_type: &str,
+        cost: &[(&str, i64)],
+        x: i64,
+        y: i64,
+        rot: i64,
+        now: i64,
+    ) -> Result<Option<(Structure, PlotStation)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // MATERIALS COME FROM THE PACK AND THE STOREHOUSE TOGETHER, and they
+        // have to. A station costs more than `MAX_CARRY` on purpose — 52 units
+        // against a 50-unit pack, so building one is a haul rather than a click
+        // — which means it can NEVER be paid for out of carried inventory
+        // alone. The first version of this took only from the pack and the
+        // station was therefore unbuildable; the test caught it immediately.
+        //
+        // The storehouse is the thing you hauled to. Drawing on it is what
+        // makes the over-a-load price coherent instead of impossible.
+        //
+        // Everything is checked before anything is taken. Same ordering rule as
+        // a station job (#167): a partial take on a build that then fails is
+        // theft.
+        for (item, qty) in cost {
+            let carried: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(qty) FROM inventory_item WHERE character_id = ? AND item_id = ?",
+            )
+            .bind(character_id)
+            .bind(*item)
+            .fetch_one(&mut *tx)
+            .await?;
+            let stored: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(qty) FROM storage_item WHERE character_id = ? AND item_id = ?",
+            )
+            .bind(character_id)
+            .bind(*item)
+            .fetch_one(&mut *tx)
+            .await?;
+            if carried.unwrap_or(0) + stored.unwrap_or(0) < *qty {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+        for (item, qty) in cost {
+            // Pack first, so a player who is holding the materials does not
+            // have to deposit them before they can build.
+            let took = remove_inventory_in_tx(&mut tx, character_id, item, *qty).await?;
+            if took < *qty {
+                remove_storage_in_tx(&mut tx, character_id, item, *qty - took).await?;
+            }
+        }
+
+        let sid = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO structure (id, plot_id, kind, x, y, rot, hp, built_by, data) \
+             VALUES (?, ?, 'station', ?, ?, ?, 100, ?, '{}')",
+        )
+        .bind(&sid)
+        .bind(plot_id)
+        .bind(x)
+        .bind(y)
+        .bind(rot)
+        .bind(character_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let psid = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO plot_station (id, structure_id, plot_id, station_type, x, y, built_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&psid)
+        .bind(&sid)
+        .bind(plot_id)
+        .bind(station_type)
+        .bind(x)
+        .bind(y)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(Some((
+            Structure {
+                id: sid.clone(),
+                plot_id: plot_id.to_string(),
+                kind: "station".to_string(),
+                x,
+                y,
+                rot,
+                hp: 100,
+                built_by: Some(character_id.to_string()),
+                data: "{}".to_string(),
+            },
+            PlotStation {
+                id: psid,
+                structure_id: sid,
+                plot_id: plot_id.to_string(),
+                station_type: station_type.to_string(),
+                x,
+                y,
+                built_at: now,
+                owner_character_id: Some(character_id.to_string()),
+                plot_state: "active".to_string(),
+            },
+        )))
+    }
+
+    /// Tear a station down: refund the materials, hand back the fuel, and drop
+    /// both rows — in one transaction.
+    ///
+    /// **Refunding is the point.** #43 objected that reclaim deletes structures,
+    /// and was right to; now that placing one costs 40 stone and 12 ingots,
+    /// deleting it silently would be destroying real property. Any RUNNING jobs
+    /// must be failed by the caller first — this returns their ids so the
+    /// gateway can, rather than doing it here where the refund rules (#168's
+    /// `failed`, not `spoiled`) do not belong.
+    ///
+    /// Returns the refunded materials and fuel, or `None` if there was no such
+    /// station on that plot.
+    pub async fn demolish_plot_station(
+        &self,
+        station_id: &str,
+        plot_id: &str,
+        refund: &[(&str, i64)],
+    ) -> Result<Option<(Vec<(String, i64)>, i64)>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT structure_id, plot_id FROM plot_station WHERE id = ? AND plot_id = ?",
+        )
+        .bind(station_id)
+        .bind(plot_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((structure_id, _)) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_character_id FROM plot WHERE id = ?")
+                .bind(plot_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+
+        // The fuel in the buffer is nobody's in particular — it is shared by
+        // design (#167) — so it goes back to the owner as the only answer that
+        // is not "it evaporates".
+        let fuel: i64 = sqlx::query_scalar("SELECT units FROM station_fuel WHERE station_id = ?")
+            .bind(station_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(0);
+        sqlx::query("DELETE FROM station_fuel WHERE station_id = ?")
+            .bind(station_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Refunded to STORAGE, not the pack. 52 units will not fit in a
+        // 50-unit inventory, and a refund that silently dropped the overflow
+        // would be the property destruction this whole path exists to avoid
+        // (#43). The storehouse is uncapped and is where the materials came
+        // from anyway.
+        let mut given = Vec::new();
+        if let Some(owner) = &owner {
+            for (item, qty) in refund {
+                add_storage_in_tx(&mut tx, owner, item, *qty).await?;
+                given.push(((*item).to_string(), *qty));
+            }
+        }
+
+        // The station row goes with the structure, by cascade.
+        sqlx::query("DELETE FROM structure WHERE id = ?")
+            .bind(&structure_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((given, fuel)))
     }
 
     // --- Stations, fuel and timed jobs (mine epic #164, issue #167) ---------
@@ -9443,6 +9672,174 @@ mod tests {
             .filter(|i| i.item_id == item)
             .map(|i| i.qty)
             .sum()
+    }
+
+    // --- Player-built stations on plots (#180) ------------------------------
+
+    async fn a_plot_for(db: &Db, cid: &str) -> String {
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(cid, "suburbs", 604_800, 0).await.unwrap().expect("a plot");
+        plot.id
+    }
+
+    /// Building a station takes the materials and produces a usable instance.
+    ///
+    /// Placement was FREE for every structure kind before this — that is why
+    /// #43 could say reclaim destroys nothing of value. A station costs, so it
+    /// is the first structure where that stops being true.
+    #[tokio::test]
+    async fn building_a_station_costs_materials_and_yields_an_instance() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let plot = a_plot_for(&db, &cid).await;
+        let cost = crate::world::structure_cost("station");
+        assert!(!cost.is_empty(), "a station must cost something or it is not capital");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&cid, item, *qty).await.unwrap();
+        }
+
+        let built = db
+            .build_plot_station(&plot, &cid, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .expect("should build");
+        let (structure, station) = built;
+        assert_eq!(structure.kind, "station");
+        assert_eq!(station.station_type, "furnace");
+        assert_eq!(station.owner_character_id.as_deref(), Some(cid.as_str()));
+
+        let left = db.storage_for_character(&cid).await.unwrap();
+        for (item, _) in cost {
+            let n: i64 = left.iter().filter(|s| s.item_id == *item).map(|s| s.qty).sum();
+            assert_eq!(n, 0, "{item} was consumed");
+        }
+        assert_eq!(db.plot_stations().await.unwrap().len(), 1);
+    }
+
+    /// Cannot pay, nothing taken. The same all-or-nothing rule a station job
+    /// follows (#167) — a partial take on a build that then fails is theft.
+    #[tokio::test]
+    async fn a_build_that_cannot_be_paid_for_takes_nothing() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let plot = a_plot_for(&db, &cid).await;
+        let cost = crate::world::structure_cost("station");
+        // Everything except the last material.
+        for (item, qty) in &cost[..cost.len() - 1] {
+            db.deposit_to_storage(&cid, item, *qty).await.unwrap();
+        }
+
+        assert!(db
+            .build_plot_station(&plot, &cid, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .is_none());
+        let left = db.storage_for_character(&cid).await.unwrap();
+        for (item, qty) in &cost[..cost.len() - 1] {
+            let n: i64 = left.iter().filter(|s| s.item_id == *item).map(|s| s.qty).sum();
+            assert_eq!(n, *qty, "{item} untouched");
+        }
+        assert!(db.plot_stations().await.unwrap().is_empty(), "and no station row");
+    }
+
+    /// Two stations on two plots do not share a fuel buffer.
+    ///
+    /// `station_fuel` keys on a `station_id` string, which was an authored id
+    /// until now. If instances collided on that key, one player's charcoal
+    /// would heat another player's furnace.
+    #[tokio::test]
+    async fn each_built_station_has_its_own_fuel_and_jobs() {
+        let (db, _t) = TempDb::open().await;
+        let (a, b) = (a_character(&db).await, a_character(&db).await);
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let pa = db.claim_plot(&a, "suburbs", 604_800, 0).await.unwrap().unwrap().id;
+        let pb = db.claim_plot(&b, "suburbs", 604_800, 0).await.unwrap().unwrap().id;
+        let cost = crate::world::structure_cost("station");
+        for (cid, plot) in [(&a, &pa), (&b, &pb)] {
+            for (item, qty) in cost {
+                db.deposit_to_storage(cid, item, *qty).await.unwrap();
+            }
+            db.build_plot_station(plot, cid, "furnace", cost, 100, 200, 0, 1_000)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let rows = db.plot_stations().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id, "distinct runtime ids");
+
+        carrying(&db, &a, "charcoal", 3).await;
+        db.load_station_fuel(&rows[0].id, &a, "charcoal", 3, 2, 100).await.unwrap();
+        assert_eq!(db.station_fuel(&rows[0].id).await.unwrap(), 6);
+        assert_eq!(db.station_fuel(&rows[1].id).await.unwrap(), 0, "not shared");
+    }
+
+    /// Demolition refunds the materials and hands back the fuel.
+    ///
+    /// #43 objected that reclaim deletes structures. Now that one costs 40
+    /// stone and 12 ingots, deleting it silently would be destroying real
+    /// property — so tearing one down gives it back.
+    #[tokio::test]
+    async fn demolishing_a_station_refunds_its_materials_and_fuel() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let plot = a_plot_for(&db, &cid).await;
+        let cost = crate::world::structure_cost("station");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&cid, item, *qty).await.unwrap();
+        }
+        let (structure, station) = db
+            .build_plot_station(&plot, &cid, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        carrying(&db, &cid, "charcoal", 2).await;
+        db.load_station_fuel(&station.id, &cid, "charcoal", 2, 2, 100).await.unwrap();
+
+        let (refunded, fuel) = db
+            .demolish_plot_station(&station.id, &plot, cost)
+            .await
+            .unwrap()
+            .expect("should demolish");
+
+        assert_eq!(fuel, 4, "the fuel in the buffer is accounted for");
+        assert_eq!(refunded.len(), cost.len());
+        let stored = db.storage_for_character(&cid).await.unwrap();
+        for (item, qty) in cost {
+            let got: i64 = stored.iter().filter(|s| s.item_id == *item).map(|s| s.qty).sum();
+            assert_eq!(got, *qty, "{item} came back to the storehouse");
+        }
+        assert!(db.plot_stations().await.unwrap().is_empty());
+        // The structure goes with it — the station row cascades off it.
+        assert!(db
+            .structures_for_plot(&plot)
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.id != structure.id));
+        assert_eq!(db.station_fuel(&station.id).await.unwrap(), 0, "no orphaned buffer");
+    }
+
+    /// Demolishing somebody else's station does nothing.
+    #[tokio::test]
+    async fn a_station_on_another_plot_cannot_be_demolished() {
+        let (db, _t) = TempDb::open().await;
+        let (a, b) = (a_character(&db).await, a_character(&db).await);
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let pa = db.claim_plot(&a, "suburbs", 604_800, 0).await.unwrap().unwrap().id;
+        let pb = db.claim_plot(&b, "suburbs", 604_800, 0).await.unwrap().unwrap().id;
+        let cost = crate::world::structure_cost("station");
+        for (item, qty) in cost {
+            db.deposit_to_storage(&a, item, *qty).await.unwrap();
+        }
+        let (_, station) = db
+            .build_plot_station(&pa, &a, "furnace", cost, 100, 200, 0, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(db.demolish_plot_station(&station.id, &pb, cost).await.unwrap().is_none());
+        assert_eq!(db.plot_stations().await.unwrap().len(), 1, "still standing");
     }
 
     // --- Pottery: shaping failure, cancel, and the catalyst (#168) ----------

@@ -413,6 +413,11 @@ const C_STATION_OPEN := "station.open"
 const C_STATION_LOAD_FUEL := "station.load_fuel"
 const C_STATION_START := "station.start"
 const C_STATION_COLLECT := "station.collect"
+## Tear down a station you own (#180). The materials go back to your storehouse
+## rather than your pack: a station costs more than a pack holds, so a refund
+## into carried inventory would silently drop the overflow.
+const C_STATION_DEMOLISH := "station.demolish"
+const S_STATION_DEMOLISHED := "station.demolished"
 const S_STATION_STATE := "station.state"
 const S_STATION_CLOSED := "station.closed"
 const S_STATION_READY := "station.ready"
@@ -483,6 +488,10 @@ const S_GOLD_UPDATE := "gold.update"
 ## Restricted server-side to the account with `role == "mayor"` (see `welcome`'s
 ## `role` field); rejected with `S_MAYOR_BUILD_ERROR` for everyone else.
 const C_MAYOR_BUILD_CREATE := "mayor.build_create"
+## A placement was refused, with a reason (#180). Placement used to be free and
+## could only fail silently; a station costs materials, so a refusal has to say
+## which of the several reasons it was.
+const S_BUILD_ERROR := "build.error"
 const S_MAYOR_BUILD_ERROR := "mayor.build_error"
 
 # --- gameplay: gated district transitions (M4 #15) ----------------------------

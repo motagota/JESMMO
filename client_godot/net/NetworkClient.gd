@@ -26,6 +26,9 @@ signal build_list(orders: Array)
 signal build_progress(order_id: String, required: Dictionary, progress: Dictionary)
 signal build_completed(order_id: String, structures: Array)
 signal build_unlocked(order_ids: Array)
+## A placement was refused: not enough materials, too close to another station,
+## or not your plot.
+signal build_error(reason: String)
 signal plot_assigned(plot_id: String, district: String, bounds: Dictionary, tier: int, just_claimed: bool)
 signal plot_district(plots: Array)
 signal build_placed(structure: Dictionary)
@@ -155,6 +158,8 @@ signal station_collected(slot: int, failed: bool, spoiled: bool, fail_reason: St
 signal station_error(reason: String, detail: Dictionary)
 ## A presence-required job ended because the player walked away (#168).
 signal station_cancelled(station_id: String, slot: int, recipe_id: String, reason: String)
+## A station you owned was torn down (#180), with what came back.
+signal station_demolished(station_id: String, refunded: Array, fuel_lost: int)
 ## The tutorial track (#169), fully evaluated server-side.
 signal tutorial_state(steps: Array, done: int, total: int)
 signal tutorial_complete(item: String, qty: int)
@@ -460,6 +465,13 @@ func _handle_text(text: String) -> void:
             tutorial_state.emit(msg.get("steps", []), int(msg.get("done", 0)), int(msg.get("total", 0)))
         Protocol.S_TUTORIAL_COMPLETE:
             tutorial_complete.emit(String(msg.get("item", "")), int(msg.get("qty", 0)))
+        Protocol.S_BUILD_ERROR:
+            build_error.emit(String(msg.get("reason", "")))
+        Protocol.S_STATION_DEMOLISHED:
+            station_demolished.emit(
+                String(msg.get("station_id", "")),
+                msg.get("refunded", []),
+                int(msg.get("fuel_lost", 0)))
         Protocol.S_STATION_CANCELLED:
             station_cancelled.emit(
                 String(msg.get("station_id", "")),
@@ -793,6 +805,9 @@ func send_station_load_fuel(item_id: String, qty: int) -> void:
 
 func send_station_start(recipe_id: String) -> void:
     _send({"type": Protocol.C_STATION_START, "recipe_id": recipe_id})
+
+func send_station_demolish(station_id: String) -> void:
+    _send({"type": Protocol.C_STATION_DEMOLISH, "station_id": station_id})
 
 func send_station_collect(job_id: String) -> void:
     _send({"type": Protocol.C_STATION_COLLECT, "job_id": job_id})
