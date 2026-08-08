@@ -605,7 +605,33 @@ pub fn structure_footprint(kind: &str) -> Option<(i32, i32)> {
         "bed" => Some((20, 20)),
         "storage" => Some((16, 16)),
         "crafting" => Some((20, 20)),
+        // A player-built crafting station (#180). Bigger than the others
+        // because it is the only one with a usable RADIUS — people stand at it,
+        // and a footprint smaller than the thing it represents would let two
+        // sit close enough to be ambiguous.
+        "station" => Some((24, 24)),
         _ => None,
+    }
+}
+
+/// What placing a structure costs, taken from the builder's inventory.
+///
+/// Structures were FREE until now — `place_structure` inserted a row and
+/// nothing was consumed. That is why #43 could observe that rent reclaim
+/// deletes them and conclude "nothing of value is lost", and why it deferred
+/// itself until placement had a cost. This is that cost.
+///
+/// A station is deliberately priced ABOVE one carry load (`MAX_CARRY` is 50):
+/// 40 stone plus 12 ingots is two trips minimum, so building one is a haul
+/// rather than a click. That is the friction the whole capital layer rests on
+/// (P1) — a business only exists because doing it yourself is worse.
+///
+/// The older kinds stay free. Making a player's first bed cost materials would
+/// be a change to the opening hour, which is not this issue's to make.
+pub fn structure_cost(kind: &str) -> &'static [(&'static str, i64)] {
+    match kind {
+        "station" => &[("stone", 40), ("iron_ingot", 12)],
+        _ => &[],
     }
 }
 
