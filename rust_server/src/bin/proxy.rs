@@ -4508,14 +4508,65 @@ impl Proxy {
         }
     }
 
+    /// How many units of a finished job's output its station's owner takes
+    /// (#182), or `None` when nobody is charging.
+    async fn in_kind_for(
+        &self,
+        db: &Db,
+        cid: &str,
+        job: &mmo::persistence::StationJob,
+    ) -> Option<(String, i64)> {
+        // Which station this job ran on, and whose it is.
+        let owner = {
+            let stations = self.plot_stations.lock().unwrap();
+            let ps = stations.iter().find(|p| p.id == job.station_id)?;
+            ps.owner_character_id.clone()?
+        };
+        if owner == cid {
+            return None; // an owner takes nothing from themselves
+        }
+        let plot = db.plot_for_character(&owner).await.ok().flatten()?;
+        if plot.station_mode == "closed" || plot.station_fee_in_kind <= 0.0 {
+            return None;
+        }
+        // The reference price. `None` for anything the provisioner does not
+        // price, which makes the ceiling inapplicable and leaves the plain
+        // fraction — never a free station, never an unbounded take.
+        let unit_price = self
+            .market_cfg
+            .defaults()
+            .provisioner
+            .get(&job.output_item)
+            .map(|b| b.floor);
+        let take = Db::in_kind_take(
+            job.output_qty,
+            plot.station_fee_in_kind,
+            plot.station_fee_in_kind_max_gp,
+            unit_price,
+        );
+        (take > 0).then_some((owner, take))
+    }
+
     /// Set the caller's own access policy (#181).
-    async fn apply_station_policy(&self, pid: &str, mode: &str, fee_gp: i64, skill_floor: i64) {
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_station_policy(
+        &self,
+        pid: &str,
+        mode: &str,
+        fee_gp: i64,
+        skill_floor: i64,
+        in_kind: f64,
+        in_kind_max: i64,
+    ) {
         let Some(db) = self.db.clone() else { return };
         let Ok(Some(plot)) = db.plot_for_character(pid).await else {
             self.push_to_player(pid, json!({"type": "station.error", "reason": "no_plot"}));
             return;
         };
-        match db.set_station_policy(&plot.id, pid, mode, fee_gp, skill_floor).await {
+        match db
+            .set_station_policy(&plot.id, pid, mode, fee_gp, skill_floor, in_kind, in_kind_max)
+            .await
+        {
             Ok(true) => {
                 println!("[Proxy] {pid} set plot {} to {mode} (fee {fee_gp}g)", plot.id);
                 self.push_to_player(
@@ -4523,6 +4574,8 @@ impl Proxy {
                     json!({
                         "type": "station.policy", "mode": mode,
                         "fee_gp": fee_gp.max(0), "skill_floor": skill_floor.max(0),
+                        "fee_in_kind": in_kind.clamp(0.0, 1.0),
+                        "fee_in_kind_max_gp": in_kind_max.max(0),
                     }),
                 );
             }
@@ -5415,6 +5468,19 @@ impl Proxy {
         // the moment config changes, and a fee discovered after the fact is
         // worse than one shown before.
         let access = self.station_access(&db, cid, &placement).await;
+        // The in-kind share too, for the same reason as the gold fee: a player
+        // deciding whether to use somebody's kiln should be told it takes one
+        // pot in five BEFORE they commit the clay.
+        let (owner_in_kind, owner_in_kind_max) = match &placement.owner {
+            Some(o) if o != cid => db
+                .plot_for_character(o)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| (p.station_fee_in_kind, p.station_fee_in_kind_max_gp))
+                .unwrap_or((0.0, 0)),
+            _ => (0.0, 0),
+        };
         let (owner_fee_gp, access_error) = match &access {
             Ok(Some((_, f))) => (*f, ""),
             Ok(None) => (0, ""),
@@ -5428,6 +5494,8 @@ impl Proxy {
                 "owner": placement.owner,
                 "mine": placement.owner.as_deref() == Some(cid),
                 "owner_fee_gp": owner_fee_gp,
+                "owner_fee_in_kind": owner_in_kind,
+                "owner_fee_in_kind_max_gp": owner_in_kind_max,
                 "access_error": access_error,
                 "name": t.display_name,
                 "kind": if t.kind == mmo::crafting_config::StationKind::Heat { "heat" } else { "shaping" },
@@ -5662,7 +5730,12 @@ impl Proxy {
             .map(|r| (job.xp as f64 * r.failure_xp_fraction).round() as i64)
             .unwrap_or(0);
 
-        match db.collect_station_job(job_id, cid, bonus, spoiled_xp, now_secs()).await {
+        // The owner's share, priced against the PROVISIONER FLOOR rather than
+        // recent trades (#182). A cap keyed to trades could be moved by making
+        // one absurd trade — a wash trade with a purpose — whereas the floor is
+        // configured, stable, and beyond any player's reach.
+        let in_kind = self.in_kind_for(&db, cid, &job).await;
+        match db.collect_station_job(job_id, cid, bonus, in_kind.clone(), spoiled_xp, now_secs()).await {
             Ok(Ok(done)) => {
                 // Spoiled attempts included: failure that teaches nothing is
                 // just a tax, and `done.xp` already carries the reduced figure.
@@ -5688,6 +5761,8 @@ impl Proxy {
                         "spoiled": done.spoiled,
                         "fail_reason": done.fail_reason,
                         "bonus": bonus,
+                        "taken_in_kind": done.taken_in_kind.iter()
+                            .map(|(i, q)| json!({"item": i, "qty": q})).collect::<Vec<_>>(),
                         "items": done.payout.iter().map(|(i, q)| json!({"item": i, "qty": q}))
                             .collect::<Vec<_>>(),
                     }),
@@ -7503,7 +7578,9 @@ impl Proxy {
                                 let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let fee = data.get("fee_gp").and_then(|v| v.as_i64()).unwrap_or(0);
                                 let floor = data.get("skill_floor").and_then(|v| v.as_i64()).unwrap_or(0);
-                                self.apply_station_policy(&player_id, &mode, fee, floor).await;
+                                let ik = data.get("fee_in_kind").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let ikmax = data.get("fee_in_kind_max_gp").and_then(|v| v.as_i64()).unwrap_or(0);
+                                self.apply_station_policy(&player_id, &mode, fee, floor, ik, ikmax).await;
                             }
                             "demolish" => {
                                 let sid = data.get("station_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -10803,7 +10880,7 @@ mod tests {
             .unwrap()
             .expect("smelting works without the tutorial");
         db.ripen_station_jobs(2_000).await.unwrap();
-        let got = db.collect_station_job(&job.id, &pid, 0, 0, 2_000).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &pid, 0, None, 0, 2_000).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)],
             "the whole economy works for someone who never met Marlow");
     }

@@ -199,6 +199,25 @@ func _process(_delta: float) -> bool:
 		_fail("...alongside the world's, not instead of it: %s" % t)
 		return true
 
+	# --- an in-kind share is stated as "1 in N", never as a decimal ----------
+	# The whole reason this was chosen over a percentage is that it needs no
+	# explanation; rendering 0.2 would undo that.
+	var kind_state := _state(6, [])
+	kind_state["owner"] = "someone_else"
+	kind_state["owner_fee_in_kind"] = 0.2
+	kind_state["owner_fee_in_kind_max_gp"] = 50
+	_panel.set_state(kind_state)
+	t = _text()
+	if t.findn("1 in 5") < 0:
+		_fail("an in-kind share should read as '1 in 5': %s" % t)
+		return true
+	if t.findn("up to 50g") < 0:
+		_fail("...and name its value ceiling: %s" % t)
+		return true
+	if t.find("0.2") >= 0:
+		_fail("it should never be shown as a decimal: %s" % t)
+		return true
+
 	# --- your own station says so, and charges you nothing -------------------
 	var mine_state := _state(6, [])
 	mine_state["mine"] = true
