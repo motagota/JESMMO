@@ -4655,7 +4655,21 @@ impl Proxy {
                 })
             })
             .collect();
-        self.push_to_player(pid, json!({"type": "plot.roster", "plot_id": plot.id, "grants": rows}));
+        // The policy rides along. The panel needs it the moment it opens, not
+        // only after the owner changes something — otherwise it renders
+        // defaults and lies about what the plot is currently doing.
+        self.push_to_player(
+            pid,
+            json!({
+                "type": "plot.roster", "plot_id": plot.id, "grants": rows,
+                "lease_state": plot.state,
+                "mode": plot.station_mode,
+                "fee_gp": plot.station_fee_gp,
+                "skill_floor": plot.station_skill_floor,
+                "fee_in_kind": plot.station_fee_in_kind,
+                "fee_in_kind_max_gp": plot.station_fee_in_kind_max_gp,
+            }),
+        );
     }
 
     /// Set the caller's own access policy (#181).
