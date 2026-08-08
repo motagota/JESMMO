@@ -1086,6 +1086,60 @@ impl Proxy {
                     ));
                     continue;
                 }
+                // --- Seeding, for live probes (#195) -------------------------
+                //
+                // Three issues (#182, #183, #184) shipped without their live
+                // probe running, all for the same reason: the only way to put a
+                // character into a known state was editing `mmo_dev.db`
+                // directly, and that does not survive the gateway's cache for a
+                // logged-in character. Inventory in particular gets written
+                // back over the top, so a probe reads an empty pack and stops.
+                //
+                // These go through the SAME code a player's actions do —
+                // `add_to_inventory`, `grant_skill_xp` — so a seeded character
+                // is in a state the game could really have produced, and the
+                // cache is updated rather than bypassed. That is the whole
+                // point: a fixture that lies is worse than no fixture.
+                //
+                // The admin socket is already a privileged, separate port that
+                // spawns bots and pushes rolling updates. This belongs there
+                // and nowhere near the client socket.
+                Some("seed_items") => {
+                    let who = data.get("character_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+                    // `to_storage` because a station costs more than a pack
+                    // holds (#180) — a probe that can only fill inventory
+                    // cannot set up a build.
+                    let to_storage = data.get("to_storage").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let msg = self.seed_items(&who, &item, qty, to_storage).await;
+                    println!("[Proxy] Admin seed: {msg}");
+                    let _ = tx.send(Message::Text(
+                        json!({"type": "ack", "message": msg}).to_string(),
+                    ));
+                    continue;
+                }
+                Some("seed_skill") => {
+                    let who = data.get("character_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let skill = data.get("skill_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let level = data.get("level").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let msg = self.seed_skill(&who, &skill, level).await;
+                    println!("[Proxy] Admin seed: {msg}");
+                    let _ = tx.send(Message::Text(
+                        json!({"type": "ack", "message": msg}).to_string(),
+                    ));
+                    continue;
+                }
+                // Find a character by account email, so a probe can name the
+                // account it just registered rather than guessing a uuid.
+                Some("whois") => {
+                    let email = data.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let cid = self.character_id_for_email(&email).await;
+                    let _ = tx.send(Message::Text(
+                        json!({"type": "whois", "email": email, "character_id": cid}).to_string(),
+                    ));
+                    continue;
+                }
                 Some("clear_bots") => {
                     let n = self.clear_bots();
                     println!("[Proxy] Admin command: clear bots ({n})");
@@ -6077,6 +6131,74 @@ impl Proxy {
         if failed > 0 {
             println!("[Proxy] Failed {failed} station job(s) whose recipe or station is gone — escrow refunded");
         }
+    }
+
+    /// Put items in a character's pack or storehouse, through the ordinary
+    /// paths (#195).
+    ///
+    /// `add_to_inventory` respects carry capacity exactly as it does for a
+    /// player, so a seeded character cannot end up in a state the game could
+    /// not produce — and the pushed inventory keeps any live client in step.
+    async fn seed_items(&self, character_id: &str, item_id: &str, qty: i64, to_storage: bool) -> String {
+        let Some(db) = self.db.clone() else { return "no database".to_string() };
+        if mmo::world::item(item_id).is_none() {
+            return format!("`{item_id}` is not a real item");
+        }
+        if qty <= 0 {
+            return "quantity must be positive".to_string();
+        }
+        let result = if to_storage {
+            db.deposit_to_storage(character_id, item_id, qty).await.map(|_| qty)
+        } else {
+            db.add_to_inventory(character_id, item_id, qty).await
+        };
+        match result {
+            Ok(added) => {
+                // Push, so a connected probe sees the change rather than
+                // holding a stale view — the exact failure that made direct DB
+                // edits useless.
+                self.send_inventory(character_id).await;
+                format!(
+                    "gave {character_id} {added} {item_id}{}",
+                    if to_storage { " (storehouse)" } else { "" }
+                )
+            }
+            Err(e) => format!("failed: {e}"),
+        }
+    }
+
+    /// Set a skill to at least `level`, by granting the XP the curve wants.
+    ///
+    /// Granting XP rather than writing the level keeps the two consistent:
+    /// a row whose level and xp disagree would be a state no amount of play
+    /// could reach, and something downstream would eventually notice.
+    async fn seed_skill(&self, character_id: &str, skill_id: &str, level: i64) -> String {
+        let Some(db) = self.db.clone() else { return "no database".to_string() };
+        if level < 0 {
+            return "level must not be negative".to_string();
+        }
+        // The curve is `floor(sqrt(xp / 100))`, so this is its inverse.
+        let want_xp = level * level * 100;
+        let have = db.skill_level(character_id, skill_id).await.unwrap_or(0);
+        if have >= level {
+            return format!("{character_id} is already {skill_id} {have}");
+        }
+        match db.grant_skill_xp(character_id, skill_id, want_xp).await {
+            Ok(gain) => {
+                self.push_skill_gain(character_id, &gain);
+                format!("{character_id} is now {skill_id} {}", gain.skill.level)
+            }
+            Err(e) => format!("failed: {e}"),
+        }
+    }
+
+    /// The character behind an account email, so a probe can name the account
+    /// it just registered rather than guessing a uuid.
+    async fn character_id_for_email(&self, email: &str) -> Option<String> {
+        let db = self.db.clone()?;
+        let account = db.find_account_by_email(email).await.ok()??;
+        let ch = db.character_for_account(&account.id).await.ok()??;
+        Some(ch.id)
     }
 
     /// Whether this connection has a durable character behind it. Guests have
