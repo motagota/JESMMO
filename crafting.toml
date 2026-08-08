@@ -108,3 +108,98 @@ item = "clay_lump"
 qty_min = 1
 qty_max = 2
 chance = 0.80
+
+# ===========================================================================
+# STATIONS (#167).
+#
+# Furnace, kiln, campfire and potter's wheel are ONE entity with a recipe
+# filter, not four implementations. `kind` decides the single thing that
+# genuinely differs — whether it burns fuel — and `recipe_tags` decides what it
+# will make. The next station is an entry in this file, not new code.
+#
+# PLACEMENT LIVES IN `zones.toml`, same split as deposits: this is behaviour.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# The public furnace in the mine yard.
+#
+# JOB SLOTS ARE PER PLAYER, and that is the load-bearing decision here, not an
+# optimisation. A queue shared across everyone standing at a public station is
+# a griefing surface and a miserable wait — one player fills it and the rest
+# watch. Per-player slots are what make a *public* station usable at all.
+#
+# FUEL, BY CONTRAST, IS SHARED, and that is also a choice rather than an
+# oversight. It is a public furnace: whoever loads charcoal is heating the fire
+# for whoever is standing there, and a player can burn fuel someone else loaded.
+# The alternative — per-player fuel buffers — turns a communal fire into a row
+# of private ones and quietly deletes the only cooperative surface the mine has.
+# The griefing risk is bounded because fuel is cheap (3 wood for 2 charcoal) and
+# a job reserves what it needs the moment it starts.
+#
+# The fee is 2 GOLD, not copper: a character starts with 500 and wood trades
+# around 8-12g. It is a sink and is burned through the same ledger path market
+# fees use, so the #154 supply identity still holds.
+# ---------------------------------------------------------------------------
+[station.furnace]
+display_name = "Furnace"
+kind = "heat"
+recipe_tags = ["smelting"]
+job_slots = 2
+usage_fee_gold = 2
+radius = 40
+# Jobs run on while you are offline and the output waits in the slot. A job that
+# silently stopped when you walked away would be indistinguishable from a bug.
+requires_presence = false
+
+[station.furnace.fuels]
+charcoal = 2
+
+# ---------------------------------------------------------------------------
+# Smelt Iron Ingot — the first timed recipe in the game.
+#
+# 2 ore -> 1 ingot is a deliberate LOSS. Smelting is a refining step, and a
+# refining step that conserved mass would make ore and ingot the same item with
+# two names. The 2:1 ratio is also what gives the ingot a floor price above the
+# ore it came from once #144's quality tiers arrive.
+#
+# 12 seconds against iron's ~24-second seam: long enough that starting a job and
+# going back to mine is the obvious play (which is the behaviour the whole timed
+# model exists to create), short enough that the tutorial in #169 doesn't stall.
+# ---------------------------------------------------------------------------
+[recipe.iron_ingot]
+display_name = "Smelt Iron Ingot"
+tags = ["smelting"]
+skill = "smelting"
+
+# ZERO, NOT ONE. `level_for_xp` returns 0 for a skill that has never been
+# trained, so 0 is the level every character actually starts at and 1 already
+# means "you have done this before". Requiring 1 here locked the game's only
+# station recipe against every new player — found by walking a fresh character
+# up to the furnace, which is exactly the path #169's tutorial will take.
+required_level = 0
+output_item = "iron_ingot"
+output_qty = 1
+fuel_units = 2
+duration_ms = 12000
+xp = 10
+
+[[recipe.iron_ingot.inputs]]
+item = "iron_ore"
+qty = 2
+
+# ---------------------------------------------------------------------------
+# Smelting's curve is the same shape as Mining's, and reuses the same type:
+# levels buy a faster job and a chance at a bonus output, both capped for the
+# same reason (see `[skill.mining]`).
+#
+# The speed bonus is slightly stronger than Mining's and the bonus-output chance
+# weaker. Smelting is pure waiting — there is no swing to time, no seam to walk
+# to — so the reward for levelling it should mostly be *less waiting*. A large
+# bonus-output chance would instead make the ore conversion rate itself scale
+# with level, which is a supply lever, and #170 wants that lever held still.
+# ---------------------------------------------------------------------------
+[skill.smelting]
+speed_bonus_pct_per_level = 0.6
+max_speed_bonus_pct = 30
+bonus_yield_chance_per_level = 0.2
+max_bonus_yield_chance = 12

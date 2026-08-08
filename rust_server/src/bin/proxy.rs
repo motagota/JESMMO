@@ -4664,6 +4664,418 @@ impl Proxy {
     /// Answers with `bounty.state` either way — paid or not — because the panel
     /// needs to show progress ("7 of 10") regardless, and a refusal that says
     /// nothing is indistinguishable from a dropped frame.
+    // --- Stations, fuel and timed jobs (mine epic #164, issue #167) ---------
+
+    /// The station this player is standing at, if any.
+    ///
+    /// Resolved gateway-side from the position cache, exactly like
+    /// [`Proxy::market_at`] — a station is a PANEL, not a swing. The zone
+    /// validates range for things it simulates (a pick hitting a seam); a panel
+    /// has no zone-side representation to validate against, and routing one
+    /// through the zone would add a synchronisation surface for nothing.
+    ///
+    /// **The zone check is not decoration.** Since #165 the same (x, y) exists
+    /// both underground and above it, so a station that matched on position
+    /// alone could be used from the wrong side of the rock — the mine yard
+    /// furnace sits at (12860, 13520), and so does a patch of Gallery B's floor
+    /// in the interior's local frame.
+    fn station_at(&self, pid: &str) -> Option<(&mmo::zone_config::StationPlacement, &mmo::crafting_config::StationType)> {
+        let (px, py, zone) = {
+            let cache = self.entity_state.lock().unwrap();
+            let c = cache.get(pid)?;
+            (c.x, c.y, c.zone.clone())
+        };
+        let interior = self.zone_is_interior(&zone);
+        self.zone_cfg.station.iter().find_map(|st| {
+            // A surface station is unreachable from inside an interior and vice
+            // versa, whatever the coordinates say.
+            match (&st.interior, interior) {
+                (Some(z), true) if *z == zone => {}
+                (None, false) => {}
+                _ => return None,
+            }
+            let t = self.crafting_cfg.station(&st.kind)?;
+            (dist2(px, py, st.pos.0, st.pos.1) <= (t.radius as i64).pow(2)).then_some((st, t))
+        })
+    }
+
+    /// The authored station placements, so the client knows where to expect one.
+    ///
+    /// Includes the radius so the client's "am I close enough to ask?" test
+    /// matches the server's "are you close enough to act?" test. They are still
+    /// two separate checks — this one just stops the client asking pointlessly.
+    fn send_station_list(&self, pid: &str) {
+        let stations: Vec<Value> = self
+            .zone_cfg
+            .station
+            .iter()
+            .filter_map(|st| {
+                let t = self.crafting_cfg.station(&st.kind)?;
+                Some(json!({
+                    "id": st.id, "name": t.display_name,
+                    "x": st.pos.0, "y": st.pos.1,
+                    "radius": t.radius,
+                    // "" means a surface fixture. The client has to honour this
+                    // for the same reason the server does: the same coordinates
+                    // exist on both sides of the rock (#165).
+                    "zone": st.interior.clone().unwrap_or_default(),
+                }))
+            })
+            .collect();
+        self.push_to_player(pid, json!({"type": "station.list", "stations": stations}));
+    }
+
+    /// Everything the station panel needs: what it is, how hot it is, what it
+    /// can make, and the caller's own jobs.
+    ///
+    /// The recipe list is derived from config here rather than mirrored in the
+    /// client, for the reason #155 made the market's fee rules server-sent: a
+    /// client-side copy of a server-side rule becomes a lie the moment the file
+    /// is edited.
+    async fn send_station_state(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        if !self.is_persistent(pid) {
+            return; // guests have no durable inventory or purse
+        }
+        let cid = pid;
+        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+            self.push_to_player(pid, json!({"type": "station.closed"}));
+            return;
+        };
+        let fuel = db.station_fuel(&placement.id).await.unwrap_or(0);
+        let jobs = db.station_jobs(&placement.id, cid).await.unwrap_or_default();
+        let now = now_secs();
+        let level = db.skill_level(cid, "smelting").await.unwrap_or(0);
+
+        let recipes: Vec<Value> = self
+            .crafting_cfg
+            .recipes_for(&t)
+            .into_iter()
+            .map(|(id, r)| {
+                let curve = self.crafting_cfg.skill(&r.skill);
+                json!({
+                    "id": id,
+                    "name": r.display_name,
+                    "inputs": r.inputs.iter().map(|i| json!({"item": i.item, "qty": i.qty}))
+                        .collect::<Vec<_>>(),
+                    "output_item": r.output_item,
+                    "output_qty": r.output_qty,
+                    "fuel_units": r.fuel_units,
+                    // The duration the CALLER would actually get, with their own
+                    // Smelting level already applied. Sending the base and
+                    // letting the client apply the curve would put the same rule
+                    // in two places.
+                    "duration_ms": curve.swing_time_ms(r.duration_ms, level),
+                    "skill": r.skill,
+                    "required_level": r.required_level,
+                    "locked": level < r.required_level,
+                })
+            })
+            .collect();
+
+        let jobs: Vec<Value> = jobs
+            .iter()
+            .map(|j| {
+                json!({
+                    "id": j.id, "slot": j.slot, "recipe_id": j.recipe_id,
+                    "output_item": j.output_item, "output_qty": j.output_qty,
+                    "state": j.state, "fail_reason": j.fail_reason,
+                    "ready_at": j.ready_at, "started_at": j.started_at,
+                    "remaining_secs": (j.ready_at - now).max(0),
+                    // A failed job hands back its escrow, so the panel can say
+                    // what is waiting rather than just "failed".
+                    "refund": j.inputs.iter().map(|(i, q)| json!({"item": i, "qty": q}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        self.push_to_player(
+            pid,
+            json!({
+                "type": "station.state",
+                "station_id": placement.id,
+                "name": t.display_name,
+                "kind": if t.kind == mmo::crafting_config::StationKind::Heat { "heat" } else { "shaping" },
+                "fuel_units": fuel,
+                "fuels": t.fuels.iter().map(|(i, u)| json!({"item": i, "units": u}))
+                    .collect::<Vec<_>>(),
+                "job_slots": t.job_slots,
+                "usage_fee_gold": t.usage_fee_gold,
+                "skill_level": level,
+                "recipes": recipes,
+                "jobs": jobs,
+            }),
+        );
+    }
+
+    /// Load fuel into the station the player is standing at.
+    async fn apply_station_load_fuel(&self, pid: &str, item_id: &str, qty: i64) {
+        let Some(db) = self.db.clone() else { return };
+        if !self.is_persistent(pid) {
+            return; // guests have no durable inventory or purse
+        }
+        let cid = pid;
+        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "out_of_range"}));
+            return;
+        };
+        let Some(units_per) = t.fuels.get(item_id).copied() else {
+            self.push_to_player(
+                pid,
+                json!({"type": "station.error", "reason": "not_a_fuel", "item_id": item_id}),
+            );
+            return;
+        };
+        match db
+            .load_station_fuel(&placement.id, cid, item_id, qty, units_per, now_secs())
+            .await
+        {
+            Ok(Some(_)) => {
+                self.send_inventory(pid).await;
+                self.send_station_state(pid).await;
+            }
+            Ok(None) => self.push_to_player(
+                pid,
+                json!({"type": "station.error", "reason": "no_fuel_to_load", "item_id": item_id}),
+            ),
+            Err(e) => eprintln!("[Proxy] load fuel failed: {e}"),
+        }
+    }
+
+    /// Start a job in the first free slot.
+    async fn apply_station_start(&self, pid: &str, recipe_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        if !self.is_persistent(pid) {
+            return; // guests have no durable inventory or purse
+        }
+        let cid = pid;
+        let Some((placement, t)) = self.station_at(pid).map(|(p, t)| (p.clone(), t.clone())) else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "out_of_range"}));
+            return;
+        };
+        let Some(recipe) = self.crafting_cfg.recipe(recipe_id).cloned() else {
+            self.push_to_player(
+                pid,
+                json!({"type": "station.error", "reason": "no_such_recipe", "recipe_id": recipe_id}),
+            );
+            return;
+        };
+        if !self.crafting_cfg.station_accepts(&t, &recipe) {
+            self.push_to_player(
+                pid,
+                json!({"type": "station.error", "reason": "wrong_station", "recipe_id": recipe_id}),
+            );
+            return;
+        }
+        let level = db.skill_level(cid, &recipe.skill).await.unwrap_or(0);
+        if level < recipe.required_level {
+            self.push_to_player(
+                pid,
+                json!({
+                    "type": "station.error", "reason": "skill_too_low",
+                    "recipe_id": recipe_id, "need": recipe.required_level, "have": level,
+                }),
+            );
+            return;
+        }
+
+        // First free slot, bounded by the station type. The unique index is what
+        // actually enforces this — reading here only picks a candidate.
+        let taken: Vec<i64> = db
+            .station_jobs(&placement.id, cid)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|j| j.slot)
+            .collect();
+        let Some(slot) = (0..t.job_slots).find(|s| !taken.contains(s)) else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "no_free_slot"}));
+            return;
+        };
+
+        let duration = self.crafting_cfg.skill(&recipe.skill).swing_time_ms(recipe.duration_ms, level);
+        match db
+            .start_station_job(
+                &placement.id, cid, slot, recipe_id, &recipe,
+                t.usage_fee_gold, duration, now_secs(),
+            )
+            .await
+        {
+            Ok(Ok(_)) => {
+                self.send_inventory(pid).await;
+                self.push_gold(pid, 0, "station_fee").await;
+                self.send_station_state(pid).await;
+            }
+            Ok(Err(e)) => {
+                let mut msg = json!({"type": "station.error", "reason": e.code()});
+                if let mmo::persistence::StartJobError::MissingInput { item, need, have } = &e {
+                    msg["item_id"] = json!(item);
+                    msg["need"] = json!(need);
+                    msg["have"] = json!(have);
+                } else if let mmo::persistence::StartJobError::NotEnoughFuel { need, have }
+                    | mmo::persistence::StartJobError::NotEnoughGold { need, have } = &e
+                {
+                    msg["need"] = json!(need);
+                    msg["have"] = json!(have);
+                }
+                self.push_to_player(pid, msg);
+            }
+            Err(e) => eprintln!("[Proxy] start job failed: {e}"),
+        }
+    }
+
+    /// Collect a finished job.
+    ///
+    /// The bonus roll happens HERE rather than at start, so a player who levels
+    /// Smelting while a job runs gets the benefit — and so the roll can't be
+    /// seen and then cancelled.
+    async fn apply_station_collect(&self, pid: &str, job_id: &str) {
+        let Some(db) = self.db.clone() else { return };
+        if !self.is_persistent(pid) {
+            return; // guests have no durable inventory or purse
+        }
+        let cid = pid;
+        // Deliberately NOT range-gated. Collecting is taking back what is
+        // already yours, and a player who walks away mid-job then logs in
+        // somewhere else should not have their materials stranded.
+        let jobs = db.all_station_jobs().await.unwrap_or_default();
+        let Some(job) = jobs.into_iter().find(|j| j.id == job_id && j.character_id == cid) else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "no_such_job"}));
+            return;
+        };
+        let level = db.skill_level(cid, &job.skill).await.unwrap_or(0);
+        let chance = self.crafting_cfg.skill(&job.skill).bonus_yield_chance(level);
+        let bonus = if job.state == "ready" && rand::random::<f64>() * 100.0 < chance { 1 } else { 0 };
+
+        match db.collect_station_job(job_id, cid, bonus, now_secs()).await {
+            Ok(Ok(done)) => {
+                if !done.failed && done.xp > 0 && !done.skill.is_empty() {
+                    if let Ok(gain) = db.grant_skill_xp(cid, &done.skill, done.xp).await {
+                        self.push_skill_gain(pid, &gain);
+                    }
+                }
+                self.send_inventory(pid).await;
+                self.push_to_player(
+                    pid,
+                    json!({
+                        "type": "station.collected",
+                        "slot": done.slot,
+                        "failed": done.failed,
+                        "fail_reason": done.fail_reason,
+                        "bonus": bonus,
+                        "items": done.payout.iter().map(|(i, q)| json!({"item": i, "qty": q}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                self.send_station_state(pid).await;
+            }
+            Ok(Err(e)) => {
+                let mut msg = json!({"type": "station.error"});
+                match e {
+                    mmo::persistence::CollectError::NoSuchJob => msg["reason"] = json!("no_such_job"),
+                    mmo::persistence::CollectError::NotReady { ready_at } => {
+                        msg["reason"] = json!("not_ready");
+                        msg["ready_at"] = json!(ready_at);
+                    }
+                    // The job is untouched and still holding the goods. Saying
+                    // so is the whole point — a silent failure here looks
+                    // exactly like the output having been destroyed.
+                    mmo::persistence::CollectError::NoRoom { need, room } => {
+                        msg["reason"] = json!("no_room");
+                        msg["need"] = json!(need);
+                        msg["room"] = json!(room);
+                    }
+                }
+                self.push_to_player(pid, msg);
+            }
+            Err(e) => eprintln!("[Proxy] collect job failed: {e}"),
+        }
+    }
+
+    /// Ripen every job that has come due and tell whoever is online.
+    ///
+    /// Runs on the periodic sweep rather than on a per-job timer, so a job
+    /// started before a restart still finishes — the row carries an absolute
+    /// `ready_at`, and nothing has to be rescheduled at boot.
+    async fn sweep_station_jobs(&self) {
+        let Some(db) = self.db.clone() else { return };
+        let ripe = match db.ripen_station_jobs(now_secs()).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[Proxy] ripen jobs failed: {e}");
+                return;
+            }
+        };
+        for job in ripe {
+            let pid = job.character_id.clone();
+            let pid = pid.as_str();
+            self.push_to_player(
+                pid,
+                json!({
+                    "type": "station.ready",
+                    "station_id": job.station_id, "job_id": job.id, "slot": job.slot,
+                    "output_item": job.output_item, "output_qty": job.output_qty,
+                }),
+            );
+            self.send_station_state(pid).await;
+        }
+    }
+
+    /// Ripen due jobs once a second.
+    async fn station_job_monitor(&self) {
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            self.sweep_station_jobs().await;
+        }
+    }
+
+    /// At boot, fail any job whose recipe has gone from `crafting.toml`.
+    ///
+    /// There is no hot reload in this server: config is read once at startup.
+    /// So the moment a recipe can vanish out from under a live job is a
+    /// RESTART with an edited file — a hand-edited config plus rows that
+    /// outlived it, which is an ordinary Tuesday rather than an invariant
+    /// violation. The escrow is refunded to the slot and the player is told why.
+    async fn fail_orphaned_station_jobs(&self) {
+        let Some(db) = self.db.clone() else { return };
+        let jobs = match db.all_station_jobs().await {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[Proxy] reading station jobs failed: {e}");
+                return;
+            }
+        };
+        let mut failed = 0;
+        for job in jobs {
+            if job.state == "failed" {
+                continue;
+            }
+            let gone = self.crafting_cfg.recipe(&job.recipe_id).is_none();
+            let homeless = !self.zone_cfg.station.iter().any(|s| s.id == job.station_id);
+            let reason = if gone {
+                "recipe_removed"
+            } else if homeless {
+                "station_removed"
+            } else {
+                continue;
+            };
+            if db.fail_station_job(&job.id, reason).await.unwrap_or(false) {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            println!("[Proxy] Failed {failed} station job(s) whose recipe or station is gone — escrow refunded");
+        }
+    }
+
+    /// Whether this connection has a durable character behind it. Guests have
+    /// no inventory or purse, so every persistence-touching interaction has to
+    /// ask — the bounty (#161) does the same check inline.
+    fn is_persistent(&self, pid: &str) -> bool {
+        self.clients.lock().unwrap().get(pid).map(|i| i.persistent).unwrap_or(false)
+    }
+
     async fn apply_bounty_turn_in(&self, pid: &str, command_id: &str) {
         let Some(db) = self.db.clone() else { return };
         let persistent = self
@@ -6069,6 +6481,12 @@ impl Proxy {
             self.send_inventory(&player_id).await;
             self.send_storage(&player_id).await;
             self.send_skills(&player_id).await;
+            // Where the world's stations stand (#167). Sent once, because it is
+            // static config — the client uses it ONLY to decide when to ask
+            // `station.open`, never as permission. The server re-resolves the
+            // station from its own position cache on every command, exactly as
+            // it does for markets.
+            self.send_station_list(&player_id);
             self.send_equipment(&player_id).await;
             self.send_build_orders(&player_id).await;
             self.send_completed_structures(&player_id).await;
@@ -6240,6 +6658,34 @@ impl Proxy {
                     // zone — same as `build_contribute`'s own proximity gate.
                     if data.get("type").and_then(|v| v.as_str()) == Some("market.open") {
                         self.apply_market_open(&player_id).await;
+                        continue;
+                    }
+                    // Stations (#167). All four share `station_at`'s gateway-side
+                    // range gate, the same one `market.open` uses — a station is
+                    // a panel, so the zone has no part in it.
+                    if let Some(op) = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| t.strip_prefix("station."))
+                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect"))
+                    {
+                        let op = op.to_string();
+                        match op.as_str() {
+                            "open" => self.send_station_state(&player_id).await,
+                            "load_fuel" => {
+                                let item = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let qty = data.get("qty").and_then(|v| v.as_i64()).unwrap_or(1);
+                                self.apply_station_load_fuel(&player_id, &item, qty).await;
+                            }
+                            "start" => {
+                                let r = data.get("recipe_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                self.apply_station_start(&player_id, &r).await;
+                            }
+                            _ => {
+                                let j = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                self.apply_station_collect(&player_id, &j).await;
+                            }
+                        }
                         continue;
                     }
                     // Interior portals (#165). Range-gated on the gateway's
@@ -6566,6 +7012,18 @@ impl Proxy {
         // back for.
         let me = self.clone();
         tokio::spawn(async move { me.sweep_expired_orders().await });
+
+        // Station jobs (#167): ripen what is due. A sweep rather than a timer
+        // per job, because `ready_at` is absolute — a job started before a
+        // restart finishes on time with nothing to reschedule at boot.
+        let me = self.clone();
+        tokio::spawn(async move { me.station_job_monitor().await });
+
+        // ...and once, at boot, fail any job whose recipe or station has gone
+        // from config. There is no hot reload here, so an edited file plus rows
+        // that outlived it is a startup condition, not a runtime one.
+        let me = self.clone();
+        tokio::spawn(async move { me.fail_orphaned_station_jobs().await });
 
         // Price-history rollup (#143): ledger -> candles, off the trade path.
         let me = self.clone();
@@ -11929,6 +12387,219 @@ listing_fee_min_gold = 4
             "#,
         )
         .unwrap()
+    }
+
+    // --- Stations: the gateway-side range gate (#167) -----------------------
+
+    /// A surface furnace and an interior one at the SAME local coordinates.
+    /// That collision is the point: since #165 a position without a zone means
+    /// nothing, and these tests exist to prove the gate knows the difference.
+    fn a_station_world() -> (mmo::zone_config::ZoneConfig, mmo::crafting_config::CraftingConfig) {
+        let zones = mmo::zone_config::ZoneConfig::parse(
+            r#"
+            [interior.mine_test]
+            display_name = "Test Cut"
+            spawn_anchor = [20, 30]
+            [[interior.mine_test.volumes]]
+            x0 = 0
+            y0 = 0
+            x1 = 200
+            y1 = 200
+            [[interior.mine_test.portals]]
+            id = "adit"
+            world = [12800, 13500]
+            inside = [20, 30]
+            radius = 40
+
+            [[station]]
+            id = "yard_furnace"
+            type = "furnace"
+            pos = [100, 100]
+
+            [[station]]
+            id = "deep_wheel"
+            type = "wheel"
+            pos = [100, 100]
+            interior = "mine_test"
+            "#,
+        )
+        .unwrap();
+        let crafting = mmo::crafting_config::CraftingConfig::parse(
+            r#"
+            [station.furnace]
+            display_name = "Furnace"
+            kind = "heat"
+            recipe_tags = ["smelting"]
+            radius = 40
+            [station.furnace.fuels]
+            charcoal = 2
+
+            [station.wheel]
+            display_name = "Potter's Wheel"
+            kind = "shaping"
+            recipe_tags = ["pottery"]
+            radius = 40
+
+            [recipe.iron_ingot]
+            display_name = "Smelt Iron Ingot"
+            tags = ["smelting"]
+            skill = "smelting"
+            output_item = "iron_ingot"
+            fuel_units = 2
+            duration_ms = 12000
+            [[recipe.iron_ingot.inputs]]
+            item = "iron_ore"
+            qty = 2
+
+            [recipe.clay_pot]
+            display_name = "Clay Pot"
+            tags = ["pottery"]
+            skill = "pottery"
+            output_item = "stone"
+            duration_ms = 5000
+            [[recipe.clay_pot.inputs]]
+            item = "clay_lump"
+            qty = 1
+            "#,
+        )
+        .unwrap();
+        (zones, crafting)
+    }
+
+    fn test_proxy_with_stations() -> Arc<Proxy> {
+        let (zones, crafting) = a_station_world();
+        let mut p = Proxy::new("127.0.0.1", 0, 0, 0, None);
+        {
+            let m = Arc::get_mut(&mut p).expect("not yet shared");
+            m.zone_cfg = zones;
+            m.crafting_cfg = crafting;
+        }
+        add_zone_region(&p, "zone_a", Region { x0: 0, y0: 0, x1: 25600, y1: 25600 });
+        add_zone_region(&p, "mine_test", Region { x0: 0, y0: 0, x1: 200, y1: 200 });
+        p.zones.lock().unwrap().get_mut("mine_test").unwrap().interior = true;
+        p
+    }
+
+    fn stand(p: &Proxy, pid: &str, x: i32, y: i32, zone: &str) {
+        p.entity_state.lock().unwrap().insert(
+            pid.to_string(),
+            EntityCache { x, y, hp: 100, zone: zone.to_string() },
+        );
+    }
+
+    /// The gate is a radius, and it is checked on the gateway's own cache
+    /// rather than on anything a client asserts.
+    #[test]
+    fn a_station_is_only_found_from_inside_its_radius() {
+        let p = test_proxy_with_stations();
+        stand(&p, "u", 100, 100, "zone_a");
+        assert_eq!(p.station_at("u").map(|(s, _)| s.id.clone()), Some("yard_furnace".into()));
+
+        stand(&p, "u", 130, 100, "zone_a"); // 30 away, radius 40
+        assert!(p.station_at("u").is_some(), "just inside");
+
+        stand(&p, "u", 150, 100, "zone_a"); // 50 away
+        assert!(p.station_at("u").is_none(), "outside the radius");
+    }
+
+    /// **The #165 lesson, applied to stations.** Two stations sit at identical
+    /// coordinates — one in the yard, one underground. A player at (100, 100) is
+    /// standing at exactly one of them, and which one depends entirely on the
+    /// zone. Matching on position alone would let someone smelt from inside the
+    /// rock, or throw a pot from the surface.
+    #[test]
+    fn the_same_coordinates_underground_are_a_different_station() {
+        let p = test_proxy_with_stations();
+
+        stand(&p, "u", 100, 100, "zone_a");
+        assert_eq!(
+            p.station_at("u").map(|(s, _)| s.id.clone()),
+            Some("yard_furnace".into()),
+            "on the surface you are at the furnace"
+        );
+
+        stand(&p, "u", 100, 100, "mine_test");
+        assert_eq!(
+            p.station_at("u").map(|(s, _)| s.id.clone()),
+            Some("deep_wheel".into()),
+            "the very same coordinates underground are the wheel, not the furnace"
+        );
+    }
+
+    /// An interior station is unreachable from a DIFFERENT interior, not merely
+    /// from the surface — the check is zone identity, not an is-interior flag.
+    #[test]
+    fn an_interior_station_belongs_to_exactly_one_interior() {
+        let p = test_proxy_with_stations();
+        add_zone_region(&p, "other_cave", Region { x0: 0, y0: 0, x1: 200, y1: 200 });
+        p.zones.lock().unwrap().get_mut("other_cave").unwrap().interior = true;
+
+        stand(&p, "u", 100, 100, "other_cave");
+        assert!(
+            p.station_at("u").is_none(),
+            "the wheel is in mine_test; standing at the same spot in another cave is not being at it"
+        );
+    }
+
+    /// A station only offers what its tags accept. The furnace makes ingots and
+    /// the wheel makes pots, from one recipe table — that filter is the whole
+    /// reason there is one station type rather than four.
+    #[test]
+    fn a_station_offers_only_the_recipes_its_tags_accept() {
+        let (_, crafting) = a_station_world();
+        let furnace = crafting.station("furnace").unwrap();
+        let wheel = crafting.station("wheel").unwrap();
+
+        let at_furnace: Vec<&str> =
+            crafting.recipes_for(furnace).iter().map(|(id, _)| id.as_str()).collect();
+        let at_wheel: Vec<&str> =
+            crafting.recipes_for(wheel).iter().map(|(id, _)| id.as_str()).collect();
+
+        assert_eq!(at_furnace, vec!["iron_ingot"]);
+        assert_eq!(at_wheel, vec!["clay_pot"]);
+    }
+
+    /// The shipped configs have to agree with each other: every placed station
+    /// must name a type that exists, or the furnace in the yard is scenery.
+    #[test]
+    fn the_shipped_configs_place_only_stations_that_exist() {
+        let zones = load_zone_config();
+        let crafting = load_crafting_config();
+        assert!(!zones.station.is_empty(), "the mine yard furnace should be placed");
+        for st in &zones.station {
+            let t = crafting.station(&st.kind).unwrap_or_else(|| {
+                panic!("station `{}` is placed as type `{}`, which crafting.toml doesn't define", st.id, st.kind)
+            });
+            assert!(
+                !crafting.recipes_for(t).is_empty(),
+                "station `{}` accepts no shipped recipe, so it could never be used",
+                st.id
+            );
+        }
+    }
+
+    /// The yard furnace stands outside the adit, close enough to be a beat in
+    /// the loop and far enough to be a different place. Asserted against the
+    /// file we actually ship, the same way #165 pinned the adit's siting.
+    #[test]
+    fn the_yard_furnace_is_sited_just_outside_the_adit() {
+        let zones = load_zone_config();
+        let furnace = zones
+            .station
+            .iter()
+            .find(|s| s.id == "furnace_mine_yard")
+            .expect("the mine yard furnace should be placed");
+        assert!(furnace.interior.is_none(), "it stands in the yard, not down a gallery");
+
+        let mine = zones.interior("mine_starter").expect("the mine should exist");
+        let adit = mine.portals.first().expect("the mine should have a portal");
+        let d = (((furnace.pos.0 - adit.world.0).pow(2) + (furnace.pos.1 - adit.world.1).pow(2))
+            as f64)
+            .sqrt();
+        assert!(
+            (40.0..200.0).contains(&d),
+            "the furnace is {d:.0} units from the adit — a round trip should be a beat, not a haul"
+        );
     }
 
     /// Interiors are invisible to geometry routing (#165). That is the property

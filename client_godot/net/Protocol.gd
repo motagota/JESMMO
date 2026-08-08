@@ -117,6 +117,10 @@ static func item_icon(item_id: String) -> String:
         "axe": return "🪓"
         "sword": return "🗡"
         "dog_pelt": return "🐺"
+        "charcoal": return "🪨"
+        "iron_ore": return "🪨"
+        "iron_ingot": return "🧱"
+        "clay_lump": return "🟤"
         _: return "✦"
 
 ## The resource-node item an ability targets, mirroring the server's
@@ -385,6 +389,58 @@ const S_LOOT_LOST := "loot.lost"
 const C_PORTAL_ENTER := "portal.enter"
 const S_PORTAL_ENTERED := "portal.entered"
 const S_PORTAL_ERROR := "portal.error"
+
+# --- gameplay: crafting stations, fuel and timed jobs (#167) ------------------
+## A station is resolved from the server's own position cache, exactly like
+## `market.open` and `portal.enter` — the client never names which one it is at,
+## because standing somewhere is a server-side fact.
+##
+## `station.state` carries EVERYTHING the panel draws: the fuel level, the job
+## slots, and the recipe list with each duration already adjusted for the
+## caller's own skill. None of that is mirrored here. #155 made the market's fee
+## rules server-sent for exactly this reason — a client-side copy of a
+## server-side rule becomes a lie the moment the config is edited.
+## Where the world's stations stand, sent once at login. The client uses this
+## ONLY to decide when to ask `station.open` — never as permission, since the
+## server re-resolves the station from its own position cache every time.
+const S_STATION_LIST := "station.list"
+const C_STATION_OPEN := "station.open"
+const C_STATION_LOAD_FUEL := "station.load_fuel"
+const C_STATION_START := "station.start"
+const C_STATION_COLLECT := "station.collect"
+const S_STATION_STATE := "station.state"
+const S_STATION_CLOSED := "station.closed"
+const S_STATION_READY := "station.ready"
+const S_STATION_COLLECTED := "station.collected"
+const S_STATION_ERROR := "station.error"
+
+## Prose for a `station.error` reason. The server sends a code and the numbers;
+## the wording lives here.
+static func station_error_text(reason: String, d: Dictionary) -> String:
+    match reason:
+        "out_of_range": return "Stand at the station to use it."
+        "not_a_fuel": return "That doesn't burn."
+        "no_fuel_to_load": return "You have none to load."
+        "no_such_recipe": return "No such recipe."
+        "wrong_station": return "That can't be made here."
+        "skill_too_low": return "Needs level %d (you are %d)." % [int(d.get("need", 0)), int(d.get("have", 0))]
+        "no_free_slot", "slot_busy": return "All your slots are busy."
+        "not_enough_gold": return "The fee is %dg and you have %dg." % [int(d.get("need", 0)), int(d.get("have", 0))]
+        "not_enough_fuel": return "The fire needs %d fuel and has %d." % [int(d.get("need", 0)), int(d.get("have", 0))]
+        "missing_input": return "You need %d %s (you have %d)." % [int(d.get("need", 0)), String(d.get("item_id", "")), int(d.get("have", 0))]
+        "not_ready": return "It isn't finished yet."
+        # The job is untouched and still holding the goods. Saying so matters:
+        # silence here reads exactly like the output having been destroyed.
+        "no_room": return "Your pack is full — it will wait in the slot."
+        "no_such_job": return "That job is gone."
+        _: return reason
+
+## Why a job failed, in words. A refund with no explanation reads as a bug.
+static func job_fail_text(reason: String) -> String:
+    match reason:
+        "recipe_removed": return "That recipe no longer exists — your materials came back."
+        "station_removed": return "The station is gone — your materials came back."
+        _: return "The job failed — your materials came back."
 
 const C_BOUNTY_TURN_IN := "bounty.turn_in"
 const S_BOUNTY_STATE := "bounty.state"

@@ -75,6 +75,15 @@ var _rent_panel_down := false
 ## The market entity we've already announced arrival at (#137), so stepping up
 ## to one sends `market.open` exactly once rather than every frame in range.
 var _market_entity := ""
+var _station: StationPanel
+## The authored station placements (#167) and which one we last announced
+## arriving at. Client-side proximity decides when to ASK; the server decides
+## whether the answer is yes.
+var _stations: Array = []
+var _station_id := ""
+## Which zone we are in, from the portal transitions. A station's coordinates
+## mean nothing without it — the same (x, y) exists on both sides of the rock.
+var _zone_id := ""
 
 func _ready() -> void:
     _editor_mode = OS.get_cmdline_user_args().has("--editor-mode") \
@@ -129,6 +138,10 @@ func _ready() -> void:
     _craft = CraftPanel.new()
     _craft.visible = false
     add_child(_craft)
+
+    _station = StationPanel.new()
+    _station.visible = false
+    add_child(_station)
 
     _hotbar = HotbarPanel.new()
     add_child(_hotbar)
@@ -194,6 +207,19 @@ func _process(_delta: float) -> void:
         else:
             _market.set_market("") # walked away: stop showing it as tradable
     _market.show_panel(market_entity != "")
+
+    # Stations (#167). Same contract as the market above: stepping into range
+    # announces arrival ONCE and the server answers with what is actually there.
+    # Stations aren't zone entities, so range is measured against the authored
+    # placements the server sent at login rather than against something rendered.
+    var station_id := _nearest_station()
+    if station_id != _station_id:
+        _station_id = station_id
+        if station_id != "":
+            _net.send_station_open()
+        else:
+            _station.note("")
+    _station.visible = station_id != ""
 
     # E purely talks to the nearest NPC in range (#127) — bare-hands resource
     # interaction doesn't exist anymore, every resource is ability-swing-gated
@@ -336,7 +362,8 @@ func _wire_signals() -> void:
         _inventory.set_inventory(items, used, capacity)
         _build.set_inventory(items)
         _market.set_inventory(items)
-        _craft.set_inventory(items))
+        _craft.set_inventory(items)
+        _station.set_inventory(items))
     _net.skill_update.connect(_on_skill_update)
     _net.skill_levelup.connect(func(skill_id, level): _hud.flash_levelup(skill_id, level))
     _net.store_update.connect(func(items): _storage.set_storage(items))
@@ -379,6 +406,32 @@ func _wire_signals() -> void:
         _net.send_market_book_request(_market.watching()) # seed the depth we're looking at
         _net.send_market_history_request(_market.watching()))
     _net.market_error.connect(func(_code, detail): _hud.flash_announce(detail))
+    # Stations (#167). The panel is a view of `station.state` and nothing else;
+    # every button round-trips to the server, which re-checks range itself.
+    _net.station_list.connect(func(stations): _stations = stations)
+    _net.station_state.connect(func(state): _station.set_state(state))
+    _net.station_closed.connect(func():
+        _station.visible = false
+        _station_id = "")
+    _net.station_error.connect(func(reason, detail):
+        _station.note(Protocol.station_error_text(reason, detail)))
+    _net.station_ready.connect(func(_sid, _jid, _slot, item, qty):
+        _hud.flash_announce("%s x%d is ready" % [item, qty]))
+    _net.station_collected.connect(func(_slot, failed, fail_reason, bonus, items):
+        if failed:
+            _station.note(Protocol.job_fail_text(fail_reason))
+            return
+        var parts: Array[String] = []
+        for it in items:
+            parts.append("%s x%d" % [String(it.get("item", "")), int(it.get("qty", 0))])
+        var text := "Collected %s" % ", ".join(parts)
+        if bonus > 0:
+            text += " (a bonus from your skill)"
+        _station.note(text)
+        _hud.flash_announce(text))
+    _station.do_load_fuel.connect(func(item_id, qty): _net.send_station_load_fuel(item_id, qty))
+    _station.do_start.connect(func(recipe_id): _net.send_station_start(recipe_id))
+    _station.do_collect.connect(func(job_id): _net.send_station_collect(job_id))
     # Warehouse (#138): custody of goods held at this market.
     _net.warehouse_state.connect(func(_market_id, items, used, slots, arrears):
         _market.set_warehouse(items, used, slots, arrears))
@@ -476,6 +529,10 @@ func _wire_signals() -> void:
     # longer see, lay the authored floor, and drop the light.
     _net.portal_geometry.connect(func(volumes): _last_portal_volumes = volumes)
     _net.portal_entered.connect(func(_zone, _x, _y, interior, display_name, ambient_light):
+        _zone_id = _zone
+        # Walking through a portal changes which stations are reachable, so the
+        # next poll must re-announce rather than assume the old one still holds.
+        _station_id = ""
         if interior:
             _world.enter_interior(_last_portal_volumes)
             _set_ambient(ambient_light)
@@ -501,6 +558,30 @@ func _wire_signals() -> void:
 
 ## Fan a skill update out to the HUD glance line, the skills panel (progress bars),
 ## and the build board (which greys orders above the player's current level).
+## The nearest authored station we are actually near enough to ask about.
+##
+## The zone check is not optional: a surface station and an interior one can sit
+## at identical coordinates (#165), so a match on distance alone would have the
+## client asking about a furnace it is standing under a hundred metres of rock
+## from. The server would refuse — this just stops the pointless round trip.
+func _nearest_station() -> String:
+    var here := _player.world_pos()
+    var best := ""
+    var best_d := INF
+    for st in _stations:
+        var zone := String(st.get("zone", ""))
+        if zone == "":
+            if Protocol.in_interior():
+                continue
+        elif zone != _zone_id:
+            continue
+        var d := here.distance_to(Vector2(float(st.get("x", 0)), float(st.get("y", 0))))
+        if d <= float(st.get("radius", 40)) and d < best_d:
+            best_d = d
+            best = String(st.get("id", ""))
+    return best
+
+
 func _on_skill_update(skill_id: String, xp: int, level: int) -> void:
     _hud.set_skill(skill_id, xp, level)
     _skills.set_skill(skill_id, xp, level)
