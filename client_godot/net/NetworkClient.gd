@@ -167,6 +167,9 @@ signal station_earned(station_id: String, gold: int, from_player: String)
 ## Your plot's roster (#183). Expired grants are included, not hidden: an owner
 ## should see that somebody lapsed rather than silently find them missing.
 signal plot_roster(plot_id: String, grants: Array)
+## The plot's own settings, sent with the roster so the panel never renders
+## defaults while claiming to show the truth.
+signal plot_policy(lease_state: String, mode: String, fee_gp: int, skill_floor: int, fee_in_kind: float, fee_in_kind_max_gp: int)
 signal plot_granted(plot_id: String, role: String, days: int)
 signal plot_revoked(plot_id: String)
 ## What is waiting in your recovery vault (#184), and how long you have.
@@ -491,6 +494,15 @@ func _handle_text(text: String) -> void:
                 String(msg.get("from", "")))
         Protocol.S_PLOT_ROSTER:
             plot_roster.emit(String(msg.get("plot_id", "")), msg.get("grants", []))
+            # The policy rides along, so the panel is never rendering defaults
+            # while claiming to show what the plot is doing.
+            plot_policy.emit(
+                String(msg.get("lease_state", "active")),
+                String(msg.get("mode", "closed")),
+                int(msg.get("fee_gp", 0)),
+                int(msg.get("skill_floor", 0)),
+                float(msg.get("fee_in_kind", 0.0)),
+                int(msg.get("fee_in_kind_max_gp", 0)))
         Protocol.S_PLOT_GRANTED:
             plot_granted.emit(
                 String(msg.get("plot_id", "")),

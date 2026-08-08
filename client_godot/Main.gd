@@ -77,6 +77,8 @@ var _rent_panel_down := false
 var _market_entity := ""
 var _station: StationPanel
 var _tutorial: TutorialPanel
+var _plot_panel: PlotPanel
+var _plot_panel_down := false
 ## The authored station placements (#167) and which one we last announced
 ## arriving at. Client-side proximity decides when to ASK; the server decides
 ## whether the answer is yes.
@@ -149,6 +151,9 @@ func _ready() -> void:
 
     _tutorial = TutorialPanel.new()
     add_child(_tutorial)
+
+    _plot_panel = PlotPanel.new()
+    add_child(_plot_panel)
 
     _hotbar = HotbarPanel.new()
     add_child(_hotbar)
@@ -267,6 +272,15 @@ func _process(_delta: float) -> void:
     if rent_key and not _rent_panel_down:
         _rent.show_panel(not _rent.visible)
     _rent_panel_down = rent_key
+
+
+    # ...and neither is running a business (#185). Its own key rather than a tab
+    # inside rent: rent is an obligation you check, this is a thing you
+    # configure, and they are read at different moments.
+    var plot_key := Input.is_physical_key_pressed(KEY_B)
+    if plot_key and not _plot_panel_down:
+        _plot_panel.show_panel(not _plot_panel.visible)
+    _plot_panel_down = plot_key
 
 func _build_environment() -> void:
     var env := Environment.new()
@@ -423,6 +437,37 @@ func _wire_signals() -> void:
     # Stations (#167). The panel is a view of `station.state` and nothing else;
     # every button round-trips to the server, which re-checks range itself.
     _net.station_list.connect(func(stations): _stations = stations)
+    # Plot management (#185): policy, roster and vault, all server-driven.
+    _net.plot_roster.connect(func(_pid, grants): _plot_panel.set_roster(grants))
+    _net.vault_state.connect(func(entries): _plot_panel.set_vault(entries))
+    _net.vault_claimed.connect(func(items):
+        if items.is_empty():
+            _plot_panel.note("Nothing left to claim.")
+            return
+        var parts: Array[String] = []
+        for it in items:
+            parts.append("%s x%d" % [String(it.get("item", "")), int(it.get("qty", 0))])
+        var text := "Recovered %s into your storehouse." % ", ".join(parts)
+        _plot_panel.note(text)
+        _hud.flash_announce(text))
+    # The policy arrives with the roster (one round trip), and again as an ack
+    # after a change. Both feed the same setter.
+    _net.plot_policy.connect(func(lease_state, mode, fee, floor, ik, ikmax):
+        _plot_panel.set_lease_state(lease_state)
+        _plot_panel.set_policy(mode, fee, floor, ik, ikmax))
+    _net.station_policy.connect(func(mode, fee, floor):
+        _plot_panel.note("Your stations are now %s." % mode)
+        # Re-read rather than guess: the ack does not carry the in-kind share,
+        # and rendering a stale one would be the panel lying about the plot.
+        _net.send_station_roster())
+    _plot_panel.do_set_policy.connect(func(mode, fee, floor, ik, ikmax):
+        _net.send_station_policy(mode, fee, floor, ik, ikmax))
+    _plot_panel.do_grant.connect(func(cid, role, days): _net.send_station_grant(cid, role, days))
+    _plot_panel.do_revoke.connect(func(cid): _net.send_station_revoke(cid))
+    _plot_panel.do_claim_vault.connect(func(): _net.send_station_claim())
+    _plot_panel.do_refresh.connect(func():
+        _net.send_station_roster()
+        _net.send_station_vault())
     _net.portal_list.connect(func(portals):
         _portals = portals
         _world.set_portals(portals))
@@ -782,6 +827,12 @@ func _on_rent_status(plot_id: String, due_at: int, paid_through: int, state: Str
     _hud.set_gold(gold) # seeds the purse readout at login, before any wage lands
     _market.set_gold(gold)
     _rent.set_status(plot_id, due_at, paid_through, state, auto_pay, gold)
+    # The business panel needs the lease state too: lapsed and derelict change
+    # what it must shout about (#184).
+    _plot_panel.set_lease(plot_id, state)
+    # The business panel needs the lease state too: lapsed and derelict change
+    # what it must shout about (#184).
+    _plot_panel.set_lease(plot_id, state)
 
 ## The client already knows every zone's district from `partition`, so it
 ## detects a gate crossing itself (comparing the live position against those
