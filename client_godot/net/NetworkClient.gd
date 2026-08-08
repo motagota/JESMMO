@@ -169,6 +169,9 @@ signal station_earned(station_id: String, gold: int, from_player: String)
 signal plot_roster(plot_id: String, grants: Array)
 signal plot_granted(plot_id: String, role: String, days: int)
 signal plot_revoked(plot_id: String)
+## What is waiting in your recovery vault (#184), and how long you have.
+signal vault_state(entries: Array)
+signal vault_claimed(items: Array)
 ## The tutorial track (#169), fully evaluated server-side.
 signal tutorial_state(steps: Array, done: int, total: int)
 signal tutorial_complete(item: String, qty: int)
@@ -495,6 +498,10 @@ func _handle_text(text: String) -> void:
                 int(msg.get("days", 0)))
         Protocol.S_PLOT_REVOKED:
             plot_revoked.emit(String(msg.get("plot_id", "")))
+        Protocol.S_VAULT_STATE:
+            vault_state.emit(msg.get("entries", []))
+        Protocol.S_VAULT_CLAIMED:
+            vault_claimed.emit(msg.get("items", []))
         Protocol.S_STATION_DEMOLISHED:
             station_demolished.emit(
                 String(msg.get("station_id", "")),
@@ -851,6 +858,12 @@ func send_station_revoke(character_id: String) -> void:
 
 func send_station_roster() -> void:
     _send({"type": Protocol.C_STATION_ROSTER})
+
+func send_station_vault() -> void:
+    _send({"type": Protocol.C_STATION_VAULT})
+
+func send_station_claim() -> void:
+    _send({"type": Protocol.C_STATION_CLAIM})
 
 func send_station_demolish(station_id: String) -> void:
     _send({"type": Protocol.C_STATION_DEMOLISH, "station_id": station_id})
