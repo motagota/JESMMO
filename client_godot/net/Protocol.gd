@@ -386,6 +386,11 @@ const S_LOOT_LOST := "loot.lost"
 ## ever ask to go somewhere it could walk to.
 ## `portal.entered {zone, x, y, interior, display_name, ambient_light}` confirms
 ## the move; `portal.error {code, detail}` says why not.
+## Where the world's portals stand, sent once at login. Without this the client
+## has no idea a mine exists until it is already inside one — which is exactly
+## how Kedron Cut shipped unreachable: nothing drawn at the adit, and nothing
+## offering to enter it.
+const S_PORTAL_LIST := "portal.list"
 const C_PORTAL_ENTER := "portal.enter"
 const S_PORTAL_ENTERED := "portal.entered"
 const S_PORTAL_ERROR := "portal.error"

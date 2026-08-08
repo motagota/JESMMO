@@ -4952,6 +4952,41 @@ impl Proxy {
         }
     }
 
+    /// Where the world's portals are, so a player can SEE one and walk into it.
+    ///
+    /// This was the gap that made the whole mine epic unreachable: the client
+    /// only ever learned a portal existed from `portal.entered`, which arrives
+    /// after you are already inside. Nothing was drawn at the adit and nothing
+    /// offered to enter it, so Kedron Cut — six issues of content — could only
+    /// be reached by a test probe calling `portal.enter` directly.
+    ///
+    /// Same contract as `send_station_list`: static config, sent once, used by
+    /// the client ONLY to decide what to draw and when to offer. The server
+    /// re-checks range on the actual `portal.enter` exactly as before.
+    fn send_portal_list(&self, pid: &str) {
+        let portals: Vec<Value> = self
+            .zone_cfg
+            .interior
+            .iter()
+            .flat_map(|(zone_id, z)| {
+                z.portals.iter().map(move |p| {
+                    json!({
+                        "id": p.id,
+                        "zone": zone_id,
+                        "display_name": z.display_name,
+                        "x": p.world.0, "y": p.world.1,
+                        // The far side, so the client can offer "leave" from
+                        // inside too. One portal entry describes both
+                        // directions (#165) and both need a prompt.
+                        "inside_x": p.inside.0, "inside_y": p.inside.1,
+                        "radius": p.radius,
+                    })
+                })
+            })
+            .collect();
+        self.push_to_player(pid, json!({"type": "portal.list", "portals": portals}));
+    }
+
     /// The authored station placements, so the client knows where to expect one.
     ///
     /// Includes the radius so the client's "am I close enough to ask?" test
@@ -6894,6 +6929,7 @@ impl Proxy {
             // station from its own position cache on every command, exactly as
             // it does for markets.
             self.send_station_list(&player_id);
+            self.send_portal_list(&player_id);
             // The track, with every step already evaluated (#169). Sent at
             // login rather than on meeting Marlow: the counters have been
             // running since this character's first session, so a player who

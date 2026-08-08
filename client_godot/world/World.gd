@@ -134,12 +134,63 @@ var _home_bounds: Dictionary = {}
 var _roster_plots: Array = []
 var _my_plot_id := ""
 var _plots_dirty := false
+## Authored portals from `portal.list`, drawn as adit markers on the surface.
+var _portals_root := Node3D.new()
+var _portals: Array = []
 
 func _ready() -> void:
     add_child(_tiles_root)
     add_child(_roads_root)
     add_child(_home_root)
     add_child(_plots_root)
+    add_child(_portals_root)
+
+## Draw a marker at every surface portal.
+##
+## Kedron Cut shipped with NOTHING here — no mesh, no marker, no indication the
+## adit existed. Combined with an interact key that only ever talked to NPCs, it
+## made the entire mine unreachable in the real client while every test probe
+## sailed in by calling `portal.enter` directly.
+##
+## A dark recess set into a pale frame, tall enough to read at distance: the
+## whole point is being findable from across the yard, not being pretty.
+func set_portals(portals: Array) -> void:
+    _portals = portals
+    _rebuild_portals()
+
+func _rebuild_portals() -> void:
+    for c in _portals_root.get_children():
+        _portals_root.remove_child(c)
+        c.queue_free()
+    for p in _portals:
+        var wx := float(p.get("x", 0))
+        var wy := float(p.get("y", 0))
+        var h := Protocol.terrain_height(wx, wy)
+
+        # The frame: a pale slab, deliberately oversized so it reads as
+        # structure rather than terrain from a distance.
+        var frame := MeshInstance3D.new()
+        var fm := BoxMesh.new()
+        fm.size = Vector3(14, 10, 3)
+        frame.mesh = fm
+        var fmat := StandardMaterial3D.new()
+        fmat.albedo_color = Color(0.72, 0.68, 0.60)
+        frame.material_override = fmat
+        frame.position = Vector3(wx, h + 5.0, wy)
+        _portals_root.add_child(frame)
+
+        # The mouth: near-black, sitting proud of the frame so it never
+        # z-fights, and unshaded so it stays legibly dark at any time of day.
+        var mouth := MeshInstance3D.new()
+        var mm := BoxMesh.new()
+        mm.size = Vector3(9, 7, 1)
+        mouth.mesh = mm
+        var mmat := StandardMaterial3D.new()
+        mmat.albedo_color = Color(0.04, 0.03, 0.03)
+        mmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+        mouth.material_override = mmat
+        mouth.position = Vector3(wx, h + 3.5, wy - 1.6)
+        _portals_root.add_child(mouth)
 
 ## The displayed terrain changed under us (a fine tile streamed in/out, or an
 ## edit patch landed — `TerrainStreamer.terrain_changed`): the plot markers
