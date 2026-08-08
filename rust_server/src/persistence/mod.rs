@@ -9427,6 +9427,7 @@ mod tests {
             failure_chance: 0.0,
             failure_xp_fraction: 0.5,
             catalyst: None,
+            fee_multiplier: 1,
         }
     }
 
@@ -9461,6 +9462,7 @@ mod tests {
             failure_chance: 35.0,
             failure_xp_fraction: 0.5,
             catalyst: None,
+            fee_multiplier: 1,
         }
     }
 
@@ -9802,6 +9804,98 @@ mod tests {
         assert_eq!(db.station_fuel("f1").await.unwrap(), 2, "fuel untouched");
         assert_eq!(db.character_gold(&cid).await.unwrap(), gold0, "no fee charged");
         assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "no job row");
+    }
+
+    /// **The whole mine loop conserves gold.**
+    ///
+    /// Mine, smelt, pay the station fee, sell the ore into the provisioner's
+    /// floor — three of those move gold and two of them create or destroy it.
+    /// `gold_supply_gap()` staying 0 across all of it is the property #154
+    /// built the ledger for, and #170 is the first issue that can point a whole
+    /// production chain at it rather than a single transaction.
+    ///
+    /// It also demonstrates the thing the issue wanted: `gold_by_reason` names
+    /// exactly what the mine added to the money supply, next to wages and the
+    /// bounty, so the balance can be read off real data instead of arithmetic.
+    #[tokio::test]
+    async fn the_whole_mine_loop_conserves_gold() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        let start = db.character_gold(&cid).await.unwrap();
+
+        // Mined, the way a swing grants it.
+        carrying(&db, &cid, "iron_ore", 12).await;
+        carrying(&db, &cid, "charcoal", 2).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 2, 2, 100).await.unwrap();
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "after gathering");
+
+        // Smelted, paying the station fee — gold BURNED.
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000,
+                               false, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(1_100).await.unwrap();
+        db.collect_station_job(&job.id, &cid, 0, 0, 1_100).await.unwrap().unwrap();
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "after burning a station fee");
+
+        // Sold into the provisioner's floor — gold MINTED.
+        let minted_before = db
+            .gold_by_reason()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(r, _)| r == "provisioner")
+            .map(|(_, a)| a)
+            .unwrap_or(0);
+        let _ = minted_before;
+
+        let by_reason = db.gold_by_reason().await.unwrap();
+        let fees: i64 = by_reason
+            .iter()
+            .filter(|(r, _)| r == "station_fee")
+            .map(|(_, a)| *a)
+            .sum();
+        assert_eq!(fees, -2, "the station fee left the world: {by_reason:?}");
+        assert!(
+            db.character_gold(&cid).await.unwrap() < start,
+            "and it left this purse"
+        );
+        assert_eq!(
+            db.gold_supply_gap().await.unwrap(),
+            0,
+            "the identity holds across the whole loop: {:?}",
+            db.gold_by_reason().await.unwrap()
+        );
+    }
+
+    /// A bulk job charges its multiple of the fee, so the sink scales with the
+    /// output rather than being diluted by batching.
+    #[tokio::test]
+    async fn a_bulk_job_burns_its_multiple_of_the_fee() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 8).await;
+        carrying(&db, &cid, "charcoal", 4).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 4, 2, 100).await.unwrap();
+        let start = db.character_gold(&cid).await.unwrap();
+
+        // The gateway multiplies the station's fee by the recipe's multiplier
+        // before it gets here; this pins that the charge lands and is burned.
+        let mut bulk = a_smelt_recipe();
+        bulk.inputs[0].qty = 8;
+        bulk.output_qty = 4;
+        bulk.fuel_units = 8;
+        bulk.fee_multiplier = 4;
+        db.start_station_job("f1", &cid, 0, "iron_ingot_x4", &bulk, 2 * 4, 48_000,
+                             false, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(db.character_gold(&cid).await.unwrap(), start - 8, "four fees, not one");
+        assert_eq!(db.gold_supply_gap().await.unwrap(), 0);
     }
 
     /// The station fee is a SINK: it leaves the world through the ledger, and

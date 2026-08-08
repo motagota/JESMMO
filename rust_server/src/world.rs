@@ -2405,3 +2405,296 @@ mod tests {
     }
 }
 
+// --- The mine balance model (#170) ------------------------------------------
+//
+// #129 established this shape and it is worth restating: these tests pin the
+// DERIVED CONSEQUENCES of the tuning, not the constants themselves. Anyone can
+// change a number in `crafting.toml`; the point is that changing one
+// immediately shows what it did to the loop, in the units the loop is actually
+// judged in — gold per minute against the two benchmarks the game really has.
+//
+// Nothing here asserts "iron has 8 charges". Change the charges and these tests
+// tell you what that did to a miner's income and to the faucet's ceiling.
+#[cfg(test)]
+mod balance {
+    use crate::crafting_config::CraftingConfig;
+    use crate::market_config::MarketConfigSet;
+    use std::path::Path;
+
+    /// Build wages (#145): 1 gold per unit, roughly one unit per two-second
+    /// swing, before any hauling. The floor of the earning benchmarks.
+    const WAGE_GOLD_PER_MIN: f64 = 25.0;
+    /// The dog bounty (#161): 10 pelts for 100 gold, dogs dying in one swing.
+    /// The game's largest faucet, deliberately.
+    const BOUNTY_GOLD_PER_MIN: f64 = 100.0;
+
+    /// Seconds spent walking from a worked-out seam to the next one.
+    ///
+    /// This is an OPTIMISTIC figure and the rate built on it is a ceiling, not
+    /// a forecast. Two 150-second live runs came out at 3.2 ore/min against the
+    /// 9.1 this model computes, because a solo miner empties the seams around
+    /// them in under a minute and then waits out a 75-second respawn. The yield
+    /// chance itself measured true (0.50 and 0.57 against 0.55 configured), so
+    /// the gap is pacing rather than probability.
+    ///
+    /// The assertions below are therefore framed as bounds on the BEST case:
+    /// if even a perfectly-routed miner cannot out-earn the bounty, no real one
+    /// can either.
+    const WALK_BETWEEN_SEAMS_SECS: f64 = 5.0;
+
+    /// What a naive bot actually achieved underground, twice. Kept as a floor
+    /// on the model: if a change makes the paper figure LOWER than what was
+    /// physically observed, the model has stopped describing the game.
+    const OBSERVED_SOLO_ORE_PER_MIN: f64 = 3.2;
+
+    fn shipped() -> (CraftingConfig, MarketConfigSet) {
+        let crafting = CraftingConfig::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../crafting.toml"
+        )))
+        .expect("crafting.toml");
+        let market = MarketConfigSet::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../market.toml"
+        )))
+        .expect("market.toml");
+        (crafting, market)
+    }
+
+    /// Expected ore from one seam worked out, after the yield chance.
+    fn ore_per_seam(cfg: &CraftingConfig) -> f64 {
+        let t = cfg.deposit("iron_starter").expect("the iron seam");
+        let per_swing: f64 = t
+            .yields
+            .iter()
+            .filter(|y| y.item == "iron_ore")
+            .map(|y| y.chance * (y.qty_min + y.qty_max) as f64 / 2.0)
+            .sum();
+        per_swing * t.charges as f64
+    }
+
+    fn seam_work_secs(cfg: &CraftingConfig) -> f64 {
+        let t = cfg.deposit("iron_starter").unwrap();
+        t.charges as f64 * t.swing_time_ms as f64 / 1000.0
+    }
+
+    /// What one miner earns, selling ore into the provisioner's floor.
+    fn solo_gold_per_min(cfg: &CraftingConfig, market: &MarketConfigSet) -> f64 {
+        let floor = market
+            .defaults()
+            .provisioner
+            .get("iron_ore")
+            .expect("iron ore needs a floor for the mine to be a faucet at all")
+            .floor as f64;
+        let cycle = seam_work_secs(cfg) + WALK_BETWEEN_SEAMS_SECS;
+        ore_per_seam(cfg) * 60.0 / cycle * floor
+    }
+
+    /// **A miner earns more than a labourer and much less than a hunter.**
+    ///
+    /// This is the whole balance question in one assertion. Mining is safer than
+    /// combat, needs no weapon, and is the first activity a new player reaches;
+    /// if it out-earned the bounty, combat would have no economic reason to
+    /// exist. If it fell below wages, nobody would go down the hole.
+    #[test]
+    fn a_miner_earns_between_a_labourer_and_a_hunter() {
+        let (crafting, market) = shipped();
+        let rate = solo_gold_per_min(&crafting, &market);
+        assert!(
+            rate > WAGE_GOLD_PER_MIN,
+            "mining pays {rate:.0} g/min, at or below the {WAGE_GOLD_PER_MIN:.0} that hauling \
+             logs pays — nobody would go down the hole"
+        );
+        assert!(
+            rate < BOUNTY_GOLD_PER_MIN,
+            "mining pays {rate:.0} g/min against the bounty's {BOUNTY_GOLD_PER_MIN:.0} — if the \
+             safe, weaponless, first-thing-you-find activity out-earns combat, combat has no \
+             economic reason to exist"
+        );
+        // Closer to wages than to the bounty, as intended.
+        let midpoint = (WAGE_GOLD_PER_MIN + BOUNTY_GOLD_PER_MIN) / 2.0;
+        assert!(rate < midpoint, "mining should sit nearer wages than the bounty ({rate:.0} g/min)");
+
+        // The model must stay above what was actually observed, or it has
+        // stopped describing the game rather than merely idealising it.
+        let cfg_ore = ore_per_seam(&crafting) * 60.0
+            / (seam_work_secs(&crafting) + WALK_BETWEEN_SEAMS_SECS);
+        assert!(
+            cfg_ore >= OBSERVED_SOLO_ORE_PER_MIN,
+            "the model predicts {cfg_ore:.1} ore/min, below the {OBSERVED_SOLO_ORE_PER_MIN} a bot              managed live — the model is no longer an upper bound"
+        );
+    }
+
+    /// **The faucet has a ceiling, and it is the mine rather than the price.**
+    ///
+    /// Seam count times respawn caps the whole mine's output no matter how many
+    /// players turn up — roughly five miners saturate it and the sixth just
+    /// makes everyone slower. That is a consequence of shared contested nodes
+    /// with no lock, and it is the reason that choice is load-bearing rather
+    /// than merely convenient. A future change that gave deposits a per-player
+    /// lock, or an owner, would delete this property silently; this test is
+    /// what would notice.
+    #[test]
+    fn the_whole_mine_is_bounded_however_many_players_turn_up() {
+        let (crafting, market) = shipped();
+        let zones = crate::zone_config::ZoneConfig::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../zones.toml"
+        )))
+        .expect("zones.toml");
+        let mine = zones.interior("mine_starter").expect("the mine");
+        let seams = mine.deposits.iter().filter(|d| d.kind == "iron_starter").count() as f64;
+        assert!(seams > 0.0, "there should be iron in the mine");
+
+        let t = crafting.deposit("iron_starter").unwrap();
+        // A seam is unavailable while being worked AND while respawning, so its
+        // cycle is both. Jitter is symmetric, so the mean respawn is the base.
+        let cycle = seam_work_secs(&crafting) + t.respawn_seconds as f64;
+        let mine_ore_per_min = seams * ore_per_seam(&crafting) * 60.0 / cycle;
+        let floor = market.defaults().provisioner.get("iron_ore").unwrap().floor as f64;
+        let mine_gold_per_min = mine_ore_per_min * floor;
+
+        let solo = solo_gold_per_min(&crafting, &market);
+        let saturating_players = mine_gold_per_min / solo;
+        assert!(
+            (3.0..8.0).contains(&saturating_players),
+            "{saturating_players:.1} miners saturate the mine — under 3 and it is a queue, over 8 \
+             and the contested-node ceiling has stopped being a real constraint"
+        );
+        // The total tap, shared by everyone, stays within sight of what ONE
+        // hunter makes. A mine that out-produced the whole bounty economy would
+        // be the uncapped faucet this issue exists to prevent.
+        assert!(
+            mine_gold_per_min < BOUNTY_GOLD_PER_MIN * 2.5,
+            "the entire mine mints {mine_gold_per_min:.0} g/min at full contention"
+        );
+    }
+
+    /// A pickaxe pays for its own stone, and costs a real share of what it digs.
+    ///
+    /// #129 put tool upkeep at ~27% of what a tool gathers and that is the band
+    /// this has to stay in: free tools make gathering a pure faucet, and
+    /// expensive ones make the first hour miserable.
+    #[test]
+    fn a_pickaxe_costs_a_real_share_of_what_it_digs_and_funds_its_own_stone() {
+        let (crafting, _) = shipped();
+        let t = crafting.deposit("iron_starter").unwrap();
+        let max_durability = crate::world::tool_max_durability("pickaxe").unwrap() as f64;
+        let swings = max_durability / t.durability_per_swing.max(1) as f64;
+
+        let stone_per_swing: f64 = t
+            .yields
+            .iter()
+            .filter(|y| y.item == "stone")
+            .map(|y| y.chance * (y.qty_min + y.qty_max) as f64 / 2.0)
+            .sum();
+        let stone_mined = swings * stone_per_swing;
+
+        let recipe = crate::world::recipe("pickaxe").expect("the pickaxe recipe");
+        let stone_cost = recipe
+            .inputs
+            .iter()
+            .find(|(i, _)| *i == "stone")
+            .map(|(_, q)| *q as f64)
+            .unwrap_or(0.0);
+        assert!(
+            stone_mined > stone_cost,
+            "a pickaxe digs {stone_mined:.1} stone over its life but costs {stone_cost:.0} — \
+             mining should fund its own replacement rock"
+        );
+
+        // ...but not so much that the tool is free. The pickaxe is the dearer of
+        // the two tools on purpose (#129): mining is the high-effort track.
+        let ore_per_pickaxe = swings * t.yields.iter()
+            .filter(|y| y.item == "iron_ore")
+            .map(|y| y.chance * (y.qty_min + y.qty_max) as f64 / 2.0)
+            .sum::<f64>();
+        assert!(
+            (10.0..40.0).contains(&ore_per_pickaxe),
+            "one pickaxe yields {ore_per_pickaxe:.1} ore — under 10 and upkeep dominates, over 40 \
+             and the tool has stopped being a cost at all"
+        );
+    }
+
+    /// **Bulk is fewer clicks, never fewer resources.**
+    ///
+    /// Every bulk recipe must cost exactly its multiple of inputs, fuel, fee and
+    /// time. A bulk recipe that were cheaper per unit would not be a
+    /// convenience — it would be a discount for knowing which button to press,
+    /// and the single version would become a trap for anyone who had not found
+    /// it. The station fee is the easy one to get wrong, since it is charged per
+    /// JOB.
+    #[test]
+    fn bulk_recipes_are_never_cheaper_per_unit_than_the_slow_way() {
+        let (crafting, _) = shipped();
+        let pairs = [("iron_ingot", "iron_ingot_x4"), ("greenware_crucible", "greenware_crucible_x4")];
+        for (single_id, bulk_id) in pairs {
+            let single = crafting.recipe(single_id).unwrap_or_else(|| panic!("{single_id}"));
+            let bulk = crafting.recipe(bulk_id).unwrap_or_else(|| panic!("{bulk_id}"));
+            let n = bulk.output_qty as f64 / single.output_qty as f64;
+            assert!(n > 1.0, "{bulk_id} should make more than {single_id}");
+
+            for i in &single.inputs {
+                let bulk_qty = bulk
+                    .inputs
+                    .iter()
+                    .find(|b| b.item == i.item)
+                    .unwrap_or_else(|| panic!("{bulk_id} should still need {}", i.item))
+                    .qty as f64;
+                assert!(
+                    bulk_qty >= i.qty as f64 * n - 1e-9,
+                    "{bulk_id} needs {bulk_qty} {} for {n}x the output — cheaper per unit",
+                    i.item
+                );
+            }
+            assert!(
+                bulk.fuel_units as f64 >= single.fuel_units as f64 * n - 1e-9,
+                "{bulk_id} burns less fuel per unit than {single_id}"
+            );
+            assert!(
+                bulk.duration_ms as f64 >= single.duration_ms as f64 * n - 1e-9,
+                "{bulk_id} is faster per unit than {single_id}"
+            );
+            // The one that is easy to miss: the fee is per job, so a x4 recipe
+            // paying one fee is a quarter of the cost per ingot.
+            assert!(
+                bulk.fee_multiplier as f64 >= n - 1e-9,
+                "{bulk_id} pays {} fee(s) for {n}x the output — a discount for knowing the button",
+                bulk.fee_multiplier
+            );
+            // And the catalyst, for the same reason: a crucible that lasted 20
+            // BULK jobs would be 80 ingots on one crucible and would gut the
+            // potters' only market.
+            if let (Some(sc), Some(bc)) = (&single.catalyst, &bulk.catalyst) {
+                assert!(
+                    bc.wear as f64 >= sc.wear as f64 * n - 1e-9,
+                    "{bulk_id} wears its catalyst less per unit than {single_id}"
+                );
+            }
+        }
+    }
+
+    /// The starter mine stops being worth grinding long before it stops being
+    /// usable. That distinction is the whole reason XP falloff exists rather
+    /// than a level cap: a gate would lock a newcomer out, falloff just makes
+    /// the veteran bored.
+    #[test]
+    fn the_starter_mine_is_worthless_to_grind_but_never_closed() {
+        let (crafting, _) = shipped();
+        let t = crafting.deposit("iron_starter").unwrap();
+        let at_start = crate::world::xp_with_falloff(t.xp_per_swing, 0, t.xp_falloff_level);
+        // The curve holds the FULL rate up to and including `xp_falloff_level`
+        // and decays above it — so the level named in config is the last one
+        // that learns at full speed, not the first that is penalised.
+        let at_falloff = crate::world::xp_with_falloff(t.xp_per_swing, t.xp_falloff_level, t.xp_falloff_level);
+        let past = crate::world::xp_with_falloff(t.xp_per_swing, t.xp_falloff_level + 3, t.xp_falloff_level);
+        let well_past = crate::world::xp_with_falloff(t.xp_per_swing, t.xp_falloff_level * 3, t.xp_falloff_level);
+
+        assert_eq!(at_start, t.xp_per_swing, "a beginner gets the full rate");
+        assert_eq!(at_falloff, t.xp_per_swing, "and keeps it right up to the named level");
+        assert!(past < at_start, "past it, the rate decays");
+        assert_eq!(well_past, 0, "to nothing, well past the intended level");
+
+        // Never CLOSED, though: the seam still yields ore at any level, because
+        // the level gate is 0. A veteran can still mine — they just learn
+        // nothing doing it.
+        assert_eq!(t.required_level, 0, "the starter mine must never lock anyone out");
+    }
+}

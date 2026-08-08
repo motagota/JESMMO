@@ -334,6 +334,17 @@ pub struct StationRecipe {
     /// An optional catalyst that improves the job if the player has one.
     #[serde(default)]
     pub catalyst: Option<Catalyst>,
+    /// How many station fees this job costs (#170).
+    ///
+    /// A bulk recipe MUST set this to its multiple. The station's fee is charged
+    /// per job, so a x4 recipe paying one fee would be a quarter of the cost per
+    /// ingot — and a bulk recipe that is cheaper per unit is not a convenience,
+    /// it is a discount for knowing which button to press. Same anti-split
+    /// property the market fees needed in #141, pointing the other way.
+    ///
+    /// Bulk exists to spend fewer clicks, never fewer resources.
+    #[serde(default = "one")]
+    pub fee_multiplier: i64,
 }
 
 fn half() -> f64 {
@@ -532,6 +543,9 @@ impl CraftingConfig {
             }
             if !(0.0..=1.0).contains(&r.failure_xp_fraction) {
                 return bad("failure_xp_fraction must be between 0.0 and 1.0");
+            }
+            if r.fee_multiplier < 1 {
+                return bad("fee_multiplier must be at least 1 — a job cannot cost less than one fee");
             }
             if let Some(c) = &r.catalyst {
                 if crate::world::item(&c.item).is_none() {
