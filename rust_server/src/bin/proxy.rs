@@ -4547,6 +4547,73 @@ impl Proxy {
         (take > 0).then_some((owner, take))
     }
 
+    /// Put somebody on the caller's roster (#183), or renew them.
+    ///
+    /// GRANTS ALWAYS EXPIRE. `days` is bounded rather than trusted: a grant of
+    /// a million days is a permanent grant wearing a number, and permanence is
+    /// the thing the expiry exists to prevent.
+    async fn apply_plot_grant(&self, pid: &str, who: &str, role: &str, days: i64) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else {
+            self.push_to_player(pid, json!({"type": "station.error", "reason": "no_plot"}));
+            return;
+        };
+        let days = days.clamp(1, 90);
+        let now = now_secs();
+        match db
+            .grant_plot_role(&plot.id, pid, who, role, now + days * 86_400, now)
+            .await
+        {
+            Ok(true) => {
+                println!("[Proxy] {pid} granted {who} `{role}` on {} for {days}d", plot.id);
+                self.send_plot_roster_panel(pid).await;
+                // The grantee is told, because a role they did not ask for
+                // changes what they can do and they should not have to
+                // discover it by trying.
+                self.push_to_player(
+                    who,
+                    json!({"type": "plot.granted", "plot_id": plot.id, "role": role, "days": days}),
+                );
+            }
+            Ok(false) => self.push_to_player(pid, json!({"type": "station.error", "reason": "bad_grant"})),
+            Err(e) => eprintln!("[Proxy] grant failed: {e}"),
+        }
+    }
+
+    async fn apply_plot_revoke(&self, pid: &str, who: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        if db.revoke_plot_role(&plot.id, pid, who).await.unwrap_or(false) {
+            self.send_plot_roster_panel(pid).await;
+            self.push_to_player(who, json!({"type": "plot.revoked", "plot_id": plot.id}));
+        }
+    }
+
+    /// The caller's roster, expired rows included so they can see who lapsed.
+    async fn send_plot_roster_panel(&self, pid: &str) {
+        let Some(db) = self.db.clone() else { return };
+        let Ok(Some(plot)) = db.plot_for_character(pid).await else { return };
+        let now = now_secs();
+        let rows: Vec<Value> = db
+            .plot_roster(&plot.id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|g| {
+                json!({
+                    "character_id": g.character_id,
+                    "role": g.role,
+                    "expires_at": g.expires_at,
+                    // Shown, not inferred: an expiry nobody can see is an
+                    // expiry that surprises people.
+                    "days_left": ((g.expires_at - now) / 86_400).max(0),
+                    "expired": g.expires_at <= now,
+                })
+            })
+            .collect();
+        self.push_to_player(pid, json!({"type": "plot.roster", "plot_id": plot.id, "grants": rows}));
+    }
+
     /// Set the caller's own access policy (#181).
     #[allow(clippy::too_many_arguments)]
     async fn apply_station_policy(
@@ -5238,13 +5305,30 @@ impl Proxy {
         if plot.state != "active" {
             return Err("closed");
         }
+        // Their standing on this plot, if any (#183). Evaluated against NOW,
+        // not against whenever a sweep last ran — a lapsed grant must stop
+        // working the moment it lapses.
+        let role = db.plot_role_for(&plot.id, pid, now_secs()).await.ok().flatten();
+
         match plot.station_mode.as_str() {
             "public" => Ok(None),
-            "fee" => Ok(Some((owner, plot.station_fee_gp.max(0)))),
-            // The roster lands in #183. Until it exists, `roster` means nobody
-            // but the owner — the safe reading, and it must not silently behave
-            // as `public` in the meantime.
-            "roster" => Err("not_on_the_roster"),
+            "fee" => {
+                // Staff are not customers. A manager or worker the owner
+                // deliberately put on the roster should not be charged to do
+                // the job they were rostered for; a patron is a customer and
+                // pays like one.
+                match role.as_deref() {
+                    Some(r) if !mmo::persistence::role_pays_fee(r) => Ok(None),
+                    _ => Ok(Some((owner, plot.station_fee_gp.max(0)))),
+                }
+            }
+            "roster" => match role.as_deref() {
+                Some(r) if mmo::persistence::role_pays_fee(r) => {
+                    Ok(Some((owner, plot.station_fee_gp.max(0))))
+                }
+                Some(_) => Ok(None),
+                None => Err("not_on_the_roster"),
+            },
             _ => Err("closed"),
         }
     }
@@ -7569,11 +7653,22 @@ impl Proxy {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .and_then(|t| t.strip_prefix("station."))
-                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish" | "policy"))
+                        .filter(|op| matches!(*op, "open" | "load_fuel" | "start" | "collect" | "demolish" | "policy" | "grant" | "revoke" | "roster"))
                     {
                         let op = op.to_string();
                         match op.as_str() {
                             "open" => self.send_station_state(&player_id).await,
+                            "grant" => {
+                                let who = data.get("character_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let role = data.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let days = data.get("days").and_then(|v| v.as_i64()).unwrap_or(30);
+                                self.apply_plot_grant(&player_id, &who, &role, days).await;
+                            }
+                            "revoke" => {
+                                let who = data.get("character_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                self.apply_plot_revoke(&player_id, &who).await;
+                            }
+                            "roster" => self.send_plot_roster_panel(&player_id).await,
                             "policy" => {
                                 let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let fee = data.get("fee_gp").and_then(|v| v.as_i64()).unwrap_or(0);

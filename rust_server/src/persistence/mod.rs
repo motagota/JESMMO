@@ -897,6 +897,36 @@ pub struct SkillGain {
 }
 
 
+/// A role somebody holds on somebody else's plot (#183).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PlotGrant {
+    pub plot_id: String,
+    pub character_id: String,
+    /// `manager` | `worker` | `patron`. Never `owner` — that comes from the
+    /// lease, so it cannot expire out from under the person who holds it.
+    pub role: String,
+    pub granted_at: i64,
+    /// Every grant expires. Without this a guild that stops playing leaves a
+    /// plot rostered to people who will never log in again.
+    pub expires_at: i64,
+}
+
+/// What a role may do. The table is small on purpose.
+pub fn role_may_use(role: &str) -> bool {
+    matches!(role, "manager" | "worker" | "patron")
+}
+
+/// Whether a role pays the owner's fee. The owner and their staff do not;
+/// a patron is a customer and does.
+pub fn role_pays_fee(role: &str) -> bool {
+    role == "patron"
+}
+
+/// Whether a role may take finished output off the plot.
+pub fn role_may_take_output(role: &str) -> bool {
+    matches!(role, "manager")
+}
+
 /// A station standing on a plot (#180), joined to its plot's ownership.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PlotStation {
@@ -3387,6 +3417,123 @@ impl Db {
         }
         tx.commit().await?;
         Ok(add)
+    }
+
+    // --- The roster: who else may use your plot (#183) ----------------------
+
+    /// Grant `character_id` a role on `plot_id`, or renew one they hold.
+    ///
+    /// Refuses `owner`: an owner's access comes from the lease, not a row, so
+    /// that a lapsed grant can never lock somebody out of their own storage.
+    /// Refuses granting to the owner themselves for the same reason — it would
+    /// be a row that does nothing and expires confusingly.
+    pub async fn grant_plot_role(
+        &self,
+        plot_id: &str,
+        owner: &str,
+        character_id: &str,
+        role: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, DbError> {
+        if !matches!(role, "manager" | "worker" | "patron") {
+            return Ok(false);
+        }
+        if character_id == owner {
+            return Ok(false);
+        }
+        // The plot must be theirs to grant on. Checked here rather than trusted
+        // from the caller, because this is the one write that hands another
+        // player access to somebody's property.
+        let owns: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM plot WHERE id = ? AND owner_character_id = ?",
+        )
+        .bind(plot_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await?;
+        if owns.is_none() {
+            return Ok(false);
+        }
+        // A grant to somebody who does not exist would sit on the roster
+        // forever looking like a real person.
+        let real: Option<i64> = sqlx::query_scalar("SELECT 1 FROM character WHERE id = ?")
+            .bind(character_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if real.is_none() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO plot_grant (plot_id, character_id, role, granted_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(plot_id, character_id) DO UPDATE SET \
+             role = excluded.role, expires_at = excluded.expires_at",
+        )
+        .bind(plot_id)
+        .bind(character_id)
+        .bind(role)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    pub async fn revoke_plot_role(
+        &self,
+        plot_id: &str,
+        owner: &str,
+        character_id: &str,
+    ) -> Result<bool, DbError> {
+        let n = sqlx::query(
+            "DELETE FROM plot_grant WHERE plot_id = ? AND character_id = ? \
+             AND plot_id IN (SELECT id FROM plot WHERE owner_character_id = ?)",
+        )
+        .bind(plot_id)
+        .bind(character_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// The whole roster, expired rows included, for the owner's panel.
+    ///
+    /// Expired grants are RETURNED rather than hidden: an owner should see that
+    /// somebody's access ran out, not silently find them missing. The access
+    /// gate filters; the panel explains.
+    pub async fn plot_roster(&self, plot_id: &str) -> Result<Vec<PlotGrant>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT plot_id, character_id, role, granted_at, expires_at \
+             FROM plot_grant WHERE plot_id = ? ORDER BY granted_at",
+        )
+        .bind(plot_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The role `character_id` holds on `plot_id` **right now**, or `None`.
+    ///
+    /// Expiry is evaluated here, against `now`, rather than depending on a
+    /// sweep having run. A sweep is a convenience; this is the authoritative
+    /// answer, and anything less means a lapsed grant keeps working until a
+    /// timer happens to fire.
+    pub async fn plot_role_for(
+        &self,
+        plot_id: &str,
+        character_id: &str,
+        now: i64,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT role FROM plot_grant \
+             WHERE plot_id = ? AND character_id = ? AND expires_at > ?",
+        )
+        .bind(plot_id)
+        .bind(character_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     // --- Player-built stations on plots (business epic #179, issue #180) ----
@@ -9864,6 +10011,113 @@ mod tests {
             .filter(|i| i.item_id == item)
             .map(|i| i.qty)
             .sum()
+    }
+
+    // --- The roster (#183) --------------------------------------------------
+
+    async fn a_plot_and_owner(db: &Db) -> (String, String) {
+        let owner = a_character(db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 604_800, 0).await.unwrap().unwrap();
+        (owner, plot.id)
+    }
+
+    /// **Expiry is evaluated at the moment of asking**, not by a sweep.
+    ///
+    /// A sweep is a convenience; this is the authoritative answer. Depending on
+    /// one would mean a lapsed grant keeps working until a timer happens to
+    /// fire, which is exactly the ghost-guild rot the expiry exists to prevent.
+    #[tokio::test]
+    async fn a_grant_stops_working_the_moment_it_lapses() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, plot) = a_plot_and_owner(&db).await;
+        let hand = a_character(&db).await;
+
+        assert!(db.grant_plot_role(&plot, &owner, &hand, "worker", 2_000, 1_000).await.unwrap());
+        assert_eq!(db.plot_role_for(&plot, &hand, 1_500).await.unwrap().as_deref(), Some("worker"));
+        assert_eq!(db.plot_role_for(&plot, &hand, 1_999).await.unwrap().as_deref(), Some("worker"));
+        // On the second it expires, with no sweep having run.
+        assert_eq!(db.plot_role_for(&plot, &hand, 2_000).await.unwrap(), None);
+        assert_eq!(db.plot_role_for(&plot, &hand, 9_999).await.unwrap(), None);
+
+        // ...and the row is still THERE, so the owner's panel can show that
+        // somebody lapsed rather than silently losing them.
+        let roster = db.plot_roster(&plot).await.unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].role, "worker");
+    }
+
+    /// The owner is never a row. Their access comes from the lease, so it
+    /// cannot expire out from under them and lock them out of their own
+    /// storage.
+    #[tokio::test]
+    async fn an_owner_is_never_on_their_own_roster() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, plot) = a_plot_and_owner(&db).await;
+
+        assert!(!db.grant_plot_role(&plot, &owner, &owner, "manager", 9_999, 0).await.unwrap(),
+            "granting yourself a role would be a row that expires confusingly");
+        assert!(!db.grant_plot_role(&plot, &owner, &a_character(&db).await, "owner", 9_999, 0).await.unwrap(),
+            "`owner` is not a grantable role");
+        assert!(db.plot_roster(&plot).await.unwrap().is_empty());
+    }
+
+    /// Only the plot's owner may hand out roles on it, and only to real people.
+    #[tokio::test]
+    async fn only_the_owner_grants_and_only_to_real_characters() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, plot) = a_plot_and_owner(&db).await;
+        let stranger = a_character(&db).await;
+        let hand = a_character(&db).await;
+
+        assert!(!db.grant_plot_role(&plot, &stranger, &hand, "worker", 9_999, 0).await.unwrap(),
+            "somebody else's plot is not theirs to staff");
+        assert!(!db.grant_plot_role(&plot, &owner, "nobody-at-all", "worker", 9_999, 0).await.unwrap(),
+            "a grant to a nonexistent character would sit on the roster looking real");
+        assert!(!db.grant_plot_role(&plot, &owner, &hand, "overlord", 9_999, 0).await.unwrap(),
+            "an unknown role is refused rather than stored");
+        assert!(db.plot_roster(&plot).await.unwrap().is_empty());
+    }
+
+    /// Granting twice renews rather than duplicating, and revoking removes.
+    #[tokio::test]
+    async fn granting_twice_renews_and_revoking_removes() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, plot) = a_plot_and_owner(&db).await;
+        let hand = a_character(&db).await;
+
+        db.grant_plot_role(&plot, &owner, &hand, "worker", 2_000, 1_000).await.unwrap();
+        db.grant_plot_role(&plot, &owner, &hand, "manager", 5_000, 1_500).await.unwrap();
+        let roster = db.plot_roster(&plot).await.unwrap();
+        assert_eq!(roster.len(), 1, "one row per person, renewed in place");
+        assert_eq!(roster[0].role, "manager", "the newer role wins");
+        assert_eq!(roster[0].expires_at, 5_000);
+
+        let stranger = a_character(&db).await;
+        assert!(!db.revoke_plot_role(&plot, &stranger, &hand).await.unwrap(),
+            "a stranger cannot sack somebody else's staff");
+        assert!(db.revoke_plot_role(&plot, &owner, &hand).await.unwrap());
+        assert!(db.plot_roster(&plot).await.unwrap().is_empty());
+    }
+
+    /// The role table is small, and each role means one thing.
+    #[test]
+    fn each_role_means_exactly_one_thing() {
+        use crate::persistence::{role_may_take_output, role_may_use, role_pays_fee};
+        for r in ["manager", "worker", "patron"] {
+            assert!(role_may_use(r), "{r} should be able to use the stations");
+        }
+        assert!(!role_may_use("bystander"));
+
+        // Staff are not customers; a patron is.
+        assert!(!role_pays_fee("manager"));
+        assert!(!role_pays_fee("worker"));
+        assert!(role_pays_fee("patron"));
+
+        // Only a manager takes finished goods off somebody else's plot.
+        assert!(role_may_take_output("manager"));
+        assert!(!role_may_take_output("worker"));
+        assert!(!role_may_take_output("patron"));
     }
 
     // --- Payment in goods, capped by value (#182) ---------------------------
