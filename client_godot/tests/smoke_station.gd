@@ -182,6 +182,63 @@ func _process(_delta: float) -> bool:
 		_fail("a full pack must be described as waiting, not lost: '%s'" % msg)
 		return true
 
+	# --- a spoiled job must NOT read like a refund (#168) --------------------
+	# The clay is genuinely gone. A "materials came back" message here would
+	# just move the player's surprise to their inventory screen.
+	_panel.set_state(_state(4, [{
+		"id": "j3", "slot": 0, "recipe_id": "greenware_crucible",
+		"output_item": "greenware_crucible", "output_qty": 1, "state": "spoiled",
+		"started_at": now - 10, "ready_at": now - 4, "remaining_secs": 0, "refund": [],
+	}]))
+	t = _text()
+	if t.findn("came out wrong") < 0 or t.findn("clay is lost") < 0:
+		_fail("a spoiled job should say the clay is lost: %s" % t)
+		return true
+	if t.findn("came back") >= 0:
+		_fail("a spoil must NOT be worded as a refund: %s" % t)
+		return true
+	if _button("Take materials back") != null:
+		_fail("a spoiled job has no materials to hand back: %s" % t)
+		return true
+
+	# --- walking away is a refund, and reads as one --------------------------
+	var cancel_msg := Protocol.job_cancel_text("walked_away")
+	if cancel_msg.findn("came back") < 0:
+		_fail("a cancel should say the materials returned: '%s'" % cancel_msg)
+		return true
+
+	# --- a presence-required station says so up front ------------------------
+	var wheel_state := _state(0, [])
+	wheel_state["kind"] = "shaping"
+	wheel_state["fuels"] = []
+	wheel_state["requires_presence"] = true
+	wheel_state["recipes"] = [{
+		"id": "greenware_crucible", "name": "Throw a Crucible",
+		"inputs": [{"item": "clay_lump", "qty": 2}],
+		"output_item": "greenware_crucible", "output_qty": 1,
+		"fuel_units": 0, "duration_ms": 6000,
+		"skill": "pottery", "required_level": 0, "locked": false,
+		"failure_pct": 35.0,
+	}]
+	_panel.set_inventory([{"item_id": "clay_lump", "qty": 4}])
+	_panel.set_state(wheel_state)
+	t = _text()
+	if t.findn("stay at the wheel") < 0:
+		_fail("a presence-required station should warn before you commit: %s" % t)
+		return true
+	if t.findn("35% spoil") < 0:
+		_fail("the real spoil odds should be shown: %s" % t)
+		return true
+
+	# --- the catalyst is advertised where the decision is made ---------------
+	var cat_state := _state(6, [])
+	cat_state["recipes"][0]["catalyst"] = {"item": "clay_crucible", "bonus_chance": 25.0}
+	_panel.set_inventory([{"item_id": "iron_ore", "qty": 4}, {"item_id": "charcoal", "qty": 3}])
+	_panel.set_state(cat_state)
+	if _text().findn("with a clay_crucible") < 0:
+		_fail("an optional catalyst should be advertised on the recipe: %s" % _text())
+		return true
+
 	# --- a shaping station has no fuel gauge at all --------------------------
 	var wheel := _state(0, [])
 	wheel["kind"] = "shaping"
@@ -194,7 +251,9 @@ func _process(_delta: float) -> bool:
 
 	print("SMOKE_OK: the station panel renders the server's fuel, slots and recipes;",
 		" every disabled button says why; a running job counts down, a ready one",
-		" collects, a failed one explains itself and hands the escrow back; and a",
+		" collects, a failed one hands the escrow back while a SPOILED one says the",
+		" clay is lost; the wheel warns it must be attended and shows the real spoil",
+		" odds; the optional catalyst is advertised where the choice is made; and a",
 		" shaping station has no fire")
 	quit(0)
 	return true

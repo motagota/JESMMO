@@ -146,8 +146,13 @@ signal station_state(state: Dictionary)
 signal station_closed()
 ## A job finished while you were standing somewhere else.
 signal station_ready(station_id: String, job_id: String, slot: int, output_item: String, output_qty: int)
-signal station_collected(slot: int, failed: bool, fail_reason: String, bonus: int, items: Array)
+## `failed` means the world failed it and everything came back; `spoiled`
+## means the attempt itself failed and the inputs are gone (#168). They are
+## separate flags because they are separate outcomes with separate refunds.
+signal station_collected(slot: int, failed: bool, spoiled: bool, fail_reason: String, bonus: int, items: Array)
 signal station_error(reason: String, detail: Dictionary)
+## A presence-required job ended because the player walked away (#168).
+signal station_cancelled(station_id: String, slot: int, recipe_id: String, reason: String)
 signal rent_status(plot_id: String, due_at: int, paid_through: int, state: String, auto_pay: bool, gold: int)
 signal rent_warning(plot_id: String, due_at: int)
 signal rent_reclaimed(plot_id: String, moved_to_storage: Array)
@@ -438,11 +443,18 @@ func _handle_text(text: String) -> void:
             station_collected.emit(
                 int(msg.get("slot", 0)),
                 bool(msg.get("failed", false)),
+                bool(msg.get("spoiled", false)),
                 # An explicit null on the wire is not an absent key, and a
                 # default doesn't apply to one (#165 was bitten by exactly this).
                 String(msg.get("fail_reason", "") if msg.get("fail_reason") != null else ""),
                 int(msg.get("bonus", 0)),
                 msg.get("items", []))
+        Protocol.S_STATION_CANCELLED:
+            station_cancelled.emit(
+                String(msg.get("station_id", "")),
+                int(msg.get("slot", 0)),
+                String(msg.get("recipe_id", "")),
+                String(msg.get("reason", "")))
         Protocol.S_STATION_ERROR:
             station_error.emit(String(msg.get("reason", "")), msg)
         Protocol.S_BOUNTY_STATE:

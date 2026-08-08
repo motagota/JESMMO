@@ -137,6 +137,17 @@ pub struct SkillCurve {
     pub bonus_yield_chance_per_level: f64,
     #[serde(default)]
     pub max_bonus_yield_chance: f64,
+    /// Percentage points of `failure_chance` removed per level (#168).
+    #[serde(default)]
+    pub failure_reduction_per_level: f64,
+    /// The lowest failure chance this skill can ever reach, as a percentage.
+    ///
+    /// NEVER ZERO for a skill that has one. The floor is a permanent material
+    /// sink — it is the reason pottery keeps consuming clay after everyone has
+    /// levelled it, and the reason the clay seams stay worth working. A mastery
+    /// curve that ends in "no failure ever" ends the demand with it.
+    #[serde(default)]
+    pub min_failure_chance: f64,
 }
 
 impl Default for SkillCurve {
@@ -146,6 +157,8 @@ impl Default for SkillCurve {
             max_speed_bonus_pct: 0.0,
             bonus_yield_chance_per_level: 0.0,
             max_bonus_yield_chance: 0.0,
+            failure_reduction_per_level: 0.0,
+            min_failure_chance: 0.0,
         }
     }
 }
@@ -165,6 +178,22 @@ impl SkillCurve {
         let pct = (self.bonus_yield_chance_per_level * level.max(0) as f64)
             .min(self.max_bonus_yield_chance.max(0.0));
         (pct / 100.0).clamp(0.0, 1.0)
+    }
+
+    /// A recipe's failure chance at this level, as a fraction 0.0-1.0.
+    ///
+    /// Skill drives it DOWN toward `min_failure_chance` and no further. A
+    /// recipe that declares no failure has none at any level — levelling can't
+    /// invent a risk that isn't there.
+    pub fn failure_chance(&self, base_pct: f64, level: i64) -> f64 {
+        if base_pct <= 0.0 {
+            return 0.0;
+        }
+        let reduced = base_pct - self.failure_reduction_per_level * level.max(0) as f64;
+        // The floor applies even when it is above the base: a recipe easier
+        // than the floor stays as easy as it was written.
+        let floored = reduced.max(self.min_failure_chance.min(base_pct));
+        (floored / 100.0).clamp(0.0, 1.0)
     }
 }
 
@@ -232,6 +261,33 @@ fn default_station_radius() -> i64 {
     40
 }
 
+/// An optional catalyst a recipe can consume the wear of (#168).
+///
+/// GENERIC ON PURPOSE. The clay crucible is the first, but nothing here knows
+/// what a crucible is: any recipe may name any durable item, so the next
+/// catalyst is a config entry.
+///
+/// OPTIONAL, NOT REQUIRED, and that is the load-bearing part. A required
+/// crucible would mean a clay shortage stalls the entire iron economy, and
+/// every new player hits a wall between "I mined ore" and "I have metal".
+/// Optional keeps the chain unbroken while still giving potters permanent
+/// demand — every crucible in the world is on its way to being used up.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Catalyst {
+    /// The item that must be equipped in the `catalyst` slot to apply.
+    pub item: String,
+    /// Durability spent per job.
+    #[serde(default = "one")]
+    pub wear: i64,
+    /// Percentage chance of one extra output, on top of any skill bonus.
+    #[serde(default)]
+    pub bonus_chance: f64,
+    /// Percentage cut to the job's duration.
+    #[serde(default)]
+    pub speed_bonus_pct: f64,
+}
+
 /// A timed recipe made at a station, as opposed to the instant `world::Recipe`
 /// made at a home crafting structure.
 ///
@@ -260,6 +316,28 @@ pub struct StationRecipe {
     pub duration_ms: i64,
     #[serde(default)]
     pub xp: i64,
+    /// Percentage chance the job FAILS, consuming its inputs and producing
+    /// nothing (#168). Zero for everything but shaping.
+    ///
+    /// This is on the recipe rather than the station because difficulty belongs
+    /// to what you are making, not to what you are making it on — a crucible is
+    /// harder to throw than a jar at the same wheel.
+    #[serde(default)]
+    pub failure_chance: f64,
+    /// What fraction of the XP a FAILED attempt still grants, 0.0-1.0.
+    ///
+    /// Nonzero by default, because failure that teaches nothing is just a tax:
+    /// the player spent the clay and the time either way, and a skill whose
+    /// early levels are pure loss is a skill nobody levels.
+    #[serde(default = "half")]
+    pub failure_xp_fraction: f64,
+    /// An optional catalyst that improves the job if the player has one.
+    #[serde(default)]
+    pub catalyst: Option<Catalyst>,
+}
+
+fn half() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -449,6 +527,38 @@ impl CraftingConfig {
             if r.xp < 0 {
                 return bad("xp must not be negative");
             }
+            if !(0.0..=100.0).contains(&r.failure_chance) {
+                return bad("failure_chance must be a percentage between 0 and 100");
+            }
+            if !(0.0..=1.0).contains(&r.failure_xp_fraction) {
+                return bad("failure_xp_fraction must be between 0.0 and 1.0");
+            }
+            if let Some(c) = &r.catalyst {
+                if crate::world::item(&c.item).is_none() {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("recipe.{id}"),
+                        why: format!("names catalyst `{}`, which is not a real item", c.item),
+                    });
+                }
+                // A catalyst is spent by USE, so it needs durability to spend.
+                // Without this a config could name a stackable item and the
+                // wear would silently do nothing.
+                if crate::world::tool_max_durability(&c.item).is_none() {
+                    return Err(CraftingConfigError::Invalid {
+                        what: format!("recipe.{id}"),
+                        why: format!("catalyst `{}` has no durability, so it could never be consumed", c.item),
+                    });
+                }
+                if c.wear <= 0 {
+                    return bad("a catalyst that never wears is a permanent upgrade, not a catalyst");
+                }
+                if c.bonus_chance < 0.0 || c.speed_bonus_pct < 0.0 {
+                    return bad("catalyst bonuses must not be negative");
+                }
+                if c.bonus_chance <= 0.0 && c.speed_bonus_pct <= 0.0 {
+                    return bad("a catalyst that grants nothing would only cost the player a crucible");
+                }
+            }
             if crate::world::item(&r.output_item).is_none() {
                 return Err(CraftingConfigError::Invalid {
                     what: format!("recipe.{id}"),
@@ -546,6 +656,81 @@ mod tests {
 
     /// Both bonuses are capped, and the cap is what stops a high-level miner
     /// becoming the only correct answer.
+    /// Skill drives shaping failure DOWN toward the floor and stops there.
+    ///
+    /// The floor never reaching zero is not a rounding detail — it is the
+    /// economic point of the whole skill. It is what keeps clay worth mining
+    /// after everyone has levelled Pottery, and what gives potters a reason to
+    /// keep buying it. A curve that ended in "no failure ever" would end the
+    /// demand with it, and pottery would become a thing you finish rather than
+    /// a thing you do.
+    #[test]
+    fn shaping_failure_falls_with_level_but_never_reaches_zero() {
+        let curve = SkillCurve {
+            failure_reduction_per_level: 1.2,
+            min_failure_chance: 8.0,
+            ..SkillCurve::default()
+        };
+
+        assert!((curve.failure_chance(35.0, 0) - 0.35).abs() < 1e-9, "untrained: as written");
+        assert!((curve.failure_chance(35.0, 10) - 0.23).abs() < 1e-9, "35 - 12 = 23%");
+
+        // The floor, and everything past it.
+        assert!((curve.failure_chance(35.0, 25) - 0.08).abs() < 1e-9, "floored at 8%");
+        for level in [30, 60, 200, 10_000] {
+            assert!(
+                (curve.failure_chance(35.0, level) - 0.08).abs() < 1e-9,
+                "level {level} must not fall through the floor"
+            );
+            assert!(curve.failure_chance(35.0, level) > 0.0, "and must never reach zero");
+        }
+
+        // A recipe that declares no failure has none at any level — levelling
+        // cannot invent a risk that isn't in the recipe.
+        assert_eq!(curve.failure_chance(0.0, 0), 0.0);
+        assert_eq!(curve.failure_chance(0.0, 99), 0.0);
+
+        // A recipe EASIER than the floor stays as easy as it was written, rather
+        // than being dragged up to it.
+        assert!((curve.failure_chance(5.0, 0) - 0.05).abs() < 1e-9);
+        assert!((curve.failure_chance(5.0, 99) - 0.05).abs() < 1e-9);
+
+        // An unconfigured skill has no failure curve at all, so a recipe's own
+        // chance stands unmodified rather than silently becoming zero.
+        let flat = SkillCurve::default();
+        assert!((flat.failure_chance(35.0, 50) - 0.35).abs() < 1e-9);
+    }
+
+    /// The shipped Pottery curve actually reaches its floor within a level
+    /// range a player will see, and the shipped recipes agree with it.
+    #[test]
+    fn the_shipped_pottery_curve_is_reachable_and_bites() {
+        let cfg = CraftingConfig::load(std::path::Path::new(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../crafting.toml"),
+        ))
+        .expect("the shipped crafting.toml should load");
+        let curve = cfg.skill("pottery");
+        assert!(curve.min_failure_chance > 0.0, "pottery's floor must not be zero");
+
+        let crucible = cfg.recipe("greenware_crucible").expect("the crucible recipe");
+        assert!(crucible.failure_chance > 0.0, "shaping should be able to fail");
+        assert!(crucible.failure_xp_fraction > 0.0, "a failed throw should still teach");
+
+        let at_0 = curve.failure_chance(crucible.failure_chance, 0);
+        let at_50 = curve.failure_chance(crucible.failure_chance, 50);
+        assert!(at_50 < at_0, "levelling should visibly help");
+        assert!(at_50 > 0.0, "but never all the way");
+        assert!(
+            (at_50 - curve.min_failure_chance / 100.0).abs() < 1e-9,
+            "a level-50 potter should be sitting exactly on the floor"
+        );
+
+        // Firing must NOT be able to fail: the player is not present for it, and
+        // punishing them for something they cannot influence is just a tax.
+        let fired = cfg.recipe("clay_crucible").expect("the firing recipe");
+        assert_eq!(fired.failure_chance, 0.0, "firing is safe by design");
+    }
+
     #[test]
     fn skill_bonuses_scale_with_level_and_stop_at_their_cap() {
         let cfg = CraftingConfig::parse(

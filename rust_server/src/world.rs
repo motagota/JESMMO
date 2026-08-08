@@ -191,6 +191,13 @@ pub fn items() -> Vec<Item> {
         // (#169). The kiln chain that should really produce it is Phase 2.
         Item { id: "charcoal", name: "Charcoal", stack_size: 100, category: "fuel" },
         Item { id: "iron_ingot", name: "Iron Ingot", stack_size: 100, category: "metal" },
+        // Pottery (#168). Greenware is the UNFIRED intermediate: an ordinary
+        // tradable commodity, so the two-stage chain creates something to trade
+        // as well as something to use.
+        Item { id: "greenware_crucible", name: "Greenware Crucible", stack_size: 100, category: "pottery" },
+        Item { id: "greenware_jar", name: "Greenware Jar", stack_size: 100, category: "pottery" },
+        Item { id: "clay_crucible", name: "Clay Crucible", stack_size: 1, category: "pottery" },
+        Item { id: "storage_jar", name: "Storage Jar", stack_size: 1, category: "pottery" },
         // The game's first WEAPON (#160). stack_size 1, like the tools: it's an
         // instance with its own wear, not a stack.
         Item { id: "sword", name: "Sword", stack_size: 1, category: "weapon" },
@@ -371,6 +378,10 @@ pub fn equippable_slot(item_id: &str) -> Option<&'static str> {
         // quarry a chore rather than a risk — you'd arrive unable to mine, or
         // mine unable to defend yourself.
         "sword" => Some("weapon"),
+        // The catalyst slot (#168). Its own slot rather than sharing the tool's:
+        // you smelt with a crucible loaded AND a pickaxe in hand, and making
+        // that a choice would mean unequipping to mine between every smelt.
+        "clay_crucible" => Some("catalyst"),
         _ => None,
     }
 }
@@ -499,9 +510,40 @@ pub fn tool_max_durability(item_id: &str) -> Option<i64> {
         // is no reason for equipment to age at different rates, and one number
         // is one thing to tune.
         "sword" => Some(30),
+        // The smelting catalyst (#168). It wears one point per smelt and leaves
+        // the same repairable husk a broken tool does — #128's model, reused
+        // rather than a second wear system invented beside it.
+        //
+        // 20 uses is the potters' whole business case. A crucible is OPTIONAL:
+        // smelting works without one, so a clay shortage can never stall the
+        // iron economy, and a new player never hits a wall between "I mined
+        // ore" and "I have metal". What it buys the potter instead is permanent
+        // demand — every crucible in the world is on its way to being gone.
+        "clay_crucible" => Some(20),
         _ => None,
     }
 }
+
+/// Extra carry capacity a held item grants (#168).
+///
+/// The Storage Jar attaches to [`crate::persistence::MAX_CARRY`], which is a
+/// limit players hit constantly — it is why collecting a finished job can be
+/// refused for want of room at all. It was NOT attached to home storage, which
+/// the issue proposed: `storage_item` has no cap of any kind, so a jar that
+/// expanded it would expand something already infinite.
+///
+/// The jar occupies a slot itself, so the net gain is one less than this.
+pub fn carry_bonus(item_id: &str) -> i64 {
+    match item_id {
+        "storage_jar" => 15,
+        _ => 0,
+    }
+}
+
+/// The most carry capacity any character can reach, however many jars they
+/// stack. Without a ceiling the cap stops being a constraint and the whole
+/// haul-and-return loop the world is built around goes with it.
+pub const MAX_CARRY_BONUS: i64 = 45;
 
 /// The tool item an ability wears down on a successful swing — the inverse
 /// of [`abilities_for_item`]. `None` for an ability with no tool of its own

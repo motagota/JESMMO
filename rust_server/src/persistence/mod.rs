@@ -91,6 +91,24 @@ fn dump_cost(cost: &BTreeMap<String, i64>) -> String {
 /// practice always 1: every current tool source — craft, NPC grant — hands
 /// over exactly one at a time). Ordinary items keep merging onto a single
 /// stack row like always.
+/// This character's carry capacity: the base [`MAX_CARRY`] plus whatever their
+/// Storage Jars add (#168), bounded by [`world::MAX_CARRY_BONUS`].
+///
+/// EVERY capacity check goes through this. The bare constant was previously
+/// read in five places, and a jar that only widened four of them would be a
+/// pack that holds more when you deposit than when you gather — the kind of
+/// inconsistency that reads as a duplication bug.
+async fn carry_capacity_in_tx(tx: &mut Tx<'_>, character_id: &str) -> Result<i64, DbError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT item_id, SUM(qty) FROM inventory_item WHERE character_id = ? GROUP BY item_id",
+    )
+    .bind(character_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let bonus: i64 = rows.iter().map(|(item, qty)| world::carry_bonus(item) * qty).sum();
+    Ok(MAX_CARRY + bonus.min(world::MAX_CARRY_BONUS))
+}
+
 async fn add_inventory_in_tx(tx: &mut Tx<'_>, character_id: &str, item_id: &str, qty: i64) -> Result<(), DbError> {
     if let Some(max) = world::tool_max_durability(item_id) {
         for _ in 0..qty {
@@ -856,10 +874,12 @@ struct StationJobRow {
     ready_at: i64,
     state: String,
     fail_reason: Option<String>,
+    will_fail: i64,
+    catalyst_bonus: f64,
 }
 
 /// A timed job at a station (#167), with its escrowed inputs decoded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StationJob {
     pub id: String,
     pub station_id: String,
@@ -878,6 +898,13 @@ pub struct StationJob {
     pub ready_at: i64,
     pub state: String,
     pub fail_reason: Option<String>,
+    /// Decided at START (#168): this job is going to spoil. Fixed when the
+    /// inputs are committed, because it decides whether they are refundable.
+    pub will_fail: bool,
+    /// The catalyst's bonus-output chance, captured when the crucible was worn.
+    /// Stored rather than looked up, so a crucible that breaks or is traded away
+    /// mid-job cannot change what the job it already paid for pays out.
+    pub catalyst_bonus: f64,
 }
 
 impl From<StationJobRow> for StationJob {
@@ -898,6 +925,8 @@ impl From<StationJobRow> for StationJob {
             ready_at: r.ready_at,
             state: r.state,
             fail_reason: r.fail_reason,
+            will_fail: r.will_fail != 0,
+            catalyst_bonus: r.catalyst_bonus,
         }
     }
 }
@@ -939,7 +968,10 @@ pub enum CollectError {
 pub struct CollectedJob {
     pub station_id: String,
     pub slot: i64,
+    /// The world failed it: full escrow refunded.
     pub failed: bool,
+    /// The attempt failed on its own merits: inputs consumed, partial XP.
+    pub spoiled: bool,
     pub fail_reason: Option<String>,
     pub payout: Vec<(String, i64)>,
     pub xp: i64,
@@ -1520,7 +1552,7 @@ impl Db {
                 .bind(character_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let room = (MAX_CARRY - total.unwrap_or(0)).max(0);
+        let room = (carry_capacity_in_tx(&mut tx, character_id).await? - total.unwrap_or(0)).max(0);
         let add = qty.min(room);
         if add > 0 {
             add_inventory_in_tx(&mut tx, character_id, item_id, add).await?;
@@ -1588,7 +1620,7 @@ impl Db {
                 .bind(character_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        let room = (carry_capacity_in_tx(&mut tx, character_id).await? - carried.unwrap_or(0)).max(0);
         let moved = qty.min(stored.unwrap_or(0)).min(room);
         if moved > 0 {
             remove_storage_in_tx(&mut tx, character_id, item_id, moved).await?;
@@ -1743,7 +1775,7 @@ impl Db {
                 .bind(character_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        let room = (carry_capacity_in_tx(&mut tx, character_id).await? - carried.unwrap_or(0)).max(0);
         if room <= 0 {
             tx.commit().await?;
             return Ok(0);
@@ -3233,6 +3265,12 @@ impl Db {
         recipe: &crate::crafting_config::StationRecipe,
         fee_gold: i64,
         duration_ms: i64,
+        // Rolled by the caller and fixed here (#168) — see `will_fail` on the row.
+        will_fail: bool,
+        // The catalyst instance to wear and the bonus chance it grants, if the
+        // player had one equipped. Worn at START, so a crucible that breaks or
+        // is traded away mid-job cannot retroactively change this job.
+        catalyst: Option<(String, i64, f64)>,
         now: i64,
     ) -> Result<Result<StationJob, StartJobError>, DbError> {
         let mut tx = self.pool.begin().await?;
@@ -3323,6 +3361,36 @@ impl Db {
             ledger_gold_in_tx(&mut tx, character_id, -fee_gold, "station_fee", now).await?;
         }
 
+        // The catalyst is spent here with everything else. Worn at start, its
+        // contribution recorded on the row, and then never consulted again —
+        // which is precisely what makes "the crucible vanished mid-job" a
+        // non-event rather than an error path.
+        //
+        // A crucible that is already a husk grants nothing and is left alone: it
+        // has no durability left to spend, and wearing it further would just be
+        // a second way to say broken.
+        let mut catalyst_bonus = 0.0_f64;
+        if let Some((instance_id, wear, bonus)) = &catalyst {
+            let durability: Option<i64> = sqlx::query_scalar(
+                "SELECT durability FROM inventory_item WHERE id = ? AND character_id = ?",
+            )
+            .bind(instance_id)
+            .bind(character_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            if durability.unwrap_or(0) > 0 {
+                sqlx::query(
+                    "UPDATE inventory_item SET durability = MAX(durability - ?, 0) WHERE id = ?",
+                )
+                .bind(*wear)
+                .bind(instance_id)
+                .execute(&mut *tx)
+                .await?;
+                catalyst_bonus = *bonus;
+            }
+        }
+
         let inputs: Vec<(String, i64)> =
             recipe.inputs.iter().map(|i| (i.item.clone(), i.qty)).collect();
         let inputs_json = serde_json::to_string(&inputs).unwrap_or_else(|_| "[]".to_string());
@@ -3342,11 +3410,14 @@ impl Db {
             ready_at: now + (duration_ms.max(1) + 999) / 1000,
             state: "running".to_string(),
             fail_reason: None,
+            will_fail,
+            catalyst_bonus,
         };
         sqlx::query(
             "INSERT INTO station_job (id, station_id, character_id, slot, recipe_id, inputs_json, \
-             fuel_units, output_item, output_qty, xp, skill, started_at, ready_at, state) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+             fuel_units, output_item, output_qty, xp, skill, started_at, ready_at, state, \
+             will_fail, catalyst_bonus) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)",
         )
         .bind(&job.id)
         .bind(&job.station_id)
@@ -3361,6 +3432,8 @@ impl Db {
         .bind(&job.skill)
         .bind(job.started_at)
         .bind(job.ready_at)
+        .bind(will_fail as i64)
+        .bind(catalyst_bonus)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3375,7 +3448,8 @@ impl Db {
     ) -> Result<Vec<StationJob>, DbError> {
         let rows: Vec<StationJobRow> = sqlx::query_as(
             "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
-             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason, \
+             will_fail, catalyst_bonus \
              FROM station_job WHERE station_id = ? AND character_id = ? ORDER BY slot",
         )
         .bind(station_id)
@@ -3395,22 +3469,37 @@ impl Db {
         let mut tx = self.pool.begin().await?;
         let rows: Vec<StationJobRow> = sqlx::query_as(
             "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
-             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason, \
+             will_fail, catalyst_bonus \
              FROM station_job WHERE state = 'running' AND ready_at <= ?",
         )
         .bind(now)
         .fetch_all(&mut *tx)
         .await?;
         if !rows.is_empty() {
-            sqlx::query("UPDATE station_job SET state = 'ready' WHERE state = 'running' AND ready_at <= ?")
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+            // A job that was doomed at start ripens into `spoiled`, not `ready`.
+            // The two differ only in what collecting them pays out, but they
+            // have to differ in the ROW as well — otherwise the refund rule
+            // would depend on re-reading `will_fail` at collect time, and a
+            // state that can be reinterpreted later is not a state.
+            sqlx::query(
+                "UPDATE station_job SET state = CASE WHEN will_fail <> 0 THEN 'spoiled' ELSE 'ready' END \
+                 WHERE state = 'running' AND ready_at <= ?",
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(rows
             .into_iter()
-            .map(|r| StationJob { state: "ready".to_string(), ..StationJob::from(r) })
+            .map(|r| {
+                let doomed = r.will_fail != 0;
+                StationJob {
+                    state: if doomed { "spoiled" } else { "ready" }.to_string(),
+                    ..StationJob::from(r)
+                }
+            })
             .collect())
     }
 
@@ -3454,12 +3543,16 @@ impl Db {
         job_id: &str,
         character_id: &str,
         bonus_qty: i64,
+        // What a spoiled attempt still teaches, computed by the caller from the
+        // recipe's `failure_xp_fraction`.
+        spoiled_xp: i64,
         now: i64,
     ) -> Result<Result<CollectedJob, CollectError>, DbError> {
         let mut tx = self.pool.begin().await?;
         let row: Option<StationJobRow> = sqlx::query_as(
             "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
-             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason, \
+             will_fail, catalyst_bonus \
              FROM station_job WHERE id = ? AND character_id = ?",
         )
         .bind(job_id)
@@ -3476,10 +3569,22 @@ impl Db {
             return Ok(Err(CollectError::NotReady { ready_at: job.ready_at }));
         }
 
-        // What is actually owed: the output, or the refund of a failed job.
+        // Three endings, and they pay out differently ON PURPOSE (#168):
+        //
+        //   failed  -> the world let the player down (recipe gone, station gone,
+        //              they were carried off a presence-required wheel). Full
+        //              escrow back, no XP. Losing materials to a restart is not
+        //              a game mechanic.
+        //   spoiled -> the clay came out wrong. Inputs consumed, partial XP, no
+        //              output. This is the permanent sink that keeps clay worth
+        //              mining forever.
+        //   ready   -> it worked.
         let failed = job.state == "failed";
+        let spoiled = job.state == "spoiled";
         let payout: Vec<(String, i64)> = if failed {
             job.inputs.clone()
+        } else if spoiled {
+            Vec::new()
         } else {
             vec![(job.output_item.clone(), job.output_qty + bonus_qty.max(0))]
         };
@@ -3491,7 +3596,7 @@ impl Db {
                 .bind(character_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let room = (MAX_CARRY - carried.unwrap_or(0)).max(0);
+        let room = (carry_capacity_in_tx(&mut tx, character_id).await? - carried.unwrap_or(0)).max(0);
         let want: i64 = payout.iter().map(|(_, q)| *q).sum();
         if want > room {
             tx.commit().await?;
@@ -3514,6 +3619,8 @@ impl Db {
         }
         // A failed job also hands back the fuel it reserved, to the station
         // rather than to the player — it was never theirs, it was the fire's.
+        // A SPOILED one does not: the fire burned, the clay was worked, and the
+        // attempt genuinely happened. Only the result was bad.
         if failed && job.fuel_units > 0 {
             sqlx::query(
                 "INSERT INTO station_fuel (station_id, units, updated_at) VALUES (?, ?, ?) \
@@ -3531,11 +3638,81 @@ impl Db {
             station_id: job.station_id,
             slot: job.slot,
             failed,
+            spoiled,
             fail_reason: job.fail_reason,
             payout,
-            xp: if failed { 0 } else { job.xp },
+            // A spoiled attempt still teaches something. Failure that granted
+            // nothing would just be a tax: the player spent the clay and the
+            // time either way, and a skill whose early levels are pure loss is
+            // a skill nobody levels — which would make the failure floor a wall
+            // rather than a sink. The caller supplies the reduced figure.
+            xp: if failed { 0 } else if spoiled { spoiled_xp.max(0) } else { job.xp },
             skill: job.skill,
         }))
+    }
+
+    /// Cancel a RUNNING job and hand everything straight back — inputs to the
+    /// player, fuel to the station — clearing the slot in the same transaction.
+    ///
+    /// This is what walking away from a presence-required wheel does, and it is
+    /// deliberately not the same as spoiling. #168 called it exactly right:
+    /// losing materials to a network hiccup is not the same as losing them to
+    /// bad luck. A cancel is the former, so it costs nothing.
+    ///
+    /// Only `running` jobs cancel. Once a job has ripened the work is done, and
+    /// walking away from a finished pot should not un-make it.
+    pub async fn cancel_station_job(
+        &self,
+        job_id: &str,
+        now: i64,
+    ) -> Result<Option<StationJob>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<StationJobRow> = sqlx::query_as(
+            "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason, \
+             will_fail, catalyst_bonus \
+             FROM station_job WHERE id = ? AND state = 'running'",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let job = StationJob::from(row);
+
+        // Compare-and-clear, same as collect: the DELETE carries the state, so a
+        // cancel racing a ripen can't refund a job that already finished.
+        let cleared = sqlx::query("DELETE FROM station_job WHERE id = ? AND state = 'running'")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        if cleared.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        // Refunded to the pack even if that overfills it. The alternative is
+        // stranding the goods to make room for a rule, and the player did not
+        // ask for this to happen — the wheel did.
+        for (item, qty) in &job.inputs {
+            add_inventory_in_tx(&mut tx, &job.character_id, item, *qty).await?;
+        }
+        if job.fuel_units > 0 {
+            sqlx::query(
+                "INSERT INTO station_fuel (station_id, units, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(station_id) DO UPDATE SET units = units + excluded.units, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(&job.station_id)
+            .bind(job.fuel_units)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(job))
     }
 
     /// Every job in the world that is not yet collected. The gateway uses this
@@ -3543,7 +3720,8 @@ impl Db {
     pub async fn all_station_jobs(&self) -> Result<Vec<StationJob>, DbError> {
         let rows: Vec<StationJobRow> = sqlx::query_as(
             "SELECT id, station_id, character_id, slot, recipe_id, inputs_json, fuel_units, \
-             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason \
+             output_item, output_qty, xp, skill, started_at, ready_at, state, fail_reason, \
+             will_fail, catalyst_bonus \
              FROM station_job ORDER BY started_at",
         )
         .fetch_all(&self.pool)
@@ -9111,6 +9289,9 @@ mod tests {
             fuel_units: 2,
             duration_ms: 12_000,
             xp: 10,
+            failure_chance: 0.0,
+            failure_xp_fraction: 0.5,
+            catalyst: None,
         }
     }
 
@@ -9126,6 +9307,235 @@ mod tests {
             .filter(|i| i.item_id == item)
             .map(|i| i.qty)
             .sum()
+    }
+
+    // --- Pottery: shaping failure, cancel, and the catalyst (#168) ----------
+
+    fn a_shaping_recipe() -> StationRecipe {
+        StationRecipe {
+            display_name: "Throw a Crucible".into(),
+            tags: vec!["pottery_shaping".into()],
+            skill: "pottery".into(),
+            required_level: 0,
+            inputs: vec![Ingredient { item: "clay_lump".into(), qty: 2 }],
+            output_item: "greenware_crucible".into(),
+            output_qty: 1,
+            fuel_units: 0,
+            duration_ms: 6_000,
+            xp: 12,
+            failure_chance: 35.0,
+            failure_xp_fraction: 0.5,
+            catalyst: None,
+        }
+    }
+
+    /// A spoiled attempt consumes the clay, produces nothing, and still teaches.
+    ///
+    /// All three halves matter. Consuming the clay is the sink; producing
+    /// nothing is the failure; teaching anyway is what stops the failure floor
+    /// being a wall that nobody climbs.
+    #[tokio::test]
+    async fn a_spoiled_attempt_eats_the_clay_and_still_grants_partial_xp() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "clay_lump", 5).await;
+        let job = db
+            .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
+                               0, 6_000, true, None, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held(&db, &cid, "clay_lump").await, 3, "the clay is committed at start");
+
+        let ripe = db.ripen_station_jobs(100).await.unwrap();
+        assert_eq!(ripe[0].state, "spoiled", "a doomed job ripens spoiled, not ready");
+
+        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        assert!(got.spoiled);
+        assert!(!got.failed, "spoiled is not failed — the world did nothing wrong");
+        assert!(got.payout.is_empty(), "no greenware");
+        assert_eq!(got.xp, 6, "half of 12, so the attempt still taught something");
+        assert_eq!(held(&db, &cid, "clay_lump").await, 3, "and the clay does NOT come back");
+    }
+
+    /// The other ending: a job the WORLD failed refunds in full and teaches
+    /// nothing. The asymmetry with spoiling is the whole reason both exist.
+    #[tokio::test]
+    async fn a_world_failure_refunds_in_full_where_a_spoil_refunds_nothing() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "clay_lump", 4).await;
+        let job = db
+            .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
+                               0, 6_000, false, None, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.fail_station_job(&job.id, "recipe_removed").await.unwrap();
+
+        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        assert!(got.failed && !got.spoiled);
+        assert_eq!(got.payout, vec![("clay_lump".to_string(), 2)], "all of it back");
+        assert_eq!(got.xp, 0, "and nothing learned — this was not an attempt");
+        assert_eq!(held(&db, &cid, "clay_lump").await, 4);
+    }
+
+    /// Walking away hands everything back: inputs to the player, fuel to the
+    /// fire, slot cleared. Losing materials to a disconnect is not a mechanic.
+    #[tokio::test]
+    async fn cancelling_a_running_job_returns_everything() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 4).await;
+        carrying(&db, &cid, "charcoal", 1).await;
+        db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(),
+                               0, 12_000, false, None, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held(&db, &cid, "iron_ore").await, 2);
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 0);
+
+        let cancelled = db.cancel_station_job(&job.id, 200).await.unwrap();
+        assert!(cancelled.is_some());
+        assert_eq!(held(&db, &cid, "iron_ore").await, 4, "ore back");
+        assert_eq!(db.station_fuel("f1").await.unwrap(), 2, "fuel back to the fire");
+        assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "slot freed");
+    }
+
+    /// A finished job is not cancellable. Walking away from a pot that is
+    /// already thrown should not un-throw it.
+    #[tokio::test]
+    async fn a_ripened_job_cannot_be_cancelled_out_from_under_itself() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "clay_lump", 4).await;
+        let job = db
+            .start_station_job("w1", &cid, 0, "greenware_crucible", &a_shaping_recipe(),
+                               0, 6_000, false, None, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+
+        assert!(db.cancel_station_job(&job.id, 200).await.unwrap().is_none(),
+            "only a running job cancels");
+        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("greenware_crucible".to_string(), 1)]);
+    }
+
+    /// The crucible wears at START and its bonus is recorded on the row, so a
+    /// crucible that breaks or is traded away mid-job cannot change what the
+    /// job it already paid for pays out.
+    #[tokio::test]
+    async fn the_catalyst_wears_at_start_and_its_bonus_survives_it_vanishing() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 4).await;
+        carrying(&db, &cid, "clay_crucible", 1).await;
+        let crucible = db
+            .inventory_for_character(&cid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.item_id == "clay_crucible")
+            .expect("an instanced crucible");
+        assert_eq!(crucible.durability, Some(20), "instanced with durability, like a tool");
+
+        let mut recipe = a_smelt_recipe();
+        recipe.fuel_units = 0;
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, 12_000, false,
+                               Some((crucible.id.clone(), 1, 25.0)), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.catalyst_bonus, 25.0, "the bonus is captured on the row");
+
+        let worn = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.id == crucible.id).unwrap();
+        assert_eq!(worn.durability, Some(19), "one point spent at start");
+
+        // The crucible is destroyed outright mid-job — the harshest version of
+        // "it vanished". The job must not care.
+        db.remove_from_inventory(&cid, "clay_crucible", 1).await.unwrap();
+        db.ripen_station_jobs(100).await.unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 1, 0, 200).await.unwrap().unwrap();
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 2)],
+            "the bonus the crucible bought still lands");
+    }
+
+    /// A crucible with nothing left grants nothing and is not worn past zero —
+    /// it is a husk, and #128's husks are repairable rather than deleted.
+    #[tokio::test]
+    async fn a_spent_crucible_grants_no_bonus_and_is_not_worn_further() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        carrying(&db, &cid, "iron_ore", 4).await;
+        carrying(&db, &cid, "clay_crucible", 1).await;
+        let crucible = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.item_id == "clay_crucible").unwrap();
+        sqlx::query("UPDATE inventory_item SET durability = 0 WHERE id = ?")
+            .bind(&crucible.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let mut recipe = a_smelt_recipe();
+        recipe.fuel_units = 0;
+        let job = db
+            .start_station_job("f1", &cid, 0, "iron_ingot", &recipe, 0, 12_000, false,
+                               Some((crucible.id.clone(), 1, 25.0)), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.catalyst_bonus, 0.0, "a husk buys nothing");
+
+        let still = db.inventory_for_character(&cid).await.unwrap()
+            .into_iter().find(|i| i.id == crucible.id).expect("the husk survives, repairable");
+        assert_eq!(still.durability, Some(0), "not worn into the negative");
+    }
+
+    /// A Storage Jar raises carry capacity, and it does so for EVERY capacity
+    /// check — the constant was read in four places, and a jar that widened
+    /// three of them would be a pack that holds more when you deposit than
+    /// when you gather.
+    #[tokio::test]
+    async fn a_storage_jar_raises_carry_capacity_everywhere() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+
+        // Base: filling up stops at MAX_CARRY.
+        db.add_to_inventory(&cid, "wood", MAX_CARRY + 20).await.unwrap();
+        assert_eq!(db.inventory_total(&cid).await.unwrap(), MAX_CARRY);
+
+        // Make room for the jar, then add it: capacity rises by its bonus.
+        db.remove_from_inventory(&cid, "wood", 1).await.unwrap();
+        db.add_to_inventory(&cid, "storage_jar", 1).await.unwrap();
+        let added = db.add_to_inventory(&cid, "wood", 100).await.unwrap();
+        assert_eq!(added, world::carry_bonus("storage_jar"), "exactly the jar's bonus fits");
+        assert_eq!(
+            db.inventory_total(&cid).await.unwrap(),
+            MAX_CARRY + world::carry_bonus("storage_jar"),
+            "the jar itself occupies a slot, so the net gain is one less"
+        );
+    }
+
+    /// However many jars, capacity stops. Without a ceiling the cap stops being
+    /// a constraint and the haul-and-return loop goes with it.
+    #[tokio::test]
+    async fn stacking_jars_stops_at_the_ceiling() {
+        let (db, _t) = TempDb::open().await;
+        let cid = a_character(&db).await;
+        db.add_to_inventory(&cid, "storage_jar", 10).await.unwrap();
+        db.add_to_inventory(&cid, "wood", 500).await.unwrap();
+        assert_eq!(
+            db.inventory_total(&cid).await.unwrap(),
+            MAX_CARRY + world::MAX_CARRY_BONUS,
+            "ten jars buy no more than the ceiling"
+        );
     }
 
     /// The core custody claim: inputs and fuel leave at START, not at collect.
@@ -9145,7 +9555,7 @@ mod tests {
 
         let r = a_smelt_recipe();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .expect("should start");
@@ -9169,7 +9579,7 @@ mod tests {
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let r = a_smelt_recipe();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 0, 12_000, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .unwrap();
@@ -9183,7 +9593,7 @@ mod tests {
 
         let ripe = db2.ripen_station_jobs(1_020).await.unwrap();
         assert_eq!(ripe.len(), 1);
-        let got = db2.collect_station_job(&job.id, &cid, 0, 1_020).await.unwrap().unwrap();
+        let got = db2.collect_station_job(&job.id, &cid, 0, 0, 1_020).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
         assert_eq!(held(&db2, &cid, "iron_ingot").await, 1, "exactly one, not two");
     }
@@ -9202,20 +9612,20 @@ mod tests {
         let r = a_smelt_recipe();
         // A fills both their slots.
         for slot in 0..2 {
-            db.start_station_job("f1", &a, slot, "iron_ingot", &r, 0, 12_000, 1_000)
+            db.start_station_job("f1", &a, slot, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
                 .await
                 .unwrap()
                 .expect("A's own slots are free");
         }
         assert!(
             matches!(
-                db.start_station_job("f1", &a, 0, "iron_ingot", &r, 0, 12_000, 1_000).await.unwrap(),
+                db.start_station_job("f1", &a, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000).await.unwrap(),
                 Err(StartJobError::SlotBusy)
             ),
             "A's slot 0 is taken"
         );
         // B is unaffected — same station, same slot number, different player.
-        db.start_station_job("f1", &b, 0, "iron_ingot", &r, 0, 12_000, 1_000)
+        db.start_station_job("f1", &b, 0, "iron_ingot", &r, 0, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .expect("B's slot 0 is their own");
@@ -9235,19 +9645,19 @@ mod tests {
         let gold0 = db.character_gold(&cid).await.unwrap();
 
         // No ore, no fuel.
-        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1).await.unwrap();
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1).await.unwrap();
         assert!(matches!(e, Err(StartJobError::MissingInput { .. })), "{e:?}");
 
         // Ore but still no fuel.
         carrying(&db, &cid, "iron_ore", 2).await;
-        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, 1).await.unwrap();
+        let e = db.start_station_job("f1", &cid, 0, "iron_ingot", &r, 2, 12_000, false, None, 1).await.unwrap();
         assert!(matches!(e, Err(StartJobError::NotEnoughFuel { need: 2, have: 0 })), "{e:?}");
 
         // Fuel, but not enough gold for the fee.
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let e = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &r, gold0 + 1, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &r, gold0 + 1, 12_000, false, None, 1)
             .await
             .unwrap();
         assert!(matches!(e, Err(StartJobError::NotEnoughGold { .. })), "{e:?}");
@@ -9270,7 +9680,7 @@ mod tests {
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let gold0 = db.character_gold(&cid).await.unwrap();
 
-        db.start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000, 1)
+        db.start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 2, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9296,7 +9706,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9304,7 +9714,7 @@ mod tests {
         assert_eq!(db.station_fuel("f1").await.unwrap(), 0);
 
         assert!(db.fail_station_job(&job.id, "recipe_gone").await.unwrap());
-        let got = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap().unwrap();
 
         assert!(got.failed);
         assert_eq!(got.fail_reason.as_deref(), Some("recipe_gone"));
@@ -9326,7 +9736,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9334,7 +9744,7 @@ mod tests {
 
         // Fill the pack to the brim while the job runs.
         carrying(&db, &cid, "stone", MAX_CARRY).await;
-        let e = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
+        let e = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
         assert!(matches!(e, Err(CollectError::NoRoom { .. })), "{e:?}");
         assert_eq!(
             db.station_jobs("f1", &cid).await.unwrap().len(),
@@ -9344,7 +9754,7 @@ mod tests {
 
         // Make room; now it collects.
         db.remove_from_inventory(&cid, "stone", 5).await.unwrap();
-        let got = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
         assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "slot freed");
     }
@@ -9366,14 +9776,14 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
         db.ripen_station_jobs(100).await.unwrap();
 
-        let first = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
-        let second = db.collect_station_job(&job.id, &cid, 0, 200).await.unwrap();
+        let first = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
+        let second = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
         assert!(first.is_ok(), "{first:?}");
         assert!(matches!(second, Err(CollectError::NoSuchJob)), "{second:?}");
         assert_eq!(held(&db, &cid, "iron_ingot").await, 1, "exactly one ingot");
@@ -9393,7 +9803,7 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
@@ -9404,8 +9814,8 @@ mod tests {
         let (j1, j2) = (job.id.clone(), job.id.clone());
         let (c1, c2) = (cid.clone(), cid.clone());
         let (a, b) = tokio::join!(
-            tokio::spawn(async move { d1.collect_station_job(&j1, &c1, 0, 200).await.unwrap() }),
-            tokio::spawn(async move { d2.collect_station_job(&j2, &c2, 0, 200).await.unwrap() }),
+            tokio::spawn(async move { d1.collect_station_job(&j1, &c1, 0, 0, 200).await.unwrap() }),
+            tokio::spawn(async move { d2.collect_station_job(&j2, &c2, 0, 0, 200).await.unwrap() }),
         );
         let wins = [a.unwrap().is_ok(), b.unwrap().is_ok()];
         assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one collect wins");
@@ -9422,18 +9832,18 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1_000)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1_000)
             .await
             .unwrap()
             .unwrap();
 
-        let e = db.collect_station_job(&job.id, &cid, 0, 1_005).await.unwrap();
+        let e = db.collect_station_job(&job.id, &cid, 0, 0, 1_005).await.unwrap();
         assert!(matches!(e, Err(CollectError::NotReady { ready_at: 1_012 })), "{e:?}");
 
         // Not yet due: ripening does nothing.
         assert!(db.ripen_station_jobs(1_005).await.unwrap().is_empty());
         assert_eq!(db.ripen_station_jobs(1_012).await.unwrap().len(), 1, "due on the second");
-        assert!(db.collect_station_job(&job.id, &cid, 0, 1_012).await.unwrap().is_ok());
+        assert!(db.collect_station_job(&job.id, &cid, 0, 0, 1_012).await.unwrap().is_ok());
     }
 
     /// Fuel is SHARED: one player can burn what another loaded. That is the
@@ -9448,7 +9858,7 @@ mod tests {
         assert_eq!(db.station_fuel("f1").await.unwrap(), 4);
 
         carrying(&db, &b, "iron_ore", 2).await;
-        db.start_station_job("f1", &b, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+        db.start_station_job("f1", &b, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .expect("B burns the fire A lit");
@@ -9465,13 +9875,13 @@ mod tests {
         carrying(&db, &cid, "charcoal", 1).await;
         db.load_station_fuel("f1", &cid, "charcoal", 1, 2, 100).await.unwrap();
         let job = db
-            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, 1)
+            .start_station_job("f1", &cid, 0, "iron_ingot", &a_smelt_recipe(), 0, 12_000, false, None, 1)
             .await
             .unwrap()
             .unwrap();
         db.ripen_station_jobs(100).await.unwrap();
 
-        let got = db.collect_station_job(&job.id, &cid, 1, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 1, 0, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 2)], "1 base + 1 bonus");
         assert_eq!(held(&db, &cid, "iron_ingot").await, 2);
     }
