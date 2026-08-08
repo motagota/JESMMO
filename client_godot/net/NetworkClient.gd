@@ -820,9 +820,13 @@ func send_station_load_fuel(item_id: String, qty: int) -> void:
 func send_station_start(recipe_id: String) -> void:
     _send({"type": Protocol.C_STATION_START, "recipe_id": recipe_id})
 
-func send_station_policy(mode: String, fee_gp: int, skill_floor: int) -> void:
+func send_station_policy(
+    mode: String, fee_gp: int, skill_floor: int,
+    fee_in_kind: float = 0.0, fee_in_kind_max_gp: int = 0
+) -> void:
     _send({"type": Protocol.C_STATION_POLICY, "mode": mode,
-           "fee_gp": fee_gp, "skill_floor": skill_floor})
+           "fee_gp": fee_gp, "skill_floor": skill_floor,
+           "fee_in_kind": fee_in_kind, "fee_in_kind_max_gp": fee_in_kind_max_gp})
 
 func send_station_demolish(station_id: String) -> void:
     _send({"type": Protocol.C_STATION_DEMOLISH, "station_id": station_id})

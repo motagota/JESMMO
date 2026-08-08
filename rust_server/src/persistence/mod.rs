@@ -1035,6 +1035,8 @@ pub struct CollectedJob {
     pub spoiled: bool,
     pub fail_reason: Option<String>,
     pub payout: Vec<(String, i64)>,
+    /// What the station's owner took in kind (#182), if anything.
+    pub taken_in_kind: Vec<(String, i64)>,
     pub xp: i64,
     pub skill: String,
 }
@@ -1091,7 +1093,10 @@ pub struct StorageItem {
 
 /// A plot of rented land. `owner_character_id` is `None` while it sits in the
 /// pool; `state` is one of `unowned | active | lapsed | reclaimed`.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+// `Eq` is gone: `station_fee_in_kind` is a fraction, and a fraction is not
+// equatable by exact bit pattern. Nothing compares plots for equality outside
+// tests, which want `PartialEq` anyway.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Plot {
     pub id: String,
     pub owner_character_id: Option<String>,
@@ -1111,6 +1116,10 @@ pub struct Plot {
     pub station_fee_gp: i64,
     /// Minimum skill to use them. Stops wastage rather than gating content.
     pub station_skill_floor: i64,
+    /// 0.0-1.0. The share of a job's output the owner takes in GOODS (#182).
+    pub station_fee_in_kind: f64,
+    /// Value ceiling in gold on a single in-kind take. 0 = no ceiling.
+    pub station_fee_in_kind_max_gp: i64,
     /// Whether the ticker should try to auto-deduct gold when rent comes due,
     /// rather than requiring an explicit `rent.pay` (#14; opt-in, default off).
     pub auto_pay: bool,
@@ -3984,6 +3993,9 @@ impl Db {
         job_id: &str,
         character_id: &str,
         bonus_qty: i64,
+        // The plot owner and how many units of the output they take in kind
+        // (#182), computed by the caller from the policy and the value cap.
+        in_kind: Option<(String, i64)>,
         // What a spoiled attempt still teaches, computed by the caller from the
         // recipe's `failure_xp_fraction`.
         spoiled_xp: i64,
@@ -4022,7 +4034,7 @@ impl Db {
         //   ready   -> it worked.
         let failed = job.state == "failed";
         let spoiled = job.state == "spoiled";
-        let payout: Vec<(String, i64)> = if failed {
+        let mut payout: Vec<(String, i64)> = if failed {
             job.inputs.clone()
         } else if spoiled {
             Vec::new()
@@ -4038,7 +4050,10 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await?;
         let room = (carry_capacity_in_tx(&mut tx, character_id).await? - carried.unwrap_or(0)).max(0);
-        let want: i64 = payout.iter().map(|(_, q)| *q).sum();
+        // Only what the PLAYER will end up carrying needs to fit: the owner's
+        // share goes to their storage and never touches this pack.
+        let owner_units = in_kind.as_ref().map(|(_, u)| *u).unwrap_or(0).max(0);
+        let want: i64 = (payout.iter().map(|(_, q)| *q).sum::<i64>() - owner_units).max(0);
         if want > room {
             tx.commit().await?;
             return Ok(Err(CollectError::NoRoom { need: want, room }));
@@ -4054,6 +4069,28 @@ impl Db {
             tx.commit().await?;
             return Ok(Err(CollectError::NoSuchJob));
         }
+
+        // The owner's share comes off the top, BEFORE the rest reaches the
+        // player — so a full pack refuses the whole collect rather than
+        // quietly stiffing the owner (#182).
+        let mut taken: Vec<(String, i64)> = Vec::new();
+        if let Some((owner, units)) = &in_kind {
+            if *units > 0 && !failed && !spoiled {
+                if let Some((item, have)) = payout.first().cloned() {
+                    let take = (*units).min(have);
+                    if take > 0 {
+                        // To the owner's STORAGE, not their pack. They may be
+                        // offline, on the other side of the world, or already
+                        // full — none of which should lose them the fee, and
+                        // none of which should block the customer's collect.
+                        add_storage_in_tx(&mut tx, owner, &item, take).await?;
+                        taken.push((item.clone(), take));
+                        payout[0].1 = have - take;
+                    }
+                }
+            }
+        }
+        payout.retain(|(_, q)| *q > 0);
 
         for (item, qty) in &payout {
             add_inventory_in_tx(&mut tx, character_id, item, *qty).await?;
@@ -4082,6 +4119,8 @@ impl Db {
             spoiled,
             fail_reason: job.fail_reason,
             payout,
+            // What the station's owner took in kind, for the client to show.
+            taken_in_kind: taken,
             // A spoiled attempt still teaches something. Failure that granted
             // nothing would just be a tax: the player spent the clay and the
             // time either way, and a skill whose early levels are pure loss is
@@ -4154,6 +4193,37 @@ impl Db {
         }
         tx.commit().await?;
         Ok(Some(job))
+    }
+
+    /// How much of `qty` the owner takes in kind, and it is a **whole number**.
+    ///
+    /// Two rules, both of which matter:
+    ///
+    /// **Rounding never rounds up.** A job yielding 1 pot at 20% takes 0, not
+    /// 1. Accumulating a fractional debt across jobs is tempting and wrong: it
+    /// makes the fee unpredictable, which is the one property this mechanic was
+    /// chosen for having.
+    ///
+    /// **The value ceiling binds after the fraction.** One pot in five is a
+    /// modest tax; one sword in five is confiscation, and an owner setting 20%
+    /// cannot tell which they configured. The ceiling is the owner's stated
+    /// limit in gold, and units come off the take until it fits.
+    ///
+    /// An item with no reference price falls back to the plain count — never to
+    /// a free station, and never to an unbounded take.
+    pub fn in_kind_take(qty: i64, fraction: f64, max_gp: i64, unit_price: Option<i64>) -> i64 {
+        if qty <= 0 || fraction <= 0.0 {
+            return 0;
+        }
+        let mut take = (qty as f64 * fraction).floor() as i64;
+        take = take.clamp(0, qty);
+        if let (Some(price), true) = (unit_price, max_gp > 0) {
+            if price > 0 {
+                let affordable = max_gp / price;
+                take = take.min(affordable);
+            }
+        }
+        take.max(0)
     }
 
     /// Every job in the world that is not yet collected. The gateway uses this
@@ -4501,6 +4571,8 @@ impl Db {
             station_mode: "closed".to_string(),
             station_fee_gp: 0,
             station_skill_floor: 0,
+            station_fee_in_kind: 0.0,
+            station_fee_in_kind_max_gp: 0,
             auto_pay: false,
             warned: false,
         })
@@ -4519,16 +4591,24 @@ impl Db {
         mode: &str,
         fee_gp: i64,
         skill_floor: i64,
+        fee_in_kind: f64,
+        fee_in_kind_max_gp: i64,
     ) -> Result<bool, DbError> {
         if !matches!(mode, "closed" | "public" | "fee" | "roster") {
             return Ok(false);
         }
+        // A share above 1.0 would take more than was produced; below 0 would
+        // have the owner paying out. Clamped rather than refused, so a slider
+        // dragged to an end does something sensible.
+        let in_kind = fee_in_kind.clamp(0.0, 1.0);
         let n = sqlx::query(
-            "UPDATE plot SET station_mode = ?, station_fee_gp = ?, station_skill_floor = ?              WHERE id = ? AND owner_character_id = ?",
+            "UPDATE plot SET station_mode = ?, station_fee_gp = ?, station_skill_floor = ?,              station_fee_in_kind = ?, station_fee_in_kind_max_gp = ?              WHERE id = ? AND owner_character_id = ?",
         )
         .bind(mode)
         .bind(fee_gp.max(0))
         .bind(skill_floor.max(0))
+        .bind(in_kind)
+        .bind(fee_in_kind_max_gp.max(0))
         .bind(plot_id)
         .bind(owner)
         .execute(&self.pool)
@@ -9786,6 +9866,193 @@ mod tests {
             .sum()
     }
 
+    // --- Payment in goods, capped by value (#182) ---------------------------
+
+    /// **Rounding never rounds up.**
+    ///
+    /// A job yielding 1 pot at 20% takes 0, not 1. Accumulating a fractional
+    /// debt across jobs is tempting and wrong: it makes the fee unpredictable,
+    /// which is the one property this mechanic was chosen for having.
+    #[test]
+    fn an_in_kind_take_rounds_down_and_never_exceeds_the_output() {
+        // One in five, no ceiling.
+        assert_eq!(Db::in_kind_take(5, 0.2, 0, None), 1);
+        assert_eq!(Db::in_kind_take(10, 0.2, 0, None), 2);
+        // Under the threshold: nothing, rather than a rounded-up unit.
+        assert_eq!(Db::in_kind_take(4, 0.2, 0, None), 0);
+        assert_eq!(Db::in_kind_take(1, 0.2, 0, None), 0);
+        // No fee, no take.
+        assert_eq!(Db::in_kind_take(100, 0.0, 0, None), 0);
+        // And never more than was produced, whatever the fraction says.
+        assert_eq!(Db::in_kind_take(3, 2.0, 0, None), 3);
+        assert_eq!(Db::in_kind_take(0, 0.5, 0, None), 0);
+    }
+
+    /// **The value ceiling is what makes one fraction safe for everything.**
+    ///
+    /// This is the question #168's design doc asked (§13.5) and did not answer:
+    /// one pot in five is a modest tax, one sword in five is confiscation, and
+    /// an owner setting 20% cannot tell which they have configured.
+    #[test]
+    fn the_value_ceiling_binds_on_dear_output_and_not_on_cheap() {
+        // Cheap output, 50g ceiling: the fraction stands.
+        assert_eq!(Db::in_kind_take(10, 0.2, 50, Some(3)), 2, "2 pots at 3g is 6g, well under");
+
+        // Dear output, same fraction, same ceiling: cut down to fit.
+        assert_eq!(Db::in_kind_take(10, 0.2, 50, Some(200)), 0, "one 200g unit already exceeds 50g");
+        assert_eq!(Db::in_kind_take(10, 0.5, 50, Some(25)), 2, "5 units would be 125g; 2 fits");
+
+        // Exactly on the line is allowed.
+        assert_eq!(Db::in_kind_take(10, 0.5, 50, Some(10)), 5, "5 at 10g is exactly 50g");
+
+        // No ceiling configured means the fraction is the whole rule.
+        assert_eq!(Db::in_kind_take(10, 0.5, 0, Some(999)), 5);
+
+        // AN UNPRICED ITEM FALLS BACK TO THE PLAIN COUNT — never to a free
+        // station, and never to an unbounded take. A missing price is the
+        // common case for anything the provisioner does not carry.
+        assert_eq!(Db::in_kind_take(10, 0.2, 50, None), 2);
+    }
+
+    /// The owner's share comes off the top and lands in their STORAGE — they
+    /// may be offline, far away, or already full, and none of that should lose
+    /// them the fee or block the customer's collect.
+    #[tokio::test]
+    async fn the_owner_takes_their_share_of_a_finished_job() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &user, "iron_ore", 8).await;
+        carrying(&db, &user, "charcoal", 4).await;
+        db.load_station_fuel("f1", &user, "charcoal", 4, 2, 100).await.unwrap();
+
+        // A x4 job so a 25% share is a whole unit.
+        let mut bulk = a_smelt_recipe();
+        bulk.inputs[0].qty = 8;
+        bulk.output_qty = 4;
+        bulk.fuel_units = 8;
+        let job = db
+            .start_station_job("f1", &user, 0, "iron_ingot_x4", &bulk, 0, None, 48_000,
+                               false, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(2_000).await.unwrap();
+
+        let got = db
+            .collect_station_job(&job.id, &user, 0, Some((owner.clone(), 1)), 0, 2_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(got.payout, vec![("iron_ingot".to_string(), 3)], "the customer keeps 3 of 4");
+        assert_eq!(got.taken_in_kind, vec![("iron_ingot".to_string(), 1)], "and the owner took 1");
+        assert_eq!(held(&db, &user, "iron_ingot").await, 3);
+
+        let stored = db.storage_for_character(&owner).await.unwrap();
+        let owner_got: i64 = stored.iter().filter(|s| s.item_id == "iron_ingot").map(|s| s.qty).sum();
+        assert_eq!(owner_got, 1, "the owner's share is in their storehouse, not their pack");
+    }
+
+    /// **Goods are conserved.** What the customer lost, the owner gained —
+    /// nothing created, nothing destroyed. The item equivalent of #181's money
+    /// identity, and just as easy to get wrong by one.
+    #[tokio::test]
+    async fn an_in_kind_fee_conserves_the_goods() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &user, "iron_ore", 8).await;
+        carrying(&db, &user, "charcoal", 4).await;
+        db.load_station_fuel("f1", &user, "charcoal", 4, 2, 100).await.unwrap();
+        let mut bulk = a_smelt_recipe();
+        bulk.inputs[0].qty = 8;
+        bulk.output_qty = 4;
+        bulk.fuel_units = 8;
+        let job = db
+            .start_station_job("f1", &user, 0, "iron_ingot_x4", &bulk, 0, None, 48_000,
+                               false, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(2_000).await.unwrap();
+        let got = db
+            .collect_station_job(&job.id, &user, 0, Some((owner.clone(), 1)), 0, 2_000)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let to_user: i64 = got.payout.iter().map(|(_, q)| *q).sum();
+        let to_owner: i64 = got.taken_in_kind.iter().map(|(_, q)| *q).sum();
+        assert_eq!(to_user + to_owner, 4, "every ingot the job made went somewhere");
+    }
+
+    /// A spoiled or failed job pays no in-kind fee. There is no output to take
+    /// a share of, and charging for a failure would be charging twice.
+    #[tokio::test]
+    async fn a_spoiled_or_failed_job_owes_the_owner_nothing() {
+        let (db, _t) = TempDb::open().await;
+        let (owner, user) = (a_character(&db).await, a_character(&db).await);
+        carrying(&db, &user, "clay_lump", 8).await;
+
+        // Spoiled: the clay is gone, but the owner takes nothing from nothing.
+        let job = db
+            .start_station_job("w1", &user, 0, "greenware_crucible", &a_shaping_recipe(),
+                               0, None, 6_000, true, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.ripen_station_jobs(2_000).await.unwrap();
+        let got = db
+            .collect_station_job(&job.id, &user, 0, Some((owner.clone(), 1)), 6, 2_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.spoiled);
+        assert!(got.taken_in_kind.is_empty(), "nothing was made, so nothing is owed");
+
+        // Failed: the escrow is refunded IN FULL — the owner does not get a
+        // cut of somebody's returned materials.
+        let job2 = db
+            .start_station_job("w1", &user, 0, "greenware_crucible", &a_shaping_recipe(),
+                               0, None, 6_000, false, None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        db.fail_station_job(&job2.id, "station_removed").await.unwrap();
+        let got2 = db
+            .collect_station_job(&job2.id, &user, 0, Some((owner.clone(), 1)), 0, 2_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got2.failed);
+        assert!(got2.taken_in_kind.is_empty(), "a refund is not output");
+        assert_eq!(got2.payout, vec![("clay_lump".to_string(), 2)], "all of it back");
+    }
+
+    /// The in-kind share is stored on the policy and clamped to something
+    /// sane. Above 1.0 would take more than was produced; below 0 would have
+    /// the owner paying out.
+    #[tokio::test]
+    async fn the_in_kind_policy_is_clamped_to_a_real_share() {
+        let (db, _t) = TempDb::open().await;
+        let owner = a_character(&db).await;
+        db.seed_capital(&crate::world::capital(), 0).await.unwrap();
+        let plot = db.claim_plot(&owner, "suburbs", 604_800, 0).await.unwrap().unwrap();
+
+        db.set_station_policy(&plot.id, &owner, "fee", 0, 0, 0.2, 50).await.unwrap();
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert!((p.station_fee_in_kind - 0.2).abs() < 1e-9);
+        assert_eq!(p.station_fee_in_kind_max_gp, 50);
+
+        db.set_station_policy(&plot.id, &owner, "fee", 0, 0, 5.0, -10).await.unwrap();
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert!((p.station_fee_in_kind - 1.0).abs() < 1e-9, "clamped to the whole output");
+        assert_eq!(p.station_fee_in_kind_max_gp, 0, "and never negative");
+
+        db.set_station_policy(&plot.id, &owner, "fee", 0, 0, -1.0, 0).await.unwrap();
+        let p = db.load_plot(&plot.id).await.unwrap().unwrap();
+        assert_eq!(p.station_fee_in_kind, 0.0, "an owner cannot pay the customer");
+    }
+
     // --- One player charging another (#181) ---------------------------------
 
     /// **The money identity survives a player-to-player fee.**
@@ -9900,7 +10167,7 @@ mod tests {
                 .unwrap()
                 .expect("should start");
             db.ripen_station_jobs(2_000).await.unwrap();
-            db.collect_station_job(&job.id, &user, 0, 0, 2_000).await.unwrap().unwrap();
+            db.collect_station_job(&job.id, &user, 0, None, 0, 2_000).await.unwrap().unwrap();
         }
 
         let after = db.character_gold(&owner).await.unwrap() + db.character_gold(&user).await.unwrap();
@@ -9921,20 +10188,20 @@ mod tests {
         let plot = db.claim_plot(&owner, "suburbs", 604_800, 0).await.unwrap().unwrap();
         assert_eq!(plot.station_mode, "closed", "closed by default, never open by accident");
 
-        assert!(db.set_station_policy(&plot.id, &owner, "fee", 5, 3).await.unwrap());
+        assert!(db.set_station_policy(&plot.id, &owner, "fee", 5, 3, 0.0, 0).await.unwrap());
         let p = db.load_plot(&plot.id).await.unwrap().unwrap();
         assert_eq!((p.station_mode.as_str(), p.station_fee_gp, p.station_skill_floor), ("fee", 5, 3));
 
-        assert!(!db.set_station_policy(&plot.id, &owner, "freeforall", 5, 0).await.unwrap(),
+        assert!(!db.set_station_policy(&plot.id, &owner, "freeforall", 5, 0, 0.0, 0).await.unwrap(),
             "an unknown mode is refused, not silently treated as closed");
-        assert!(!db.set_station_policy(&plot.id, &stranger, "public", 0, 0).await.unwrap(),
+        assert!(!db.set_station_policy(&plot.id, &stranger, "public", 0, 0, 0.0, 0).await.unwrap(),
             "somebody else's plot is not theirs to open");
         let p = db.load_plot(&plot.id).await.unwrap().unwrap();
         assert_eq!(p.station_mode, "fee", "and neither refusal changed anything");
 
         // A negative fee would be the owner paying the user to use their
         // furnace — a gold faucet with someone else's hand on the tap.
-        db.set_station_policy(&plot.id, &owner, "fee", -50, -1).await.unwrap();
+        db.set_station_policy(&plot.id, &owner, "fee", -50, -1, 0.0, 0).await.unwrap();
         let p = db.load_plot(&plot.id).await.unwrap().unwrap();
         assert_eq!((p.station_fee_gp, p.station_skill_floor), (0, 0), "clamped, never negative");
     }
@@ -10149,7 +10416,7 @@ mod tests {
         let ripe = db.ripen_station_jobs(100).await.unwrap();
         assert_eq!(ripe[0].state, "spoiled", "a doomed job ripens spoiled, not ready");
 
-        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, None, 6, 200).await.unwrap().unwrap();
         assert!(got.spoiled);
         assert!(!got.failed, "spoiled is not failed — the world did nothing wrong");
         assert!(got.payout.is_empty(), "no greenware");
@@ -10172,7 +10439,7 @@ mod tests {
             .unwrap();
         db.fail_station_job(&job.id, "recipe_removed").await.unwrap();
 
-        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, None, 6, 200).await.unwrap().unwrap();
         assert!(got.failed && !got.spoiled);
         assert_eq!(got.payout, vec![("clay_lump".to_string(), 2)], "all of it back");
         assert_eq!(got.xp, 0, "and nothing learned — this was not an attempt");
@@ -10221,7 +10488,7 @@ mod tests {
 
         assert!(db.cancel_station_job(&job.id, 200).await.unwrap().is_none(),
             "only a running job cancels");
-        let got = db.collect_station_job(&job.id, &cid, 0, 6, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, None, 6, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("greenware_crucible".to_string(), 1)]);
     }
 
@@ -10261,7 +10528,7 @@ mod tests {
         // "it vanished". The job must not care.
         db.remove_from_inventory(&cid, "clay_crucible", 1).await.unwrap();
         db.ripen_station_jobs(100).await.unwrap();
-        let got = db.collect_station_job(&job.id, &cid, 1, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 1, None, 0, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 2)],
             "the bonus the crucible bought still lands");
     }
@@ -10392,7 +10659,7 @@ mod tests {
 
         let ripe = db2.ripen_station_jobs(1_020).await.unwrap();
         assert_eq!(ripe.len(), 1);
-        let got = db2.collect_station_job(&job.id, &cid, 0, 0, 1_020).await.unwrap().unwrap();
+        let got = db2.collect_station_job(&job.id, &cid, 0, None, 0, 1_020).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
         assert_eq!(held(&db2, &cid, "iron_ingot").await, 1, "exactly one, not two");
     }
@@ -10499,7 +10766,7 @@ mod tests {
             .unwrap()
             .unwrap();
         db.ripen_station_jobs(1_100).await.unwrap();
-        db.collect_station_job(&job.id, &cid, 0, 0, 1_100).await.unwrap().unwrap();
+        db.collect_station_job(&job.id, &cid, 0, None, 0, 1_100).await.unwrap().unwrap();
         assert_eq!(db.gold_supply_gap().await.unwrap(), 0, "after burning a station fee");
 
         // Sold into the provisioner's floor — gold MINTED.
@@ -10605,7 +10872,7 @@ mod tests {
         assert_eq!(db.station_fuel("f1").await.unwrap(), 0);
 
         assert!(db.fail_station_job(&job.id, "recipe_gone").await.unwrap());
-        let got = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, None, 0, 200).await.unwrap().unwrap();
 
         assert!(got.failed);
         assert_eq!(got.fail_reason.as_deref(), Some("recipe_gone"));
@@ -10635,7 +10902,7 @@ mod tests {
 
         // Fill the pack to the brim while the job runs.
         carrying(&db, &cid, "stone", MAX_CARRY).await;
-        let e = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
+        let e = db.collect_station_job(&job.id, &cid, 0, None, 0, 200).await.unwrap();
         assert!(matches!(e, Err(CollectError::NoRoom { .. })), "{e:?}");
         assert_eq!(
             db.station_jobs("f1", &cid).await.unwrap().len(),
@@ -10645,7 +10912,7 @@ mod tests {
 
         // Make room; now it collects.
         db.remove_from_inventory(&cid, "stone", 5).await.unwrap();
-        let got = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 0, None, 0, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 1)]);
         assert!(db.station_jobs("f1", &cid).await.unwrap().is_empty(), "slot freed");
     }
@@ -10673,8 +10940,8 @@ mod tests {
             .unwrap();
         db.ripen_station_jobs(100).await.unwrap();
 
-        let first = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
-        let second = db.collect_station_job(&job.id, &cid, 0, 0, 200).await.unwrap();
+        let first = db.collect_station_job(&job.id, &cid, 0, None, 0, 200).await.unwrap();
+        let second = db.collect_station_job(&job.id, &cid, 0, None, 0, 200).await.unwrap();
         assert!(first.is_ok(), "{first:?}");
         assert!(matches!(second, Err(CollectError::NoSuchJob)), "{second:?}");
         assert_eq!(held(&db, &cid, "iron_ingot").await, 1, "exactly one ingot");
@@ -10705,8 +10972,8 @@ mod tests {
         let (j1, j2) = (job.id.clone(), job.id.clone());
         let (c1, c2) = (cid.clone(), cid.clone());
         let (a, b) = tokio::join!(
-            tokio::spawn(async move { d1.collect_station_job(&j1, &c1, 0, 0, 200).await.unwrap() }),
-            tokio::spawn(async move { d2.collect_station_job(&j2, &c2, 0, 0, 200).await.unwrap() }),
+            tokio::spawn(async move { d1.collect_station_job(&j1, &c1, 0, None, 0, 200).await.unwrap() }),
+            tokio::spawn(async move { d2.collect_station_job(&j2, &c2, 0, None, 0, 200).await.unwrap() }),
         );
         let wins = [a.unwrap().is_ok(), b.unwrap().is_ok()];
         assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one collect wins");
@@ -10728,13 +10995,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let e = db.collect_station_job(&job.id, &cid, 0, 0, 1_005).await.unwrap();
+        let e = db.collect_station_job(&job.id, &cid, 0, None, 0, 1_005).await.unwrap();
         assert!(matches!(e, Err(CollectError::NotReady { ready_at: 1_012 })), "{e:?}");
 
         // Not yet due: ripening does nothing.
         assert!(db.ripen_station_jobs(1_005).await.unwrap().is_empty());
         assert_eq!(db.ripen_station_jobs(1_012).await.unwrap().len(), 1, "due on the second");
-        assert!(db.collect_station_job(&job.id, &cid, 0, 0, 1_012).await.unwrap().is_ok());
+        assert!(db.collect_station_job(&job.id, &cid, 0, None, 0, 1_012).await.unwrap().is_ok());
     }
 
     /// Fuel is SHARED: one player can burn what another loaded. That is the
@@ -10772,7 +11039,7 @@ mod tests {
             .unwrap();
         db.ripen_station_jobs(100).await.unwrap();
 
-        let got = db.collect_station_job(&job.id, &cid, 1, 0, 200).await.unwrap().unwrap();
+        let got = db.collect_station_job(&job.id, &cid, 1, None, 0, 200).await.unwrap().unwrap();
         assert_eq!(got.payout, vec![("iron_ingot".to_string(), 2)], "1 base + 1 bonus");
         assert_eq!(held(&db, &cid, "iron_ingot").await, 2);
     }

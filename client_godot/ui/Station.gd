@@ -133,6 +133,19 @@ func _redraw() -> void:
         _title.text += "  (%dg to the owner)" % owner_fee
     elif fee > 0:
         _title.text += "  (%dg per job)" % fee
+    # One pot in five, stated plainly. The whole reason `fee_in_kind` was
+    # chosen over a percentage is that it needs no explanation, so the UI must
+    # not undo that by rendering it as a decimal.
+    var in_kind := float(_state.get("owner_fee_in_kind", 0.0))
+    if in_kind > 0.0 and not mine:
+        var one_in := int(round(1.0 / in_kind)) if in_kind > 0.0 else 0
+        if one_in > 1:
+            _title.text += "  — the owner takes 1 in %d" % one_in
+        else:
+            _title.text += "  — the owner takes it all"
+        var cap := int(_state.get("owner_fee_in_kind_max_gp", 0))
+        if cap > 0:
+            _title.text += " (up to %dg)" % cap
     if mine:
         _title.text += "  — yours"
     var denied := String(_state.get("access_error", ""))
