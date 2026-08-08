@@ -181,6 +181,54 @@ ceiling = 60
 bid_qty = 120
 seed_stock = 60
 
+# Iron ore — the mine's only tap into the money supply (#170).
+#
+# MEASURED, NOT GUESSED, AND THE MEASUREMENT MOVED THE NUMBER.
+#
+# On paper: 8 charges at 3s with a 0.55 yield chance is 4.4 ore per seam and
+# ~29s of work-plus-walk to take it — 9.1 ore/min. That is the CEILING for one
+# miner, and it assumes a live seam always within a few steps.
+#
+# Actually running it says otherwise. Two 150-second runs underground both came
+# out at 3.2 ore/min, and the reason is visible in the refusals: a solo miner
+# empties the seams around them in under a minute and then waits out a 75-second
+# respawn. The yield chance itself checked out exactly — 0.50 and 0.57 observed
+# against 0.55 configured — so the shortfall is pacing, not probability.
+#
+# A competent human routes better than the bot that produced those runs and
+# worse than the paper figure, so the real rate is somewhere around 6 ore/min.
+# At 5g that is ~30 gold/min, just above wages. At the 4g this issue first
+# reached for, a real miner would have earned ~24 — BELOW hauling logs, which
+# would have made the whole mine a worse use of time than the thing it is
+# supposed to be more interesting than. That is the number the live run caught.
+#
+# The benchmarks it has to sit between are real and both checkable on
+# `gold_by_reason`: build wages pay ~25 g/min, the dog bounty ~100 g/min. 36
+# lands above wages and well below the bounty, which is where mining belongs —
+# it is safer than combat, needs no weapon, and is the first activity a new
+# player reaches. If it out-earned the bounty, combat would have no economic
+# reason to exist.
+#
+# (The doc's benchmark was "one deer is about 17 copper". There are no deer, no
+# hunting and no copper. These two are what the game actually has.)
+#
+# THE FAUCET HAS A HARD CEILING, and it is not this number — it is the mine.
+# 16 seams, each 24s of work then a ~75s respawn, caps the WHOLE MINE at ~43
+# ore/min no matter how many players turn up: about 213 g/min in total, shared.
+# Roughly five miners saturate it, and the sixth makes everyone slower rather
+# than making more gold. That ceiling is a consequence of shared contested
+# nodes with no lock (see crafting.toml) — it is the reason that choice is
+# load-bearing rather than merely convenient, and it should not be "fixed".
+#
+# Iron INGOTS deliberately get no table. Smelting is a refining step whose
+# price should be found between players, and a second NPC bid on the same
+# material chain would be a second faucet on top of a capped one.
+[defaults.provisioner.iron_ore]
+floor = 5
+ceiling = 120
+bid_qty = 100
+seed_stock = 40
+
 # ---------------------------------------------------------------------------
 # The creature bounty (wild dogs epic #157, issue #161).
 #

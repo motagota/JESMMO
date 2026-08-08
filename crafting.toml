@@ -32,7 +32,12 @@
 [deposit.iron_starter]
 display_name = "Iron Deposit"
 skill = "mining"
-required_level = 1
+# ZERO, not one. `level_for_xp` returns 0 for an untrained skill, so 1 already
+# means "you have done this before" — and #170 wired this gate up for the first
+# time, having found it read nowhere. At 1 it would have locked the starter mine
+# against every new player, exactly as it did the furnace in #167. The gate is
+# for the deeper seams Phase 2 wants, not for the tutorial.
+required_level = 0
 required_tool = "pickaxe"
 charges = 8
 swing_time_ms = 3000
@@ -93,7 +98,7 @@ max_bonus_yield_chance = 20
 [deposit.clay_starter]
 display_name = "Clay Seam"
 skill = "mining"
-required_level = 1
+required_level = 0
 required_tool = "pickaxe"
 charges = 10
 swing_time_ms = 2400
@@ -365,3 +370,75 @@ xp = 14
 [[recipe.storage_jar.inputs]]
 item = "greenware_jar"
 qty = 1
+
+# ===========================================================================
+# BULK RECIPES (#170).
+#
+# BULK BUYS FEWER CLICKS, NEVER FEWER RESOURCES. Every bulk recipe below costs
+# exactly its multiple of the inputs, the fuel, the fee and the time. A bulk
+# recipe that was cheaper per unit would not be a convenience — it would be a
+# discount for knowing which button to press, and the slow way would become a
+# trap for anyone who hadn't found it yet.
+#
+# The `fee_multiplier` is the part that is easy to get wrong: the station fee is
+# charged PER JOB, so a x4 recipe paying one fee would be a quarter of the cost
+# per ingot without anyone intending it.
+#
+# What bulk DOES buy is more work in flight — four units in a slot instead of
+# one. That is safe here because the mine's output is capped upstream by seam
+# count and respawn (see market.toml), so a faster furnace cannot widen the
+# faucet. It only means a skilled player spends their time mining instead of
+# clicking.
+# ===========================================================================
+
+[recipe.iron_ingot_x4]
+display_name = "Smelt Iron Ingots (x4)"
+tags = ["smelting"]
+skill = "smelting"
+# Not a beginner's button. By the time this unlocks the player has smelted
+# enough single ingots to know what it is a shortcut FOR.
+required_level = 8
+output_item = "iron_ingot"
+output_qty = 4
+fuel_units = 8
+duration_ms = 48000
+xp = 40
+fee_multiplier = 4
+
+[[recipe.iron_ingot_x4.inputs]]
+item = "iron_ore"
+qty = 8
+
+[recipe.iron_ingot_x4.catalyst]
+item = "clay_crucible"
+# Four smelts, four points of wear. A crucible that lasted 20 BULK jobs would
+# be 80 ingots on one crucible and would quietly gut the potters' only market.
+wear = 4
+bonus_chance = 25.0
+speed_bonus_pct = 15.0
+
+[recipe.greenware_crucible_x4]
+display_name = "Throw Crucibles (x4)"
+tags = ["pottery_shaping"]
+skill = "pottery"
+required_level = 12
+output_item = "greenware_crucible"
+output_qty = 4
+duration_ms = 24000
+xp = 48
+# Each of the four is rolled as one job, so a spoil costs the whole batch. That
+# is the risk premium for batching, and the reason the unlock sits above the
+# level where the floor starts to bite.
+failure_chance = 35.0
+failure_xp_fraction = 0.5
+# The wheel charges no fee today, so this multiplies zero. Set anyway: the
+# moment the wheel ever charges anything, a x4 recipe paying one fee becomes a
+# quarter-price shortcut without anyone touching this recipe. Config that is
+# only correct because another number happens to be zero is the same trap that
+# `swing_time_ms`, `requires_presence` and `required_level` each sprang in this
+# epic.
+fee_multiplier = 4
+
+[[recipe.greenware_crucible_x4.inputs]]
+item = "clay_lump"
+qty = 8

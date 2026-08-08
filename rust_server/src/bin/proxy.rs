@@ -5014,6 +5014,7 @@ impl Proxy {
                     "output_item": r.output_item,
                     "output_qty": r.output_qty,
                     "fuel_units": r.fuel_units,
+                    "fee_gold": t.usage_fee_gold * r.fee_multiplier.max(1),
                     // The duration the CALLER would actually get, with their own
                     // Smelting level already applied. Sending the base and
                     // letting the client apply the curve would put the same rule
@@ -5189,7 +5190,8 @@ impl Proxy {
         match db
             .start_station_job(
                 &placement.id, cid, slot, recipe_id, &recipe,
-                t.usage_fee_gold, duration.max(1), will_fail, catalyst, now_secs(),
+                t.usage_fee_gold * recipe.fee_multiplier.max(1),
+                duration.max(1), will_fail, catalyst, now_secs(),
             )
             .await
         {
@@ -10351,7 +10353,7 @@ mod tests {
             inputs: vec![mmo::crafting_config::Ingredient { item: "iron_ore".into(), qty: 2 }],
             output_item: "iron_ingot".into(), output_qty: 1, fuel_units: 2,
             duration_ms: 1_000, xp: 10, failure_chance: 0.0,
-            failure_xp_fraction: 0.5, catalyst: None,
+            failure_xp_fraction: 0.5, catalyst: None, fee_multiplier: 1,
         };
         recipe.fuel_units = 2;
         let job = db

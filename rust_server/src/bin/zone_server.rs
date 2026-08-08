@@ -896,7 +896,27 @@ impl ZoneServer {
                     None => node.item_id == target_item,
                 }
             };
+            // A seam's `required_level`, which until #170 was config that did
+            // NOTHING — declared on every deposit and read nowhere, so a level
+            // gate could be written in the file and silently not exist. The same
+            // class of bug as `swing_time_ms` (fixed in #172) and
+            // `requires_presence` (fixed in #169); this is the third and last of
+            // them in this epic.
+            //
+            // Both shipped seams require level 1 and `level_for_xp(0)` is 0, so
+            // wiring this up would have locked the starter mine against every
+            // new player — exactly what it did to the furnace in #167. Both are
+            // therefore dropped to 0 in the same change. The gate is here for
+            // the deeper seams #164's Phase 2 wants, not to fence off the
+            // tutorial.
+            let level_gate = |node: &ResourceNode| -> bool {
+                match node.deposit.as_deref().and_then(|k| self.crafting.deposit(k)) {
+                    Some(t) => skill_level >= t.required_level,
+                    None => true,
+                }
+            };
             match nodes.get_mut(node_id) {
+                Some(node) if targetable(node) && !level_gate(node) => Err("skill_too_low"),
                 Some(node) if targetable(node) && node.qty > 0 => {
                     if dist2(p.x, p.y, node.x, node.y) > (SWING_RANGE as i64).pow(2) {
                         Err("out_of_range")
