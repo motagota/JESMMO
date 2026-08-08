@@ -9694,7 +9694,7 @@ mod tests {
     /// as they don't overlap, but placement outside the plot's bounds, or onto
     /// something already there, is a silent no-op.
     #[tokio::test]
-    async fn build_place_validates_bounds_and_overlap_but_allows_multiple_per_kind() {
+    async fn build_place_refuses_bounds_and_overlap_with_a_reason_but_allows_multiple_per_kind() {
         let (proxy, dbf, mut zone) = proxy_with_db().await;
         let db = Db::connect(dbf.url()).await.unwrap();
         db.seed_capital(&mmo::world::capital(), 0).await.unwrap();
@@ -9713,17 +9713,28 @@ mod tests {
         let placed2 = place_home_structure(&mut zone, &mut ws, &pid, "bed", bx + 40, by + 40).await;
         assert_ne!(placed2["structure"]["id"], placed["structure"]["id"]);
 
-        // Overlapping the first bed's footprint is a silent no-op.
+        // Overlapping the first bed's footprint is refused, WITH A REASON.
+        //
+        // This used to assert silence, and silence was defensible while
+        // placement was free: nothing was lost, so nothing needed explaining.
+        // #180 made a station cost 40 stone and 12 ingots, at which point a
+        // refusal the player cannot see is the same shape of bug as the
+        // unreachable mine (#186) — the action does nothing and nothing says
+        // why. The stronger assertion is that it refuses AND explains.
         zone.to_proxy.send(Message::Text(json!({
             "type": "build_place", "player_id": pid, "kind": "storage", "x": bx + 10, "y": by + 10, "rot": 0,
         }).to_string())).unwrap();
-        assert!(recv_frame(&mut ws).await.is_none(), "overlapping placement should not succeed");
+        let refused = recv_frame(&mut ws).await.expect("a refusal should be sent, not silence");
+        assert_eq!(refused["type"], "build.error");
+        assert_eq!(refused["reason"], "overlaps_something");
 
-        // Outside the plot's bounds entirely is also a silent no-op.
+        // Outside the plot's bounds entirely, likewise.
         zone.to_proxy.send(Message::Text(json!({
             "type": "build_place", "player_id": pid, "kind": "crafting", "x": 0, "y": 0, "rot": 0,
         }).to_string())).unwrap();
-        assert!(recv_frame(&mut ws).await.is_none(), "placement off the owner's plot should not succeed");
+        let off_plot = recv_frame(&mut ws).await.expect("a refusal should be sent, not silence");
+        assert_eq!(off_plot["type"], "build.error");
+        assert_eq!(off_plot["reason"], "outside_your_plot");
 
         // Durable: exactly the two beds landed, nothing else.
         let plot = db.plot_for_character(&pid).await.unwrap().unwrap();
